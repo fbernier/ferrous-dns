@@ -20,7 +20,7 @@ pub use eviction::EvictionStrategy;
 pub use key::{BorrowedKey, CacheKey};
 pub use metrics::CacheMetrics;
 pub use negative_ttl::{NegativeQueryTracker, TrackerStats};
-pub use port::DnsCacheAccess;
+pub use port::{DnsCacheAccess, LocalRecordStatus};
 pub use record::CachedRecord;
 pub use refresh::RefreshScanOptions;
 pub use storage::{DnsCache, DnsCacheConfig, RefreshRequest, RefreshSenders};

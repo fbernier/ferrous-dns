@@ -1,7 +1,8 @@
 use super::super::cache::key::CacheKey;
 use super::super::cache::negative_cache::clamp_negative_ttl;
 use super::super::cache::{
-    CachedAddresses, CachedData, CachedDnssecStatus, DnsCacheAccess, NegativeQueryTracker,
+    CachedAddresses, CachedData, CachedDnssecStatus, DnsCacheAccess, LocalRecordStatus,
+    NegativeQueryTracker,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,6 +21,7 @@ use tokio::sync::watch;
 
 struct InflightResult {
     addresses: Arc<Vec<IpAddr>>,
+    local_dns: bool,
     cname_chain: Arc<[Arc<str>]>,
     dnssec_status: Option<&'static str>,
     min_ttl: Option<u32>,
@@ -82,6 +84,25 @@ impl CachedResolver {
     }
 
     fn check_cache_str(&self, domain: &str, record_type: RecordType) -> Option<DnsResolution> {
+        let local_status = self.cache.local_record_status(domain, &record_type);
+        if local_status == LocalRecordStatus::MissingType {
+            // A configured address owns the name, not only its record type.
+            // Check before ordinary cached answers so stale upstream data cannot win.
+            return Some(DnsResolution {
+                addresses: Arc::clone(&EMPTY_ADDRESSES),
+                cache_hit: true,
+                local_dns: true,
+                dnssec_status: None,
+                cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
+                upstream_server: None,
+                upstream_pool: None,
+                min_ttl: None,
+                negative_soa_ttl: None,
+                upstream_wire_data: None,
+            });
+        }
+        let local_dns = local_status == LocalRecordStatus::Present;
+
         self.cache
             .get(domain, &record_type)
             .map(|(data, dnssec_status, remaining_ttl)| {
@@ -90,7 +111,7 @@ impl CachedResolver {
                     CachedData::IpAddresses(entry) => DnsResolution {
                         addresses: Arc::clone(&entry.addresses),
                         cache_hit: true,
-                        local_dns: false,
+                        local_dns,
                         dnssec_status: dnssec_str,
                         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
                         upstream_server: None,
@@ -102,7 +123,7 @@ impl CachedResolver {
                     CachedData::CanonicalName(name) => DnsResolution {
                         addresses: Arc::clone(&EMPTY_ADDRESSES),
                         cache_hit: true,
-                        local_dns: false,
+                        local_dns,
                         dnssec_status: dnssec_str,
                         cname_chain: Arc::from([Arc::clone(&name)]),
                         upstream_server: None,
@@ -114,7 +135,7 @@ impl CachedResolver {
                     CachedData::WireData(bytes) => DnsResolution {
                         addresses: Arc::clone(&EMPTY_ADDRESSES),
                         cache_hit: true,
-                        local_dns: false,
+                        local_dns,
                         dnssec_status: dnssec_str,
                         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
                         upstream_server: None,
@@ -126,7 +147,7 @@ impl CachedResolver {
                     CachedData::NegativeResponse => DnsResolution {
                         addresses: Arc::clone(&EMPTY_ADDRESSES),
                         cache_hit: true,
-                        local_dns: false,
+                        local_dns,
                         dnssec_status: dnssec_str,
                         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
                         upstream_server: None,
@@ -270,7 +291,7 @@ impl CachedResolver {
                 return Ok(DnsResolution {
                     addresses: Arc::clone(&result.addresses),
                     cache_hit: true,
-                    local_dns: false,
+                    local_dns: result.local_dns,
                     dnssec_status: result.dnssec_status,
                     cname_chain: Arc::clone(&result.cname_chain),
                     upstream_server: None,
@@ -286,7 +307,7 @@ impl CachedResolver {
             return Ok(DnsResolution {
                 addresses: Arc::clone(&result.addresses),
                 cache_hit: true,
-                local_dns: false,
+                local_dns: result.local_dns,
                 dnssec_status: result.dnssec_status,
                 cname_chain: Arc::clone(&result.cname_chain),
                 upstream_server: None,
@@ -400,6 +421,7 @@ impl CachedResolver {
         }
         let inflight = Arc::new(InflightResult {
             addresses: Arc::clone(&resolution.addresses),
+            local_dns: resolution.local_dns,
             cname_chain: Arc::clone(&resolution.cname_chain),
             dnssec_status: resolution.dnssec_status,
             min_ttl: resolution.min_ttl,

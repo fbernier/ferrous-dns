@@ -4,11 +4,13 @@ use super::eviction::{ActiveEvictionPolicy, EvictionStrategy};
 use super::key::{BorrowedKey, CacheKey};
 use super::l1::{l1_clear, l1_get, l1_insert};
 use super::negative_cache::NegativeDnsCache;
-use super::port::DnsCacheAccess;
+use super::port::{DnsCacheAccess, LocalRecordStatus};
 use super::{CacheMetrics, CachedData, CachedDnssecStatus, CachedRecord};
-use dashmap::{DashMap, DashSet};
+use compact_str::CompactString;
+use dashmap::DashMap;
 use ferrous_dns_domain::RecordType;
 use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -110,7 +112,7 @@ pub struct DnsCache {
     pub(super) refresh_sample_period: u64,
     pub(super) negative: NegativeDnsCache,
     pub(crate) eviction_pending: AtomicBool,
-    permanent_keys: Arc<DashSet<CacheKey, FxBuildHasher>>,
+    permanent_records: DashMap<CompactString, SmallVec<[RecordType; 2]>, FxBuildHasher>,
     min_ttl: u32,
     max_ttl: u32,
     refresh_senders: OnceLock<RefreshSenders>,
@@ -161,7 +163,7 @@ impl DnsCache {
             },
             negative: NegativeDnsCache::new(config.max_entries),
             eviction_pending: AtomicBool::new(false),
-            permanent_keys: Arc::new(DashSet::with_hasher(FxBuildHasher)),
+            permanent_records: DashMap::with_hasher(FxBuildHasher),
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
             refresh_senders: OnceLock::new(),
@@ -376,7 +378,6 @@ impl DnsCache {
         let domain = domain.as_ref();
         let key = CacheKey::new(domain, record_type);
         self.bloom.set(&key);
-        self.permanent_keys.insert(key.clone());
 
         if self.cache.len() >= self.max_entries {
             self.evict_entries();
@@ -389,6 +390,15 @@ impl DnsCache {
         };
 
         let record = CachedRecord::permanent(data, ttl, record_type);
+        // Lock ownership before the backing cache, as remove() does, so a
+        // concurrent removal cannot discard a newly inserted name or family.
+        let mut types = self
+            .permanent_records
+            .entry(key.domain.clone())
+            .or_default();
+        if !types.contains(&record_type) {
+            types.push(record_type);
+        }
         self.cache.insert(key, record);
 
         if let Some(addresses) = maybe_l1_addresses {
@@ -410,8 +420,9 @@ impl DnsCache {
     /// record preloaded from config, not something resolved from upstream.
     pub fn is_permanent(&self, domain: &str, record_type: &RecordType) -> bool {
         let domain = normalize_domain(domain);
-        let key = CacheKey::new(domain.as_ref(), *record_type);
-        self.permanent_keys.contains(&key)
+        self.permanent_records
+            .get(domain.as_ref())
+            .is_some_and(|types| types.contains(record_type))
     }
 
     pub fn remove(&self, domain: &str, record_type: &RecordType) -> bool {
@@ -419,8 +430,14 @@ impl DnsCache {
         let domain = domain.as_ref();
         let key = CacheKey::new(domain, *record_type);
 
+        let permanent_entry = self.permanent_records.entry(key.domain.clone());
         if self.cache.remove(&key).is_some() {
-            self.permanent_keys.remove(&key);
+            if let dashmap::Entry::Occupied(mut entry) = permanent_entry {
+                entry.get_mut().retain(|kind| *kind != *record_type);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
             self.metrics.evictions.fetch_add(1, AtomicOrdering::Relaxed);
             // The per-thread L1 keeps serving a removed record until it
             // expires locally, so bump the generation like `clear()` does.
@@ -436,25 +453,23 @@ impl DnsCache {
         // Permanent entries are configuration, not cached upstream answers:
         // local DNS records live here and nothing reloads them, so dropping them
         // would leave every one of them unanswerable until the next restart.
-        let preserved: Vec<(CacheKey, CachedData, u32, RecordType)> = self
-            .permanent_keys
-            .iter()
-            .filter_map(|key| {
-                let entry = self.cache.get(key.key())?;
-                let record = entry.value();
-                Some((
-                    key.key().clone(),
-                    record.data.clone(),
-                    record.ttl,
-                    record.record_type,
-                ))
-            })
-            .collect();
+        let mut preserved = Vec::new();
+        for types in self.permanent_records.iter() {
+            for &record_type in types.value() {
+                let key = CacheKey {
+                    domain: types.key().clone(),
+                    record_type,
+                };
+                if let Some(record) = self.cache.get(&key) {
+                    preserved.push((key, record.data.clone(), record.ttl, record.record_type));
+                }
+            }
+        }
 
         self.cache.clear();
         self.bloom.clear();
         self.negative.clear();
-        self.permanent_keys.clear();
+        self.permanent_records.clear();
         l1_clear();
         self.metrics.hits.store(0, AtomicOrdering::Relaxed);
         self.metrics.misses.store(0, AtomicOrdering::Relaxed);
@@ -463,7 +478,13 @@ impl DnsCache {
         let restored = preserved.len();
         for (key, data, ttl, record_type) in preserved {
             self.bloom.set(&key);
-            self.permanent_keys.insert(key.clone());
+            let mut types = self
+                .permanent_records
+                .entry(key.domain.clone())
+                .or_default();
+            if !types.contains(&record_type) {
+                types.push(record_type);
+            }
             self.cache
                 .insert(key, CachedRecord::permanent(data, ttl, record_type));
         }
@@ -528,8 +549,11 @@ impl DnsCache {
             reseeded += 1;
         }
 
-        for key in self.permanent_keys.iter() {
-            self.bloom.set(key.key());
+        for types in self.permanent_records.iter() {
+            for &record_type in types.value() {
+                self.bloom
+                    .set(&BorrowedKey::new(types.key().as_str(), record_type));
+            }
         }
 
         debug!(reseeded, "Bloom rotated and re-seeded from live cache");
@@ -903,6 +927,23 @@ impl DnsCacheAccess for DnsCache {
         record_type: &RecordType,
     ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
         DnsCache::get(self, domain, record_type)
+    }
+
+    fn local_record_status(&self, domain: &str, record_type: &RecordType) -> LocalRecordStatus {
+        let domain = normalize_domain(domain);
+        let Some(types) = self.permanent_records.get(domain.as_ref()) else {
+            return LocalRecordStatus::NotLocal;
+        };
+        if types.contains(record_type) {
+            LocalRecordStatus::Present
+        } else if types
+            .iter()
+            .any(|kind| matches!(kind, RecordType::A | RecordType::AAAA))
+        {
+            LocalRecordStatus::MissingType
+        } else {
+            LocalRecordStatus::NotLocal
+        }
     }
 
     fn insert(

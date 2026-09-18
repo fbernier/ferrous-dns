@@ -24,8 +24,8 @@ pub mod wire_response;
 pub use block_filter::BlockFilterEngine;
 pub use cache::{
     CacheKey, CacheMetrics, CachedAddresses, CachedData, CachedDnssecStatus, CachedRecord,
-    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
-    RefreshRequest, RefreshScanOptions, RefreshSenders,
+    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, LocalRecordStatus,
+    NegativeQueryTracker, RefreshRequest, RefreshScanOptions, RefreshSenders,
 };
 pub use cache_maintenance::{DnsCacheMaintenance, RefreshPace};
 pub use dga_detection::DgaDetector;
