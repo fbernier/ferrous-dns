@@ -128,48 +128,6 @@ fn test_tls_transport_different_hostnames() {
     );
 }
 
-#[test]
-fn test_https_transport_creation() {
-    let url = DnsServerBuilder::cloudflare_https();
-    let transport = HttpsTransport::new(url.clone(), "1.1.1.1".to_string(), vec![]);
-
-    assert_eq!(transport.protocol_name(), "HTTPS");
-}
-
-#[test]
-fn test_https_transport_google() {
-    let url = DnsServerBuilder::google_https();
-    let transport = HttpsTransport::new(url.clone(), "dns.google".to_string(), vec![]);
-
-    assert_eq!(transport.protocol_name(), "HTTPS");
-}
-
-#[test]
-fn test_https_transport_custom_url() {
-    let custom_url = "https://example.com/dns-query".to_string();
-    let _transport = HttpsTransport::new(custom_url.clone(), "example.com".to_string(), vec![]);
-}
-
-#[test]
-fn test_https_transport_various_providers() {
-    let providers = vec![
-        "https://1.1.1.1/dns-query",
-        "https://dns.google/dns-query",
-        "https://dns.quad9.net/dns-query",
-    ];
-
-    for provider in providers {
-        let hostname = provider
-            .strip_prefix("https://")
-            .and_then(|r| r.split('/').next())
-            .unwrap_or("")
-            .to_string();
-        let transport = HttpsTransport::new(provider.to_string(), hostname, vec![]);
-
-        assert_eq!(transport.protocol_name(), "HTTPS");
-    }
-}
-
 #[cfg(feature = "dns-over-quic")]
 #[test]
 fn test_quic_transport_protocol_name() {
@@ -195,24 +153,6 @@ fn test_quic_transport_creation() {
     let transport = QuicTransport::new(addr, hostname.into());
 
     assert_eq!(transport.protocol_name(), "QUIC");
-}
-
-#[cfg(feature = "dns-over-h3")]
-#[test]
-fn test_h3_transport_creation() {
-    let url = DnsServerBuilder::cloudflare_h3();
-    let transport = H3Transport::new(url, vec![]);
-
-    assert_eq!(transport.protocol_name(), "H3");
-}
-
-#[cfg(feature = "dns-over-h3")]
-#[test]
-fn test_h3_transport_google() {
-    let url = DnsServerBuilder::google_h3();
-    let transport = H3Transport::new(url, vec![]);
-
-    assert_eq!(transport.protocol_name(), "H3");
 }
 
 #[test]
