@@ -17,6 +17,15 @@ use std::time::Duration;
 
 pub use udp_pool::{PoolStats, UdpSocketPool};
 
+// RFC 8484 §6 bounds application/dns-message independently of HTTP framing.
+const MAX_DOH_MESSAGE_SIZE: usize = u16::MAX as usize;
+
+fn doh_response_too_large(url: &str) -> DomainError {
+    DomainError::IoError(format!(
+        "DoH response from {url} exceeds {MAX_DOH_MESSAGE_SIZE} bytes"
+    ))
+}
+
 #[derive(Debug)]
 pub struct TransportResponse {
     pub bytes: bytes::Bytes,

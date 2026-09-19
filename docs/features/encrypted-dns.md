@@ -17,6 +17,12 @@ When Ferrous DNS resolves a query, it can communicate with upstream servers usin
 | DNS-over-QUIC (DoQ) | RFC 9250 | DNS over QUIC. Lowest latency of encrypted options |
 | HTTP/3 | RFC 9114 | DoH over HTTP/3 (QUIC). Combines DoH benefits with QUIC performance |
 
+DoH and HTTP/3 upstream responses are limited to 65,535 bytes, as required by
+[RFC 8484 §6](https://www.rfc-editor.org/rfc/rfc8484.html#section-6). Oversized
+responses are rejected while reading, including when `Content-Length` is absent.
+HTTP/3 reconnects once on a connection failure; HTTP error statuses, stream-local
+failures, and request timeouts do not by themselves discard a pooled connection.
+
 ### Configuring Upstreams
 
 ```toml

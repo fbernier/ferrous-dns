@@ -1,5 +1,6 @@
-use super::{DnsTransport, TransportResponse};
+use super::{doh_response_too_large, DnsTransport, TransportResponse, MAX_DOH_MESSAGE_SIZE};
 use async_trait::async_trait;
+use bytes::BytesMut;
 use dashmap::DashMap;
 use ferrous_dns_domain::DomainError;
 use std::net::SocketAddr;
@@ -87,7 +88,7 @@ impl DnsTransport for HttpsTransport {
             Self::get_or_create_client(&self.hostname, &self.resolved_addrs)
         };
 
-        let response = tokio::time::timeout(
+        let mut response = tokio::time::timeout(
             timeout,
             client
                 .post(&self.url)
@@ -110,21 +111,52 @@ impl DnsTransport for HttpsTransport {
             )));
         }
 
-        let remaining = timeout
-            .checked_sub(start.elapsed())
-            .unwrap_or(Duration::ZERO);
-
-        let response_bytes = tokio::time::timeout(remaining, response.bytes())
-            .await
-            .map_err(|_| {
-                DomainError::IoError(format!("Timeout reading DoH response from {}", self.url))
-            })?
-            .map_err(|e| {
-                DomainError::IoError(format!(
-                    "Failed to read DoH response from {}: {}",
-                    self.url, e
-                ))
-            })?;
+        let content_length = response.content_length();
+        if content_length.is_some_and(|length| length > MAX_DOH_MESSAGE_SIZE as u64) {
+            return Err(doh_response_too_large(&self.url));
+        }
+        enum Body {
+            Single(bytes::Bytes),
+            Multiple(BytesMut),
+        }
+        let mut body = Body::Single(bytes::Bytes::new());
+        while let Some(chunk) = {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            tokio::time::timeout(remaining, response.chunk())
+                .await
+                .map_err(|_| {
+                    DomainError::IoError(format!("Timeout reading DoH response from {}", self.url))
+                })?
+                .map_err(|e| {
+                    DomainError::IoError(format!(
+                        "Failed to read DoH response from {}: {}",
+                        self.url, e
+                    ))
+                })?
+        } {
+            let body_len = match &body {
+                Body::Single(bytes) => bytes.len(),
+                Body::Multiple(bytes) => bytes.len(),
+            };
+            if chunk.len() > MAX_DOH_MESSAGE_SIZE - body_len {
+                return Err(doh_response_too_large(&self.url));
+            }
+            match &mut body {
+                Body::Single(first) if first.is_empty() => *first = chunk,
+                Body::Single(first) => {
+                    let capacity = content_length.unwrap_or((body_len + chunk.len()) as u64);
+                    let mut combined = BytesMut::with_capacity(capacity as usize);
+                    combined.extend_from_slice(first);
+                    combined.extend_from_slice(&chunk);
+                    body = Body::Multiple(combined);
+                }
+                Body::Multiple(bytes) => bytes.extend_from_slice(&chunk),
+            }
+        }
+        let response_bytes = match body {
+            Body::Single(bytes) => bytes,
+            Body::Multiple(bytes) => bytes.freeze(),
+        };
 
         debug!(
             url = %self.url,
@@ -140,5 +172,82 @@ impl DnsTransport for HttpsTransport {
 
     fn protocol_name(&self) -> &'static str {
         "HTTPS"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DnsTransport, HttpsTransport, HTTPS_CLIENT_POOL};
+    use bytes::Bytes;
+    use ferrous_dns_domain::DomainError;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn loopback_response(response: Vec<u8>) -> Result<Bytes, DomainError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hostname = format!("response-limit-{}", addr.port());
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .build()
+            .unwrap();
+        HTTPS_CLIENT_POOL.insert(hostname.clone(), (client, Instant::now()));
+        let transport = HttpsTransport::new(
+            format!("http://{addr}/dns-query"),
+            hostname.clone(),
+            vec![addr],
+        );
+        let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            let mut query = [0; 12];
+            socket.read_exact(&mut query).await.unwrap();
+            socket.write_all(&response).await.unwrap();
+            // Keep EOF withheld so an oversized response must be rejected while streaming.
+            let _ = consumed_rx.await;
+        };
+        let client = async {
+            let result = transport.send(&[0; 12], Duration::from_secs(30)).await;
+            let _ = consumed_tx.send(());
+            result.map(|response| response.bytes)
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client).1
+        })
+        .await;
+        HTTPS_CLIENT_POOL.remove(&hostname);
+        result.expect(
+            "DoH response handling must finish without waiting for EOF or the request timeout",
+        )
+    }
+
+    #[tokio::test]
+    async fn test_https_rejects_oversized_responses_before_eof() {
+        let advertised = b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n".to_vec();
+        let mut streamed =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8000\r\n".to_vec();
+        streamed.extend_from_slice(&[0; 32_768]);
+        streamed.extend_from_slice(b"\r\n8000\r\n");
+        streamed.extend_from_slice(&[0; 32_768]);
+        streamed.extend_from_slice(b"\r\n");
+        for response in [advertised, streamed] {
+            assert!(matches!(
+                loopback_response(response).await,
+                Err(DomainError::IoError(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_https_accepts_maximum_sized_response() {
+        let expected = vec![42; 65_535];
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 65535\r\n\r\n".to_vec();
+        response.extend_from_slice(&expected);
+        assert_eq!(loopback_response(response).await.unwrap(), expected);
     }
 }
