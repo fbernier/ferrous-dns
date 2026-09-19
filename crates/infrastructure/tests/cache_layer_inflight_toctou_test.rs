@@ -26,7 +26,7 @@ use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::{
     CachedAddresses, CachedData, CachedDnssecStatus, DnsCache, DnsCacheAccess, DnsCacheConfig,
-    EvictionStrategy, NegativeQueryTracker,
+    EvictionStrategy, LocalRecordStatus, NegativeQueryTracker,
 };
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,6 +113,10 @@ impl DnsCacheAccess for FirstMissOnceCache {
             return None;
         }
         self.inner.get(domain, record_type)
+    }
+
+    fn local_record_status(&self, domain: &str, record_type: &RecordType) -> LocalRecordStatus {
+        self.inner.local_record_status(domain, record_type)
     }
 
     fn insert(
@@ -300,6 +304,10 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
                 // the wake-up ever regress) delegate to the inner cache.
                 _ => self.inner.get(domain, record_type),
             }
+        }
+
+        fn local_record_status(&self, domain: &str, record_type: &RecordType) -> LocalRecordStatus {
+            self.inner.local_record_status(domain, record_type)
         }
 
         fn insert(

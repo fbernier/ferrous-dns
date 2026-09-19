@@ -158,6 +158,13 @@ ttl = 300
 | `record_type` | `"A"` for IPv4, `"AAAA"` for IPv6 |
 | `ttl` | Time-to-live in seconds |
 
+An exact local name stays local even when the requested record type is not
+configured. For example, an `AAAA` query for the A-only `router.local` above
+returns **NODATA** (`NOERROR` with an empty answer): the name exists, but has no
+IPv6 address. It is not forwarded upstream or filled by a covering wildcard.
+Adding or removing a record type takes effect immediately; removing the last
+local address record restores normal resolution for the name.
+
 ### Wildcard Records
 
 Set `hostname` to `*` to answer for every subdomain of `domain`, instead of

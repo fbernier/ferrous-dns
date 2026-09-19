@@ -42,9 +42,10 @@ impl DnsResolution {
     }
 
     /// Returns true when the resolution carries useful response data
-    /// (IP addresses or raw wire bytes from upstream).
+    /// (addresses, CNAMEs, upstream wire bytes, or an authoritative local NODATA).
     pub fn has_response_data(&self) -> bool {
-        !self.addresses.is_empty()
+        self.local_dns
+            || !self.addresses.is_empty()
             || self.upstream_wire_data.is_some()
             || !self.cname_chain.is_empty()
     }
