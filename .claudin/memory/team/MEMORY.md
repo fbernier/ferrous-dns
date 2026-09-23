@@ -15,6 +15,7 @@ Shared memories for the ferrous-dns team (one file per fact, with `name`/`descri
 - [Docs screenshot recipe](docs-screenshot-recipe.md) — how the ten dashboard screenshots were seeded and captured, and the conventions to keep
 - [Fuzz workspace is invisible to Dependabot](fuzz-workspace-excluded-from-dependabot.md) — duplicate exact pins in `fuzz/Cargo.toml` break every dependency-group bump
 - [Container CVE triage](container-cve-triage.md) — the alpine tag lags its own repo; runtime stages need `apk upgrade`, and the binary never loads the image's libssl
+- [Pi-hole compat auth](pihole-compat-auth.md) — read commit `81c1b7b` before changing auth in `crates/api-pihole`
 
 ## Decisions
 
@@ -25,6 +26,7 @@ Shared memories for the ferrous-dns team (one file per fact, with `name`/`descri
 
 ## Bugs
 
+- [local_dns_server forwarder was unhardened](bugs/local-dns-forwarder-unhardened.md) — no 0x20, cookie or TXID check on local answers; fixed by #240 (2026-09-23)
 - [dashmap Iter holds the shard guard](bugs/cache-eviction-random-branch-deadlock.md) — collect keys into a let-statement before removing (issue #228, fixed 2026-09-19)
 - [Settings upstream health 404](bugs/settings-upstream-health-404.md) — `settings.js` calls `/health/upstreams`; the API serves `/upstream/health`
 - [Vendored OpenSSL blind spot](bugs/vendored-openssl-blind-spot.md) — webauthn-rs statically links OpenSSL 3.6.3 into the binary; Trivy and cargo audit both miss it
