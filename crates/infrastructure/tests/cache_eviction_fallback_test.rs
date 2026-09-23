@@ -1,9 +1,9 @@
 //! The eviction branch that does not score candidates.
 //!
 //! `evict_entries` falls back to it whenever the cache already sits at or below
-//! half of `max_entries` — which happens routinely when compaction drops a burst
-//! of short-TTL entries between the moment `insert` raises `eviction_pending`
-//! and the moment the maintenance cycle consumes it.
+//! half of `max_entries` — which happens when compaction drops a burst of
+//! short-TTL entries between the maintenance cycle's capacity check and the
+//! eviction it triggers.
 //!
 //! That branch used to remove a key while still holding the dashmap shard guard
 //! it was iterating, so it deadlocked on its own shard and took the whole cache

@@ -13,7 +13,7 @@ use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -111,7 +111,6 @@ pub struct DnsCache {
     pub(super) eviction_sample_size: usize,
     pub(super) refresh_sample_period: u64,
     pub(super) negative: NegativeDnsCache,
-    pub(crate) eviction_pending: AtomicBool,
     permanent_records: DashMap<CompactString, SmallVec<[RecordType; 2]>, FxBuildHasher>,
     min_ttl: u32,
     max_ttl: u32,
@@ -162,7 +161,6 @@ impl DnsCache {
                 (1.0 / r).ceil() as u64
             },
             negative: NegativeDnsCache::new(config.max_entries),
-            eviction_pending: AtomicBool::new(false),
             permanent_records: DashMap::with_hasher(FxBuildHasher),
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
@@ -191,6 +189,12 @@ impl DnsCache {
 
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
+    }
+
+    /// Locks every shard in turn, so it belongs on the maintenance cycle, never
+    /// on a per-query path.
+    pub(crate) fn is_over_capacity(&self) -> bool {
+        self.cache.len() >= self.max_entries
     }
 
     pub fn get(
@@ -321,10 +325,6 @@ impl DnsCache {
 
         let ttl = self.clamp_ttl(ttl);
         let key = CacheKey::new(domain, record_type);
-
-        if self.cache.len() >= self.max_entries {
-            self.eviction_pending.store(true, AtomicOrdering::Relaxed);
-        }
 
         let maybe_l1_addresses = if let CachedData::IpAddresses(ref entry) = data {
             Some(Arc::clone(&entry.addresses))
