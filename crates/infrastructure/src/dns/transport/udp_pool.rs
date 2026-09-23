@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use rustc_hash::FxBuildHasher;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,7 +31,7 @@ struct PooledEntry {
 }
 
 pub struct UdpSocketPool {
-    pools: DashMap<SocketAddr, Vec<PooledEntry>>,
+    pools: DashMap<SocketAddr, Vec<PooledEntry>, FxBuildHasher>,
 
     max_per_server: usize,
 
@@ -49,7 +50,7 @@ impl UdpSocketPool {
         info!(max_per_server, total_limit, "Initializing UDP socket pool");
 
         Self {
-            pools: DashMap::new(),
+            pools: DashMap::with_hasher(FxBuildHasher),
             max_per_server,
             semaphore: Semaphore::new(total_limit),
             total_created: AtomicU64::new(0),

@@ -1,7 +1,7 @@
+use super::strategy::ServerDisplays;
 use crate::dns::forwarding::{DnsResponse, ResponseParser, ResponseValidator};
 use crate::dns::transport;
 use ferrous_dns_domain::{DnsProtocol, DomainError};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ pub struct QueryAttemptResult {
     pub server_display: Arc<str>,
 }
 
-fn get_display(protocol: &DnsProtocol, cache: &HashMap<Arc<DnsProtocol>, Arc<str>>) -> Arc<str> {
+fn get_display(protocol: &DnsProtocol, cache: &ServerDisplays) -> Arc<str> {
     cache
         .get(protocol)
         .map(Arc::clone)
@@ -25,7 +25,7 @@ pub async fn query_server(
     query_bytes: &[u8],
     timeout_ms: u64,
     validator: &ResponseValidator,
-    server_displays: &Arc<HashMap<Arc<DnsProtocol>, Arc<str>>>,
+    server_displays: &Arc<ServerDisplays>,
 ) -> Result<QueryAttemptResult, DomainError> {
     let start = Instant::now();
     let timeout_duration = Duration::from_millis(timeout_ms);

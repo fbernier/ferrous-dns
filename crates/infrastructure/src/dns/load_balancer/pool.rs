@@ -2,7 +2,7 @@ use super::balanced::BalancedStrategy;
 use super::failover::FailoverStrategy;
 use super::health::HealthChecker;
 use super::parallel::ParallelStrategy;
-use super::strategy::{QueryContext, Strategy, UpstreamResult};
+use super::strategy::{QueryContext, ServerDisplays, Strategy, UpstreamResult};
 use crate::dns::forwarding::{HardeningOpts, MessageBuilder, ResponseParser};
 use crate::dns::transport::resolver;
 use arc_swap::ArcSwap;
@@ -10,7 +10,6 @@ use ferrous_dns_domain::{
     Config, DnsProtocol, DomainError, RecordType, UpstreamPool, UpstreamStrategy,
 };
 use smallvec::SmallVec;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +36,7 @@ struct PoolWithStrategy {
     server_protocols: Vec<Arc<DnsProtocol>>,
     server_groups: Vec<ServerGroup>,
     name_arc: Arc<str>,
-    server_displays: Arc<HashMap<Arc<DnsProtocol>, Arc<str>>>,
+    server_displays: Arc<ServerDisplays>,
 }
 
 /// An opaque, fully-rebuilt pool set produced by [`PoolManager::prepare`] and ready
@@ -140,7 +139,7 @@ impl PoolManager {
                 .iter()
                 .flat_map(|g| g.protocols.iter().cloned())
                 .collect();
-            let server_displays: Arc<HashMap<Arc<DnsProtocol>, Arc<str>>> = Arc::new(
+            let server_displays: Arc<ServerDisplays> = Arc::new(
                 server_protocols
                     .iter()
                     .map(|p| (Arc::clone(p), Arc::from(p.to_string())))

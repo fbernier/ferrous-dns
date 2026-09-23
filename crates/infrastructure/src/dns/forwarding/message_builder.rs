@@ -5,9 +5,7 @@ use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
 use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::Name;
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use ring::rand::{SecureRandom, SystemRandom};
 use std::str::FromStr;
-use std::sync::LazyLock;
 
 const CLIENT_COOKIE_LEN: usize = 8;
 const COOKIE_OPTION_CODE: u16 = 10;
@@ -98,12 +96,18 @@ impl MessageBuilder {
         };
 
         let hickory_type = RecordTypeMapper::to_hickory(record_type);
-        let id = Self::secure_random_id();
+
+        // One draw for both secrets: each OS RNG call is a syscall where the
+        // vDSO getrandom is unavailable.
+        let mut secrets = [0u8; 2 + CLIENT_COOKIE_LEN];
+        let drawn = if use_cookie { secrets.len() } else { 2 };
+        Self::fill_random(&mut secrets[..drawn]);
+        let id = u16::from_be_bytes([secrets[0], secrets[1]]);
 
         let mut edns = Self::build_edns(dnssec_ok);
         let client_cookie = if use_cookie {
             let mut cookie = [0u8; CLIENT_COOKIE_LEN];
-            Self::fill_random(&mut cookie);
+            cookie.copy_from_slice(&secrets[2..]);
             edns.options_mut()
                 .insert(EdnsOption::Unknown(COOKIE_OPTION_CODE, cookie.to_vec()));
             Some(cookie)
@@ -171,8 +175,9 @@ impl MessageBuilder {
     }
 
     fn fill_random(buf: &mut [u8]) {
-        static SECURE_RNG: LazyLock<SystemRandom> = LazyLock::new(SystemRandom::new);
-        if SECURE_RNG.fill(buf).is_err() {
+        // getrandom 0.3 goes through libc, which serves it from the vDSO on
+        // glibc >= 2.41 / Linux >= 6.11 (~25 ns vs ~200 ns for the syscall).
+        if getrandom::fill(buf).is_err() {
             for b in buf.iter_mut() {
                 *b = fastrand::u8(..);
             }

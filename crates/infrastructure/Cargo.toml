@@ -25,6 +25,7 @@ hickory-server.workspace = true
 hickory-proto.workspace = true
 tracing.workspace = true
 fastrand.workspace = true
+getrandom.workspace = true
 lru.workspace = true
 hostname.workspace = true
 dashmap.workspace = true
