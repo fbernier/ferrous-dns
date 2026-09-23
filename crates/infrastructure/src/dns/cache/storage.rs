@@ -204,11 +204,11 @@ impl DnsCache {
     ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
-        let borrowed = BorrowedKey::new(domain, *record_type);
 
+        // Hits leave the bloom alone: `rotate_bloom` re-seeds every live key,
+        // so reads never decide membership.
         if let Some((arc_data, dnssec_status, remaining_ttl)) = l1_get(domain, record_type) {
             self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
-            self.bloom.refresh(&borrowed);
             return Some((
                 CachedData::IpAddresses(super::data::CachedAddresses {
                     addresses: arc_data,
@@ -218,6 +218,7 @@ impl DnsCache {
             ));
         }
 
+        let borrowed = BorrowedKey::new(domain, *record_type);
         let in_bloom = self.bloom.check(&borrowed);
 
         if !in_bloom {
@@ -242,7 +243,6 @@ impl DnsCache {
                     .stale_hits
                     .fetch_add(1, AtomicOrdering::Relaxed);
                 record.record_hit();
-                self.bloom.refresh(&borrowed);
                 if let Some(senders) = self.refresh_senders.get() {
                     if record.try_set_refreshing()
                         && senders
@@ -272,7 +272,6 @@ impl DnsCache {
             } else {
                 self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
                 record.record_hit();
-                self.bloom.refresh(&borrowed);
                 // A permanent entry never expires, so the distance to
                 // `expires_at_secs` (u64::MAX) is meaningless — serve the TTL the
                 // record was configured with instead, or the client is told to

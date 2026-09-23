@@ -1,6 +1,6 @@
 use super::coarse_clock::coarse_now_secs;
 use super::key::CacheKey;
-use dashmap::DashMap;
+use crate::counted_map::CountedDashMap;
 use ferrous_dns_domain::RecordType;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
@@ -32,7 +32,7 @@ struct NegativeEntry {
 }
 
 pub struct NegativeDnsCache {
-    cache: DashMap<CacheKey, NegativeEntry, FxBuildHasher>,
+    cache: CountedDashMap<CacheKey, NegativeEntry, FxBuildHasher>,
     max_entries: usize,
 }
 
@@ -50,7 +50,7 @@ impl NegativeDnsCache {
     /// cache via `cache_max_entries`.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            cache: DashMap::with_capacity_and_hasher(max_entries, FxBuildHasher),
+            cache: CountedDashMap::with_capacity_and_hasher(max_entries, FxBuildHasher),
             max_entries,
         }
     }
@@ -128,13 +128,8 @@ impl NegativeDnsCache {
     /// The insert path only samples a bounded prefix of the map, so expired
     /// entries elsewhere would otherwise hold capacity until read again.
     pub fn purge_expired(&self, now_secs: u64) -> usize {
-        let mut removed = 0;
-        self.cache.retain(|_, entry| {
-            let live = now_secs < entry.expires_at_secs;
-            removed += usize::from(!live);
-            live
-        });
-        removed
+        self.cache
+            .retain(|_, entry| now_secs < entry.expires_at_secs)
     }
 
     pub fn len(&self) -> usize {

@@ -1,7 +1,7 @@
 use super::super::types::{DnskeyRecord, DsRecord};
 use super::entries::{DnskeyEntry, DsEntry};
 use super::stats::{CacheStats, CacheStatsSnapshot};
-use dashmap::DashMap;
+use crate::counted_map::CountedDashMap;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -16,9 +16,9 @@ const MAX_ENTRIES: usize = 50_000;
 const EVICTION_BATCH_SIZE: usize = 32;
 
 pub struct DnssecCache {
-    dnskeys: DashMap<Arc<str>, DnskeyEntry>,
+    dnskeys: CountedDashMap<Arc<str>, DnskeyEntry>,
 
-    ds_records: DashMap<Arc<str>, DsEntry>,
+    ds_records: CountedDashMap<Arc<str>, DsEntry>,
 
     stats: Arc<CacheStats>,
 }
@@ -26,8 +26,8 @@ pub struct DnssecCache {
 impl DnssecCache {
     pub fn new() -> Self {
         Self {
-            dnskeys: DashMap::new(),
-            ds_records: DashMap::new(),
+            dnskeys: CountedDashMap::new(),
+            ds_records: CountedDashMap::new(),
             stats: Arc::new(CacheStats::default()),
         }
     }
@@ -148,7 +148,7 @@ impl Default for DnssecCache {
 /// insert cannot grow the map past the ceiling. Hot zones (root, common TLDs)
 /// re-populate on the next miss, so worst case is extra churn, never unbounded
 /// growth.
-fn evict_if_full<V, F>(map: &DashMap<Arc<str>, V>, is_expired: F)
+fn evict_if_full<V, F>(map: &CountedDashMap<Arc<str>, V>, is_expired: F)
 where
     F: Fn(&V) -> bool,
 {
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn eviction_bounds_inspections_and_makes_room() {
         for expired in [false, true] {
-            let map: DashMap<Arc<str>, bool> = (0..MAX_ENTRIES)
+            let map: CountedDashMap<Arc<str>, bool> = (0..MAX_ENTRIES)
                 .map(|i| (Arc::from(format!("zone{i}.example")), expired))
                 .collect();
             let inspected = Cell::new(0);
