@@ -90,6 +90,10 @@ The resolver wrappers preserve borrowed domain lookups through the local-PTR and
 
 UDP fallback processing has a shared limit of **4096 in-flight queries**, independent of worker count and per-client rate limits. Admission happens before packet allocation and task creation. When full, additional fallback datagrams are dropped rather than queued; clients can retry. Shedding logs a `UDP fallback capacity exhausted` warning at most once per second, with the datagrams shed since the previous warning (`shed`) and since startup (`total_shed`), so it can be told apart from packet loss. Inline cache hits remain serviceable while fallback capacity is exhausted.
 
+## Resolution path
+
+Everything the inline path does not answer — cache misses, blocked and refused queries, DO-bit queries, and every TCP, DoT, DoH and DoQ query including cache hits — goes through one resolution path. It decodes the query with the same wire parser as the fast path and writes the response straight to wire; hickory only decodes queries that parser declines (internationalized or escaped names, uncommon record types, several questions), so cache keys stay identical either way. Upstream queries are likewise encoded directly, with the transaction ID and client cookie drawn in one call to the OS random source.
+
 ---
 
 ## Blocklist compilation
