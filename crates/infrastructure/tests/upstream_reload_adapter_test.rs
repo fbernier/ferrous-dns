@@ -1,6 +1,5 @@
 use ferrous_dns_application::ports::UpstreamReloadPort;
 use ferrous_dns_domain::{UpstreamPool, UpstreamStrategy};
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 use ferrous_dns_infrastructure::dns::UpstreamReloadAdapter;
 use std::sync::Arc;
@@ -17,7 +16,7 @@ fn pool(server: &str) -> UpstreamPool {
 
 async fn manager(server: &str) -> Arc<PoolManager> {
     Arc::new(
-        PoolManager::new(vec![pool(server)], None, QueryEventEmitter::new_disabled())
+        PoolManager::new(vec![pool(server)], None)
             .await
             .expect("PoolManager should create"),
     )

@@ -9,7 +9,6 @@
 //! QNAME case so the case-sensitive question check still passes.
 
 use ferrous_dns_domain::{RecordType, UpstreamPool, UpstreamStrategy};
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::forwarding::HardeningOpts;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 use std::sync::Arc;
@@ -24,7 +23,7 @@ async fn hardened_pm(server: &str, qname_0x20: bool) -> Arc<PoolManager> {
         weight: None,
     };
     Arc::new(
-        PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+        PoolManager::new(vec![pool], None)
             .await
             .unwrap()
             .with_hardening(HardeningOpts {

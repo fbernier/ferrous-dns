@@ -1,5 +1,4 @@
 use ferrous_dns_domain::{UpstreamPool, UpstreamStrategy};
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 
 fn pool(name: &str, server: &str) -> UpstreamPool {
@@ -14,13 +13,9 @@ fn pool(name: &str, server: &str) -> UpstreamPool {
 
 #[tokio::test]
 async fn reload_swaps_live_servers() {
-    let pm = PoolManager::new(
-        vec![pool("p1", "udp://8.8.8.8:53")],
-        None,
-        QueryEventEmitter::new_disabled(),
-    )
-    .await
-    .expect("PoolManager should create");
+    let pm = PoolManager::new(vec![pool("p1", "udp://8.8.8.8:53")], None)
+        .await
+        .expect("PoolManager should create");
 
     let before: Vec<String> = pm.get_all_servers().iter().map(|a| a.to_string()).collect();
     assert!(before.iter().any(|a| a == "8.8.8.8:53"));
@@ -42,13 +37,9 @@ async fn reload_swaps_live_servers() {
 
 #[tokio::test]
 async fn reload_rejects_empty_pool_set() {
-    let pm = PoolManager::new(
-        vec![pool("p1", "udp://8.8.8.8:53")],
-        None,
-        QueryEventEmitter::new_disabled(),
-    )
-    .await
-    .expect("PoolManager should create");
+    let pm = PoolManager::new(vec![pool("p1", "udp://8.8.8.8:53")], None)
+        .await
+        .expect("PoolManager should create");
 
     assert!(
         pm.reload(Vec::new()).await.is_err(),

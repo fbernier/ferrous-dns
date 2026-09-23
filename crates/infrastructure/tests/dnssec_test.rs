@@ -4,7 +4,6 @@ use ferrous_dns_infrastructure::dns::dnssec::{
     ChainVerifier, DnskeyRecord, DnssecCache, DsRecord, SignatureVerifier, TrustAnchorStore,
     ValidationResult,
 };
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 use std::sync::Arc;
 use std::thread;
@@ -414,14 +413,7 @@ fn make_chain_verifier_for_test() -> ChainVerifier {
         weight: None,
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let pm = Arc::new(
-        rt.block_on(PoolManager::new(
-            vec![pool],
-            None,
-            QueryEventEmitter::new_disabled(),
-        ))
-        .unwrap(),
-    );
+    let pm = Arc::new(rt.block_on(PoolManager::new(vec![pool], None)).unwrap());
     ChainVerifier::new(pm, TrustAnchorStore::empty(), Arc::new(DnssecCache::new()))
 }
 

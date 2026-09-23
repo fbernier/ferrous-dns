@@ -2,7 +2,6 @@ use ferrous_dns_domain::{UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::dnssec::trust_anchor::TrustAnchorStore;
 use ferrous_dns_infrastructure::dns::dnssec::{ChainVerifier, DnskeyRecord, DnssecCache};
 use ferrous_dns_infrastructure::dns::PoolManager;
-use ferrous_dns_infrastructure::dns::QueryEventEmitter;
 use std::sync::Arc;
 
 fn make_chain_verifier() -> ChainVerifier {
@@ -14,14 +13,7 @@ fn make_chain_verifier() -> ChainVerifier {
         weight: None,
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let pm = Arc::new(
-        rt.block_on(PoolManager::new(
-            vec![pool],
-            None,
-            QueryEventEmitter::new_disabled(),
-        ))
-        .unwrap(),
-    );
+    let pm = Arc::new(rt.block_on(PoolManager::new(vec![pool], None)).unwrap());
     ChainVerifier::new(pm, TrustAnchorStore::empty(), Arc::new(DnssecCache::new()))
 }
 

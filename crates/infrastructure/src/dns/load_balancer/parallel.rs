@@ -19,32 +19,19 @@ impl ParallelStrategy {
             0 => Err(DomainError::TransportNoHealthyServers),
             1 => {
                 let protocol = Arc::clone(ctx.servers[0]);
-                let domain = Arc::clone(ctx.domain);
-                let record_type = *ctx.record_type;
-                let emitter = ctx.emitter.clone();
                 let pool_name = Arc::clone(ctx.pool_name);
                 let sd = Arc::clone(ctx.server_displays);
                 let qb = Arc::clone(&ctx.query_bytes);
 
-                query_server(
-                    &protocol,
-                    &qb,
-                    &domain,
-                    &record_type,
-                    ctx.timeout_ms,
-                    ctx.validator,
-                    &emitter,
-                    &pool_name,
-                    &sd,
-                )
-                .await
-                .map(|r| UpstreamResult {
-                    response: r.response,
-                    server: r.server_addr,
-                    latency_ms: r.latency_ms,
-                    pool_name,
-                    server_display: r.server_display,
-                })
+                query_server(&protocol, &qb, ctx.timeout_ms, ctx.validator, &sd)
+                    .await
+                    .map(|r| UpstreamResult {
+                        response: r.response,
+                        server: r.server_addr,
+                        latency_ms: r.latency_ms,
+                        pool_name,
+                        server_display: r.server_display,
+                    })
             }
             2 => {
                 // Race both upstreams on the stack (zero heap alloc vs FuturesUnordered),
@@ -53,10 +40,6 @@ impl ParallelStrategy {
                 // instead of failing the whole attempt.
                 let s0 = Arc::clone(ctx.servers[0]);
                 let s1 = Arc::clone(ctx.servers[1]);
-                let domain = Arc::clone(ctx.domain);
-                let record_type = *ctx.record_type;
-                let emitter0 = ctx.emitter.clone();
-                let emitter1 = ctx.emitter.clone();
                 let pool_name = Arc::clone(ctx.pool_name);
                 let sd = Arc::clone(ctx.server_displays);
                 let qb = Arc::clone(&ctx.query_bytes);
@@ -64,28 +47,8 @@ impl ParallelStrategy {
                 let timeout_ms = ctx.timeout_ms;
 
                 let result = timeout(Duration::from_millis(timeout_ms), async move {
-                    let f0 = query_server(
-                        &s0,
-                        &qb,
-                        &domain,
-                        &record_type,
-                        timeout_ms,
-                        &validator,
-                        &emitter0,
-                        &pool_name,
-                        &sd,
-                    );
-                    let f1 = query_server(
-                        &s1,
-                        &qb,
-                        &domain,
-                        &record_type,
-                        timeout_ms,
-                        &validator,
-                        &emitter1,
-                        &pool_name,
-                        &sd,
-                    );
+                    let f0 = query_server(&s0, &qb, timeout_ms, &validator, &sd);
+                    let f1 = query_server(&s1, &qb, timeout_ms, &validator, &sd);
                     tokio::pin!(f0, f1);
 
                     // Track which future settled first so the fallback only re-awaits
@@ -121,13 +84,8 @@ impl ParallelStrategy {
                 let mut futs = FuturesUnordered::new();
 
                 let per_server_timeout_ms = ctx.timeout_ms;
-                let domain_arc = Arc::clone(ctx.domain);
                 for &protocol in ctx.servers {
                     let protocol = Arc::clone(protocol);
-                    let domain = Arc::clone(&domain_arc);
-                    let record_type = *ctx.record_type;
-                    let emitter = ctx.emitter.clone();
-                    let pool_name = Arc::clone(ctx.pool_name);
                     let server_displays = Arc::clone(ctx.server_displays);
                     let query_bytes = Arc::clone(&ctx.query_bytes);
                     let validator = Arc::clone(ctx.validator);
@@ -136,12 +94,8 @@ impl ParallelStrategy {
                         query_server(
                             &protocol,
                             &query_bytes,
-                            &domain,
-                            &record_type,
                             per_server_timeout_ms,
                             &validator,
-                            &emitter,
-                            &pool_name,
                             &server_displays,
                         )
                         .await
