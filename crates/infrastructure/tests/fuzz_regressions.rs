@@ -237,7 +237,7 @@ fn fast_path_handles_query_with_malformed_tsig_record() {
     );
 }
 
-/// `build_cache_hit_response` writes into a fixed 523-byte stack buffer. A
+/// `build_cache_hit_response` writes into a fixed 523-byte buffer. A
 /// large RRset combined with a high EDNS buffer size used to overflow it and
 /// panic the UDP worker; it must decline and let the slow path answer.
 #[test]
@@ -251,9 +251,14 @@ fn cache_hit_response_declines_oversized_rrset() {
         .map(|i| IpAddr::V4(Ipv4Addr::new(192, 0, 2, i)))
         .collect();
 
-    assert!(
-        wire_response::build_cache_hit_response(&query, &packet, &addresses, u32::MAX).is_none()
-    );
+    assert!(wire_response::build_cache_hit_response(
+        &query,
+        &packet,
+        &addresses,
+        u32::MAX,
+        &mut [0u8; wire_response::RESPONSE_BUF_LEN]
+    )
+    .is_none());
 }
 
 #[test]
@@ -262,7 +267,8 @@ fn cache_hit_response_stays_inside_the_fixed_buffer() {
     let query = fast_path::parse_query(&packet).expect("valid A query");
     let addresses = vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))];
 
-    let (buf, len) = wire_response::build_cache_hit_response(&query, &packet, &addresses, 300)
+    let mut buf = [0u8; wire_response::RESPONSE_BUF_LEN];
+    let len = wire_response::build_cache_hit_response(&query, &packet, &addresses, 300, &mut buf)
         .expect("a single A record fits");
 
     assert!(len <= buf.len());
@@ -305,8 +311,9 @@ fn query_fast_path_seed_corpus_is_clean() {
         }
 
         let addresses = vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))];
-        if let Some((buf, len)) =
-            wire_response::build_cache_hit_response(&query, &packet, &addresses, 300)
+        let mut buf = [0u8; wire_response::RESPONSE_BUF_LEN];
+        if let Some(len) =
+            wire_response::build_cache_hit_response(&query, &packet, &addresses, 300, &mut buf)
         {
             assert!(len <= buf.len(), "seed: {}", path.display());
         }

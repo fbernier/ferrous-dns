@@ -10,7 +10,7 @@ const OPT_RECORD: [u8; 11] = [
 
 /// Capacity of the fixed fast-path cache-hit response buffer. A hit that would
 /// exceed it is rejected (`None`) and handled by the slow path instead.
-const RESPONSE_BUF_LEN: usize = 523;
+pub const RESPONSE_BUF_LEN: usize = 523;
 
 /// Clones the cached wire bytes and overwrites the query ID (bytes 0–1) with
 /// `new_id` so the response matches the client's original query.
@@ -64,12 +64,15 @@ pub fn wire_fits_udp_buffer(wire_len: usize, client_max_size: u16) -> bool {
     wire_len <= client_max_size as usize
 }
 
+/// Encodes a cache hit into `out`, which may hold a previous response, and
+/// returns its length. `None` if it would not fit the client or `out`.
 pub fn build_cache_hit_response(
     query: &FastPathQuery,
     query_buf: &[u8],
     addresses: &[IpAddr],
     ttl: u32,
-) -> Option<([u8; RESPONSE_BUF_LEN], usize)> {
+    out: &mut [u8; RESPONSE_BUF_LEN],
+) -> Option<usize> {
     if addresses.is_empty() || query.question_end > query_buf.len() {
         return None;
     }
@@ -91,34 +94,29 @@ pub fn build_cache_hit_response(
         return None;
     }
 
-    let mut buf = [0u8; RESPONSE_BUF_LEN];
-
-    buf[0] = (query.id >> 8) as u8;
-    buf[1] = query.id as u8;
-    buf[2] = 0x81;
-    buf[3] = 0x80;
-    buf[4] = 0x00;
-    buf[5] = 0x01;
     let ancount = addresses.len() as u16;
-    buf[6] = (ancount >> 8) as u8;
-    buf[7] = ancount as u8;
-    buf[10] = 0x00;
-    buf[11] = if query.has_edns { 0x01 } else { 0x00 };
+    // Every byte of `out[..total_size]` is written: `out` is reused, not zeroed.
+    out[0..2].copy_from_slice(&query.id.to_be_bytes());
+    out[2..4].copy_from_slice(&[0x81, 0x80]);
+    out[4..6].copy_from_slice(&1u16.to_be_bytes());
+    out[6..8].copy_from_slice(&ancount.to_be_bytes());
+    out[8..10].copy_from_slice(&0u16.to_be_bytes());
+    out[10..12].copy_from_slice(&u16::from(query.has_edns).to_be_bytes());
 
-    buf[12..12 + question_len].copy_from_slice(&query_buf[12..query.question_end]);
+    out[12..12 + question_len].copy_from_slice(&query_buf[12..query.question_end]);
 
     let mut pos = 12 + question_len;
 
     for addr in addresses {
-        pos += write_address_rr(&mut buf[pos..], addr, ttl);
+        pos += write_address_rr(&mut out[pos..], addr, ttl);
     }
 
     if query.has_edns {
-        buf[pos..pos + OPT_RECORD.len()].copy_from_slice(&OPT_RECORD);
+        out[pos..pos + OPT_RECORD.len()].copy_from_slice(&OPT_RECORD);
         pos += OPT_RECORD.len();
     }
 
-    Some((buf, pos))
+    Some(pos)
 }
 
 /// Answer-section size of one A (16) or AAAA (28) record owned by `C0 0C`.
@@ -433,6 +431,30 @@ mod tests {
         }
         .write(&mut written);
         assert_eq!(written, OPT_RECORD);
+    }
+
+    #[test]
+    fn cache_hit_encoding_ignores_previous_buffer_contents() {
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1];
+        query.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+        let parsed = super::super::fast_path::parse_query(&query).unwrap();
+        let addresses = ["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+
+        let mut clean = [0u8; RESPONSE_BUF_LEN];
+        let mut dirty = [0xA5u8; RESPONSE_BUF_LEN];
+        let clean_len =
+            build_cache_hit_response(&parsed, &query, &addresses, 60, &mut clean).unwrap();
+        let dirty_len =
+            build_cache_hit_response(&parsed, &query, &addresses, 60, &mut dirty).unwrap();
+        assert_eq!(&dirty[..dirty_len], &clean[..clean_len]);
+        assert_eq!(
+            Message::from_vec(&clean[..clean_len])
+                .unwrap()
+                .answers
+                .len(),
+            2
+        );
     }
 
     #[test]
