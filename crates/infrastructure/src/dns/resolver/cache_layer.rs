@@ -455,27 +455,15 @@ impl DnsResolver for CachedResolver {
     }
 
     async fn resolve(&self, query: &DnsQuery) -> Result<DnsResolution, DomainError> {
-        if let Some(cached) = self.check_cache(query) {
-            return if !cached.has_response_data() {
-                Err(DomainError::NxDomain)
-            } else {
-                Ok(cached)
-            };
-        }
-
+        // No cache probe before registering: callers probe with `try_cache`
+        // first, and the leader re-checks once its guard is in place, which is
+        // also what closes the race with a leader that just finished.
         let key = CacheKey::new(query.domain.as_ref(), query.record_type);
         let (is_leader, rx) = self.register_or_join_inflight(&key);
 
         if !is_leader {
             return self.resolve_as_follower(query, rx).await;
         }
-
-        // Phase 5: the second cache-check that used to live here (and its
-        // non-atomic `self.inflight.remove`) moved into `resolve_as_leader`,
-        // where it runs *after* the guard is already in place. That closes
-        // the TOCTOU race: a follower arriving between the leader election
-        // above and the cache check could previously be orphaned by the
-        // leader taking the shortcut and unregistering the inflight entry.
         self.resolve_as_leader(query, key).await
     }
 }

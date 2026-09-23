@@ -1,24 +1,12 @@
-//! Phase 5: regression tests for the TOCTOU race in the coalescing
-//! leader-election path.
+//! Regression tests for the coalescing leader's cache check.
 //!
-//! Before the fix, `resolve` performed a second `check_cache` + `inflight.remove`
-//! between `register_or_join_inflight` and `resolve_as_leader`. That sequence
-//! could:
-//!   1. orphan followers that subscribed between the two ops, forcing them
-//!      to fall back through the watch-channel-closed path; and
-//!   2. still dispatch a redundant upstream call when an elected leader's
-//!      own cached data was discovered only after election.
-//!
-//! The fix moves the second cache check INSIDE `resolve_as_leader`, where
-//! the leader already holds an `InflightLeaderGuard` and can wake followers
-//! via the same watch channel used by the upstream-success branch.
-//!
-//! These tests simulate the cache-populated-mid-flight scenario by wrapping
-//! the real cache in an interceptor that suppresses the *first* `get()` for
-//! a target key (forcing the first `check_cache` in `resolve` to miss), and
-//! then delegates to the inner cache for every subsequent call. That pins
-//! the race window to the second (in-leader) check, which the Phase 5 fix
-//! is responsible for handling.
+//! `CachedResolver::resolve` does not probe the cache itself — callers probe
+//! with `try_cache` first — so the only check runs inside `resolve_as_leader`,
+//! after the leader holds its `InflightLeaderGuard`. A cache filled between the
+//! caller's probe and that check (by another leader, or a refresh) must answer
+//! the leader without an upstream call, and must reach any followers through
+//! the same watch channel the upstream-success branch uses, rather than
+//! orphaning them.
 
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
@@ -33,10 +21,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Resolver that records how many times it was invoked. Used as a
-/// sentinel: after the fix, a leader that finds a cached value during
-/// its in-flight check must NOT reach the upstream mock — the counter
-/// should stay at zero.
+/// Resolver that records how many times it was invoked: a leader that finds a
+/// cached value must never reach it.
 struct CountingMockResolver {
     call_count: Arc<AtomicUsize>,
     response: DnsResolution,
@@ -64,71 +50,6 @@ impl DnsResolver for CountingMockResolver {
         // it ever returns — with the fix in place, we should never await here.
         tokio::time::sleep(Duration::from_millis(25)).await;
         Ok(self.response.clone())
-    }
-}
-
-/// Cache wrapper that suppresses the first `get()` call for each
-/// `(domain, record_type)` pair, forcing the caller to miss once before
-/// every subsequent call delegates to the inner cache.
-///
-/// This is how the tests synthesize the TOCTOU window: the first
-/// `check_cache` in `CachedResolver::resolve` is guaranteed to miss,
-/// then by the time the leader reaches its in-flight `check_cache`
-/// (moved there by Phase 5), the inner cache has already been populated
-/// by the test harness, so the leader short-circuits without invoking
-/// `inner.resolve`.
-struct FirstMissOnceCache {
-    inner: Arc<dyn DnsCacheAccess>,
-    // Number of times `get()` has returned a forced-miss. Kept as a shared
-    // atomic so the test can assert the suppression actually triggered.
-    suppressed_calls: Arc<AtomicUsize>,
-    // How many forced misses to issue before delegating. `1` means the
-    // very first `get()` misses, then every subsequent one delegates.
-    force_miss_count: usize,
-}
-
-impl FirstMissOnceCache {
-    fn new(inner: Arc<dyn DnsCacheAccess>, force_miss_count: usize) -> Self {
-        Self {
-            inner,
-            suppressed_calls: Arc::new(AtomicUsize::new(0)),
-            force_miss_count,
-        }
-    }
-
-    fn suppressed_calls(&self) -> usize {
-        self.suppressed_calls.load(Ordering::SeqCst)
-    }
-}
-
-impl DnsCacheAccess for FirstMissOnceCache {
-    fn get(
-        &self,
-        domain: &str,
-        record_type: &RecordType,
-    ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
-        let prev = self.suppressed_calls.load(Ordering::SeqCst);
-        if prev < self.force_miss_count {
-            self.suppressed_calls.fetch_add(1, Ordering::SeqCst);
-            return None;
-        }
-        self.inner.get(domain, record_type)
-    }
-
-    fn local_record_status(&self, domain: &str, record_type: &RecordType) -> LocalRecordStatus {
-        self.inner.local_record_status(domain, record_type)
-    }
-
-    fn insert(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-        data: CachedData,
-        ttl: u32,
-        dnssec_status: Option<CachedDnssecStatus>,
-    ) {
-        self.inner
-            .insert(domain, record_type, data, ttl, dnssec_status);
     }
 }
 
@@ -172,36 +93,17 @@ fn preload(cache: &dyn DnsCacheAccess, domain: &str, record_type: RecordType, ad
     );
 }
 
-/// Scenario: the leader is elected and its in-flight `check_cache` now
-/// finds the requested entry (populated concurrently by another code
-/// path). The leader must short-circuit and NEVER call `inner.resolve`.
-///
-/// Setup: `FirstMissOnceCache` with `force_miss_count = 1` makes the
-/// first `check_cache` inside `resolve` miss. The inner cache is then
-/// pre-populated BEFORE we spawn the leader, so when the leader reaches
-/// its in-flight `check_cache` it delegates and hits. Expectation:
-/// upstream call count stays at zero and the leader returns the cached
-/// value.
+/// The entry was filled after the caller's own probe: the leader's in-flight
+/// check must find it and never call `inner.resolve`.
 #[tokio::test]
-async fn should_not_make_second_upstream_call_when_cache_filled_between_leader_election_and_resolve(
-) {
+async fn leader_answers_from_a_cache_filled_after_the_callers_probe() {
     let mock = Arc::new(CountingMockResolver::new("10.0.0.1"));
-    let inner_cache = make_inner_cache();
-    let intercept = Arc::new(FirstMissOnceCache::new(Arc::clone(&inner_cache), 1));
-
-    // Pre-populate the *inner* cache so the in-leader check delegates
-    // to a populated store; the interceptor's first-call miss still
-    // guarantees the outer (in-`resolve`) check misses first.
-    preload(
-        inner_cache.as_ref(),
-        "example.com",
-        RecordType::A,
-        "10.0.0.1",
-    );
+    let cache = make_inner_cache();
+    preload(cache.as_ref(), "example.com", RecordType::A, "10.0.0.1");
 
     let resolver = Arc::new(CachedResolver::new(
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
-        Arc::clone(&intercept) as Arc<dyn DnsCacheAccess>,
+        cache,
         300,
         Arc::new(NegativeQueryTracker::new()),
         4,
@@ -216,11 +118,6 @@ async fn should_not_make_second_upstream_call_when_cache_filled_between_leader_e
         mock.call_count(),
         0,
         "leader must NOT call upstream when its in-flight cache check hits"
-    );
-    assert_eq!(
-        intercept.suppressed_calls(),
-        1,
-        "interceptor must have forced exactly one miss (the first resolve check)"
     );
     assert_eq!(
         result.addresses.as_ref(),
@@ -239,8 +136,8 @@ async fn should_not_make_second_upstream_call_when_cache_filled_between_leader_e
 /// to fall back through the watch-channel-closed path and trigger a
 /// redundant resolve).
 ///
-/// We need a cache `get` hook that blocks the leader's in-flight check
-/// (its 2nd `get` for the target key) until a follower has joined.
+/// We need a cache `get` hook that blocks the leader's in-flight check (the
+/// first `get` for the target key) until a follower has joined.
 /// `DnsCacheAccess::get` is synchronous — we park it on a
 /// `std::sync::mpsc::Receiver::recv()`, which blocks the tokio worker
 /// thread but is safe here because:
@@ -258,10 +155,10 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
         target_domain: String,
         target_type: RecordType,
         hits: AtomicUsize,
-        // Sender side signalled by the test to unblock the 2nd `get`.
+        // Sender side signalled by the test to unblock the leader's `get`.
         gate_rx: Mutex<Option<mpsc::Receiver<()>>>,
         // Notifies the test that the leader is parked at the in-flight
-        // cache check (hit index == 1). Exposed via a `mpsc::Sender`.
+        // cache check. Exposed via a `mpsc::Sender`.
         checkpoint_tx: mpsc::Sender<()>,
     }
 
@@ -277,14 +174,11 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
             }
             let hit_index = self.hits.fetch_add(1, Ordering::SeqCst);
             match hit_index {
-                // 1st hit: leader's `resolve` first check — force miss.
-                0 => None,
-                // 2nd hit: leader's in-flight `resolve_as_leader` check.
-                // Park here until the test opens the gate, which only
-                // happens after the follower has joined on the inflight
-                // entry (so the leader's subsequent `wake_followers_with_cached`
-                // actually has a follower to wake).
-                1 => {
+                // The leader's in-flight `resolve_as_leader` check. Park here
+                // until the test opens the gate, which only happens after the
+                // follower has joined on the inflight entry (so the leader's
+                // publish actually has a follower to wake).
+                0 => {
                     let _ = self.checkpoint_tx.send(());
                     let rx = self
                         .gate_rx
@@ -295,13 +189,9 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
                     let _ = rx.recv();
                     self.inner.get(domain, record_type)
                 }
-                // 3rd hit: follower's `resolve` first check — force miss
-                // so the follower proceeds into `register_or_join_inflight`
-                // and SUBSCRIBES to the inflight entry as a follower.
-                2 => None,
-                // 4th+ hits: all subsequent calls (e.g. the follower's
-                // fallback `check_cache` on a watch-closed path, should
-                // the wake-up ever regress) delegate to the inner cache.
+                // Any later call (the follower's fallback `check_cache` on a
+                // watch-closed path, should the wake-up ever regress)
+                // delegates to the inner cache.
                 _ => self.inner.get(domain, record_type),
             }
         }
@@ -371,11 +261,9 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
     .await
     .expect("checkpoint-waiter task join failed");
 
-    // Spawn follower AFTER the leader is parked. The interceptor's 3rd
-    // `get` call (the follower's first `check_cache`) is forced to miss,
-    // so the follower subscribes as a real follower on the leader's
-    // inflight entry — which is exactly the configuration
-    // `wake_followers_with_cached` is designed to serve.
+    // Spawn follower AFTER the leader is parked: `resolve` does not probe the
+    // cache, so the follower subscribes straight to the leader's inflight
+    // entry — exactly the configuration the leader's publish must serve.
     let follower_resolver = Arc::clone(&resolver);
     let follower = tokio::spawn(async move {
         follower_resolver
