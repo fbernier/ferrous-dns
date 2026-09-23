@@ -1,6 +1,9 @@
+use super::ede::{self, ExtendedDnsError};
 use super::fast_path::FastPathQuery;
 use std::net::IpAddr;
 
+/// The fast path's fixed OPT: `EdnsReply` with DO clear and no options, as a
+/// constant so a cache hit copies it instead of encoding it.
 const OPT_RECORD: [u8; 11] = [
     0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
@@ -73,13 +76,7 @@ pub fn build_cache_hit_response(
 
     let question_len = query.question_end - 12;
 
-    let answers_size: usize = addresses
-        .iter()
-        .map(|a| match a {
-            IpAddr::V4(_) => 16,
-            IpAddr::V6(_) => 28,
-        })
-        .sum();
+    let answers_size: usize = addresses.iter().map(address_rr_len).sum();
 
     let opt_size = if query.has_edns { OPT_RECORD.len() } else { 0 };
     let total_size = 12 + question_len + answers_size + opt_size;
@@ -113,39 +110,7 @@ pub fn build_cache_hit_response(
     let mut pos = 12 + question_len;
 
     for addr in addresses {
-        buf[pos] = 0xC0;
-        buf[pos + 1] = 0x0C;
-
-        match addr {
-            IpAddr::V4(ipv4) => {
-                buf[pos + 2] = 0x00;
-                buf[pos + 3] = 0x01;
-                buf[pos + 4] = 0x00;
-                buf[pos + 5] = 0x01;
-                buf[pos + 6] = (ttl >> 24) as u8;
-                buf[pos + 7] = (ttl >> 16) as u8;
-                buf[pos + 8] = (ttl >> 8) as u8;
-                buf[pos + 9] = ttl as u8;
-                buf[pos + 10] = 0x00;
-                buf[pos + 11] = 0x04;
-                buf[pos + 12..pos + 16].copy_from_slice(&ipv4.octets());
-                pos += 16;
-            }
-            IpAddr::V6(ipv6) => {
-                buf[pos + 2] = 0x00;
-                buf[pos + 3] = 0x1C;
-                buf[pos + 4] = 0x00;
-                buf[pos + 5] = 0x01;
-                buf[pos + 6] = (ttl >> 24) as u8;
-                buf[pos + 7] = (ttl >> 16) as u8;
-                buf[pos + 8] = (ttl >> 8) as u8;
-                buf[pos + 9] = ttl as u8;
-                buf[pos + 10] = 0x00;
-                buf[pos + 11] = 0x10;
-                buf[pos + 12..pos + 28].copy_from_slice(&ipv6.octets());
-                pos += 28;
-            }
-        }
+        pos += write_address_rr(&mut buf[pos..], addr, ttl);
     }
 
     if query.has_edns {
@@ -154,4 +119,496 @@ pub fn build_cache_hit_response(
     }
 
     Some((buf, pos))
+}
+
+/// Answer-section size of one A (16) or AAAA (28) record owned by `C0 0C`.
+#[inline]
+fn address_rr_len(addr: &IpAddr) -> usize {
+    match addr {
+        IpAddr::V4(_) => 16,
+        IpAddr::V6(_) => 28,
+    }
+}
+
+/// Writes one A/AAAA record whose owner is a pointer to the first question
+/// name (offset 12) at the start of `out`; returns its length.
+#[inline]
+fn write_address_rr(out: &mut [u8], addr: &IpAddr, ttl: u32) -> usize {
+    let (rtype, rdlen): (u16, u16) = match addr {
+        IpAddr::V4(_) => (1, 4),
+        IpAddr::V6(_) => (28, 16),
+    };
+    out[0..2].copy_from_slice(&[0xC0, 0x0C]);
+    out[2..4].copy_from_slice(&rtype.to_be_bytes());
+    out[4..6].copy_from_slice(&CLASS_IN.to_be_bytes());
+    out[6..10].copy_from_slice(&ttl.to_be_bytes());
+    out[10..12].copy_from_slice(&rdlen.to_be_bytes());
+    match addr {
+        IpAddr::V4(v4) => out[12..16].copy_from_slice(&v4.octets()),
+        IpAddr::V6(v6) => out[12..28].copy_from_slice(&v6.octets()),
+    }
+    12 + usize::from(rdlen)
+}
+
+const CLASS_IN: u16 = 1;
+const TYPE_SOA: u16 = 6;
+const TYPE_OPT: u16 = 41;
+const OPTION_COOKIE: u16 = 10;
+/// UDP payload size advertised in every OPT this server writes.
+const EDNS_UDP_PAYLOAD: u16 = 4096;
+/// `hostmaster.ferrous-dns.invalid.` — the synthetic SOA RNAME.
+const SOA_RNAME: &[u8] = b"\x0ahostmaster\x0bferrous-dns\x07invalid\x00";
+
+/// Response codes this server sets in the header (RFC 1035 §4.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Rcode {
+    NoError = 0,
+    ServFail = 2,
+    NxDomain = 3,
+    Refused = 5,
+}
+
+/// Header fields of a response that are not derived from its sections.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseHead {
+    pub id: u16,
+    pub recursion_desired: bool,
+    pub authentic_data: bool,
+    pub rcode: Rcode,
+}
+
+impl ResponseHead {
+    fn flags(&self, truncated: bool) -> [u8; 2] {
+        let mut hi = 0x80 | u8::from(self.recursion_desired);
+        if truncated {
+            hi |= 0x02;
+        }
+        // RA is always set: this server recurses for every client.
+        let lo = 0x80 | (u8::from(self.authentic_data) << 5) | self.rcode as u8;
+        [hi, lo]
+    }
+}
+
+/// The response OPT record. Callers pass one iff the query carried OPT —
+/// RFC 6891 §7 forbids an OPT in the reply to a query without one.
+#[derive(Debug, Clone, Copy)]
+pub struct EdnsReply<'a> {
+    /// RFC 3225 §3: the DO bit is copied from the query.
+    pub dnssec_ok: bool,
+    /// Full COOKIE option payload: client cookie followed by server cookie.
+    pub cookie: Option<&'a [u8]>,
+    pub ede: Option<&'a ExtendedDnsError>,
+}
+
+impl EdnsReply<'_> {
+    fn write(&self, out: &mut Vec<u8>) {
+        let cookie_len = self.cookie.map_or(0, |c| 4 + c.len());
+        let ede_len = self.ede.map_or(0, |e| 6 + e.extra_text.map_or(0, str::len));
+        let rdlen = (cookie_len + ede_len) as u16;
+        out.push(0);
+        out.extend_from_slice(&TYPE_OPT.to_be_bytes());
+        out.extend_from_slice(&EDNS_UDP_PAYLOAD.to_be_bytes());
+        // Extended RCODE 0, version 0, then the flags word with DO in the top bit.
+        out.extend_from_slice(&[0, 0, u8::from(self.dnssec_ok) << 7, 0]);
+        out.extend_from_slice(&rdlen.to_be_bytes());
+        if let Some(cookie) = self.cookie {
+            out.extend_from_slice(&OPTION_COOKIE.to_be_bytes());
+            out.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+            out.extend_from_slice(cookie);
+        }
+        if let Some(ede) = self.ede {
+            let text = ede.extra_text.unwrap_or_default().as_bytes();
+            out.extend_from_slice(&ede::OPTION_CODE.to_be_bytes());
+            out.extend_from_slice(&((2 + text.len()) as u16).to_be_bytes());
+            out.extend_from_slice(&ede.info_code.to_be_bytes());
+            out.extend_from_slice(text);
+        }
+    }
+}
+
+/// What follows the question section.
+#[derive(Debug, Clone, Copy)]
+pub enum ResponseBody<'a> {
+    Empty,
+    /// A/AAAA answers owned by the first question name.
+    Addresses {
+        addresses: &'a [IpAddr],
+        ttl: u32,
+    },
+    /// No answer, plus a synthetic SOA in authority so resolvers can cache the
+    /// negative answer for `ttl` (RFC 2308).
+    NegativeSoa {
+        ttl: u32,
+    },
+}
+
+/// Encodes a response echoing `question` — `qdcount` wire-format questions
+/// whose first name is uncompressed, so `C0 0C` addresses it.
+pub fn encode_response(
+    head: &ResponseHead,
+    question: &[u8],
+    qdcount: u16,
+    body: ResponseBody<'_>,
+    edns: Option<&EdnsReply<'_>>,
+) -> Vec<u8> {
+    let (ancount, nscount, body_len) = match body {
+        ResponseBody::Empty => (0, 0, 0),
+        ResponseBody::Addresses { addresses, .. } => (
+            addresses.len() as u16,
+            0,
+            addresses.iter().map(address_rr_len).sum(),
+        ),
+        ResponseBody::NegativeSoa { .. } => (0, 1, 12 + 2 + SOA_RNAME.len() + 20),
+    };
+    let mut out = Vec::with_capacity(12 + question.len() + body_len + 64);
+    write_header(
+        &mut out,
+        head.id,
+        head.flags(false),
+        qdcount,
+        ancount,
+        nscount,
+        u16::from(edns.is_some()),
+    );
+    out.extend_from_slice(question);
+    match body {
+        ResponseBody::Empty => {}
+        ResponseBody::Addresses { addresses, ttl } => {
+            for addr in addresses {
+                let mut rr = [0u8; 28];
+                let len = write_address_rr(&mut rr, addr, ttl);
+                out.extend_from_slice(&rr[..len]);
+            }
+        }
+        ResponseBody::NegativeSoa { ttl } => {
+            out.extend_from_slice(&[0xC0, 0x0C]);
+            out.extend_from_slice(&TYPE_SOA.to_be_bytes());
+            out.extend_from_slice(&CLASS_IN.to_be_bytes());
+            out.extend_from_slice(&ttl.to_be_bytes());
+            out.extend_from_slice(&((2 + SOA_RNAME.len() + 20) as u16).to_be_bytes());
+            // MNAME is the queried name itself; resolvers key the negative
+            // cache off MINIMUM, so an exact zone apex is not required.
+            out.extend_from_slice(&[0xC0, 0x0C]);
+            out.extend_from_slice(SOA_RNAME);
+            for field in [1u32, 3600, 600, 604_800, ttl] {
+                out.extend_from_slice(&field.to_be_bytes());
+            }
+        }
+    }
+    if let Some(edns) = edns {
+        edns.write(&mut out);
+    }
+    out
+}
+
+/// Header plus question with TC=1: tells a UDP client to retry over TCP.
+pub fn encode_truncated(
+    id: u16,
+    recursion_desired: bool,
+    question: &[u8],
+    qdcount: u16,
+) -> Vec<u8> {
+    let head = ResponseHead {
+        id,
+        recursion_desired,
+        authentic_data: false,
+        rcode: Rcode::NoError,
+    };
+    let mut out = Vec::with_capacity(12 + question.len());
+    write_header(&mut out, id, head.flags(true), qdcount, 0, 0, 0);
+    out.extend_from_slice(question);
+    out
+}
+
+fn write_header(out: &mut Vec<u8>, id: u16, flags: [u8; 2], qd: u16, an: u16, ns: u16, ar: u16) {
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&flags);
+    for count in [qd, an, ns, ar] {
+        out.extend_from_slice(&count.to_be_bytes());
+    }
+}
+
+/// Re-issues a cached upstream response under the client's header and OPT:
+/// ID and RD from the client, AD as given, every upstream OPT dropped and
+/// `edns` appended in its place. `None` if `upstream` is not a well-formed
+/// sequence of sections.
+pub fn relay_with_edns(
+    upstream: &[u8],
+    id: u16,
+    recursion_desired: bool,
+    authentic_data: bool,
+    edns: Option<&EdnsReply<'_>>,
+) -> Option<Vec<u8>> {
+    let header = upstream.get(..12)?;
+    let count = |i: usize| u16::from_be_bytes([header[i], header[i + 1]]);
+    let (qd, an, ns, ar) = (count(4), count(6), count(8), count(10));
+
+    let mut pos = 12;
+    for _ in 0..qd {
+        pos = skip_name(upstream, pos)?.checked_add(4)?;
+    }
+    for _ in 0..usize::from(an) + usize::from(ns) {
+        pos = skip_rr(upstream, pos)?.1;
+    }
+    let sections_end = pos;
+    upstream.get(..sections_end)?;
+
+    let mut out = Vec::with_capacity(upstream.len() + 64);
+    out.extend_from_slice(&upstream[..sections_end]);
+    let mut kept_ar = 0u16;
+    for _ in 0..ar {
+        let (rtype, end) = skip_rr(upstream, pos)?;
+        if rtype != TYPE_OPT {
+            out.extend_from_slice(&upstream[pos..end]);
+            kept_ar += 1;
+        }
+        pos = end;
+    }
+    if let Some(edns) = edns {
+        edns.write(&mut out);
+        kept_ar += 1;
+    }
+
+    out[0..2].copy_from_slice(&id.to_be_bytes());
+    out[2] = (out[2] & !0x01) | u8::from(recursion_desired);
+    set_ad_bit(&mut out, authentic_data);
+    out[10..12].copy_from_slice(&kept_ar.to_be_bytes());
+    Some(out)
+}
+
+/// Offset just past the (possibly compressed) name at `pos`.
+fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *buf.get(pos)?;
+        match len & 0xC0 {
+            0xC0 => return buf.get(pos + 1).map(|_| pos + 2),
+            0x00 if len == 0 => return Some(pos + 1),
+            0x00 => pos += 1 + usize::from(len),
+            _ => return None,
+        }
+    }
+}
+
+/// `(type, end offset)` of the resource record at `pos`.
+fn skip_rr(buf: &[u8], pos: usize) -> Option<(u16, usize)> {
+    let fixed = skip_name(buf, pos)?;
+    let f = buf.get(fixed..fixed + 10)?;
+    let rtype = u16::from_be_bytes([f[0], f[1]]);
+    let end = fixed + 10 + usize::from(u16::from_be_bytes([f[8], f[9]]));
+    buf.get(..end)?;
+    Some((rtype, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::rdata::opt::EdnsOption;
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use std::str::FromStr;
+
+    fn question(name: &str, qtype: RecordType) -> Vec<u8> {
+        let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+        msg.add_query(Query::query(Name::from_str(name).unwrap(), qtype));
+        msg.to_vec().unwrap()[12..].to_vec()
+    }
+
+    fn head(rcode: Rcode) -> ResponseHead {
+        ResponseHead {
+            id: 0xBEEF,
+            recursion_desired: true,
+            authentic_data: true,
+            rcode,
+        }
+    }
+
+    #[test]
+    fn fast_path_opt_constant_is_the_plain_edns_reply() {
+        let mut written = Vec::new();
+        EdnsReply {
+            dnssec_ok: false,
+            cookie: None,
+            ede: None,
+        }
+        .write(&mut written);
+        assert_eq!(written, OPT_RECORD);
+    }
+
+    #[test]
+    fn address_response_decodes_with_header_answers_and_opt() {
+        let q = question("example.com.", RecordType::AAAA);
+        let addresses = ["2001:db8::1".parse().unwrap(), "192.0.2.1".parse().unwrap()];
+        let cookie = [7u8; 16];
+        let wire = encode_response(
+            &head(Rcode::NoError),
+            &q,
+            1,
+            ResponseBody::Addresses {
+                addresses: &addresses,
+                ttl: 300,
+            },
+            Some(&EdnsReply {
+                dnssec_ok: true,
+                cookie: Some(&cookie),
+                ede: None,
+            }),
+        );
+
+        let msg = Message::from_vec(&wire).unwrap();
+        assert_eq!(msg.id, 0xBEEF);
+        assert_eq!(msg.message_type, MessageType::Response);
+        assert!(msg.recursion_desired && msg.recursion_available && msg.authentic_data);
+        assert!(!msg.truncation);
+        assert_eq!(msg.response_code, ResponseCode::NoError);
+        assert_eq!(
+            msg.queries[0].name(),
+            &Name::from_str("example.com.").unwrap()
+        );
+        let answers: Vec<_> = msg
+            .answers
+            .iter()
+            .map(|r| (r.name.clone(), r.ttl, r.data.clone()))
+            .collect();
+        let owner = Name::from_str("example.com.").unwrap();
+        assert_eq!(
+            answers,
+            [
+                (
+                    owner.clone(),
+                    300,
+                    RData::AAAA("2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().into())
+                ),
+                (
+                    owner,
+                    300,
+                    RData::A("192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap().into())
+                ),
+            ]
+        );
+        let edns = msg.edns.unwrap();
+        assert!(edns.flags().dnssec_ok);
+        assert_eq!(edns.max_payload(), EDNS_UDP_PAYLOAD);
+        assert!(edns
+            .options()
+            .as_ref()
+            .iter()
+            .any(|(_, o)| matches!(o, EdnsOption::Unknown(10, d) if d == &cookie)));
+    }
+
+    #[test]
+    fn negative_soa_is_cacheable_for_the_block_ttl() {
+        let q = question("ads.example.com.", RecordType::A);
+        let wire = encode_response(
+            &head(Rcode::NxDomain),
+            &q,
+            1,
+            ResponseBody::NegativeSoa { ttl: 120 },
+            None,
+        );
+
+        let msg = Message::from_vec(&wire).unwrap();
+        assert_eq!(msg.response_code, ResponseCode::NXDomain);
+        assert!(msg.answers.is_empty() && msg.edns.is_none());
+        let soa = &msg.authorities[0];
+        assert_eq!(soa.ttl, 120);
+        match &soa.data {
+            RData::SOA(soa) => {
+                assert_eq!(soa.mname, Name::from_str("ads.example.com.").unwrap());
+                assert_eq!(
+                    soa.rname,
+                    Name::from_str("hostmaster.ferrous-dns.invalid.").unwrap()
+                );
+                assert_eq!(soa.minimum, 120);
+            }
+            other => panic!("expected SOA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_response_carries_tc_and_the_question_only() {
+        let q = question("big.example.com.", RecordType::TXT);
+        let msg = Message::from_vec(&encode_truncated(9, false, &q, 1)).unwrap();
+        assert!(msg.truncation && !msg.recursion_desired);
+        assert_eq!(msg.queries.len(), 1);
+        assert!(msg.answers.is_empty() && msg.edns.is_none());
+    }
+
+    #[test]
+    fn relay_replaces_the_upstream_opt_and_keeps_every_other_record() {
+        let owner = Name::from_str("mail.example.com.").unwrap();
+        let mut upstream = Message::new(0x1111, MessageType::Response, OpCode::Query);
+        upstream.metadata.recursion_desired = true;
+        upstream.metadata.recursion_available = true;
+        upstream.add_query(Query::query(owner.clone(), RecordType::MX));
+        upstream.add_answer(Record::from_rdata(
+            owner.clone(),
+            60,
+            RData::MX(hickory_proto::rr::rdata::MX::new(
+                10,
+                Name::from_str("mx.example.com.").unwrap(),
+            )),
+        ));
+        upstream.add_additional(Record::from_rdata(
+            Name::from_str("mx.example.com.").unwrap(),
+            60,
+            RData::A("192.0.2.25".parse::<std::net::Ipv4Addr>().unwrap().into()),
+        ));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![0xAA; 16]));
+        upstream.set_edns(edns);
+        let upstream = upstream.to_vec().unwrap();
+
+        let ours = [0x55u8; 16];
+        let relayed = relay_with_edns(
+            &upstream,
+            0x2222,
+            false,
+            true,
+            Some(&EdnsReply {
+                dnssec_ok: true,
+                cookie: Some(&ours),
+                ede: None,
+            }),
+        )
+        .unwrap();
+
+        let msg = Message::from_vec(&relayed).unwrap();
+        assert_eq!(msg.id, 0x2222);
+        assert!(!msg.recursion_desired && msg.authentic_data);
+        assert_eq!(msg.answers.len(), 1);
+        assert_eq!(
+            msg.additionals.len(),
+            1,
+            "the A glue survives, the OPT does not"
+        );
+        let cookies: Vec<_> = msg
+            .edns
+            .unwrap()
+            .options()
+            .as_ref()
+            .iter()
+            .filter_map(|(_, o)| match o {
+                EdnsOption::Unknown(10, d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cookies, [ours.to_vec()]);
+
+        let without = relay_with_edns(&upstream, 1, true, false, None).unwrap();
+        assert!(Message::from_vec(&without).unwrap().edns.is_none());
+    }
+
+    #[test]
+    fn relay_rejects_sections_that_overrun_the_message() {
+        let mut upstream = Message::new(1, MessageType::Response, OpCode::Query);
+        upstream.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let mut wire = upstream.to_vec().unwrap();
+        wire[7] = 1; // ANCOUNT claims a record the message does not hold
+        assert!(relay_with_edns(&wire, 1, true, false, None).is_none());
+    }
 }

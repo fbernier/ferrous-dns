@@ -1,10 +1,11 @@
-//! Integration tests for the domain-verdict block responder on the raw UDP
-//! fast path (`build_blocked_wire`) for every `BlockResponseMode`.
+//! Integration tests for the domain-verdict block responder
+//! (`build_blocked_wire`) for every `BlockResponseMode`.
 
 use ferrous_dns_domain::{BlockResponseMode, DomainError};
 use ferrous_dns_infrastructure::dns::ede;
-use ferrous_dns_infrastructure::dns::server::{build_blocked_wire, BlockPolicy};
-use hickory_proto::op::{Message, Query, ResponseCode};
+use ferrous_dns_infrastructure::dns::forwarding::RecordTypeMapper;
+use ferrous_dns_infrastructure::dns::server::{build_blocked_wire, BlockPolicy, ClientQuery};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -40,16 +41,29 @@ fn assert_soa(msg: &Message) {
     }
 }
 
-// ── UDP fast path: build_blocked_wire ────────────────────────────────────
+// ── build_blocked_wire ───────────────────────────────────────────────────
 
 fn decode(mode: BlockResponseMode, record_type: RecordType) -> Message {
     decode_with(policy(mode), record_type)
 }
 
+/// Encodes `record_type`'s question and blocks it under `policy`.
+fn blocked(
+    policy: BlockPolicy,
+    record_type: RecordType,
+    edns_dnssec_ok: Option<bool>,
+    ede: Option<&ede::ExtendedDnsError>,
+) -> Vec<u8> {
+    let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+    msg.add_query(query(record_type));
+    let question = msg.to_vec().unwrap()[12..].to_vec();
+    let query = ClientQuery::new(0x1234, true, &question, edns_dnssec_ok);
+    let record_type = RecordTypeMapper::from_hickory(record_type).expect("mapped type");
+    build_blocked_wire(&query, record_type, policy, ede)
+}
+
 fn decode_with(policy: BlockPolicy, record_type: RecordType) -> Message {
-    let wire = build_blocked_wire(0x1234, true, &[query(record_type)], policy, false, None)
-        .expect("wire bytes");
-    Message::from_vec(&wire).expect("valid DNS message")
+    Message::from_vec(&blocked(policy, record_type, None, None)).expect("valid DNS message")
 }
 
 #[test]
@@ -162,18 +176,31 @@ fn refused_mode_sets_refused_with_no_answer() {
 #[test]
 fn edns_request_gets_edns_response_with_ede() {
     let ede = ede::from_domain_error(&DomainError::Blocked);
-    let wire = build_blocked_wire(
-        0x1234,
-        true,
-        &[query(RecordType::A)],
+    let wire = blocked(
         policy(BlockResponseMode::NullIp),
-        true,
-        ede,
-    )
-    .expect("wire bytes");
-    let msg = Message::from_vec(&wire).expect("valid DNS message");
-    assert!(
-        msg.edns.is_some(),
-        "EDNS OPT (carrying the EDE) should be present"
+        RecordType::A,
+        Some(false),
+        ede.as_ref(),
     );
+    let msg = Message::from_vec(&wire).expect("valid DNS message");
+    let edns = msg
+        .edns
+        .expect("EDNS OPT (carrying the EDE) should be present");
+    let ede = ede.unwrap();
+    let mut expected = ede.info_code.to_be_bytes().to_vec();
+    expected.extend_from_slice(ede.extra_text.unwrap().as_bytes());
+    assert!(
+        edns.options().as_ref().iter().any(|(_, opt)| matches!(
+            opt,
+            hickory_proto::rr::rdata::opt::EdnsOption::Unknown(15, data) if *data == expected
+        )),
+        "the EDE option must carry the info code and text"
+    );
+}
+
+#[test]
+fn non_edns_request_gets_no_opt() {
+    // RFC 6891 §7: no OPT in the reply to a query that carried none.
+    let msg = decode(BlockResponseMode::NullIp, RecordType::A);
+    assert!(msg.edns.is_none());
 }

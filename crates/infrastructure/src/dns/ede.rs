@@ -17,6 +17,7 @@ pub mod codes {
     pub const BAD_COOKIE: u16 = 25;
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct ExtendedDnsError {
     pub info_code: u16,
     pub extra_text: Option<&'static str>,
