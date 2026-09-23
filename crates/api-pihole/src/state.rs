@@ -1,5 +1,8 @@
 use ferrous_dns_application::ports::{BlockFilterEnginePort, UpstreamHealthPort};
-use ferrous_dns_application::use_cases::{AssignClientGroupUseCase, GetTopAllowedDomainsUseCase};
+use ferrous_dns_application::use_cases::{
+    AppPasswordLoginUseCase, AssignClientGroupUseCase, GetTopAllowedDomainsUseCase, LoginUseCase,
+    LogoutUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
+};
 use ferrous_dns_application::use_cases::{
     CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateGroupUseCase,
     CreateManagedDomainUseCase, CreateManualClientUseCase, CreateRegexFilterUseCase,
@@ -29,10 +32,27 @@ pub struct PiholeAppState {
     pub groups: PiholeGroupState,
     pub clients: PiholeClientState,
     pub system: PiholeSystemState,
-    /// Auth use cases for real session-based auth.
-    pub login: Option<Arc<ferrous_dns_application::use_cases::LoginUseCase>>,
-    /// Admin username from TOML config (for Pi-hole password-only login).
-    pub admin_username: Option<String>,
+    pub auth: PiholeAuthState,
+}
+
+/// The same auth use cases the Ferrous API uses, so Pi-hole logins share its
+/// sessions and its login lockout. Not optional: a state without them would
+/// serve every route unauthenticated.
+#[derive(Clone)]
+pub struct PiholeAuthState {
+    pub login: Arc<LoginUseCase>,
+    pub verify_mfa: Arc<VerifyMfaUseCase>,
+    pub app_password_login: Arc<AppPasswordLoginUseCase>,
+    pub logout: Arc<LogoutUseCase>,
+    pub validate_session: Arc<ValidateSessionUseCase>,
+}
+
+impl PiholeAppState {
+    /// Reads `[auth] enabled` from the live config, so toggling it applies
+    /// without a restart — the same source the Ferrous API checks.
+    pub async fn auth_enabled(&self) -> bool {
+        self.system.config.read().await.auth.enabled
+    }
 }
 
 #[derive(Clone)]

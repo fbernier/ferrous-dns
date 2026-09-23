@@ -1,8 +1,10 @@
-use axum::Router;
+use axum::{middleware, Router};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::{handlers, openapi::PiholeApiDoc, state::PiholeAppState};
+use crate::{
+    handlers, middleware::require_pihole_auth, openapi::PiholeApiDoc, state::PiholeAppState,
+};
 
 /// Builds the Axum router for all Pi-hole v6 compatible endpoints.
 ///
@@ -16,18 +18,21 @@ pub fn create_pihole_routes(state: PiholeAppState) -> Router {
 ///
 /// Returns a tuple `(Router, OpenApi)` so the caller can mount the router and
 /// expose the spec under the same `nest` prefix (e.g. `/openapi.json` + `/docs`).
+///
+/// As on Pi-hole, only `/auth` is public; every other route sits behind
+/// [`require_pihole_auth`].
 pub fn create_pihole_router_with_openapi(
     state: PiholeAppState,
 ) -> (Router, utoipa::openapi::OpenApi) {
     use utoipa::OpenApi;
 
-    let (router, api) = OpenApiRouter::with_openapi(PiholeApiDoc::openapi())
-        // Auth
-        .routes(routes!(
-            handlers::auth::get_session,
-            handlers::auth::login,
-            handlers::auth::logout
-        ))
+    let public_routes = OpenApiRouter::new().routes(routes!(
+        handlers::auth::get_session,
+        handlers::auth::login,
+        handlers::auth::logout
+    ));
+
+    let protected_routes = OpenApiRouter::new()
         // Stats — Phase 1
         .routes(routes!(handlers::stats::get_summary))
         .routes(routes!(handlers::stats::get_history))
@@ -127,6 +132,14 @@ pub fn create_pihole_router_with_openapi(
         .routes(routes!(handlers::action::gravity))
         .routes(routes!(handlers::action::restartdns))
         .routes(routes!(handlers::action::flush_logs))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_pihole_auth,
+        ));
+
+    let (router, api) = OpenApiRouter::with_openapi(PiholeApiDoc::openapi())
+        .merge(public_routes)
+        .merge(protected_routes)
         .with_state(state)
         .split_for_parts();
 

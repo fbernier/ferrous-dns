@@ -162,7 +162,7 @@ Published so you can plan around it rather than discover it.
 | Gap | What it means | Status |
 |:----|:--------------|:-------|
 | No API rate limiting | The REST API has no request throttling middleware of any kind. Put the dashboard behind a reverse proxy or a trusted network. | Not implemented |
-| Login lockout is inert | `login_rate_limit_attempts` and `login_rate_limit_window_secs` are accepted, persisted and returned by the API, but nothing enforces them — password attempts are not throttled. Do not count on them. | Config accepted, not enforced |
+| Login lockout behind a reverse proxy | The lockout counts failures per TCP peer and ignores `X-Forwarded-For`, so behind a proxy all logins share the proxy's count. See [Login lockout](security.md#login-lockout). | By design |
 | DS-denial fail-open | Downgrade *detection* only; a response with no authority section still degrades to insecure. Tracked by `ds_denial_fail_opens`. | Detection only |
 | EDNS Client Subnet | Client ECS is not stripped from upstream queries yet. | Planned (RFC 7871) |
 | RFC 5011 trust-anchor rollover | Root key updates need a new release or a manual anchor file. | Planned |
@@ -178,4 +178,4 @@ Published so you can plan around it rather than discover it.
 - [ ] Consider `dnssec_mode = "strict"` once you have watched `permissive` for a while without false Bogus.
 - [ ] Try `qname_case_randomization = true` and watch upstream failure counts before keeping it.
 - [ ] Keep `metrics_enabled = false` unless the port is reachable only from your monitoring host.
-- [ ] Put the dashboard behind HTTPS and enable TOTP or a passkey — there is no login throttling to fall back on.
+- [ ] Put the dashboard behind HTTPS and enable TOTP or a passkey — the login lockout slows password guessing but does not replace a second factor.

@@ -1,3 +1,4 @@
+mod app_password_login;
 mod authenticate_passkey;
 mod change_password;
 mod confirm_totp;
@@ -8,6 +9,7 @@ mod get_active_sessions;
 mod get_auth_status;
 mod get_mfa_status;
 mod login;
+mod login_rate_limiter;
 mod logout;
 mod register_passkey;
 mod session_factory;
@@ -16,6 +18,7 @@ mod setup_totp;
 mod validate_session;
 mod verify_mfa;
 
+pub use app_password_login::AppPasswordLoginUseCase;
 pub use authenticate_passkey::AuthenticatePasskeyUseCase;
 pub use change_password::ChangePasswordUseCase;
 pub use confirm_totp::ConfirmTotpUseCase;
@@ -26,6 +29,7 @@ pub use get_active_sessions::GetActiveSessionsUseCase;
 pub use get_auth_status::{AuthStatus, GetAuthStatusUseCase};
 pub use get_mfa_status::{GetMfaStatusUseCase, MfaStatus, PasskeySummary};
 pub use login::{LoginOutcome, LoginUseCase};
+pub use login_rate_limiter::LoginRateLimiter;
 pub use logout::LogoutUseCase;
 pub use register_passkey::{RegisterPasskeyUseCase, RegistrationStart};
 pub use setup_password::SetupPasswordUseCase;

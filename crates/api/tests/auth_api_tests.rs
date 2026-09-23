@@ -11,8 +11,12 @@ use ferrous_dns_domain::{
     AuthConfig, AuthSession, Config, DomainError, MfaChallenge, MfaMethod, RecoveryCode, User,
     UserMfa, UserRole, UserSource, WebauthnCredential,
 };
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// TCP peer every test client connects from; the login lockout is keyed by it.
+const PEER: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// MFA repository double: no factors enrolled (login stays single-factor).
 struct NoMfaRepository;
@@ -315,6 +319,7 @@ async fn login_with_correct_password_creates_session() {
             "admin",
             "correct-password",
             false,
+            PEER,
             "127.0.0.1",
             "test-agent",
         )
@@ -344,7 +349,14 @@ async fn login_with_wrong_password_fails() {
     let login_uc = LoginUseCase::new(user_provider, session_repo, hasher, no_mfa(), config);
 
     let result = login_uc
-        .execute("admin", "wrong-password", false, "127.0.0.1", "test-agent")
+        .execute(
+            "admin",
+            "wrong-password",
+            false,
+            PEER,
+            "127.0.0.1",
+            "test-agent",
+        )
         .await;
 
     assert!(result.is_err());
@@ -367,6 +379,7 @@ async fn login_with_unknown_user_fails() {
             "nobody",
             "correct-password",
             false,
+            PEER,
             "127.0.0.1",
             "test-agent",
         )
@@ -403,6 +416,7 @@ async fn validate_session_succeeds_for_valid_session() {
                 "admin",
                 "correct-password",
                 false,
+                PEER,
                 "127.0.0.1",
                 "test-agent",
             )
@@ -578,7 +592,14 @@ async fn totp_enrolled_login_accepts_totp_and_single_use_recovery_codes() {
 
     // Phase 1: correct password → MFA challenge, no session yet.
     let outcome = login_uc
-        .execute("admin", "correct-password", true, "127.0.0.1", "agent")
+        .execute(
+            "admin",
+            "correct-password",
+            true,
+            PEER,
+            "127.0.0.1",
+            "agent",
+        )
         .await
         .unwrap();
     let challenge_token = match outcome {
@@ -604,13 +625,13 @@ async fn totp_enrolled_login_accepts_totp_and_single_use_recovery_codes() {
 
     // Wrong code is rejected; challenge survives for retry.
     assert!(verify_uc
-        .execute(&challenge_token, "000000", "127.0.0.1", "agent")
+        .execute(&challenge_token, "000000", PEER, "127.0.0.1", "agent")
         .await
         .is_err());
 
     // Phase 2: correct code → session honoring remember_me.
     let session = verify_uc
-        .execute(&challenge_token, "123456", "127.0.0.1", "agent")
+        .execute(&challenge_token, "123456", PEER, "127.0.0.1", "agent")
         .await
         .unwrap();
     assert_eq!(session.username.as_ref(), "admin");
@@ -635,14 +656,21 @@ async fn totp_enrolled_login_accepts_totp_and_single_use_recovery_codes() {
         let LoginOutcome::MfaRequired {
             challenge_token, ..
         } = login_uc
-            .execute("admin", "correct-password", false, "127.0.0.1", "agent")
+            .execute(
+                "admin",
+                "correct-password",
+                false,
+                PEER,
+                "127.0.0.1",
+                "agent",
+            )
             .await
             .unwrap()
         else {
             panic!("expected MFA challenge");
         };
         let result = verify_uc
-            .execute(&challenge_token, code, "127.0.0.1", "agent")
+            .execute(&challenge_token, code, PEER, "127.0.0.1", "agent")
             .await;
         if accepted {
             assert_eq!(result.unwrap().username.as_ref(), "admin");
@@ -651,6 +679,123 @@ async fn totp_enrolled_login_accepts_totp_and_single_use_recovery_codes() {
         }
     }
     assert_eq!(session_repo.get_all_active().await.unwrap().len(), 3);
+}
+
+/// `login_rate_limit_attempts` wrong passwords lock the client out for
+/// `login_rate_limit_window_secs`; during the lockout even the right password
+/// is refused, and a different forwarded address does not reset the count.
+#[tokio::test]
+async fn login_locks_out_after_max_failed_attempts() {
+    let user_provider: Arc<dyn UserProvider> = Arc::new(TestUserProvider {
+        admin: make_admin_user("$hashed$"),
+    });
+    let session_repo: Arc<dyn SessionRepository> = Arc::new(InMemorySessionRepository::new());
+    let hasher: Arc<dyn PasswordHasher> = Arc::new(TestPasswordHasher);
+    let config = Arc::new(AuthConfig::default());
+    let max_attempts = config.login_rate_limit_attempts;
+
+    let login_uc = LoginUseCase::new(user_provider, session_repo, hasher, no_mfa(), config);
+
+    for attempt in 1..=max_attempts {
+        let result = login_uc
+            .execute(
+                "admin",
+                "wrong-password",
+                false,
+                PEER,
+                &format!("203.0.113.{attempt}"),
+                "agent",
+            )
+            .await;
+        assert!(
+            matches!(result, Err(DomainError::InvalidCredentials)),
+            "attempt {attempt} must fail as a wrong password"
+        );
+    }
+
+    let result = login_uc
+        .execute(
+            "admin",
+            "correct-password",
+            false,
+            PEER,
+            "198.51.100.7",
+            "agent",
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::RateLimited)),
+        "a locked-out client must be refused even with the right password, got error {:?}",
+        result.as_ref().err()
+    );
+}
+
+/// Wrong second-factor codes count toward the same lockout, so a pending MFA
+/// challenge cannot be brute-forced through its whole lifetime.
+#[tokio::test]
+async fn totp_verification_locks_out_after_max_failed_codes() {
+    use ferrous_dns_application::use_cases::VerifyMfaUseCase;
+
+    let user_provider: Arc<dyn UserProvider> = Arc::new(TestUserProvider {
+        admin: make_admin_user("$hashed$"),
+    });
+    let session_repo: Arc<dyn SessionRepository> = Arc::new(InMemorySessionRepository::new());
+    let hasher: Arc<dyn PasswordHasher> = Arc::new(TestPasswordHasher);
+    let mfa_repo: Arc<dyn MfaRepository> = Arc::new(TotpEnrolledMfaRepository::new());
+    let config = Arc::new(AuthConfig::default());
+    let max_attempts = config.login_rate_limit_attempts;
+
+    let login_uc = LoginUseCase::new(
+        user_provider.clone(),
+        session_repo.clone(),
+        hasher.clone(),
+        mfa_repo.clone(),
+        config.clone(),
+    );
+    let LoginOutcome::MfaRequired {
+        challenge_token, ..
+    } = login_uc
+        .execute(
+            "admin",
+            "correct-password",
+            false,
+            PEER,
+            "127.0.0.1",
+            "agent",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected MFA challenge");
+    };
+
+    let verify_uc = VerifyMfaUseCase::new(
+        mfa_repo,
+        Arc::new(FixedTotpService),
+        hasher,
+        user_provider,
+        session_repo,
+        config,
+    );
+
+    for attempt in 1..=max_attempts {
+        let result = verify_uc
+            .execute(&challenge_token, "000000", PEER, "127.0.0.1", "agent")
+            .await;
+        assert!(
+            matches!(result, Err(DomainError::InvalidMfaCode)),
+            "attempt {attempt} must fail as a wrong code"
+        );
+    }
+
+    let result = verify_uc
+        .execute(&challenge_token, "123456", PEER, "127.0.0.1", "agent")
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::RateLimited)),
+        "a locked-out client must be refused even with the right code, got error {:?}",
+        result.as_ref().err()
+    );
 }
 
 /// WebAuthn service double that reports "not configured" (rp_id/rp_origin unset).

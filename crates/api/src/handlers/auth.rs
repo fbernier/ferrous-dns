@@ -1,9 +1,10 @@
 use axum::{
-    extract::{Path, Request, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -149,6 +150,7 @@ pub async fn login_public(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<impl IntoResponse, ApiError> {
+    let peer_ip = extract_peer_ip(&request);
     let ip_address = extract_client_ip(&request);
     let user_agent = extract_user_agent(&request);
 
@@ -161,6 +163,7 @@ pub async fn login_public(
             &req.username,
             &req.password,
             req.remember_me,
+            peer_ip,
             &ip_address,
             &user_agent,
         )
@@ -216,6 +219,7 @@ pub async fn verify_mfa_public(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<impl IntoResponse, ApiError> {
+    let peer_ip = extract_peer_ip(&request);
     let ip_address = extract_client_ip(&request);
     let user_agent = extract_user_agent(&request);
     let req: VerifyMfaRequest = read_json(request).await?;
@@ -223,7 +227,13 @@ pub async fn verify_mfa_public(
     let session = state
         .auth
         .verify_mfa
-        .execute(&req.challenge_token, &req.code, &ip_address, &user_agent)
+        .execute(
+            &req.challenge_token,
+            &req.code,
+            peer_ip,
+            &ip_address,
+            &user_agent,
+        )
         .await?;
 
     let max_age = state.auth.login.session_max_age(session.remember_me);
@@ -741,6 +751,18 @@ fn extract_client_ip(request: &Request) -> String {
                 .map(String::from)
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// TCP peer of the connection — the one client address a caller cannot forge,
+/// so the login lockout is keyed by it. Absent only when the router is driven
+/// without a listener, as in tests.
+fn extract_peer_ip(request: &Request) -> IpAddr {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |ConnectInfo(addr)| {
+            addr.ip()
+        })
 }
 
 fn extract_user_agent(request: &Request) -> String {

@@ -1,11 +1,15 @@
 use async_trait::async_trait;
-use ferrous_dns_application::ports::ApiTokenRepository;
+use ferrous_dns_application::ports::{ApiTokenRepository, SessionRepository, UserProvider};
 use ferrous_dns_application::use_cases::{
-    CreateApiTokenUseCase, DeleteApiTokenUseCase, GetApiTokensUseCase, UpdateApiTokenUseCase,
-    ValidateApiTokenUseCase,
+    AppPasswordLoginUseCase, CreateApiTokenUseCase, DeleteApiTokenUseCase, GetApiTokensUseCase,
+    LoginRateLimiter, UpdateApiTokenUseCase, ValidateApiTokenUseCase,
 };
-use ferrous_dns_domain::{ApiToken, DomainError};
+use ferrous_dns_domain::{
+    ApiToken, AuthConfig, AuthSession, DomainError, User, UserRole, UserSource,
+};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
@@ -428,4 +432,191 @@ async fn validate_empty_repo_returns_invalid_credentials() {
 
     let err = validate.execute("any-token").await.unwrap_err();
     assert!(matches!(err, DomainError::InvalidCredentials));
+}
+
+// ---------------------------------------------------------------------------
+// AppPasswordLoginUseCase
+// ---------------------------------------------------------------------------
+
+const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+
+struct AdminOnlyUserProvider {
+    enabled: bool,
+}
+
+#[async_trait]
+impl UserProvider for AdminOnlyUserProvider {
+    async fn get_by_username(&self, username: &str) -> Result<Option<User>, DomainError> {
+        Ok((username == "admin").then(|| User {
+            id: Some(1),
+            username: Arc::from("admin"),
+            display_name: None,
+            password_hash: Arc::from("$hashed$"),
+            role: UserRole::Admin,
+            source: UserSource::Toml,
+            enabled: self.enabled,
+            created_at: None,
+            updated_at: None,
+        }))
+    }
+    async fn get_all(&self) -> Result<Vec<User>, DomainError> {
+        Ok(Vec::new())
+    }
+    async fn update_password(&self, _: &str, _: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct InMemorySessionRepo {
+    sessions: RwLock<Vec<AuthSession>>,
+}
+
+#[async_trait]
+impl SessionRepository for InMemorySessionRepo {
+    async fn create(&self, session: &AuthSession) -> Result<(), DomainError> {
+        self.sessions.write().await.push(session.clone());
+        Ok(())
+    }
+    async fn get_by_id(&self, id: &str) -> Result<Option<AuthSession>, DomainError> {
+        let sessions = self.sessions.read().await;
+        Ok(sessions.iter().find(|s| s.id.as_ref() == id).cloned())
+    }
+    async fn update_last_seen(&self, _: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+    async fn delete(&self, id: &str) -> Result<(), DomainError> {
+        self.sessions.write().await.retain(|s| s.id.as_ref() != id);
+        Ok(())
+    }
+    async fn delete_expired(&self) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+    async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError> {
+        Ok(self.sessions.read().await.clone())
+    }
+}
+
+struct AppPasswordFixture {
+    use_case: AppPasswordLoginUseCase,
+    sessions: Arc<InMemorySessionRepo>,
+    rate_limiter: Arc<LoginRateLimiter>,
+    token: String,
+}
+
+async fn app_password_fixture(admin_enabled: bool) -> AppPasswordFixture {
+    let repo = Arc::new(MockApiTokenRepo::new());
+    let token = CreateApiTokenUseCase::new(repo.clone())
+        .execute("pihole-app", None)
+        .await
+        .unwrap()
+        .raw_token;
+    let sessions = Arc::new(InMemorySessionRepo::default());
+    let rate_limiter = Arc::new(LoginRateLimiter::new(3, Duration::from_secs(900)));
+    let use_case = AppPasswordLoginUseCase::new(
+        Arc::new(ValidateApiTokenUseCase::new(repo)),
+        Arc::new(AdminOnlyUserProvider {
+            enabled: admin_enabled,
+        }),
+        sessions.clone(),
+        Arc::new(AuthConfig::default()),
+        rate_limiter.clone(),
+    );
+    AppPasswordFixture {
+        use_case,
+        sessions,
+        rate_limiter,
+        token,
+    }
+}
+
+#[tokio::test]
+async fn app_password_login_with_valid_token_creates_session() {
+    let fixture = app_password_fixture(true).await;
+
+    let session = fixture
+        .use_case
+        .execute("admin", &fixture.token, PEER, "192.0.2.10", "agent")
+        .await
+        .unwrap();
+
+    assert_eq!(session.username.as_ref(), "admin");
+    assert_eq!(session.role, UserRole::Admin);
+    let stored = fixture.sessions.get_all_active().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, session.id);
+}
+
+#[tokio::test]
+async fn app_password_login_rejects_unknown_token() {
+    let fixture = app_password_fixture(true).await;
+
+    let err = fixture
+        .use_case
+        .execute("admin", "not-a-token", PEER, "192.0.2.10", "agent")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, DomainError::InvalidCredentials));
+    assert!(fixture.sessions.get_all_active().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn app_password_login_rejects_disabled_user() {
+    let fixture = app_password_fixture(false).await;
+
+    let err = fixture
+        .use_case
+        .execute("admin", &fixture.token, PEER, "192.0.2.10", "agent")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, DomainError::InvalidCredentials));
+}
+
+#[tokio::test]
+async fn app_password_login_is_refused_while_locked_out() {
+    let fixture = app_password_fixture(true).await;
+    for _ in 0..3 {
+        fixture.rate_limiter.record_failure(PEER);
+    }
+
+    let err = fixture
+        .use_case
+        .execute("admin", &fixture.token, PEER, "192.0.2.10", "agent")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, DomainError::RateLimited));
+}
+
+#[tokio::test]
+async fn app_password_login_does_not_count_wrong_tokens() {
+    let fixture = app_password_fixture(true).await;
+
+    for _ in 0..10 {
+        let _ = fixture
+            .use_case
+            .execute("admin", "not-a-token", PEER, "192.0.2.10", "agent")
+            .await;
+    }
+
+    assert!(fixture.rate_limiter.check(PEER).is_ok());
+}
+
+#[tokio::test]
+async fn app_password_login_clears_earlier_failures() {
+    let fixture = app_password_fixture(true).await;
+    fixture.rate_limiter.record_failure(PEER);
+    fixture.rate_limiter.record_failure(PEER);
+
+    fixture
+        .use_case
+        .execute("admin", &fixture.token, PEER, "192.0.2.10", "agent")
+        .await
+        .unwrap();
+
+    fixture.rate_limiter.record_failure(PEER);
+    fixture.rate_limiter.record_failure(PEER);
+    assert!(fixture.rate_limiter.check(PEER).is_ok());
 }

@@ -87,6 +87,7 @@ use crate::dto;
     components(schemas(
         dto::action::ActionResponse,
         dto::auth::LoginRequest,
+        dto::auth::TotpCode,
         dto::auth::SessionInfo,
         dto::auth::AuthResponse,
         dto::clients::PiholeClientEntry,

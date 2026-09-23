@@ -1,7 +1,9 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use tracing::{info, instrument, warn};
 
+use super::login_rate_limiter::LoginRateLimiter;
 use super::session_factory::build_session;
 use crate::ports::{MfaRepository, PasswordHasher, SessionRepository, TotpService, UserProvider};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError};
@@ -15,6 +17,7 @@ pub struct VerifyMfaUseCase {
     user_provider: Arc<dyn UserProvider>,
     session_repo: Arc<dyn SessionRepository>,
     auth_config: Arc<AuthConfig>,
+    rate_limiter: Arc<LoginRateLimiter>,
 }
 
 impl VerifyMfaUseCase {
@@ -26,6 +29,7 @@ impl VerifyMfaUseCase {
         session_repo: Arc<dyn SessionRepository>,
         auth_config: Arc<AuthConfig>,
     ) -> Self {
+        let rate_limiter = Arc::new(LoginRateLimiter::from_config(&auth_config));
         Self {
             mfa_repo,
             totp,
@@ -33,19 +37,31 @@ impl VerifyMfaUseCase {
             user_provider,
             session_repo,
             auth_config,
+            rate_limiter,
         }
+    }
+
+    /// Shares one lockout with the other credential checks, so failures on
+    /// any of them count toward the same limit.
+    pub fn with_rate_limiter(mut self, rate_limiter: Arc<LoginRateLimiter>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     /// Returns the created `AuthSession`. The challenge is consumed only on a
     /// correct code; a wrong code leaves it valid for retry until it expires.
+    /// Wrong codes count toward the `peer_ip` lockout, which bounds those retries.
     #[instrument(skip(self, code))]
     pub async fn execute(
         &self,
         challenge_token: &str,
         code: &str,
+        peer_ip: IpAddr,
         ip_address: &str,
         user_agent: &str,
     ) -> Result<AuthSession, DomainError> {
+        self.rate_limiter.check(peer_ip)?;
+
         let challenge = self
             .mfa_repo
             .get_challenge(challenge_token)
@@ -79,6 +95,7 @@ impl VerifyMfaUseCase {
 
         if !verified {
             warn!(username = username, "Failed second-factor attempt");
+            self.rate_limiter.record_failure(peer_ip);
             return Err(DomainError::InvalidMfaCode);
         }
 
@@ -93,6 +110,7 @@ impl VerifyMfaUseCase {
             &self.auth_config,
         )?;
         self.session_repo.create(&session).await?;
+        self.rate_limiter.reset(peer_ip);
 
         info!(
             username = username,

@@ -1129,6 +1129,11 @@ When `pihole_compat = true`, the Pi-hole v6 endpoints below are available at
 is **not read-only** — it implements full CRUD for domains, lists, groups and
 clients, a blocking toggle, and the Pi-hole action endpoints.
 
+With `[auth]` enabled, every endpoint except `/api/auth` needs the `sid` from
+`POST /api/auth` in an `X-FTL-SID` header (or a `sid` header, or `?sid=`); the
+native `X-Api-Key` header is not read here — send an API token as the password
+instead. See [Pi-hole Compatibility > Authentication](features/pihole-compat.md#authentication).
+
 **Auth & session**
 
 | Method | Endpoint | Description |

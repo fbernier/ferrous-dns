@@ -1,7 +1,9 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use tracing::{info, instrument, warn};
 
+use super::login_rate_limiter::LoginRateLimiter;
 use super::session_factory::{build_session, generate_session_id, session_max_age};
 use crate::ports::{MfaRepository, PasswordHasher, SessionRepository, UserProvider};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, MfaChallenge, MfaMethod};
@@ -29,6 +31,7 @@ pub struct LoginUseCase {
     password_hasher: Arc<dyn PasswordHasher>,
     mfa_repo: Arc<dyn MfaRepository>,
     auth_config: Arc<AuthConfig>,
+    rate_limiter: Arc<LoginRateLimiter>,
 }
 
 impl LoginUseCase {
@@ -39,13 +42,22 @@ impl LoginUseCase {
         mfa_repo: Arc<dyn MfaRepository>,
         auth_config: Arc<AuthConfig>,
     ) -> Self {
+        let rate_limiter = Arc::new(LoginRateLimiter::from_config(&auth_config));
         Self {
             user_provider,
             session_repo,
             password_hasher,
             mfa_repo,
             auth_config,
+            rate_limiter,
         }
+    }
+
+    /// Shares one lockout with the other credential checks, so failures on
+    /// any of them count toward the same limit.
+    pub fn with_rate_limiter(mut self, rate_limiter: Arc<LoginRateLimiter>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     /// Verify username + password, then branch on second-factor enrollment.
@@ -53,24 +65,28 @@ impl LoginUseCase {
     /// Returns the created `AuthSession` (no factor enrolled) or an
     /// `MfaRequired` outcome carrying a challenge token. The caller is
     /// responsible for setting the `Set-Cookie` header on `Authenticated`.
+    ///
+    /// `peer_ip` is the TCP peer the lockout is keyed by; `ip_address` is only
+    /// recorded on the session. A correct password that still needs a second
+    /// factor does not clear earlier failures — otherwise knowing the password
+    /// would buy unlimited second-factor guesses.
     #[instrument(skip(self, password))]
     pub async fn execute(
         &self,
         username: &str,
         password: &str,
         remember_me: bool,
+        peer_ip: IpAddr,
         ip_address: &str,
         user_agent: &str,
     ) -> Result<LoginOutcome, DomainError> {
-        let user = self
-            .user_provider
-            .get_by_username(username)
-            .await?
-            .ok_or(DomainError::InvalidCredentials)?;
+        self.rate_limiter.check(peer_ip)?;
 
-        if !user.enabled {
+        let user = self.user_provider.get_by_username(username).await?;
+        let Some(user) = user.filter(|user| user.enabled) else {
+            self.rate_limiter.record_failure(peer_ip);
             return Err(DomainError::InvalidCredentials);
-        }
+        };
 
         let valid = self
             .password_hasher
@@ -79,6 +95,7 @@ impl LoginUseCase {
 
         if !valid {
             warn!(username = username, "Failed login attempt");
+            self.rate_limiter.record_failure(peer_ip);
             return Err(DomainError::InvalidCredentials);
         }
 
@@ -136,6 +153,7 @@ impl LoginUseCase {
         )?;
 
         self.session_repo.create(&session).await?;
+        self.rate_limiter.reset(peer_ip);
 
         info!(
             username = username,

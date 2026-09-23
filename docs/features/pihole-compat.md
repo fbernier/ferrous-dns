@@ -159,12 +159,24 @@ Pi-hole action endpoints. All paths below are served under `/api/*` when
 
 ## Authentication
 
-The Pi-hole v6 compatible API uses **session-based authentication**, matching the same flow as Pi-hole v6:
+With `[auth] enabled = true` (the default), every endpoint except `/api/auth` requires a session — the same rule as a Pi-hole that has a password set. With `[auth] enabled = false` the API is open, like a Pi-hole without a password, and `POST /api/auth` answers `{"valid": true, "sid": null, "validity": -1}`.
 
-1. `POST /api/auth` with `{"password": "your-password"}` — creates a session and returns a session token
-2. Include the session token in subsequent requests via the `sid` cookie or header
+The login flow is Pi-hole v6's:
 
-The Pi-hole API uses the same authentication backend as the Ferrous DNS native API. The admin password configured in the `[auth]` section is used for both.
+1. `POST /api/auth` with `{"password": "..."}` returns `session.sid`. The password can be:
+    - the **admin password** from `[auth.admin]` — the Pi-hole API always logs in as that account, since Pi-hole has a single password; or
+    - an **API token** (Settings > API > API Tokens), the equivalent of Pi-hole's *app password*. As on Pi-hole, it skips the second factor, so use one for unattended integrations — it is what the Home Assistant Pi-hole v6 integration asks for as its "API key".
+2. If the admin account has TOTP enabled, send the code in the same request: `{"password": "...", "totp": 123456}`. Without it the reply is `400` (`bad_request`); a wrong code is `401` (`unauthorized`).
+3. Send the `sid` with every later request, in the `X-FTL-SID` header, a `sid` header, or the `?sid=` query parameter. Anything else gets `401` with `{"error": {"key": "unauthorized", ...}}`.
+4. `DELETE /api/auth` with the same `sid` ends the session.
+
+Failed logins count toward the same lockout as the dashboard login: after `login_rate_limit_attempts` wrong passwords or codes from one client, `POST /api/auth` answers `429` (`rate_limiting`) until `login_rate_limit_window_secs` has passed. See [Login lockout](security.md#login-lockout).
+
+!!! note "Not supported"
+    Pi-hole's `sid` **cookie** (sent with an `X-FTL-CSRF` header — what the Pi-hole web interface uses) and a `sid` inside the request body are not accepted, and `session.csrf` is always `null`. `validity` is the seconds left on the session (`session_ttl_hours`), not Pi-hole's sliding 30-minute timeout.
+
+!!! warning "Changed in v0.9.19"
+    Earlier versions served every Pi-hole endpoint without checking the session, and `POST /api/auth` accepted any password. Integrations that never logged in now need the admin password or an API token. An integration configured with a key that was never valid here — often an old Pi-hole app password — now gets `401`, and the server log shows `Pi-hole API login rejected`; add that same key as an API token (Settings > API > API Tokens > **Custom Token**) and the integration works again unchanged.
 
 !!! note "Shared auth backend"
     Since v0.7.0, Pi-hole compat auth and Ferrous DNS auth share the same session system. A session created via `POST /api/auth` (Pi-hole) is also valid for Ferrous DNS native endpoints, and vice versa.
@@ -238,6 +250,7 @@ If you have tools pointing to Pi-hole's API:
 
 - **Same server IP**: no changes needed — `/api/*` continues to work
 - **Different server**: update the IP/hostname in your integration
+- **Tools logged in with a Pi-hole app password**: create an API token with the same value (Settings > API > API Tokens > **Custom Token**) and they keep working unchanged
 
 ---
 

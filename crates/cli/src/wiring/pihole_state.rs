@@ -1,7 +1,7 @@
 use ferrous_dns_api_pihole::{
     state::{
-        PiholeBlockingState, PiholeClientState, PiholeGroupState, PiholeListsState,
-        PiholeQueryState, PiholeSystemState,
+        PiholeAuthState, PiholeBlockingState, PiholeClientState, PiholeGroupState,
+        PiholeListsState, PiholeQueryState, PiholeSystemState,
     },
     PiholeAppState,
 };
@@ -10,12 +10,14 @@ use ferrous_dns_domain::Config;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
+use super::auth::AuthServices;
 use super::UseCases;
 
 /// Constructs [`PiholeAppState`] by reusing the `Arc` use cases already
 /// wired for the Ferrous dashboard API — zero duplication of business logic.
 pub fn build_pihole_state(
     use_cases: &UseCases,
+    auth: &AuthServices,
     block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     upstream_health: Arc<dyn UpstreamHealthPort>,
     config: Arc<RwLock<Config>>,
@@ -74,7 +76,12 @@ pub fn build_pihole_state(
             config_path,
             process_start: std::time::Instant::now(),
         },
-        login: None,
-        admin_username: None,
+        auth: PiholeAuthState {
+            login: auth.use_cases.login.clone(),
+            verify_mfa: auth.use_cases.verify_mfa.clone(),
+            app_password_login: auth.app_password_login.clone(),
+            logout: auth.use_cases.logout.clone(),
+            validate_session: auth.use_cases.validate_session.clone(),
+        },
     }
 }

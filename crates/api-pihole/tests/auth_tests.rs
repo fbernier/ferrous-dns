@@ -3,197 +3,69 @@ mod helpers;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
+    Router,
 };
-use ferrous_dns_application::ports::{
-    MfaRepository, PasswordHasher, SessionRepository, UserProvider,
-};
-use ferrous_dns_application::use_cases::LoginUseCase;
-use ferrous_dns_domain::{
-    AuthConfig, AuthSession, DomainError, MfaChallenge, RecoveryCode, User, UserMfa, UserRole,
-    UserSource, WebauthnCredential,
-};
-
-struct NoMfaRepository;
-
-#[async_trait::async_trait]
-impl MfaRepository for NoMfaRepository {
-    async fn get(&self, _u: &str) -> Result<Option<UserMfa>, DomainError> {
-        Ok(None)
-    }
-    async fn upsert_secret(&self, _u: &str, _s: &str) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn enable(&self, _u: &str) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn delete_all(&self, _u: &str) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn replace_recovery_codes(&self, _u: &str, _h: &[String]) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn list_unused_recovery_codes(&self, _u: &str) -> Result<Vec<RecoveryCode>, DomainError> {
-        Ok(vec![])
-    }
-    async fn mark_recovery_code_used(&self, _id: i64) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn create_challenge(&self, _c: &MfaChallenge) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn get_challenge(&self, _t: &str) -> Result<Option<MfaChallenge>, DomainError> {
-        Ok(None)
-    }
-    async fn delete_challenge(&self, _t: &str) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn delete_expired_challenges(&self) -> Result<u64, DomainError> {
-        Ok(0)
-    }
-    async fn add_credential(&self, _c: &WebauthnCredential) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn list_credentials(&self, _u: &str) -> Result<Vec<WebauthnCredential>, DomainError> {
-        Ok(vec![])
-    }
-    async fn find_credential_by_id(
-        &self,
-        _c: &str,
-    ) -> Result<Option<WebauthnCredential>, DomainError> {
-        Ok(None)
-    }
-    async fn update_credential_counter(&self, _c: &str, _n: i64) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn delete_credential(&self, _id: i64, _u: &str) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn has_credentials(&self, _u: &str) -> Result<bool, DomainError> {
-        Ok(false)
-    }
-}
+use helpers::auth::{ADMIN_PASSWORD, APP_PASSWORD, TOTP_CODE};
 use http_body_util::BodyExt;
 use serde_json::Value;
-use std::sync::Arc;
 use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// Lightweight auth mocks for LoginUseCase integration
-// ---------------------------------------------------------------------------
-
-struct TestUserProvider {
-    admin: User,
+/// Sends `request` to a clone of `app` and returns the status and JSON body
+/// (`Value::Null` for an empty body).
+async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
+    let response = app.clone().oneshot(request).await.expect("request failed");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to read body")
+        .to_bytes();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("invalid JSON")
+    };
+    (status, json)
 }
 
-#[async_trait::async_trait]
-impl UserProvider for TestUserProvider {
-    async fn get_by_username(&self, username: &str) -> Result<Option<User>, DomainError> {
-        if username == self.admin.username.as_ref() {
-            Ok(Some(self.admin.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-    async fn get_all(&self) -> Result<Vec<User>, DomainError> {
-        Ok(vec![self.admin.clone()])
-    }
-    async fn update_password(&self, _: &str, _: &str) -> Result<(), DomainError> {
-        Ok(())
-    }
+fn post_auth(body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/auth")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("failed to build request")
 }
 
-struct TestPasswordHasher;
-
-#[async_trait::async_trait]
-impl PasswordHasher for TestPasswordHasher {
-    async fn hash(&self, _: &str) -> Result<String, DomainError> {
-        Ok("$hashed$".to_string())
-    }
-    async fn verify(&self, password: &str, _: &str) -> Result<bool, DomainError> {
-        Ok(password == "correct-password")
-    }
-    async fn hash_many(&self, passwords: &[String]) -> Result<Vec<String>, DomainError> {
-        Ok(passwords.iter().map(|_| "$hashed$".to_string()).collect())
-    }
-    async fn verify_any(
-        &self,
-        password: &str,
-        hashes: Vec<Arc<str>>,
-    ) -> Result<Option<usize>, DomainError> {
-        Ok((password == "correct-password" && !hashes.is_empty()).then_some(0))
-    }
+fn get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .expect("failed to build request")
 }
 
-struct InMemorySessionRepo {
-    sessions: tokio::sync::Mutex<Vec<AuthSession>>,
+fn get_with_header(uri: &str, header: &str, value: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header, value)
+        .body(Body::empty())
+        .expect("failed to build request")
 }
 
-impl InMemorySessionRepo {
-    fn new() -> Self {
-        Self {
-            sessions: tokio::sync::Mutex::new(Vec::new()),
-        }
-    }
+/// Logs in with `password` and returns the session id.
+async fn login(app: &Router, password: &str) -> String {
+    let (status, json) = send(app, post_auth(serde_json::json!({ "password": password }))).await;
+    assert_eq!(status, StatusCode::OK, "login failed: {json}");
+    json["session"]["sid"]
+        .as_str()
+        .expect("sid must be a string")
+        .to_string()
 }
 
-#[async_trait::async_trait]
-impl SessionRepository for InMemorySessionRepo {
-    async fn create(&self, session: &AuthSession) -> Result<(), DomainError> {
-        self.sessions.lock().await.push(session.clone());
-        Ok(())
-    }
-    async fn get_by_id(&self, id: &str) -> Result<Option<AuthSession>, DomainError> {
-        Ok(self
-            .sessions
-            .lock()
-            .await
-            .iter()
-            .find(|s| s.id.as_ref() == id)
-            .cloned())
-    }
-    async fn update_last_seen(&self, _: &str) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn delete(&self, id: &str) -> Result<(), DomainError> {
-        self.sessions.lock().await.retain(|s| s.id.as_ref() != id);
-        Ok(())
-    }
-    async fn delete_expired(&self) -> Result<u64, DomainError> {
-        Ok(0)
-    }
-    async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError> {
-        Ok(self.sessions.lock().await.clone())
-    }
-}
-
-fn build_login_use_case() -> Arc<LoginUseCase> {
-    let user_provider: Arc<dyn UserProvider> = Arc::new(TestUserProvider {
-        admin: User {
-            id: Some(1),
-            username: Arc::from("admin"),
-            display_name: None,
-            password_hash: Arc::from("$hashed$"),
-            role: UserRole::Admin,
-            source: UserSource::Toml,
-            enabled: true,
-            created_at: None,
-            updated_at: None,
-        },
-    });
-    let session_repo: Arc<dyn SessionRepository> = Arc::new(InMemorySessionRepo::new());
-    let hasher: Arc<dyn PasswordHasher> = Arc::new(TestPasswordHasher);
-    let config = Arc::new(AuthConfig {
-        enabled: true,
-        session_ttl_hours: 24,
-        ..AuthConfig::default()
-    });
-    Arc::new(LoginUseCase::new(
-        user_provider,
-        session_repo,
-        hasher,
-        Arc::new(NoMfaRepository),
-        config,
-    ))
+async fn auth_app(totp_enrolled: bool) -> Router {
+    let pool = helpers::create_test_db().await;
+    helpers::create_pihole_test_app_with_auth(pool, totp_enrolled).await
 }
 
 // ---------------------------------------------------------------------------
@@ -202,88 +74,226 @@ fn build_login_use_case() -> Arc<LoginUseCase> {
 
 #[tokio::test]
 async fn get_auth_returns_unauthenticated_session_when_no_active_session() {
-    let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = auth_app(false).await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/auth")
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let (status, json) = send(&app, get("/auth")).await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&body).expect("invalid JSON");
-
-    assert!(
-        json["session"].is_object(),
-        "response must have a 'session' field"
-    );
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(json["session"]["valid"], false);
     assert_eq!(json["session"]["totp"], false);
-    assert!(
-        json["session"]["sid"]
-            .as_str()
-            .unwrap_or("nonempty")
-            .is_empty(),
-        "sid must be empty for unauthenticated session"
-    );
-    assert!(
-        json["session"]["validity"].as_i64().unwrap_or(1) == 0,
-        "validity must be 0 for unauthenticated session"
-    );
+    assert!(json["session"]["sid"].is_null());
+    assert_eq!(json["session"]["validity"], -1);
+}
+
+#[tokio::test]
+async fn get_auth_reflects_a_valid_session() {
+    let app = auth_app(false).await;
+    let sid = login(&app, ADMIN_PASSWORD).await;
+
+    let (status, json) = send(&app, get_with_header("/auth", "X-FTL-SID", &sid)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["session"]["valid"], true);
+    assert_eq!(json["session"]["sid"], sid.as_str());
+    assert!(json["session"]["validity"].as_i64().unwrap() > 0);
 }
 
 // ---------------------------------------------------------------------------
-// POST /auth — no LoginUseCase wired → open access
+// POST /auth — password
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn login_succeeds_when_no_login_use_case_is_wired() {
+async fn login_with_correct_password_returns_session() {
+    let app = auth_app(false).await;
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": ADMIN_PASSWORD })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["session"]["valid"], true);
+    assert_eq!(json["session"]["message"], "password correct");
+    let sid = json["session"]["sid"].as_str().expect("sid must be string");
+    assert!(!sid.is_empty(), "sid must be non-empty on successful login");
+    assert_eq!(json["session"]["validity"], 24 * 3600);
+}
+
+/// `cli/src/wiring/pihole_state.rs` built the state without a `LoginUseCase`,
+/// which made `POST /auth` hand out a session for any password even though
+/// `[auth]` is enabled.
+#[tokio::test]
+async fn login_rejects_wrong_password_when_auth_is_enabled() {
+    let app = auth_app(false).await;
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": "anything-at-all" })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["session"]["valid"], false);
+    assert_eq!(json["session"]["message"], "password incorrect");
+    assert!(json["session"]["sid"].is_null());
+}
+
+#[tokio::test]
+async fn auth_response_schema_contains_all_required_pihole_v6_session_fields() {
+    let app = auth_app(false).await;
+
+    let (_, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": ADMIN_PASSWORD })),
+    )
+    .await;
+
+    let session = &json["session"];
+    assert!(
+        session["valid"].is_boolean(),
+        "session.valid must be boolean"
+    );
+    assert!(session["totp"].is_boolean(), "session.totp must be boolean");
+    assert!(session["sid"].is_string(), "session.sid must be string");
+    assert!(
+        session.get("csrf").is_some(),
+        "session.csrf must be present"
+    );
+    assert!(
+        session["validity"].is_number(),
+        "session.validity must be number"
+    );
+    assert!(
+        session["message"].is_string(),
+        "session.message must be string"
+    );
+}
+
+#[tokio::test]
+async fn login_answers_like_a_pihole_without_password_when_auth_is_disabled() {
     let pool = helpers::create_test_db().await;
     let app = helpers::create_pihole_test_app(pool, None).await;
 
-    let body = serde_json::json!({ "password": "anything-at-all" }).to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": "anything" })),
+    )
+    .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["session"]["valid"], true);
+    assert!(json["session"]["sid"].is_null());
+    assert_eq!(json["session"]["validity"], -1);
+    assert_eq!(json["session"]["message"], "no password set");
+}
 
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
+// ---------------------------------------------------------------------------
+// POST /auth — app password (API token)
+// ---------------------------------------------------------------------------
 
-    assert_eq!(
-        json["session"]["valid"], true,
-        "any password should be accepted when no LoginUseCase is wired"
-    );
-    let sid = json["session"]["sid"]
-        .as_str()
-        .expect("sid must be a string");
-    assert!(!sid.is_empty(), "sid must be non-empty on successful login");
+#[tokio::test]
+async fn login_with_api_token_as_app_password_returns_session() {
+    let app = auth_app(false).await;
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": APP_PASSWORD })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["session"]["message"], "app-password correct");
+    let sid = json["session"]["sid"].as_str().expect("sid must be string");
+    let (status, _) = send(&app, get_with_header("/stats/summary", "X-FTL-SID", sid)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn app_password_skips_the_second_factor() {
+    let app = auth_app(true).await;
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": APP_PASSWORD })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["session"]["valid"], true);
+}
+
+// ---------------------------------------------------------------------------
+// POST /auth — second factor
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn login_with_totp_enrolled_requires_the_code() {
+    let app = auth_app(true).await;
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": ADMIN_PASSWORD })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"]["key"], "bad_request");
+}
+
+#[tokio::test]
+async fn login_with_totp_code_as_number_returns_session() {
+    let app = auth_app(true).await;
+    let code: u32 = TOTP_CODE.parse().unwrap();
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": ADMIN_PASSWORD, "totp": code })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["session"]["valid"], true);
+    assert_eq!(json["session"]["totp"], true);
+}
+
+#[tokio::test]
+async fn login_with_wrong_totp_code_is_unauthorized() {
+    let app = auth_app(true).await;
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": ADMIN_PASSWORD, "totp": "000000" })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["error"]["key"], "unauthorized");
+}
+
+// ---------------------------------------------------------------------------
+// POST /auth — lockout
+// ---------------------------------------------------------------------------
+
+/// A wrong password is tried as an app password too; that second check must
+/// not count again, or the configured five attempts would shrink to three.
+#[tokio::test]
+async fn each_wrong_password_counts_once_toward_the_lockout() {
+    let app = auth_app(false).await;
+    let wrong = serde_json::json!({ "password": "wrong-password" });
+
+    for attempt in 1..=5 {
+        let (status, _) = send(&app, post_auth(wrong.clone())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {attempt}");
+    }
+
+    let (status, json) = send(
+        &app,
+        post_auth(serde_json::json!({ "password": ADMIN_PASSWORD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json["error"]["key"], "rate_limiting");
 }
 
 // ---------------------------------------------------------------------------
@@ -295,181 +305,134 @@ async fn logout_returns_no_content() {
     let pool = helpers::create_test_db().await;
     let app = helpers::create_pihole_test_app(pool, None).await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/auth")
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/auth")
+        .body(Body::empty())
+        .expect("failed to build request");
+    let (status, _) = send(&app, request).await;
 
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn logout_invalidates_the_session() {
+    let app = auth_app(false).await;
+    let sid = login(&app, ADMIN_PASSWORD).await;
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/auth")
+        .header("X-FTL-SID", &sid)
+        .body(Body::empty())
+        .expect("failed to build request");
+    let (status, _) = send(&app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(&app, get_with_header("/stats/summary", "X-FTL-SID", &sid)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logout_without_a_session_is_unauthorized() {
+    let app = auth_app(false).await;
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/auth")
+        .body(Body::empty())
+        .expect("failed to build request");
+    let (status, _) = send(&app, request).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 // ---------------------------------------------------------------------------
-// Pi-hole v6 schema conformance
+// Protected routes — everything except /auth demands a session
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn auth_response_schema_contains_all_required_pihole_v6_session_fields() {
+async fn protected_routes_reject_requests_without_a_session() {
+    let cases = [
+        ("POST", "/action/gravity", None),
+        ("POST", "/action/flush/logs", None),
+        ("GET", "/queries", None),
+        ("GET", "/stats/summary", None),
+        ("GET", "/lists", None),
+        (
+            "POST",
+            "/dns/blocking",
+            Some(serde_json::json!({ "blocking": false })),
+        ),
+        (
+            "POST",
+            "/domains/deny/exact",
+            Some(serde_json::json!({ "domain": "example.com" })),
+        ),
+    ];
+
+    let mut open = Vec::new();
+    for (method, uri, body) in cases {
+        let app = auth_app(false).await;
+
+        let body = body.map_or_else(Body::empty, |json| Body::from(json.to_string()));
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body)
+            .expect("failed to build request");
+        let (status, _) = send(&app, request).await;
+
+        if status != StatusCode::UNAUTHORIZED {
+            open.push(format!("{method} {uri} -> {status}"));
+        }
+    }
+
+    assert!(
+        open.is_empty(),
+        "routes served without a session: {open:#?}"
+    );
+}
+
+#[tokio::test]
+async fn protected_route_rejects_unknown_session() {
+    let app = auth_app(false).await;
+
+    let (status, json) = send(
+        &app,
+        get_with_header("/stats/summary", "X-FTL-SID", "not-a-session"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["error"]["key"], "unauthorized");
+}
+
+#[tokio::test]
+async fn protected_route_accepts_every_pihole_sid_carrier() {
+    let app = auth_app(false).await;
+    let sid = login(&app, ADMIN_PASSWORD).await;
+
+    let requests = [
+        get_with_header("/stats/summary", "X-FTL-SID", &sid),
+        get_with_header("/stats/summary", "sid", &sid),
+        get(&format!("/stats/summary?sid={sid}")),
+    ];
+    for request in requests {
+        let uri = request.uri().clone();
+        let headers = request.headers().clone();
+        let (status, _) = send(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{uri} {headers:?}");
+    }
+}
+
+#[tokio::test]
+async fn protected_routes_are_open_when_auth_is_disabled() {
     let pool = helpers::create_test_db().await;
     let app = helpers::create_pihole_test_app(pool, None).await;
 
-    let body = serde_json::json!({ "password": "any" }).to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let (status, _) = send(&app, get("/stats/summary")).await;
 
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    let session = &json["session"];
-    assert!(
-        session["valid"].is_boolean(),
-        "session.valid must be boolean"
-    );
-    assert!(session["totp"].is_boolean(), "session.totp must be boolean");
-    assert!(session["sid"].is_string(), "session.sid must be string");
-    assert!(session["csrf"].is_string(), "session.csrf must be string");
-    assert!(
-        session["validity"].is_number(),
-        "session.validity must be number"
-    );
-    assert!(
-        session["message"].is_string(),
-        "session.message must be string"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// POST /auth — LoginUseCase wired → real authentication
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn login_with_correct_password_succeeds_when_login_use_case_wired() {
-    let pool = helpers::create_test_db().await;
-    let login_uc = build_login_use_case();
-    let app = helpers::create_pihole_test_app_with_auth(pool, login_uc, "admin").await;
-
-    let body = serde_json::json!({ "password": "correct-password" }).to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    assert_eq!(json["session"]["valid"], true);
-    let sid = json["session"]["sid"].as_str().expect("sid must be string");
-    assert!(!sid.is_empty(), "sid must be non-empty on successful login");
-    assert_eq!(json["session"]["validity"], 1800);
-}
-
-#[tokio::test]
-async fn login_with_wrong_password_returns_unauthorized() {
-    let pool = helpers::create_test_db().await;
-    let login_uc = build_login_use_case();
-    let app = helpers::create_pihole_test_app_with_auth(pool, login_uc, "admin").await;
-
-    let body = serde_json::json!({ "password": "wrong-password" }).to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    assert_eq!(json["session"]["valid"], false);
-    assert_eq!(
-        json["session"]["message"].as_str().unwrap(),
-        "Incorrect password"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Session ID format
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn session_id_is_32_char_hex_when_no_login_use_case() {
-    let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
-
-    let body = serde_json::json!({ "password": "any" }).to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    let sid = json["session"]["sid"].as_str().expect("sid must be string");
-    assert_eq!(
-        sid.len(),
-        32,
-        "session id should be 32 hex chars (16 bytes)"
-    );
-    assert!(
-        sid.chars().all(|c| c.is_ascii_hexdigit()),
-        "session id must be valid hex"
-    );
+    assert_eq!(status, StatusCode::OK);
 }

@@ -106,8 +106,13 @@ async fn async_main() -> anyhow::Result<()> {
             dns_services.health_checker.clone(),
         ));
 
+    let auth =
+        wiring::build_auth_services(&repos, config_arc.clone(), effective_config_path.as_deref())
+            .await;
+
     let pihole_state = wiring::build_pihole_state(
         &use_cases,
+        &auth,
         repos.block_filter_engine.clone(),
         upstream_health,
         config_arc.clone(),
@@ -131,6 +136,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let app_state = wiring::build_app_state(
         use_cases,
+        auth.use_cases,
         &repos,
         &dns_services,
         config_arc,

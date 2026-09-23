@@ -3,22 +3,13 @@ use ferrous_dns_api::{
     GroupUseCases, QueryUseCases, SafeSearchUseCases, ScheduleUseCases, ServiceUseCases,
 };
 use ferrous_dns_application::ports::{
-    BlocklistSourceCreator, ConfigFilePersistence, GroupCreator, LocalRecordCreator, UserProvider,
+    BlocklistSourceCreator, ConfigFilePersistence, GroupCreator, LocalRecordCreator,
 };
 use ferrous_dns_application::use_cases::{
-    AuthenticatePasskeyUseCase, ChangePasswordUseCase, ConfirmTotpUseCase, CreateApiTokenUseCase,
-    CreateLocalRecordUseCase, CreateUserUseCase, DeleteApiTokenUseCase, DeleteLocalRecordUseCase,
-    DeletePasskeyUseCase, DeleteUserUseCase, DisableMfaUseCase, DiscoverablePasskeyLoginUseCase,
-    ExportConfigUseCase, GetActiveSessionsUseCase, GetApiTokensUseCase, GetAuthStatusUseCase,
-    GetMfaStatusUseCase, GetUsersUseCase, ImportConfigUseCase, LoginUseCase, LogoutUseCase,
-    RegisterPasskeyUseCase, SetupPasswordUseCase, SetupTotpUseCase, UpdateApiTokenUseCase,
-    UpdateLocalRecordUseCase, ValidateApiTokenUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
+    CreateLocalRecordUseCase, DeleteLocalRecordUseCase, ExportConfigUseCase, ImportConfigUseCase,
+    UpdateLocalRecordUseCase,
 };
 use ferrous_dns_domain::Config;
-use ferrous_dns_infrastructure::auth::{
-    Argon2PasswordHasher, CompositeUserProvider, TomlAdminProvider, TotpRsService,
-    WebauthnRsService,
-};
 use ferrous_dns_infrastructure::dns::{UpstreamHealthAdapter, UpstreamReloadAdapter};
 use ferrous_dns_infrastructure::repositories::{TomlConfigFilePersistence, TomlConfigRepository};
 use ferrous_dns_infrastructure::tls::TlsCertificateService;
@@ -27,6 +18,15 @@ use tokio::sync::RwLock;
 
 use super::{DnsServices, Repositories, UseCases};
 
+/// The config file the server reads and rewrites: the path it was started with,
+/// else the one `Config` discovers, else `ferrous-dns.toml` in the working dir.
+pub(super) fn resolve_config_file(config_path: Option<&str>) -> String {
+    config_path
+        .map(String::from)
+        .or_else(Config::get_config_path)
+        .unwrap_or_else(|| "ferrous-dns.toml".to_string())
+}
+
 /// Builds the shared API state.
 ///
 /// `https_active` must reflect whether the web server really serves HTTPS, not
@@ -34,124 +34,20 @@ use super::{DnsServices, Repositories, UseCases};
 /// attribute, and a browser stores such a cookie only over a secure origin.
 pub async fn build_app_state(
     use_cases: UseCases,
+    auth: AuthUseCases,
     repos: &Repositories,
     dns_services: &DnsServices,
     config: Arc<RwLock<Config>>,
     config_path: Option<Arc<str>>,
     https_active: bool,
 ) -> AppState {
-    let effective_path = config_path
-        .as_deref()
-        .map(String::from)
-        .or_else(Config::get_config_path)
-        .unwrap_or_else(|| "ferrous-dns.toml".to_string());
+    let config_repo: Arc<dyn ferrous_dns_application::ports::ConfigRepository> = Arc::new(
+        TomlConfigRepository::new(resolve_config_file(config_path.as_deref())),
+    );
 
-    let config_repo: Arc<dyn ferrous_dns_application::ports::ConfigRepository> =
-        Arc::new(TomlConfigRepository::new(effective_path.clone()));
-
-    let auth_config = {
-        let cfg = config.read().await;
-        Arc::new(cfg.auth.clone())
-    };
+    let webauthn_configured = config.read().await.auth.webauthn.is_configured();
 
     let config_persistence: Arc<dyn ConfigFilePersistence> = Arc::new(TomlConfigFilePersistence);
-
-    let password_hasher = Arc::new(Argon2PasswordHasher::new());
-
-    let totp_service: Arc<dyn ferrous_dns_application::ports::TotpService> =
-        Arc::new(TotpRsService::new(auth_config.totp_issuer.clone()));
-    let webauthn_service: Arc<dyn ferrous_dns_application::ports::WebauthnService> = Arc::new(
-        WebauthnRsService::new(&auth_config.webauthn.rp_id, &auth_config.webauthn.rp_origin),
-    );
-    let webauthn_configured = auth_config.webauthn.is_configured();
-
-    let toml_admin = TomlAdminProvider::new(auth_config.admin.clone());
-    let user_provider: Arc<dyn UserProvider> = Arc::new(CompositeUserProvider::new(
-        toml_admin,
-        repos.user.clone(),
-        config.clone(),
-        Some(effective_path),
-        config_persistence.clone(),
-    ));
-
-    let auth = AuthUseCases {
-        login: Arc::new(LoginUseCase::new(
-            user_provider.clone(),
-            repos.session.clone(),
-            password_hasher.clone(),
-            repos.mfa.clone(),
-            auth_config.clone(),
-        )),
-        logout: Arc::new(LogoutUseCase::new(repos.session.clone())),
-        validate_session: Arc::new(ValidateSessionUseCase::new(repos.session.clone())),
-        setup_password: Arc::new(SetupPasswordUseCase::new(
-            user_provider.clone(),
-            password_hasher.clone(),
-            auth_config.admin.username.clone(),
-        )),
-        change_password: Arc::new(ChangePasswordUseCase::new(
-            user_provider.clone(),
-            password_hasher.clone(),
-        )),
-        get_auth_status: Arc::new(GetAuthStatusUseCase::new(config.clone())),
-        get_active_sessions: Arc::new(GetActiveSessionsUseCase::new(repos.session.clone())),
-        create_api_token: Arc::new(CreateApiTokenUseCase::new(repos.api_token.clone())),
-        get_api_tokens: Arc::new(GetApiTokensUseCase::new(repos.api_token.clone())),
-        update_api_token: Arc::new(UpdateApiTokenUseCase::new(repos.api_token.clone())),
-        delete_api_token: Arc::new(DeleteApiTokenUseCase::new(repos.api_token.clone())),
-        validate_api_token: Arc::new(ValidateApiTokenUseCase::new(repos.api_token.clone())),
-        create_user: Arc::new(CreateUserUseCase::new(
-            repos.user.clone(),
-            user_provider.clone(),
-            password_hasher.clone(),
-        )),
-        get_users: Arc::new(GetUsersUseCase::new(user_provider.clone())),
-        delete_user: Arc::new(DeleteUserUseCase::new(repos.user.clone())),
-        verify_mfa: Arc::new(VerifyMfaUseCase::new(
-            repos.mfa.clone(),
-            totp_service.clone(),
-            password_hasher.clone(),
-            user_provider.clone(),
-            repos.session.clone(),
-            auth_config.clone(),
-        )),
-        setup_totp: Arc::new(SetupTotpUseCase::new(
-            repos.mfa.clone(),
-            totp_service.clone(),
-        )),
-        confirm_totp: Arc::new(ConfirmTotpUseCase::new(
-            repos.mfa.clone(),
-            totp_service.clone(),
-            password_hasher.clone(),
-        )),
-        disable_mfa: Arc::new(DisableMfaUseCase::new(
-            user_provider.clone(),
-            password_hasher.clone(),
-            repos.mfa.clone(),
-        )),
-        get_mfa_status: Arc::new(GetMfaStatusUseCase::new(repos.mfa.clone())),
-        register_passkey: Arc::new(RegisterPasskeyUseCase::new(
-            webauthn_service.clone(),
-            repos.mfa.clone(),
-            auth_config.mfa_challenge_ttl_secs,
-        )),
-        authenticate_passkey: Arc::new(AuthenticatePasskeyUseCase::new(
-            webauthn_service.clone(),
-            repos.mfa.clone(),
-            user_provider.clone(),
-            repos.session.clone(),
-            auth_config.clone(),
-        )),
-        discoverable_passkey_login: Arc::new(DiscoverablePasskeyLoginUseCase::new(
-            webauthn_service.clone(),
-            repos.mfa.clone(),
-            user_provider,
-            repos.session.clone(),
-            auth_config.clone(),
-            auth_config.mfa_challenge_ttl_secs,
-        )),
-        delete_passkey: Arc::new(DeletePasskeyUseCase::new(repos.mfa.clone())),
-    };
 
     let backup = {
         let group_creator: Arc<dyn GroupCreator> = use_cases.create_group.clone();

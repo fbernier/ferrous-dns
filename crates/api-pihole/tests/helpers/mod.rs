@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod auth;
+
 use async_trait::async_trait;
 use axum::Router;
 use ferrous_dns_api_pihole::state::{
@@ -266,18 +268,20 @@ pub async fn create_test_db() -> sqlx::SqlitePool {
     pool
 }
 
+/// App with `[auth]` enabled for the `admin` account in [`auth`]; with
+/// `totp_enrolled`, logins also need [`auth::TOTP_CODE`].
 pub async fn create_pihole_test_app_with_auth(
     pool: sqlx::SqlitePool,
-    login: Arc<ferrous_dns_application::use_cases::LoginUseCase>,
-    admin_username: &str,
+    totp_enrolled: bool,
 ) -> Router {
-    let mut state = build_pihole_state(pool).await;
-    state.login = Some(login);
-    state.admin_username = Some(admin_username.to_string());
-    create_pihole_routes(state)
+    create_pihole_routes(build_pihole_state(pool, true, totp_enrolled).await)
 }
 
-async fn build_pihole_state(pool: sqlx::SqlitePool) -> PiholeAppState {
+async fn build_pihole_state(
+    pool: sqlx::SqlitePool,
+    auth_enabled: bool,
+    totp_enrolled: bool,
+) -> PiholeAppState {
     let db_config = DatabaseConfig::default();
     let client_repo = Arc::new(SqliteClientRepository::new(pool.clone(), &db_config));
     let query_log_repo = Arc::new(SqliteQueryLogRepository::new(
@@ -293,6 +297,10 @@ async fn build_pihole_state(pool: sqlx::SqlitePool) -> PiholeAppState {
     let whitelist_source_repo = Arc::new(SqliteWhitelistSourceRepository::new(pool.clone()));
 
     let block_filter_engine: Arc<dyn BlockFilterEnginePort> = Arc::new(MockBlockFilterEngine);
+
+    let mut config = Config::default();
+    config.auth.enabled = auth_enabled;
+    config.auth.admin.username = "admin".to_string();
 
     PiholeAppState {
         query: PiholeQueryState {
@@ -403,17 +411,18 @@ async fn build_pihole_state(pool: sqlx::SqlitePool) -> PiholeAppState {
         },
         system: PiholeSystemState {
             cleanup_query_logs: Arc::new(CleanupOldQueryLogsUseCase::new(query_log_repo)),
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_path: None,
             process_start: std::time::Instant::now(),
         },
-        login: None,
-        admin_username: None,
+        auth: auth::build_auth_state(totp_enrolled).await,
     }
 }
 
+/// App with `[auth]` disabled, so every route is open — the routes' own tests
+/// don't have to log in first.
 pub async fn create_pihole_test_app(pool: sqlx::SqlitePool, _unused: Option<&str>) -> Router {
-    create_pihole_routes(build_pihole_state(pool).await)
+    create_pihole_routes(build_pihole_state(pool, false, false).await)
 }
 
 pub async fn insert_query(

@@ -1,4 +1,4 @@
-use axum::Router;
+use axum::{extract::ConnectInfo, Router};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -67,7 +67,9 @@ pub(super) async fn start_https_web_server(
                 let mut svc = tower_service.clone();
                 async move {
                     use tower::Service;
-                    let (parts, body) = req.into_parts();
+                    let (mut parts, body) = req.into_parts();
+                    // Same peer address `axum::serve` exposes on the plain-HTTP path.
+                    parts.extensions.insert(ConnectInfo(peer_addr));
                     let req = hyper::Request::from_parts(parts, axum::body::Body::new(body));
                     svc.call(req).await
                 }

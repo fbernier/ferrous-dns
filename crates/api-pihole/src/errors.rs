@@ -18,13 +18,17 @@ pub struct PiholeApiError(#[from] pub DomainError);
 impl IntoResponse for PiholeApiError {
     fn into_response(self) -> Response {
         let (status, key) = pihole_status_and_key(&self.0);
-        let message = self.0.to_string();
-        (
-            status,
-            Json(json!({ "error": { "key": key, "message": message } })),
-        )
-            .into_response()
+        pihole_error_response(status, key, &self.0.to_string())
     }
+}
+
+/// A Pi-hole v6 error body, for replies with no `DomainError` behind them.
+pub(crate) fn pihole_error_response(status: StatusCode, key: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({ "error": { "key": key, "message": message } })),
+    )
+        .into_response()
 }
 
 fn pihole_status_and_key(err: &DomainError) -> (StatusCode, &'static str) {
@@ -66,6 +70,13 @@ fn pihole_status_and_key(err: &DomainError) -> (StatusCode, &'static str) {
         | DomainError::CustomServiceAlreadyExists(_)
         | DomainError::SubnetConflict(_)
         | DomainError::GroupHasAssignedClients(_) => (StatusCode::CONFLICT, "already_exists"),
+
+        DomainError::AuthRequired
+        | DomainError::SessionNotFound
+        | DomainError::InvalidCredentials
+        | DomainError::InvalidMfaCode => (StatusCode::UNAUTHORIZED, "unauthorized"),
+
+        DomainError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limiting"),
 
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     }

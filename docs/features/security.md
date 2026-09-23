@@ -33,7 +33,13 @@ Content-Type: application/json
 | Option | Description |
 |:-------|:------------|
 | **Remember Me** | Extends session lifetime from `session_ttl_hours` (default 24h) to `remember_me_days` (default 30 days) |
-| **Rate Limiting** | After `login_rate_limit_attempts` failed attempts (default 5), login is locked for `login_rate_limit_window_secs` (default 900s / 15 min) |
+| **Rate Limiting** | After `login_rate_limit_attempts` failed attempts (default 5) from one client, login is locked for `login_rate_limit_window_secs` (default 900s / 15 min) |
+
+#### Login lockout
+
+Wrong passwords and wrong second-factor codes (TOTP or recovery code) from one client count toward the same limit, on the dashboard login and on the [Pi-hole compatible](pihole-compat.md#authentication) `POST /api/auth` alike. Once the limit is reached, every login from that client — even with the right password — gets `429 Too Many Requests` until the window that opened with its first failure closes; a successful login clears the count. `login_rate_limit_attempts = 0` turns the lockout off.
+
+The client is the address of the TCP connection, never `X-Forwarded-For`: a header the client writes itself could be changed on every attempt to dodge the count. IPv6 clients are counted per /64. Behind a reverse proxy every login therefore arrives from the proxy's address and shares one count — a run of wrong passwords from anyone locks the login for everyone until the window closes.
 
 ### Auth Guard
 
@@ -126,7 +132,7 @@ password_hash = ""                      # Argon2id hash (set via setup wizard or
 | `enabled` | `bool` | `true` | Enable or disable authentication globally |
 | `session_ttl_hours` | `int` | `24` | Default session lifetime in hours |
 | `remember_me_days` | `int` | `30` | Extended session lifetime when "Remember Me" is checked |
-| `login_rate_limit_attempts` | `int` | `5` | Max failed login attempts before lockout |
+| `login_rate_limit_attempts` | `int` | `5` | Max failed login attempts per client before lockout (`0` disables the lockout) |
 | `login_rate_limit_window_secs` | `int` | `900` | Duration of lockout window in seconds |
 | `username` | `str` | `admin` | Admin username |
 | `password_hash` | `str` | `""` | Argon2id password hash (set via setup wizard or CLI) |
@@ -492,7 +498,7 @@ The following are planned for future releases:
 | Feature | Description |
 |:--------|:------------|
 | **Read-Only Mode** | Disable config changes via a flag |
-| **API / login throttling** | `login_rate_limit_attempts` and `login_rate_limit_window_secs` are accepted and persisted today, but nothing enforces them — see [Security Hardening](security-hardening.md#what-is-not-hardened-yet) |
+| **API request throttling** | A general request rate limit for the REST API — see [Security Hardening](security-hardening.md#what-is-not-hardened-yet) |
 | **EDNS Client Subnet handling** | Strip client ECS from upstream queries by default, with optional injection (RFC 7871) |
 | **Enforcing DS-denial checks** | Turn the current downgrade *detection* into an opt-in strict mode |
 | **RFC 5011 trust anchor rollover** | Track root key rolls without a new release |
@@ -524,4 +530,4 @@ The following are planned for future releases:
 | TOTP / 2FA (authenticator app) | :white_check_mark: Active |
 | Passkeys / WebAuthn (second factor + passwordless) | :white_check_mark: Active |
 | API request rate limiting | :x: Not implemented |
-| Login attempt throttling / lockout | :x: Not implemented (config keys accepted but inert) |
+| Login attempt throttling / lockout | :white_check_mark: Active — per client address, shared by the dashboard and Pi-hole logins |

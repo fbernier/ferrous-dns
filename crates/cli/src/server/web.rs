@@ -92,7 +92,11 @@ pub async fn start_web_server(
     } else {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         info!("Web server started successfully");
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
     }
 
     Ok(())
