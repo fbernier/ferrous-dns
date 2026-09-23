@@ -18,6 +18,7 @@ ferrous-dns-api.workspace = true
 ferrous-dns-api-pihole.workspace = true
 
 tokio.workspace = true
+bytes.workspace = true
 futures.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
@@ -39,7 +40,6 @@ sqlx.workspace = true
 hickory-server.workspace = true
 socket2.workspace = true
 mimalloc.workspace = true
-core_affinity.workspace = true
 libc.workspace = true
 dashmap.workspace = true
 rustc-hash.workspace = true

@@ -18,6 +18,8 @@ On first launch (when no password is configured), Ferrous DNS shows a setup wiza
 
 Users authenticate with username and password via the login page. On success, a session cookie (`ferrous_session`) is issued.
 
+Password and recovery-code hashing runs off Tokio workers, with at most two admitted cryptographic jobs process-wide. Recovery-code batches occupy one job; disconnecting a client does not release its capacity until the computation finishes.
+
 ```http
 POST /api/auth/login
 Content-Type: application/json
@@ -154,6 +156,8 @@ dnssec_mode = "Strict"
 The **AD** (Authenticated Data) bit is set only when a response validates as `Secure` and the client did not set the **CD** (Checking Disabled) bit. A client that sets CD opts out of enforcement — Strict mode will not `SERVFAIL` its queries, so it can do its own validation. Enforcement is **fail-open**: only a proven `Bogus` result is rejected; validation errors and timeouts are served.
 
 The `queries_dnssec_bogus` counter (dashboard + Prometheus `ferrousdns_queries_dnssec_bogus`) tracks how many responses failed validation.
+
+Concurrent validations use a bounded validator pool. Requests wait in admission order and lease whichever validator is free, rather than waiting behind a particular busy slot. Completing or cancelling validation returns the validator before admitting the next waiter.
 
 **Standards**: RFC 4035, RFC 6840, RFC 8914 (EDE)
 

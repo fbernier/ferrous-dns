@@ -4,28 +4,35 @@
 
 ---
 
-## Listener: one worker per core, SO_REUSEPORT
+## Listeners and runtime workers
 
-At startup Ferrous DNS detects the number of CPU cores and spawns that many **independent** UDP sockets and TCP listeners, all bound to the same address with `SO_REUSEPORT`. The kernel hashes each incoming datagram to one socket, so workers never contend on a shared receive queue and there is no single-threaded accept loop to saturate.
+Ferrous DNS creates one UDP socket and TCP listener per Tokio worker, all bound to the same address with `SO_REUSEPORT`. The kernel hashes incoming datagrams across sockets, avoiding a shared receive queue.
 
-Each socket is also configured with:
+Sockets use `SO_REUSEADDR` and 4 MB send/receive buffers to absorb bursts. Runtime and blocking-pool threads are not pinned to individual CPUs; the OS schedules them within the process's cpuset. Busy polling and per-socket CPU hints are not enabled.
 
-- `SO_REUSEADDR` and 4 MB send/receive buffers, to survive bursts without dropping datagrams.
-- `SO_INCOMING_CPU`, pinning a worker's traffic to the core it runs on so packet processing stays on one cache hierarchy.
-- `SO_BUSY_POLL` at 50 µs, trading a little CPU for lower wake-up latency (best-effort; ignored by kernels that do not support it).
+The worker count defaults to Tokio's available parallelism. Set `TOKIO_WORKER_THREADS` to a positive integer to override it; DNS listener count follows the actual runtime count. There is no `workers` TOML key. Use container CPU limits or `taskset` when process-level placement is required.
 
-Tokio's runtime threads are pinned round-robin to cores as well.
+TCP DNS and DoT listeners write each answer's length prefix and payload in one vectored write, so an answer leaves as one TCP segment or one TLS record. Written separately, the payload waited behind Nagle's algorithm for the client's delayed ACK of the 2-byte prefix, stalling even cached answers by tens of milliseconds at low query rates. The listeners also enable `TCP_NODELAY`, so an answer to a pipelined query does not wait for the ACK of the one before it. This does not change UDP processing or require a configuration option.
 
-!!! note "Worker count is not configurable"
-    There is no `workers` key. The count is always the number of detected cores. On a container with a restricted cpuset, the cpuset determines it. If you need fewer workers, restrict the cpuset.
+---
+
+## Upstream connection reuse
+
+Upstream TCP and DoT queries are framed the same way, with the length prefix and query in one vectored write, and the sockets enable `TCP_NODELAY` so a query on a reused connection does not wait for the ACK of the previous exchange. DoT enables it before the TLS handshake, which also sends the handshake flights without delay; certificate verification and query deadlines are unchanged.
+
+Each DoH transport retains its HTTP client instead of discarding healthy connection pools at a fixed age. Transports are keyed by the endpoint and its resolved addresses, so an upstream address change gets its own client rather than reusing the previous destination. HTTP pool idle expiry and server-initiated connection closure still apply.
 
 ---
 
 ## Batched syscalls: recvmmsg / sendmmsg
 
-On Linux the UDP path reads and writes datagrams in batches of **64** using `recvmmsg` and `sendmmsg`, amortizing the syscall over up to 64 queries. All buffers and control-message storage are allocated once per worker and reused, so a batch costs no allocations.
+On Linux the UDP path reads and writes datagrams in batches of **64** using `recvmmsg` and `sendmmsg`, amortizing the syscall over up to 64 queries. Receive buffers and control-message storage are allocated once per worker and reused.
+
+Receives are nonblocking: a single available query is processed immediately, without waiting to fill the batch. Sparse-query latency should be measured with idle gaps between requests, not inferred from a saturated throughput benchmark.
 
 This is selected at compile time (`#[cfg(target_os = "linux")]`), not by a feature flag or config key. On non-Linux targets the server falls back to a single-datagram loop with the same behaviour and lower throughput. Every target needs dual-stack `AF_INET6` sockets (IPv4 is handled as v4-mapped addresses); platforms without them, such as kernels built without IPv6, are not supported.
+
+Workers yield at batch boundaries after processing 256 datagrams, so a continuously readable socket cannot monopolize a Tokio worker. The non-Linux loop uses the same packet budget.
 
 ---
 
@@ -79,11 +86,19 @@ Entries are keyed on `(domain, group_id)` — the same domain can be blocked for
 
 For a cache-hit A/AAAA query, the response is built directly from wire bytes — no full DNS message construction — and queued inline for the next `sendmmsg` batch. Queries with the DNSSEC OK (DO) bit set skip the fast path and take the regular resolution route, since they need the full record set.
 
+The resolver wrappers preserve borrowed domain lookups through the local-PTR and filter layers, avoiding a temporary owned `DnsQuery` allocation on each cache probe. PTR interception, local-domain rewriting, and authoritative local NODATA behavior remain on their existing paths.
+
+UDP fallback processing has a shared limit of **4096 in-flight queries**, independent of worker count and per-client rate limits. Admission happens before packet allocation and task creation. When full, additional fallback datagrams are dropped rather than queued; clients can retry. Shedding logs a `UDP fallback capacity exhausted` warning at most once per second, with the datagrams shed since the previous warning (`shed`) and since startup (`total_shed`), so it can be told apart from packet loss. Inline cache hits remain serviceable while fallback capacity is exhausted.
+
 ---
 
 ## Blocklist compilation
 
 Enabled blocklist sources are compiled into a matcher where each domain carries a `u64` bitmask of the sources that contributed it, which is what makes "why is this blocked?" answerable without re-querying every list.
+
+Downloads are limited to four concurrent requests per build. HTTP and database operations stay asynchronous; parsing, regex compilation, and index construction run as one blocking job on the bounded build pool.
+
+Startup, periodic, and mutation-triggered rebuilds are serialized per engine. A mutation arriving during a build queues another reload so its changes cannot be lost to an older publication. Reloads queued behind the same build are coalesced: one build that starts after all of them satisfies every waiter, so a burst of mutations costs at most two rebuilds rather than one per request. A reload runs detached from the request that triggered it, so a client that disconnects mid-build does not leave its committed change unpublished until the next periodic sync. The periodic job waits one full interval before its first reload because the engine already compiles at startup.
 
 !!! warning "63 active sources maximum"
     One bit is reserved for manually added entries, leaving **63 downloaded sources**. If more than 63 sources are enabled, the 63 lowest-numbered ones are compiled and the rest are **silently skipped** — the only signal is a `WARN` line at startup and after each blocklist refresh. It is a soft cap: the UI and API will happily let you create more.
@@ -109,6 +124,6 @@ Enabled blocklist sources are compiled into a matcher where each domain carries 
 | Optimistic refresh | `[dns] cache_optimistic_refresh` and `cache_refresh_*` | on |
 | Query log batching | `[database] query_log_*` | 2000-row batches, 200 ms flush |
 
-Everything else on this page — worker count, batch size, L1 size, block decision cache, socket options — is fixed at compile time.
+Batch size, L1 size, block decision cache size, and socket buffers are fixed at compile time. Worker count can be overridden through `TOKIO_WORKER_THREADS`.
 
 See [Cache Configuration](../configuration/cache.md) for the full reference of the tunable half.
