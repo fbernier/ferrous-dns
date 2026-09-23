@@ -24,13 +24,12 @@ fn https() -> DnsProtocol {
 }
 
 fn validator(cookie: Option<[u8; 8]>, case_sensitive: bool, labels: &[&[u8]]) -> ResponseValidator {
-    ResponseValidator::new(
-        ID,
-        labels.iter().map(|l| l.to_vec()).collect(),
-        RecordType::A,
-        cookie,
-        case_sensitive,
-    )
+    let mut qname: Vec<u8> = labels
+        .iter()
+        .flat_map(|l| std::iter::once(l.len() as u8).chain(l.iter().copied()))
+        .collect();
+    qname.push(0);
+    ResponseValidator::new(ID, &qname, RecordType::A, cookie, case_sensitive)
 }
 
 fn response(id: u16, labels: &[&[u8]], qtype: RecordType, cookie: Option<&[u8]>) -> DnsResponse {

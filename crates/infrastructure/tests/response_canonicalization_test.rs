@@ -50,13 +50,12 @@ fn uncompressed_response() -> Bytes {
 }
 
 fn validator() -> ResponseValidator {
-    ResponseValidator::new(
-        0x1234,
-        QNAME_LABELS.iter().map(|l| l.as_bytes().to_vec()).collect(),
-        HRecordType::A,
-        None,
-        true,
-    )
+    let mut qname: Vec<u8> = QNAME_LABELS
+        .iter()
+        .flat_map(|l| std::iter::once(l.len() as u8).chain(l.bytes()))
+        .collect();
+    qname.push(0);
+    ResponseValidator::new(0x1234, &qname, HRecordType::A, None, true)
 }
 
 #[test]
