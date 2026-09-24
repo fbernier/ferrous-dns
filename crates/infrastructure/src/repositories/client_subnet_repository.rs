@@ -2,9 +2,11 @@ use crate::repositories::{db_err, is_fk_violation, is_unique_violation, sql_now}
 use async_trait::async_trait;
 use ferrous_dns_application::ports::ClientSubnetRepository;
 use ferrous_dns_domain::{ClientSubnet, DomainError};
+use ipnetwork::IpNetwork;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 type SubnetRow = (i64, String, i64, Option<String>, String, String);
 
@@ -36,11 +38,12 @@ impl ClientSubnetRepository for SqliteClientSubnetRepository {
     #[instrument(skip(self))]
     async fn create(
         &self,
-        subnet_cidr: String,
+        network: IpNetwork,
         group_id: i64,
         comment: Option<String>,
     ) -> Result<ClientSubnet, DomainError> {
         let now = sql_now();
+        let subnet_cidr = network.to_string();
 
         let row = sqlx::query_as::<_, SubnetRow>(
             "INSERT INTO client_subnets (subnet_cidr, group_id, comment, created_at, updated_at)
@@ -113,14 +116,65 @@ impl ClientSubnetRepository for SqliteClientSubnetRepository {
     }
 
     #[instrument(skip(self))]
-    async fn exists(&self, subnet_cidr: &str) -> Result<bool, DomainError> {
+    async fn exists(&self, network: IpNetwork) -> Result<bool, DomainError> {
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM client_subnets WHERE subnet_cidr = ?")
-                .bind(subnet_cidr)
+                .bind(network.to_string())
                 .fetch_one(&self.pool)
                 .await
                 .map_err(db_err("Failed to check subnet existence"))?;
 
         Ok(count.0 > 0)
     }
+}
+
+/// Rewrites stored subnets to the canonical text `ClientSubnet::parse_cidr`
+/// produces, so rows written before canonicalisation compare equal to new
+/// ones. Of several rows naming the same network the oldest (lowest id)
+/// survives. SQL alone can't canonicalise IPv6 text (RFC 5952), hence Rust.
+pub async fn canonicalize_stored_subnets(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, subnet_cidr FROM client_subnets ORDER BY id")
+            .fetch_all(&mut *tx)
+            .await?;
+
+    let mut seen: HashSet<String> = HashSet::with_capacity(rows.len());
+    let mut duplicates = Vec::new();
+    let mut rewrites = Vec::new();
+    for (id, stored) in rows {
+        let canonical = match ClientSubnet::parse_cidr(&stored) {
+            Ok(network) => network.to_string(),
+            Err(e) => {
+                warn!(id, subnet = %stored, error = %e, "Leaving unparseable client subnet as stored");
+                seen.insert(stored);
+                continue;
+            }
+        };
+        if !seen.insert(canonical.clone()) {
+            warn!(id, subnet = %stored, canonical = %canonical, "Dropping duplicate client subnet");
+            duplicates.push(id);
+        } else if canonical != stored {
+            rewrites.push((id, canonical));
+        }
+    }
+
+    // Deletes first: a survivor's canonical text may equal a duplicate's stored text.
+    for id in &duplicates {
+        sqlx::query("DELETE FROM client_subnets WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for (id, canonical) in &rewrites {
+        sqlx::query("UPDATE client_subnets SET subnet_cidr = ? WHERE id = ?")
+            .bind(canonical)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let changed = (duplicates.len() + rewrites.len()) as u64;
+
+    tx.commit().await?;
+    Ok(changed)
 }

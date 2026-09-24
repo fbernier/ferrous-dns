@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use ferrous_dns_domain::{
-    query_log::{DnssecStats, QueryLog, QueryLogFilter, QueryStats},
+    entities::query_log::{DnssecStats, QueryLog, QueryLogFilter, QueryStats},
     DomainError,
 };
 

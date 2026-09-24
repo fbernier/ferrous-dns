@@ -31,25 +31,17 @@ impl CreateClientSubnetUseCase {
         group_id: i64,
         comment: Option<String>,
     ) -> Result<ClientSubnet, DomainError> {
-        ClientSubnet::validate_cidr(&subnet_cidr).map_err(DomainError::InvalidCidr)?;
-
-        let _network: ipnetwork::IpNetwork = subnet_cidr
-            .parse()
-            .map_err(|e| DomainError::InvalidCidr(format!("{}", e)))?;
+        let network = ClientSubnet::parse_cidr(&subnet_cidr).map_err(DomainError::InvalidCidr)?;
 
         require_group(self.group_repo.as_ref(), group_id).await?;
 
-        if self.subnet_repo.exists(&subnet_cidr).await? {
+        if self.subnet_repo.exists(network).await? {
             return Err(DomainError::SubnetConflict(format!(
-                "Subnet {} already exists",
-                subnet_cidr
+                "Subnet {network} already exists"
             )));
         }
 
-        let subnet = self
-            .subnet_repo
-            .create(subnet_cidr, group_id, comment)
-            .await?;
+        let subnet = self.subnet_repo.create(network, group_id, comment).await?;
 
         info!(
             subnet_id = ?subnet.id,

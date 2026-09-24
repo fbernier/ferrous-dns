@@ -1,4 +1,5 @@
 use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::{validate_comment, validate_url};
 use ferrous_dns_domain::{BlocklistSource, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -8,24 +9,20 @@ use crate::ports::{BlockFilterEnginePort, BlocklistSourceRepository, GroupReposi
 pub struct UpdateBlocklistSourceUseCase {
     repo: Arc<dyn BlocklistSourceRepository>,
     group_repo: Arc<dyn GroupRepository>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl UpdateBlocklistSourceUseCase {
     pub fn new(
         repo: Arc<dyn BlocklistSourceRepository>,
         group_repo: Arc<dyn GroupRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
         Self {
             repo,
             group_repo,
-            block_filter_engine: None,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
     }
 
     #[instrument(skip(self))]
@@ -48,14 +45,10 @@ impl UpdateBlocklistSourceUseCase {
         }
 
         if let Some(ref u_opt) = url {
-            BlocklistSource::validate_url(&u_opt.as_deref().map(Arc::from))
-                .map_err(DomainError::InvalidBlocklistSource)?;
+            validate_url(u_opt.as_deref()).map_err(DomainError::InvalidBlocklistSource)?;
         }
 
-        if let Some(ref c) = comment {
-            BlocklistSource::validate_comment(&Some(Arc::from(c.as_str())))
-                .map_err(DomainError::InvalidBlocklistSource)?;
-        }
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidBlocklistSource)?;
 
         if let Some(ref ids) = group_ids {
             for &gid in ids {
@@ -75,10 +68,8 @@ impl UpdateBlocklistSourceUseCase {
             "Blocklist source updated successfully"
         );
 
-        if let Some(ref engine) = self.block_filter_engine {
-            if let Err(e) = engine.reload().await {
-                error!(error = %e, "Failed to reload block filter after blocklist source update");
-            }
+        if let Err(e) = self.block_filter_engine.reload().await {
+            error!(error = %e, "Failed to reload block filter after blocklist source update");
         }
 
         Ok(updated)

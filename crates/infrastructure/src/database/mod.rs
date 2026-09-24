@@ -76,6 +76,7 @@ pub async fn create_write_pool(
     .await?;
 
     sqlx::migrate!("../../migrations").run(&pool).await?;
+    crate::repositories::client_subnet_repository::canonicalize_stored_subnets(&pool).await?;
 
     sqlx::query("PRAGMA optimize").execute(&pool).await?;
 

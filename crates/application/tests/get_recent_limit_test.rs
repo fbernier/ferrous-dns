@@ -4,7 +4,7 @@ use ferrous_dns_application::ports::{
 };
 use ferrous_dns_application::use_cases::{GetRecentQueriesUseCase, PagedQueryInput};
 use ferrous_dns_domain::{
-    query_log::QueryLog, DnssecStats, DomainError, QueryLogFilter, QueryStats,
+    entities::query_log::QueryLog, DnssecStats, DomainError, QueryLogFilter, QueryStats,
 };
 use std::sync::{Arc, Mutex};
 

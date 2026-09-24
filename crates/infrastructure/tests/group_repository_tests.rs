@@ -25,7 +25,11 @@ async fn test_create_and_get_group() {
     let (repo, _pool) = repo().await;
 
     let group = repo
-        .create("Test Group".to_string(), Some("Test comment".to_string()))
+        .create(
+            "Test Group".to_string(),
+            Some("Test comment".to_string()),
+            true,
+        )
         .await
         .unwrap();
 
@@ -41,7 +45,9 @@ async fn test_create_and_get_group() {
 #[tokio::test]
 async fn test_get_by_name() {
     let (repo, _pool) = repo().await;
-    repo.create("Test Group".to_string(), None).await.unwrap();
+    repo.create("Test Group".to_string(), None, true)
+        .await
+        .unwrap();
 
     let fetched = repo.get_by_name("Test Group").await.unwrap().unwrap();
     assert_eq!(fetched.name.as_ref(), "Test Group");
@@ -51,8 +57,8 @@ async fn test_get_by_name() {
 #[tokio::test]
 async fn test_get_all_lists_default_group_first() {
     let (repo, _pool) = repo().await;
-    repo.create("Alpha".to_string(), None).await.unwrap();
-    repo.create("Beta".to_string(), None).await.unwrap();
+    repo.create("Alpha".to_string(), None, true).await.unwrap();
+    repo.create("Beta".to_string(), None, true).await.unwrap();
 
     let groups = repo.get_all().await.unwrap();
 
@@ -65,7 +71,7 @@ async fn test_get_all_lists_default_group_first() {
 #[tokio::test]
 async fn test_get_all_with_client_counts() {
     let (repo, pool) = repo().await;
-    let kids = repo.create("Kids".to_string(), None).await.unwrap();
+    let kids = repo.create("Kids".to_string(), None, true).await.unwrap();
     let kids_id = kids.id.unwrap();
     insert_client(&pool, "192.168.1.1", kids_id).await;
     insert_client(&pool, "192.168.1.2", kids_id).await;
@@ -83,7 +89,7 @@ async fn test_get_all_with_client_counts() {
 async fn test_update_group() {
     let (repo, _pool) = repo().await;
     let id = repo
-        .create("Original".to_string(), None)
+        .create("Original".to_string(), None, true)
         .await
         .unwrap()
         .id
@@ -108,7 +114,7 @@ async fn test_update_group() {
 async fn test_update_group_omitted_fields_keep_stored_values() {
     let (repo, _pool) = repo().await;
     let id = repo
-        .create("Keep".to_string(), Some("note".to_string()))
+        .create("Keep".to_string(), Some("note".to_string()), true)
         .await
         .unwrap()
         .id
@@ -135,9 +141,9 @@ async fn test_update_missing_group_returns_group_not_found() {
 #[tokio::test]
 async fn test_update_to_existing_name_is_rejected() {
     let (repo, _pool) = repo().await;
-    repo.create("Taken".to_string(), None).await.unwrap();
+    repo.create("Taken".to_string(), None, true).await.unwrap();
     let id = repo
-        .create("Other".to_string(), None)
+        .create("Other".to_string(), None, true)
         .await
         .unwrap()
         .id
@@ -145,24 +151,26 @@ async fn test_update_to_existing_name_is_rejected() {
 
     let result = repo.update(id, Some("Taken".to_string()), None, None).await;
 
-    assert!(matches!(result, Err(DomainError::InvalidGroupName(_))));
+    assert!(matches!(result, Err(DomainError::AlreadyExists(_))));
 }
 
 #[tokio::test]
 async fn test_unique_name_constraint() {
     let (repo, _pool) = repo().await;
-    repo.create("Unique Name".to_string(), None).await.unwrap();
+    repo.create("Unique Name".to_string(), None, true)
+        .await
+        .unwrap();
 
-    let result = repo.create("Unique Name".to_string(), None).await;
+    let result = repo.create("Unique Name".to_string(), None, true).await;
 
-    assert!(matches!(result, Err(DomainError::InvalidGroupName(_))));
+    assert!(matches!(result, Err(DomainError::AlreadyExists(_))));
 }
 
 #[tokio::test]
 async fn test_delete_group() {
     let (repo, _pool) = repo().await;
     let id = repo
-        .create("To Delete".to_string(), None)
+        .create("To Delete".to_string(), None, true)
         .await
         .unwrap()
         .id
@@ -187,7 +195,7 @@ async fn test_delete_missing_group_returns_group_not_found() {
 async fn test_delete_group_unassigns_its_clients() {
     let (repo, pool) = repo().await;
     let id = repo
-        .create("Temp".to_string(), None)
+        .create("Temp".to_string(), None, true)
         .await
         .unwrap()
         .id
@@ -208,7 +216,7 @@ async fn test_delete_group_unassigns_its_clients() {
 async fn test_delete_group_referenced_by_rule_is_refused() {
     let (repo, pool) = repo().await;
     let id = repo
-        .create("Rules".to_string(), None)
+        .create("Rules".to_string(), None, true)
         .await
         .unwrap()
         .id
@@ -225,7 +233,7 @@ async fn test_delete_group_referenced_by_rule_is_refused() {
     let result = repo.delete(id).await;
 
     assert!(
-        matches!(result, Err(DomainError::GroupHasAssignedClients(_))),
+        matches!(result, Err(DomainError::GroupInUse(_))),
         "got {result:?}"
     );
     assert!(repo.get_by_id(id).await.unwrap().is_some());
@@ -243,7 +251,7 @@ async fn test_count_clients_in_group() {
 #[tokio::test]
 async fn test_get_clients_in_group() {
     let (repo, pool) = repo().await;
-    let other = repo.create("Other".to_string(), None).await.unwrap();
+    let other = repo.create("Other".to_string(), None, true).await.unwrap();
     insert_client(&pool, "192.168.1.1", 1).await;
     insert_client(&pool, "192.168.1.2", other.id.unwrap()).await;
 

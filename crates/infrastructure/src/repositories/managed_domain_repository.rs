@@ -1,6 +1,6 @@
 use crate::repositories::{db_err, is_fk_violation, is_unique_violation, parse_db_action, sql_now};
 use async_trait::async_trait;
-use ferrous_dns_application::ports::ManagedDomainRepository;
+use ferrous_dns_application::ports::{ManagedDomainRepository, ManagedDomainUpdate};
 use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -87,8 +87,8 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                DomainError::InvalidManagedDomain(format!(
-                    "Managed domain '{name}' already exists"
+                DomainError::AlreadyExists(format!(
+                    "Managed domain '{name}' already exists in group {group_id}"
                 ))
             } else if is_fk_violation(&e) {
                 DomainError::GroupNotFound(group_id)
@@ -156,13 +156,16 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
     async fn update(
         &self,
         id: i64,
-        name: Option<String>,
-        domain: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
+        update: ManagedDomainUpdate,
     ) -> Result<ManagedDomain, DomainError> {
+        let ManagedDomainUpdate {
+            name,
+            domain,
+            action,
+            group_id,
+            comment,
+            enabled,
+        } = update;
         let row = sqlx::query_as::<_, ManagedDomainRow>(
             "UPDATE managed_domains
              SET name = COALESCE(?, name),
@@ -187,8 +190,8 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                DomainError::InvalidManagedDomain(format!(
-                    "Managed domain '{}' already exists",
+                DomainError::AlreadyExists(format!(
+                    "Managed domain '{}' already exists in the target group",
                     name.as_deref().unwrap_or_default()
                 ))
             } else if let Some(gid) = group_id.filter(|_| is_fk_violation(&e)) {

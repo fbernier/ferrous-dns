@@ -37,6 +37,8 @@ pub trait ClientRepository: Send + Sync {
 
     async fn get_by_id(&self, id: i64) -> Result<Option<Client>, DomainError>;
 
+    async fn get_by_ip(&self, ip_address: IpAddr) -> Result<Option<Client>, DomainError>;
+
     async fn assign_group(&self, client_id: i64, group_id: i64) -> Result<(), DomainError>;
 
     async fn delete(&self, id: i64) -> Result<(), DomainError>;

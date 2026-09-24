@@ -36,36 +36,28 @@ fn status_code(err: &DomainError) -> StatusCode {
 
         DomainError::InvalidCredentials
         | DomainError::AuthRequired
-        | DomainError::PasswordNotConfigured
         | DomainError::InvalidMfaCode
-        | DomainError::MfaChallengeExpired
-        | DomainError::MfaRequired => StatusCode::UNAUTHORIZED,
+        | DomainError::MfaChallengeExpired => StatusCode::UNAUTHORIZED,
 
-        DomainError::InsufficientPermissions
-        | DomainError::ProtectedUser
-        | DomainError::Blocked
-        | DomainError::DnsTunnelingDetected => StatusCode::FORBIDDEN,
+        DomainError::ProtectedUser | DomainError::Blocked | DomainError::DnsTunnelingDetected => {
+            StatusCode::FORBIDDEN
+        }
 
         DomainError::RateLimited
         | DomainError::DnsRateLimited
         | DomainError::DnsRateLimitedSlip => StatusCode::TOO_MANY_REQUESTS,
 
-        // The Invalid{BlocklistSource,…,GroupName} variants also carry
-        // repository UNIQUE-constraint violations, hence CONFLICT.
         DomainError::MfaAlreadyEnabled
         | DomainError::DuplicateApiTokenName(_)
         | DomainError::DuplicateUsername(_)
         | DomainError::PasswordAlreadyConfigured
-        | DomainError::InvalidBlocklistSource(_)
-        | DomainError::InvalidWhitelistSource(_)
-        | DomainError::InvalidManagedDomain(_)
-        | DomainError::InvalidRegexFilter(_)
-        | DomainError::InvalidGroupName(_)
         | DomainError::DuplicateScheduleProfileName(_)
         | DomainError::BlockedServiceAlreadyExists(_)
         | DomainError::CustomServiceAlreadyExists(_)
         | DomainError::SubnetConflict(_)
-        | DomainError::GroupHasAssignedClients(_) => StatusCode::CONFLICT,
+        | DomainError::GroupHasAssignedClients(_)
+        | DomainError::AlreadyExists(_)
+        | DomainError::GroupInUse(_) => StatusCode::CONFLICT,
 
         DomainError::MfaNotConfigured
         | DomainError::WebauthnNotConfigured
@@ -78,8 +70,12 @@ fn status_code(err: &DomainError) -> StatusCode {
         | DomainError::InvalidCidr(_)
         | DomainError::InvalidSafeSearchEngine(_)
         | DomainError::InvalidTimeSlot(_)
-        | DomainError::InvalidTimezone(_)
         | DomainError::InvalidScheduleProfile(_)
+        | DomainError::InvalidBlocklistSource(_)
+        | DomainError::InvalidWhitelistSource(_)
+        | DomainError::InvalidManagedDomain(_)
+        | DomainError::InvalidRegexFilter(_)
+        | DomainError::InvalidGroupName(_)
         | DomainError::ProtectedGroupCannotBeDisabled
         | DomainError::ProtectedGroupCannotBeDeleted => StatusCode::BAD_REQUEST,
 

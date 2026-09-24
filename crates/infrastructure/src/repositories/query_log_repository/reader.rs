@@ -3,7 +3,9 @@ use super::rollup;
 use crate::repositories::{db_err, hours_ago_cutoff, seconds_ago_cutoff, sql_ts};
 use chrono::{TimeDelta, Utc};
 use ferrous_dns_application::ports::PagedQueryResult;
-use ferrous_dns_domain::query_log::{ClientProtocol, DnssecStats, QueryCategory, QueryLogFilter};
+use ferrous_dns_domain::entities::query_log::{
+    ClientProtocol, DnssecStats, QueryCategory, QueryLogFilter,
+};
 use ferrous_dns_domain::{DomainError, QueryLog, QueryStats};
 use sqlx::{Row, SqlitePool};
 use std::time::{Duration, Instant};

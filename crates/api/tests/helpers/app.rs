@@ -13,7 +13,6 @@ use ferrous_dns_api::{
 use ferrous_dns_application::ports::{
     BlockFilterEnginePort, DnsCachePort, SafeSearchConfigRepository, SafeSearchEnginePort,
 };
-use ferrous_dns_application::services::SubnetMatcherService;
 use ferrous_dns_application::use_cases::*;
 use ferrous_dns_domain::config::upstream::{UpstreamPool, UpstreamStrategy};
 use ferrous_dns_domain::config::DatabaseConfig;
@@ -249,9 +248,17 @@ impl TestAppBuilder {
                 create_manual_client: Arc::new(CreateManualClientUseCase::new(
                     client_repo.clone(),
                     group_repo.clone(),
+                    null_engine.clone(),
                 )),
-                update_client: Arc::new(UpdateClientUseCase::new(client_repo.clone())),
-                delete_client: Arc::new(DeleteClientUseCase::new(client_repo.clone())),
+                update_client: Arc::new(UpdateClientUseCase::new(
+                    client_repo.clone(),
+                    group_repo.clone(),
+                    null_engine.clone(),
+                )),
+                delete_client: Arc::new(DeleteClientUseCase::new(
+                    client_repo.clone(),
+                    null_engine.clone(),
+                )),
                 get_client_subnets: Arc::new(GetClientSubnetsUseCase::new(subnet_repo.clone())),
                 create_client_subnet: Arc::new(CreateClientSubnetUseCase::new(
                     subnet_repo.clone(),
@@ -262,7 +269,6 @@ impl TestAppBuilder {
                     subnet_repo.clone(),
                     null_engine.clone(),
                 )),
-                subnet_matcher: Arc::new(SubnetMatcherService::new(subnet_repo.clone())),
             },
             blocking: BlockingUseCases {
                 get_blocklist: Arc::new(GetBlocklistUseCase::new(Arc::new(
@@ -274,13 +280,16 @@ impl TestAppBuilder {
                 create_blocklist_source: Arc::new(CreateBlocklistSourceUseCase::new(
                     blocklist_source_repo.clone(),
                     group_repo.clone(),
+                    null_engine.clone(),
                 )),
                 update_blocklist_source: Arc::new(UpdateBlocklistSourceUseCase::new(
                     blocklist_source_repo.clone(),
                     group_repo.clone(),
+                    null_engine.clone(),
                 )),
                 delete_blocklist_source: Arc::new(DeleteBlocklistSourceUseCase::new(
                     blocklist_source_repo.clone(),
+                    null_engine.clone(),
                 )),
                 sync_blocklist_sources: Arc::new(SyncBlocklistSourcesUseCase::new(sync_engine)),
                 get_whitelist: Arc::new(GetWhitelistUseCase::new(Arc::new(
@@ -447,6 +456,7 @@ fn sqlite_backup_use_cases(
     group_repo: &Arc<SqliteGroupRepository>,
     blocklist_source_repo: &Arc<SqliteBlocklistSourceRepository>,
 ) -> BackupUseCases {
+    let null_engine: Arc<dyn BlockFilterEnginePort> = Arc::new(NullBlockFilterEngine);
     BackupUseCases {
         export: Arc::new(ExportConfigUseCase::new(
             config.clone(),
@@ -461,11 +471,13 @@ fn sqlite_backup_use_cases(
             Arc::new(CreateBlocklistSourceUseCase::new(
                 blocklist_source_repo.clone(),
                 group_repo.clone(),
+                null_engine.clone(),
             )),
             Arc::new(CreateLocalRecordUseCase::new(
                 config.clone(),
                 Arc::new(NullConfigRepository),
             )),
+            null_engine.clone(),
         )),
     }
 }

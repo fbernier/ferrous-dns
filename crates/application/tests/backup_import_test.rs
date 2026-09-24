@@ -137,28 +137,26 @@ fn snapshot_with_sources(names: &[&str]) -> BackupSnapshot {
 /// path ever started reloading, the counts asserted below would grow by one per
 /// imported source.
 fn build_import(
-    engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    engine: Arc<dyn BlockFilterEnginePort>,
 ) -> (ImportConfigUseCase, Arc<MockBlocklistSourceRepository>) {
     let source_repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
 
-    let mut creator = CreateBlocklistSourceUseCase::new(source_repo.clone(), group_repo);
-    if let Some(ref engine) = engine {
-        creator = creator.with_block_filter(engine.clone());
-    }
-    let creator: Arc<dyn BlocklistSourceCreator> = Arc::new(creator);
+    let creator: Arc<dyn BlocklistSourceCreator> = Arc::new(CreateBlocklistSourceUseCase::new(
+        source_repo.clone(),
+        group_repo,
+        engine.clone(),
+    ));
 
-    let mut import = ImportConfigUseCase::new(
+    let import = ImportConfigUseCase::new(
         Arc::new(RwLock::new(Config::default())),
         Arc::new(NullConfigFilePersistence),
         Some("/tmp/ferrous-dns-backup-import-test.toml".to_string()),
         Arc::new(StubGroupCreator),
         creator,
         Arc::new(StubLocalRecordCreator),
+        engine,
     );
-    if let Some(engine) = engine {
-        import = import.with_block_filter(engine);
-    }
 
     (import, source_repo)
 }
@@ -166,7 +164,7 @@ fn build_import(
 #[tokio::test]
 async fn test_import_reloads_block_filter_once_for_the_whole_batch() {
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let (import, source_repo) = build_import(Some(engine.clone()));
+    let (import, source_repo) = build_import(engine.clone());
 
     let summary = import
         .execute(snapshot_with_sources(&[
@@ -192,7 +190,7 @@ async fn test_import_reloads_block_filter_once_for_the_whole_batch() {
 #[tokio::test]
 async fn test_import_without_blocklist_sources_does_not_reload() {
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let (import, _source_repo) = build_import(Some(engine.clone()));
+    let (import, _source_repo) = build_import(engine.clone());
 
     let summary = import.execute(snapshot_with_sources(&[])).await.unwrap();
 
@@ -207,7 +205,7 @@ async fn test_import_without_blocklist_sources_does_not_reload() {
 #[tokio::test]
 async fn test_import_reloads_once_when_some_sources_are_duplicates() {
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let (import, source_repo) = build_import(Some(engine.clone()));
+    let (import, source_repo) = build_import(engine.clone());
 
     import
         .execute(snapshot_with_sources(&["hagezi-pro"]))
@@ -223,23 +221,15 @@ async fn test_import_reloads_once_when_some_sources_are_duplicates() {
 
     assert_eq!(summary.blocklist_sources_imported, 1);
     assert_eq!(summary.blocklist_sources_skipped, 1);
+    assert!(
+        summary.errors.is_empty(),
+        "an existing source is skipped silently, not reported: {:?}",
+        summary.errors
+    );
     assert_eq!(source_repo.count().await, 2);
     assert_eq!(
         engine.reload_count().await,
         2,
         "one rebuild per import call"
     );
-}
-
-#[tokio::test]
-async fn test_import_succeeds_without_a_block_filter_engine() {
-    let (import, source_repo) = build_import(None);
-
-    let summary = import
-        .execute(snapshot_with_sources(&["hagezi-pro", "oisd"]))
-        .await
-        .unwrap();
-
-    assert_eq!(summary.blocklist_sources_imported, 2);
-    assert_eq!(source_repo.count().await, 2);
 }

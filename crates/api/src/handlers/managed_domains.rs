@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use ferrous_dns_application::ports::ManagedDomainUpdate;
 use ferrous_dns_domain::DomainError;
 use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -140,12 +141,14 @@ async fn update_managed_domain(
         .update_managed_domain
         .execute(
             id,
-            req.name,
-            req.domain,
-            action,
-            req.group_id,
-            req.comment,
-            req.enabled,
+            ManagedDomainUpdate {
+                name: req.name,
+                domain: req.domain,
+                action,
+                group_id: req.group_id,
+                comment: req.comment,
+                enabled: req.enabled,
+            },
         )
         .await?;
 

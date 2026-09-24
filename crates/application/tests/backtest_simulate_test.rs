@@ -6,7 +6,7 @@ use ferrous_dns_application::ports::{
 use ferrous_dns_application::use_cases::{
     BacktestBlocklistsUseCase, BacktestRequest, CandidateAction,
 };
-use ferrous_dns_domain::query_log::{DnssecStats, QueryLog, QueryLogFilter, QueryStats};
+use ferrous_dns_domain::entities::query_log::{DnssecStats, QueryLog, QueryLogFilter, QueryStats};
 use ferrous_dns_domain::{
     AllowMatch, AllowMatchKind, BlockMatch, BlockMatchKind, DomainError, FilterExplanation,
     MatchType,

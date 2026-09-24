@@ -7,13 +7,13 @@ use ferrous_dns_infrastructure::repositories::whitelist_repository::SqliteWhitel
 mod db;
 
 #[tokio::test]
-async fn blocklist_get_all_reports_database_error() {
+async fn blocklist_get_all_paged_reports_database_error() {
     let pool = db::migrated_pool().await;
     let repo = SqliteBlocklistRepository::new(pool.clone());
     pool.close().await;
 
     assert!(matches!(
-        repo.get_all().await,
+        repo.get_all_paged(10, 0).await,
         Err(DomainError::DatabaseError(_))
     ));
 }
@@ -39,13 +39,9 @@ async fn blocklist_get_all_tolerates_null_added_at() {
         .unwrap();
     let repo = SqliteBlocklistRepository::new(pool);
 
-    let all = repo.get_all().await.unwrap();
-    assert_eq!(all.len(), 1);
-    assert_eq!(all[0].domain, "ads.example");
-    assert!(all[0].added_at.is_none());
-
     let (page, total) = repo.get_all_paged(10, 0).await.unwrap();
     assert_eq!(total, 1);
+    assert_eq!(page[0].domain, "ads.example");
     assert!(page[0].added_at.is_none());
 }
 

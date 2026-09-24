@@ -1,7 +1,7 @@
 #[path = "support/db.rs"]
 mod db;
 
-use ferrous_dns_application::ports::RegexFilterRepository;
+use ferrous_dns_application::ports::{RegexFilterRepository, RegexFilterUpdate};
 use ferrous_dns_domain::{DomainAction, DomainError};
 use ferrous_dns_infrastructure::repositories::SqliteRegexFilterRepository;
 
@@ -82,7 +82,13 @@ async fn test_update_omitted_fields_keep_stored_values() {
     let id = create(&repo, "f", true).await;
 
     let updated = repo
-        .update(id, None, None, Some(DomainAction::Deny), None, None, None)
+        .update(
+            id,
+            RegexFilterUpdate {
+                action: Some(DomainAction::Deny),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -99,7 +105,13 @@ async fn test_update_rejects_invalid_pattern() {
     let id = create(&repo, "f", true).await;
 
     let result = repo
-        .update(id, None, Some("(".to_string()), None, None, None, None)
+        .update(
+            id,
+            RegexFilterUpdate {
+                pattern: Some("(".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidRegexFilter(_))));
@@ -113,7 +125,13 @@ async fn test_update_to_missing_group_returns_group_not_found() {
     let id = create(&repo, "f", true).await;
 
     let result = repo
-        .update(id, None, None, None, Some(999), None, None)
+        .update(
+            id,
+            RegexFilterUpdate {
+                group_id: Some(999),
+                ..Default::default()
+            },
+        )
         .await;
 
     assert!(
@@ -127,7 +145,13 @@ async fn test_update_missing_filter_returns_not_found() {
     let repo = repo().await;
 
     let result = repo
-        .update(999, Some("x".to_string()), None, None, None, None, None)
+        .update(
+            999,
+            RegexFilterUpdate {
+                name: Some("x".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
 
     assert!(matches!(result, Err(DomainError::RegexFilterNotFound(999))));
@@ -149,7 +173,7 @@ async fn test_duplicate_name_is_rejected() {
         )
         .await;
 
-    assert!(matches!(result, Err(DomainError::InvalidRegexFilter(_))));
+    assert!(matches!(result, Err(DomainError::AlreadyExists(_))));
 }
 
 #[tokio::test]
@@ -157,9 +181,15 @@ async fn test_get_enabled_skips_disabled() {
     let repo = repo().await;
     create(&repo, "on", true).await;
     let off = create(&repo, "off", true).await;
-    repo.update(off, None, None, None, None, None, Some(false))
-        .await
-        .unwrap();
+    repo.update(
+        off,
+        RegexFilterUpdate {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let names: Vec<String> = repo
         .get_enabled()

@@ -5,7 +5,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -73,10 +73,6 @@ async fn create_subnet(
         .execute(req.subnet_cidr, req.group_id, req.comment)
         .await?;
 
-    if let Err(e) = state.clients.subnet_matcher.refresh().await {
-        error!(error = %e, "Failed to refresh subnet matcher");
-    }
-
     let group_name = state
         .groups
         .get_groups
@@ -108,10 +104,6 @@ async fn delete_subnet(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     state.clients.delete_client_subnet.execute(id).await?;
-
-    if let Err(e) = state.clients.subnet_matcher.refresh().await {
-        error!(error = %e, "Failed to refresh subnet matcher");
-    }
 
     Ok(StatusCode::NO_CONTENT)
 }

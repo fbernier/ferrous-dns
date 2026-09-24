@@ -1,14 +1,6 @@
+use crate::errors::domain_error::DomainError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownScheduleAction(pub String);
-
-impl std::fmt::Display for UnknownScheduleAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown schedule action: '{}'", self.0)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,13 +19,15 @@ impl ScheduleAction {
 }
 
 impl std::str::FromStr for ScheduleAction {
-    type Err = UnknownScheduleAction;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "block_all" => Ok(ScheduleAction::BlockAll),
             "allow_all" => Ok(ScheduleAction::AllowAll),
-            _ => Err(UnknownScheduleAction(s.to_owned())),
+            other => Err(DomainError::InvalidInput(format!(
+                "unknown schedule action: '{other}'"
+            ))),
         }
     }
 }

@@ -73,7 +73,7 @@ pub async fn create_group(
     let result = state
         .groups
         .create_group
-        .execute(body.name, body.comment)
+        .execute(body.name, body.comment, body.enabled.unwrap_or(true))
         .await?;
     Ok((StatusCode::CREATED, Json(group_to_entry(&result)?)))
 }

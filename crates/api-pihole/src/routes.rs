@@ -81,7 +81,7 @@ pub fn create_pihole_router_with_openapi(
             handlers::lists::create_list
         ))
         .routes(routes!(
-            handlers::lists::get_by_id,
+            handlers::lists::get_list,
             handlers::lists::update_list,
             handlers::lists::delete_list
         ))

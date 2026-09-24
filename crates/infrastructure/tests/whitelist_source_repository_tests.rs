@@ -76,15 +76,13 @@ async fn duplicate_name_is_invalid_whitelist_source() {
         .await
         .unwrap();
 
-    match repo
+    let result = repo
         .create("Dup".to_string(), None, vec![1], None, true)
-        .await
-    {
-        Err(DomainError::InvalidWhitelistSource(msg)) => {
-            assert_eq!(msg, "Whitelist source 'Dup' already exists")
-        }
-        other => panic!("expected InvalidWhitelistSource, got {other:?}"),
-    }
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::AlreadyExists(_))),
+        "got {result:?}"
+    );
 }
 
 #[tokio::test]

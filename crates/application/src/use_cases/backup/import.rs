@@ -13,18 +13,9 @@ use super::snapshot::{BackupSnapshot, ImportSummary};
 
 const SUPPORTED_VERSION: &str = "1";
 
-/// Returns `true` for errors that represent a pre-existing entity (idempotent import).
-///
-/// When a group or blocklist source already exists, the repository returns
-/// `InvalidGroupName` / `InvalidBlocklistSource` with an "already exists" message.
-/// These are expected during re-import and must not be surfaced as failures.
+/// Pre-existing entities are expected on re-import and are skipped silently.
 fn is_duplicate_error(e: &DomainError) -> bool {
-    match e {
-        DomainError::InvalidGroupName(msg) | DomainError::InvalidBlocklistSource(msg) => {
-            msg.contains("already exists")
-        }
-        _ => false,
-    }
+    matches!(e, DomainError::AlreadyExists(_))
 }
 
 pub struct ImportConfigUseCase {
@@ -34,7 +25,7 @@ pub struct ImportConfigUseCase {
     group_creator: Arc<dyn GroupCreator>,
     blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
     local_record_creator: Arc<dyn LocalRecordCreator>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl ImportConfigUseCase {
@@ -45,6 +36,7 @@ impl ImportConfigUseCase {
         group_creator: Arc<dyn GroupCreator>,
         blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
         local_record_creator: Arc<dyn LocalRecordCreator>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
         Self {
             config,
@@ -53,13 +45,8 @@ impl ImportConfigUseCase {
             group_creator,
             blocklist_source_creator,
             local_record_creator,
-            block_filter_engine: None,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
     }
 
     #[instrument(skip(self, snapshot), name = "import_config")]
@@ -83,10 +70,8 @@ impl ImportConfigUseCase {
         // The creator above deliberately skips the per-source reload, so the
         // whole batch costs one block index rebuild instead of one each.
         if blocklist_sources_imported > 0 {
-            if let Some(ref engine) = self.block_filter_engine {
-                if let Err(e) = engine.reload().await {
-                    error!(error = %e, "Failed to reload block filter after backup import");
-                }
+            if let Err(e) = self.block_filter_engine.reload().await {
+                error!(error = %e, "Failed to reload block filter after backup import");
             }
         }
 

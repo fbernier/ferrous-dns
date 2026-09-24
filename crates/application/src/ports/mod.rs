@@ -78,7 +78,7 @@ pub use group_creator::GroupCreator;
 pub use group_repository::GroupRepository;
 pub use hostname_resolver::HostnameResolver;
 pub use local_record_creator::LocalRecordCreator;
-pub use managed_domain_repository::ManagedDomainRepository;
+pub use managed_domain_repository::{ManagedDomainRepository, ManagedDomainUpdate};
 pub use mfa_repository::MfaRepository;
 pub use nxdomain_hijack_probe_target::NxdomainHijackProbeTarget;
 pub use nxdomain_hijack_store::NxdomainHijackIpStore;
@@ -87,7 +87,7 @@ pub use ptr_record_registry::PtrRecordRegistry;
 pub use query_log_repository::{
     CacheStats, PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
 };
-pub use regex_filter_repository::RegexFilterRepository;
+pub use regex_filter_repository::{RegexFilterRepository, RegexFilterUpdate};
 pub use response_ip_filter_eviction_target::ResponseIpFilterEvictionTarget;
 pub use response_ip_filter_store::ResponseIpFilterStore;
 pub use safe_search_config_repository::SafeSearchConfigRepository;

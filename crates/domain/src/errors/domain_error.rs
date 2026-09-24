@@ -170,9 +170,6 @@ pub enum DomainError {
     #[error("Invalid time slot: {0}")]
     InvalidTimeSlot(String),
 
-    #[error("Invalid timezone: {0}")]
-    InvalidTimezone(String),
-
     #[error("Invalid credentials")]
     InvalidCredentials,
 
@@ -184,9 +181,6 @@ pub enum DomainError {
 
     #[error("Too many login attempts, try again later")]
     RateLimited,
-
-    #[error("Password not configured, run initial setup")]
-    PasswordNotConfigured,
 
     #[error("Password already configured")]
     PasswordAlreadyConfigured,
@@ -212,12 +206,6 @@ pub enum DomainError {
     #[error("Invalid password: {0}")]
     InvalidPassword(String),
 
-    #[error("Insufficient permissions")]
-    InsufficientPermissions,
-
-    #[error("Second factor required")]
-    MfaRequired,
-
     #[error("Invalid or expired verification code")]
     InvalidMfaCode,
 
@@ -238,4 +226,10 @@ pub enum DomainError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
+
+    #[error("Group is in use: {0}")]
+    GroupInUse(String),
 }

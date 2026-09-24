@@ -69,17 +69,15 @@ pub async fn build_app_state(
                 repos.group.clone(),
                 repos.blocklist_source.clone(),
             )),
-            import: Arc::new(
-                ImportConfigUseCase::new(
-                    config.clone(),
-                    config_persistence.clone(),
-                    config_path.as_deref().map(String::from),
-                    group_creator,
-                    blocklist_source_creator,
-                    local_record_creator,
-                )
-                .with_block_filter(repos.block_filter_engine.clone()),
-            ),
+            import: Arc::new(ImportConfigUseCase::new(
+                config.clone(),
+                config_persistence.clone(),
+                config_path.as_deref().map(String::from),
+                group_creator,
+                blocklist_source_creator,
+                local_record_creator,
+                repos.block_filter_engine.clone(),
+            )),
         }
     };
 
@@ -135,7 +133,6 @@ pub async fn build_app_state(
             get_client_subnets: use_cases.get_client_subnets,
             create_client_subnet: use_cases.create_client_subnet,
             delete_client_subnet: use_cases.delete_client_subnet,
-            subnet_matcher: use_cases.subnet_matcher.clone(),
         },
         blocking: BlockingUseCases {
             get_blocklist: use_cases.get_blocklist,

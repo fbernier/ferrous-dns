@@ -239,8 +239,23 @@ async fn summary_separates_cached_queries_from_forwarded_queries() {
     );
     assert_eq!(
         json["queries"]["forwarded"], 2,
-        "forwarded = total - blocked - cached"
+        "cache hits are not forwarded"
     );
+}
+
+#[tokio::test]
+async fn summary_does_not_count_local_dns_answers_as_forwarded() {
+    let pool = helpers::create_test_db().await;
+    helpers::insert_upstream_query(&pool, "remote.example", "default", "1.1.1.1:53").await;
+    for _ in 0..2 {
+        helpers::insert_local_dns_query(&pool, "nas.lan").await;
+    }
+
+    let app = helpers::create_pihole_test_app(pool).await;
+    let json = get_json(app, "/stats/summary").await;
+
+    assert_eq!(json["queries"]["total"], 3);
+    assert_eq!(json["queries"]["forwarded"], 1);
 }
 
 #[tokio::test]

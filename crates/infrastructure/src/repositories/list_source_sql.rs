@@ -12,7 +12,6 @@ pub(super) struct SourceTables {
     pub groups: &'static str,
     /// Capitalized list kind used in user-facing messages.
     pub label: &'static str,
-    pub invalid: fn(String) -> DomainError,
     pub not_found: fn(i64) -> DomainError,
 }
 
@@ -20,7 +19,6 @@ pub(super) static BLOCKLIST: SourceTables = SourceTables {
     sources: "blocklist_sources",
     groups: "blocklist_source_groups",
     label: "Blocklist",
-    invalid: DomainError::InvalidBlocklistSource,
     not_found: DomainError::BlocklistSourceNotFound,
 };
 
@@ -28,7 +26,6 @@ pub(super) static WHITELIST: SourceTables = SourceTables {
     sources: "whitelist_sources",
     groups: "whitelist_source_groups",
     label: "Whitelist",
-    invalid: DomainError::InvalidWhitelistSource,
     not_found: DomainError::WhitelistSourceNotFound,
 };
 
@@ -78,11 +75,6 @@ fn normalize(mut group_ids: Vec<i64>) -> Vec<i64> {
     group_ids.sort_unstable();
     group_ids.dedup();
     group_ids
-}
-
-/// The write-only `group_id` column predates the pivot table and is still `NOT NULL`.
-fn legacy_group_id(group_ids: &[i64]) -> i64 {
-    group_ids.first().copied().unwrap_or(1)
 }
 
 async fn fetch_group_ids<'e>(
@@ -141,7 +133,6 @@ impl SourceStore {
         enabled: bool,
     ) -> Result<SourceRecord, DomainError> {
         let now = sql_now();
-        let legacy_group_id = legacy_group_id(&group_ids);
         let group_ids = normalize(group_ids);
 
         let mut tx = self
@@ -151,14 +142,13 @@ impl SourceStore {
             .map_err(db_err("Failed to begin transaction"))?;
 
         let row = sqlx::query_as::<_, SourceRow>(&format!(
-            "INSERT INTO {} (name, url, group_id, comment, enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO {} (name, url, comment, enabled, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
              RETURNING {COLUMNS}",
             self.t.sources
         ))
         .bind(&name)
         .bind(&url)
-        .bind(legacy_group_id)
         .bind(&comment)
         .bind(enabled)
         .bind(&now)
@@ -167,7 +157,10 @@ impl SourceStore {
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                (self.t.invalid)(format!("{} source '{}' already exists", self.t.label, name))
+                DomainError::AlreadyExists(format!(
+                    "{} source '{}' already exists",
+                    self.t.label, name
+                ))
             } else {
                 db_err("Failed to create source")(e)
             }
@@ -249,7 +242,6 @@ impl SourceStore {
         enabled: Option<bool>,
     ) -> Result<SourceRecord, DomainError> {
         let now = sql_now();
-        let legacy_group_id = group_ids.as_deref().map(legacy_group_id);
         let group_ids = group_ids.map(normalize);
         let replace_url = url.is_some();
         let url = url.flatten();
@@ -264,7 +256,6 @@ impl SourceStore {
             "UPDATE {}
              SET name = COALESCE(?, name),
                  url = CASE WHEN ? THEN ? ELSE url END,
-                 group_id = COALESCE(?, group_id),
                  comment = COALESCE(?, comment),
                  enabled = COALESCE(?, enabled),
                  updated_at = ?
@@ -275,7 +266,6 @@ impl SourceStore {
         .bind(&name)
         .bind(replace_url)
         .bind(&url)
-        .bind(legacy_group_id)
         .bind(&comment)
         .bind(enabled)
         .bind(&now)
@@ -283,9 +273,10 @@ impl SourceStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| match &name {
-            Some(name) if is_unique_violation(&e) => {
-                (self.t.invalid)(format!("{} source '{}' already exists", self.t.label, name))
-            }
+            Some(name) if is_unique_violation(&e) => DomainError::AlreadyExists(format!(
+                "{} source '{}' already exists",
+                self.t.label, name
+            )),
             _ => db_err("Failed to update source")(e),
         })?
         .ok_or_else(|| (self.t.not_found)(id))?;

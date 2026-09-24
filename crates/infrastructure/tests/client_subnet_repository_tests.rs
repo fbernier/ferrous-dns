@@ -2,9 +2,14 @@
 mod db;
 
 use ferrous_dns_application::ports::ClientSubnetRepository;
-use ferrous_dns_domain::DomainError;
+use ferrous_dns_domain::{ClientSubnet, DomainError};
 use ferrous_dns_infrastructure::repositories::SqliteClientSubnetRepository;
+use ipnetwork::IpNetwork;
 use sqlx::SqlitePool;
+
+fn net(cidr: &str) -> IpNetwork {
+    ClientSubnet::parse_cidr(cidr).unwrap()
+}
 
 const GUEST: i64 = 2;
 
@@ -23,11 +28,7 @@ async fn test_create_subnet_success() {
     let (repo, _pool) = repo().await;
 
     let created = repo
-        .create(
-            "192.168.1.0/24".to_string(),
-            1,
-            Some("Office network".to_string()),
-        )
+        .create(net("192.168.1.0/24"), 1, Some("Office network".to_string()))
         .await
         .unwrap();
 
@@ -41,11 +42,9 @@ async fn test_create_subnet_success() {
 #[tokio::test]
 async fn test_create_subnet_duplicate() {
     let (repo, _pool) = repo().await;
-    repo.create("192.168.1.0/24".to_string(), 1, None)
-        .await
-        .unwrap();
+    repo.create(net("192.168.1.0/24"), 1, None).await.unwrap();
 
-    let result = repo.create("192.168.1.0/24".to_string(), GUEST, None).await;
+    let result = repo.create(net("192.168.1.0/24"), GUEST, None).await;
 
     assert!(
         matches!(result, Err(DomainError::SubnetConflict(_))),
@@ -57,7 +56,7 @@ async fn test_create_subnet_duplicate() {
 async fn test_create_subnet_invalid_group() {
     let (repo, _pool) = repo().await;
 
-    let result = repo.create("192.168.1.0/24".to_string(), 999, None).await;
+    let result = repo.create(net("192.168.1.0/24"), 999, None).await;
 
     assert!(
         matches!(result, Err(DomainError::GroupNotFound(999))),
@@ -75,7 +74,7 @@ async fn test_get_all_with_various_cidrs() {
         ("2001:db8::/32", GUEST),
     ];
     for (cidr, group_id) in cidrs {
-        repo.create(cidr.to_string(), group_id, None).await.unwrap();
+        repo.create(net(cidr), group_id, None).await.unwrap();
     }
 
     let mut all: Vec<String> = repo
@@ -102,7 +101,7 @@ async fn test_get_all_with_various_cidrs() {
 async fn test_get_by_id_success() {
     let (repo, _pool) = repo().await;
     let id = repo
-        .create("192.168.1.0/24".to_string(), 1, Some("Test".to_string()))
+        .create(net("192.168.1.0/24"), 1, Some("Test".to_string()))
         .await
         .unwrap()
         .id
@@ -126,7 +125,7 @@ async fn test_get_by_id_not_found() {
 async fn test_delete_subnet_success() {
     let (repo, _pool) = repo().await;
     let id = repo
-        .create("192.168.1.0/24".to_string(), 1, None)
+        .create(net("192.168.1.0/24"), 1, None)
         .await
         .unwrap()
         .id
@@ -152,23 +151,19 @@ async fn test_delete_subnet_not_found() {
 #[tokio::test]
 async fn test_exists() {
     let (repo, _pool) = repo().await;
-    repo.create("192.168.1.0/24".to_string(), 1, None)
-        .await
-        .unwrap();
+    repo.create(net("192.168.1.0/24"), 1, None).await.unwrap();
 
-    assert!(repo.exists("192.168.1.0/24").await.unwrap());
-    assert!(!repo.exists("192.168.2.0/24").await.unwrap());
+    assert!(repo.exists(net("192.168.1.0/24")).await.unwrap());
+    assert!(!repo.exists(net("192.168.2.0/24")).await.unwrap());
 }
 
 #[tokio::test]
 async fn test_delete_cascades_on_group_deletion() {
     let (repo, pool) = repo().await;
-    repo.create("192.168.1.0/24".to_string(), GUEST, None)
+    repo.create(net("192.168.1.0/24"), GUEST, None)
         .await
         .unwrap();
-    repo.create("10.0.0.0/8".to_string(), 1, None)
-        .await
-        .unwrap();
+    repo.create(net("10.0.0.0/8"), 1, None).await.unwrap();
 
     sqlx::query("DELETE FROM groups WHERE id = ?")
         .bind(GUEST)

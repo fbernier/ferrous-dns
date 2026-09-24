@@ -56,11 +56,7 @@ impl ManagedDomainResponse {
 
 /// Parses a request `action` field shared by managed domains and regex filters.
 pub fn parse_action(value: &str) -> Result<DomainAction, DomainError> {
-    value.parse().map_err(|()| {
-        DomainError::InvalidInput(format!(
-            "Invalid action '{value}': must be 'allow' or 'deny'"
-        ))
-    })
+    value.parse()
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]

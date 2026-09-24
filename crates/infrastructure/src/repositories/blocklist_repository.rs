@@ -1,9 +1,8 @@
 use super::db_err;
 use async_trait::async_trait;
 use ferrous_dns_application::ports::BlocklistRepository;
-use ferrous_dns_domain::{blocklist::BlockedDomain, DomainError};
+use ferrous_dns_domain::{BlockedDomain, DomainError};
 use sqlx::SqlitePool;
-use tracing::debug;
 
 type DomainRow = (i64, String, Option<String>);
 
@@ -20,10 +19,6 @@ pub struct SqliteBlocklistRepository {
 }
 
 impl SqliteBlocklistRepository {
-    pub async fn load(pool: SqlitePool) -> Result<Self, DomainError> {
-        Ok(Self::new(pool))
-    }
-
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
@@ -31,16 +26,6 @@ impl SqliteBlocklistRepository {
 
 #[async_trait]
 impl BlocklistRepository for SqliteBlocklistRepository {
-    async fn get_all(&self) -> Result<Vec<BlockedDomain>, DomainError> {
-        let rows = sqlx::query_as::<_, DomainRow>(
-            "SELECT id, domain, datetime(added_at) AS added_at FROM blocklist ORDER BY added_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err("Failed to fetch blocklist"))?;
-        Ok(rows.into_iter().map(to_domain).collect())
-    }
-
     async fn get_all_paged(
         &self,
         limit: u32,
@@ -62,33 +47,5 @@ impl BlocklistRepository for SqliteBlocklistRepository {
         .map_err(db_err("Failed to fetch blocklist page"))?;
 
         Ok((rows.into_iter().map(to_domain).collect(), total as u64))
-    }
-
-    async fn add_domain(&self, domain: &BlockedDomain) -> Result<(), DomainError> {
-        sqlx::query("INSERT INTO blocklist (domain) VALUES (?)")
-            .bind(&domain.domain)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err("Failed to add blocklist domain"))?;
-        debug!(domain = %domain.domain, "Domain added to blocklist");
-        Ok(())
-    }
-
-    async fn remove_domain(&self, domain: &str) -> Result<(), DomainError> {
-        sqlx::query("DELETE FROM blocklist WHERE domain = ?")
-            .bind(domain)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err("Failed to remove blocklist domain"))?;
-        debug!(domain = %domain, "Domain removed from blocklist");
-        Ok(())
-    }
-
-    async fn is_blocked(&self, domain: &str) -> Result<bool, DomainError> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blocklist WHERE domain = ?)")
-            .bind(domain)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err("Failed to query blocklist domain"))
     }
 }

@@ -293,6 +293,17 @@ impl ClientRepository for SqliteClientRepository {
     }
 
     #[instrument(skip(self))]
+    async fn get_by_ip(&self, ip_address: IpAddr) -> Result<Option<Client>, DomainError> {
+        let row = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_BY_IP)
+            .bind(ip_address.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err("Failed to fetch client by ip"))?;
+
+        Ok(row.and_then(row_to_client))
+    }
+
+    #[instrument(skip(self))]
     async fn assign_group(&self, client_id: i64, group_id: i64) -> Result<(), DomainError> {
         let result = sqlx::query(
             "UPDATE clients SET group_id = ?, updated_at = ?

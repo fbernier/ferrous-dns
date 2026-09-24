@@ -83,6 +83,8 @@ Errors return an appropriate HTTP status code with:
 }
 ```
 
+Validation failures (a malformed name, URL, comment, CIDR, regex, action, etc.) return `400 Bad Request`. Creating or renaming something to a name that is already taken returns `409 Conflict`, as does deleting a group that rules or regex filters still reference. Length limits count characters, not bytes.
+
 ---
 
 ## Health & System
@@ -698,6 +700,8 @@ POST /api/client-subnets
 }
 ```
 
+The subnet is stored in canonical form: host bits are cleared and IPv6 is lowercased and compressed, so `192.168.1.5/24` is stored as `192.168.1.0/24` and conflicts with an existing `192.168.1.0/24` (`409`).
+
 ### Delete Subnet
 
 ```http
@@ -723,9 +727,12 @@ POST /api/groups
 ```json
 {
   "name": "Kids",
-  "description": "Children's devices"
+  "comment": "Children's devices",
+  "enabled": true
 }
 ```
+
+`enabled` is optional and defaults to `true`; a group created with `"enabled": false` starts disabled.
 
 ### Get Group
 
@@ -744,6 +751,8 @@ PUT /api/groups/{id}
 ```http
 DELETE /api/groups/{id}
 ```
+
+Returns `409` if the group still has assigned clients, or if managed domains or regex filters still reference it. Blocklist and allowlist memberships, blocked services and schedule assignments are removed with the group; query-log entries keep their data but lose the group attribution.
 
 ### Get Group Clients
 
@@ -1188,8 +1197,8 @@ Several of these are mirrored under `/api/stats/database/*` for Pi-hole clients.
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET` | `/api/dns/blocking` | Current blocking status |
-| `POST` | `/api/dns/blocking` | Enable/disable blocking (optional `timer`) |
+| `GET` | `/api/dns/blocking` | Current blocking status (`timer`: seconds left, or `null`) |
+| `POST` | `/api/dns/blocking` | Set blocking (optional `timer`: flip back after N seconds) |
 
 **Domains (CRUD)**
 
@@ -1207,12 +1216,12 @@ Several of these are mirrored under `/api/stats/database/*` for Pi-hole clients.
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET` | `/api/lists` | List adlists |
-| `POST` | `/api/lists` | Create an adlist |
-| `GET` | `/api/lists/{id}` | Get an adlist |
-| `PUT` | `/api/lists/{id}` | Update an adlist |
-| `DELETE` | `/api/lists/{id}` | Delete an adlist |
-| `POST` | `/api/lists:batchDelete` | Batch delete |
+| `GET` | `/api/lists` | List adlists (optional `?type=allow\|block`) |
+| `POST` | `/api/lists?type=allow\|block` | Create an adlist |
+| `GET` | `/api/lists/{list}` | Lists with this address or id (optional `?type=`) |
+| `PUT` | `/api/lists/{list}?type=allow\|block` | Update an adlist |
+| `DELETE` | `/api/lists/{list}?type=allow\|block` | Delete an adlist |
+| `POST` | `/api/lists:batchDelete` | Batch delete (`[{item, type}]`) |
 
 **Groups (CRUD)**
 

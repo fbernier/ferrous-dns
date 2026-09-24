@@ -182,6 +182,16 @@ impl ClientRepository for MockClientRepository {
         Ok(self.clients.read().await.get(&id).cloned())
     }
 
+    async fn get_by_ip(&self, ip_address: IpAddr) -> Result<Option<Client>, DomainError> {
+        Ok(self
+            .clients
+            .read()
+            .await
+            .values()
+            .find(|c| c.ip_address == ip_address)
+            .cloned())
+    }
+
     async fn assign_group(&self, client_id: i64, group_id: i64) -> Result<(), DomainError> {
         let mut clients = self.clients.write().await;
         let c = clients

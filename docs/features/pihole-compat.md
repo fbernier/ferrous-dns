@@ -62,7 +62,7 @@ Pi-hole action endpoints. All paths below are served under `/api/*` when
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET` | `/api/stats/summary` | Dashboard summary (queries, blocked, percentage, clients) |
+| `GET` | `/api/stats/summary` | Dashboard summary (queries, blocked, percentage, clients); `forwarded` counts only upstream answers — cache hits and local DNS records are excluded |
 | `GET` | `/api/stats/history` | Query history timeline for charts |
 | `GET` | `/api/stats/top_blocked` | Top blocked domains |
 | `GET` | `/api/stats/top_clients` | Top querying clients |
@@ -89,8 +89,10 @@ Pi-hole action endpoints. All paths below are served under `/api/*` when
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET` | `/api/dns/blocking` | Current blocking status |
-| `POST` | `/api/dns/blocking` | Enable/disable blocking (optional `timer` to auto re-enable) |
+| `GET` | `/api/dns/blocking` | Current blocking status; `timer` is the seconds left on a pending timer, `null` when none |
+| `POST` | `/api/dns/blocking` | Set blocking: `{"blocking": false, "timer": 300}` — with a `timer` the mode flips back when it elapses |
+
+As on Pi-hole, the timer works both ways: `{"blocking": true, "timer": N}` enables blocking now and disables it after `N` seconds. Every `POST` replaces the pending timer, so one without `timer` cancels it. The timer lives in memory and does not survive a restart.
 
 ### Domains (CRUD)
 
@@ -108,12 +110,17 @@ Pi-hole action endpoints. All paths below are served under `/api/*` when
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET` | `/api/lists` | List all adlists |
-| `POST` | `/api/lists` | Create an adlist |
-| `GET` | `/api/lists/{id}` | Get an adlist by id |
-| `PUT` | `/api/lists/{id}` | Update an adlist |
-| `DELETE` | `/api/lists/{id}` | Delete an adlist |
-| `POST` | `/api/lists:batchDelete` | Batch delete adlists |
+| `GET` | `/api/lists` | List all adlists (optional `?type=allow\|block`) |
+| `POST` | `/api/lists?type=allow\|block` | Create an adlist |
+| `GET` | `/api/lists/{list}` | Lists with this address (optional `?type=allow\|block`) |
+| `PUT` | `/api/lists/{list}?type=allow\|block` | Update an adlist (`comment`, `groups`, `enabled`) |
+| `DELETE` | `/api/lists/{list}?type=allow\|block` | Delete an adlist |
+| `POST` | `/api/lists:batchDelete` | Batch delete: `[{"item": "<address>", "type": "block"}]` |
+
+As in Pi-hole v6, `{list}` is the list's URL-encoded address, and `type` says which table it lives in: blocklists and allowlists are stored separately, so the same address — or the same numeric id, which `{list}` also accepts — can name one of each. `POST`, `PUT`, `DELETE` and every `batchDelete` item require `type`; a missing or unknown type is rejected with `400` and changes nothing. `GET /api/lists/{list}` without `type` returns the matches of both types. Each list in a reply carries `"type": "allow"` or `"type": "block"`, and `GET`/`PUT` on `/api/lists/{list}` reply with `{"lists": [...]}`.
+
+!!! warning "Changed in v0.9.19"
+    Earlier versions ignored the list type on `/api/lists/{id}`, so an allowlist whose id matched a blocklist could not be read, updated or deleted — the request hit the blocklist instead. `type` in replies was `0`/`1` and is now `"block"`/`"allow"`; the type moved from the `POST` body to `?type=`; `PUT` no longer renames a list; and `batchDelete` takes Pi-hole's `[{item, type}]` array instead of `{"items": [...]}`.
 
 ### Groups (CRUD)
 

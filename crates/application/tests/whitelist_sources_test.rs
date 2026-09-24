@@ -110,7 +110,10 @@ async fn test_create_success() {
 async fn test_create_with_multiple_groups() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
     let use_case = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo);
 
     let result = use_case
@@ -224,28 +227,6 @@ async fn test_create_one_invalid_group_in_multi_group_fails() {
 }
 
 #[tokio::test]
-async fn test_create_duplicate_name() {
-    let repo = Arc::new(MockWhitelistSourceRepository::new());
-    let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo, group_repo);
-
-    use_case
-        .execute("Duplicate".to_string(), None, vec![1], None, true)
-        .await
-        .unwrap();
-
-    let result = use_case
-        .execute("Duplicate".to_string(), None, vec![1], None, true)
-        .await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        DomainError::InvalidWhitelistSource(_) => {}
-        other => panic!("Expected InvalidWhitelistSource, got {:?}", other),
-    }
-}
-
-#[tokio::test]
 async fn test_update_toggle_enabled() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
@@ -270,7 +251,10 @@ async fn test_update_toggle_enabled() {
 async fn test_update_change_groups() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
 
     let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo.clone());
     let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo);
@@ -299,7 +283,10 @@ async fn test_update_change_groups() {
 async fn test_update_assign_multiple_groups() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
 
     let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo.clone());
     let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo);

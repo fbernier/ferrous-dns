@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use ferrous_dns_domain::{ClientSubnet, DomainError};
+use ipnetwork::IpNetwork;
 
 #[async_trait]
 pub trait ClientSubnetRepository: Send + Sync {
+    /// `network` must be canonical (as returned by `ClientSubnet::parse_cidr`).
     async fn create(
         &self,
-        subnet_cidr: String,
+        network: IpNetwork,
         group_id: i64,
         comment: Option<String>,
     ) -> Result<ClientSubnet, DomainError>;
@@ -16,5 +18,5 @@ pub trait ClientSubnetRepository: Send + Sync {
 
     async fn delete(&self, id: i64) -> Result<(), DomainError>;
 
-    async fn exists(&self, subnet_cidr: &str) -> Result<bool, DomainError>;
+    async fn exists(&self, network: IpNetwork) -> Result<bool, DomainError>;
 }

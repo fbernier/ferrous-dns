@@ -42,10 +42,11 @@ fn client_to_entry(c: &Client) -> Result<PiholeClientEntry, DomainError> {
 async fn find_client_id(state: &PiholeAppState, client: &str) -> Result<i64, DomainError> {
     let not_found = || DomainError::ClientNotFound(format!("Client {client} not found"));
     let ip: IpAddr = client.parse().map_err(|_| not_found())?;
-    let clients = state.clients.get_clients.get_all(1000, 0).await?;
-    let found = clients
-        .iter()
-        .find(|c| c.ip_address == ip)
+    let found = state
+        .clients
+        .get_clients
+        .get_by_ip(ip)
+        .await?
         .ok_or_else(not_found)?;
     require_id(found.id, "client")
 }
@@ -202,13 +203,12 @@ pub async fn batch_delete(
     State(state): State<PiholeAppState>,
     Json(body): Json<BatchDeleteRequest>,
 ) -> Result<StatusCode, PiholeApiError> {
-    let clients = state.clients.get_clients.get_all(1000, 0).await?;
     for ip in body
         .items
         .iter()
         .filter_map(|item| item.parse::<IpAddr>().ok())
     {
-        if let Some(c) = clients.iter().find(|c| c.ip_address == ip) {
+        if let Some(c) = state.clients.get_clients.get_by_ip(ip).await? {
             state
                 .clients
                 .delete_client

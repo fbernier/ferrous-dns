@@ -76,8 +76,14 @@ pub struct PiholeBlockingState {
     pub create_regex_filter: Arc<CreateRegexFilterUseCase>,
     pub update_regex_filter: Arc<UpdateRegexFilterUseCase>,
     pub delete_regex_filter: Arc<DeleteRegexFilterUseCase>,
-    /// Blocking pause timer handle — only one active at a time per instance.
-    pub blocking_timer: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Blocking-mode flip scheduled by `POST /dns/blocking {timer}`; at most one per instance.
+    pub blocking_timer: Arc<tokio::sync::Mutex<Option<BlockingTimer>>>,
+}
+
+/// A pending revert of the blocking mode, due at `deadline`.
+pub struct BlockingTimer {
+    pub deadline: tokio::time::Instant,
+    pub task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]

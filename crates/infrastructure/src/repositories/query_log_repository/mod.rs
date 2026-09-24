@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use ferrous_dns_application::ports::{
     PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
 };
-use ferrous_dns_domain::query_log::{DnssecStats, QueryLogFilter};
+use ferrous_dns_domain::entities::query_log::{DnssecStats, QueryLogFilter};
 use ferrous_dns_domain::{config::DatabaseConfig, DomainError, QueryLog, QueryStats};
 use reader::DomainVerdict;
 use sqlx::SqlitePool;

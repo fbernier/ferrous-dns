@@ -1,6 +1,5 @@
 use ferrous_dns_domain::{DomainAction, ManagedDomain};
 use std::str::FromStr;
-use std::sync::Arc;
 
 #[test]
 fn test_validate_name_valid() {
@@ -75,29 +74,6 @@ fn test_validate_domain_wildcard_invalid() {
     assert!(ManagedDomain::validate_domain("x.*.com").is_err());
     assert!(ManagedDomain::validate_domain("x.com*").is_err());
     assert!(ManagedDomain::validate_domain("*").is_err());
-}
-
-#[test]
-fn test_validate_comment_valid() {
-    let comment = Some(Arc::from("A valid comment"));
-    assert!(ManagedDomain::validate_comment(&comment).is_ok());
-}
-
-#[test]
-fn test_validate_comment_none() {
-    assert!(ManagedDomain::validate_comment(&None).is_ok());
-}
-
-#[test]
-fn test_validate_comment_too_long() {
-    let long_comment = Some(Arc::from("a".repeat(501).as_str()));
-    assert!(ManagedDomain::validate_comment(&long_comment).is_err());
-}
-
-#[test]
-fn test_validate_comment_exactly_500_chars() {
-    let comment = Some(Arc::from("a".repeat(500).as_str()));
-    assert!(ManagedDomain::validate_comment(&comment).is_ok());
 }
 
 #[test]

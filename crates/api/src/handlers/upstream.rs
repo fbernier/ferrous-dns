@@ -1,7 +1,7 @@
 use axum::{extract::State, Json};
 use std::collections::HashMap;
 
-use crate::dto::upstream::{upstream_status_str, UpstreamGroupResponse};
+use crate::dto::upstream::UpstreamGroupResponse;
 use crate::state::AppState;
 
 #[utoipa::path(
@@ -22,7 +22,7 @@ pub async fn get_upstream_health(
             .upstream_health
             .get_all_upstream_status()
             .into_iter()
-            .map(|(server, status)| (server, upstream_status_str(status)))
+            .map(|(server, status)| (server, status.as_str()))
             .collect(),
     )
 }

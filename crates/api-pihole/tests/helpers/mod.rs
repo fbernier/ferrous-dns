@@ -370,13 +370,16 @@ async fn build_pihole_state(
             create_blocklist_source: Arc::new(CreateBlocklistSourceUseCase::new(
                 blocklist_source_repo.clone(),
                 group_repo.clone(),
+                block_filter_engine.clone(),
             )),
             update_blocklist_source: Arc::new(UpdateBlocklistSourceUseCase::new(
                 blocklist_source_repo.clone(),
                 group_repo.clone(),
+                block_filter_engine.clone(),
             )),
             delete_blocklist_source: Arc::new(DeleteBlocklistSourceUseCase::new(
                 blocklist_source_repo,
+                block_filter_engine.clone(),
             )),
             get_whitelist_sources: Arc::new(GetWhitelistSourcesUseCase::new(
                 whitelist_source_repo.clone(),
@@ -404,9 +407,17 @@ async fn build_pihole_state(
             create_manual_client: Arc::new(CreateManualClientUseCase::new(
                 client_repo.clone(),
                 group_repo.clone(),
+                block_filter_engine.clone(),
             )),
-            update_client: Arc::new(UpdateClientUseCase::new(client_repo.clone())),
-            delete_client: Arc::new(DeleteClientUseCase::new(client_repo)),
+            update_client: Arc::new(UpdateClientUseCase::new(
+                client_repo.clone(),
+                group_repo.clone(),
+                block_filter_engine.clone(),
+            )),
+            delete_client: Arc::new(DeleteClientUseCase::new(
+                client_repo,
+                block_filter_engine.clone(),
+            )),
         },
         system: PiholeSystemState {
             cleanup_query_logs: Arc::new(CleanupOldQueryLogsUseCase::new(query_log_repo)),
@@ -470,6 +481,20 @@ pub async fn insert_upstream_query(
     .execute(pool)
     .await
     .expect("Failed to insert query log entry");
+
+    rebuild_rollups(pool).await;
+}
+
+/// Inserts an allowed query answered from a local DNS record.
+pub async fn insert_local_dns_query(pool: &sqlx::SqlitePool, domain: &str) {
+    sqlx::query(
+        "INSERT INTO query_log (domain, record_type, client_ip, blocked, response_time_ms, cache_hit, query_source, response_status)
+         VALUES (?, 'A', '10.0.0.1', 0, 1, 0, 'client', 'LOCAL_DNS')",
+    )
+    .bind(domain)
+    .execute(pool)
+    .await
+    .expect("Failed to insert local DNS query");
 
     rebuild_rollups(pool).await;
 }

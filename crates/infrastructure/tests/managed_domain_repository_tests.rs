@@ -1,7 +1,7 @@
 #[path = "support/db.rs"]
 mod db;
 
-use ferrous_dns_application::ports::ManagedDomainRepository;
+use ferrous_dns_application::ports::{ManagedDomainRepository, ManagedDomainUpdate};
 use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain};
 use ferrous_dns_infrastructure::repositories::managed_domain_repository::SqliteManagedDomainRepository;
 use sqlx::SqlitePool;
@@ -90,7 +90,7 @@ async fn test_create_duplicate_name_fails() {
         .await;
 
     assert!(
-        matches!(result, Err(DomainError::InvalidManagedDomain(_))),
+        matches!(result, Err(DomainError::AlreadyExists(_))),
         "got {result:?}"
     );
 }
@@ -175,12 +175,10 @@ async fn test_update_name_keeps_other_fields() {
     let updated = repo
         .update(
             id,
-            Some("New Name".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
+            ManagedDomainUpdate {
+                name: Some("New Name".to_string()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -202,12 +200,11 @@ async fn test_update_action_and_enabled() {
 
     repo.update(
         id,
-        None,
-        None,
-        Some(DomainAction::Allow),
-        None,
-        None,
-        Some(false),
+        ManagedDomainUpdate {
+            action: Some(DomainAction::Allow),
+            enabled: Some(false),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -222,7 +219,13 @@ async fn test_update_not_found() {
     let (repo, _pool) = repo().await;
 
     let result = repo
-        .update(999, Some("New".to_string()), None, None, None, None, None)
+        .update(
+            999,
+            ManagedDomainUpdate {
+                name: Some("New".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
 
     assert!(
@@ -240,7 +243,13 @@ async fn test_update_to_missing_group_returns_group_not_found() {
         .unwrap();
 
     let result = repo
-        .update(id, None, None, None, Some(999), None, None)
+        .update(
+            id,
+            ManagedDomainUpdate {
+                group_id: Some(999),
+                ..Default::default()
+            },
+        )
         .await;
 
     assert!(

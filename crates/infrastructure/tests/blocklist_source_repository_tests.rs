@@ -93,12 +93,10 @@ async fn test_create_unique_name_constraint() {
         .create("Duplicate Name".to_string(), None, vec![1], None, false)
         .await;
 
-    match result {
-        Err(DomainError::InvalidBlocklistSource(msg)) => {
-            assert_eq!(msg, "Blocklist source 'Duplicate Name' already exists")
-        }
-        other => panic!("expected InvalidBlocklistSource, got {other:?}"),
-    }
+    assert!(
+        matches!(result, Err(DomainError::AlreadyExists(_))),
+        "got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -350,15 +348,13 @@ async fn test_update_rename_to_existing_name() {
         .id
         .unwrap();
 
-    match repo
+    let result = repo
         .update(id, Some("Taken".to_string()), None, None, None, None)
-        .await
-    {
-        Err(DomainError::InvalidBlocklistSource(msg)) => {
-            assert_eq!(msg, "Blocklist source 'Taken' already exists")
-        }
-        other => panic!("expected InvalidBlocklistSource, got {other:?}"),
-    }
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::AlreadyExists(_))),
+        "got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -485,23 +481,24 @@ async fn test_delete_not_found() {
     ));
 }
 
-/// The legacy `group_id` column is `ON DELETE RESTRICT` in the production schema.
 #[tokio::test]
-async fn test_fk_group_restricts_delete() {
+async fn test_deleting_a_sources_first_group_only_drops_that_membership() {
     let pool = db::migrated_pool().await;
     add_group(&pool, 2, "Office").await;
+    add_group(&pool, 3, "Kids").await;
     let repo = SqliteBlocklistSourceRepository::new(pool.clone());
-
-    repo.create("FK Test List".to_string(), None, vec![2], None, true)
+    let id = repo
+        .create("FK Test List".to_string(), None, vec![2, 3], None, true)
         .await
+        .unwrap()
+        .id
         .unwrap();
 
-    let result = sqlx::query("DELETE FROM groups WHERE id = 2")
+    sqlx::query("DELETE FROM groups WHERE id = 2")
         .execute(&pool)
-        .await;
+        .await
+        .expect("group membership lives in the pivot, which cascades");
 
-    assert!(
-        result.is_err(),
-        "FK constraint should prevent group deletion"
-    );
+    let source = repo.get_by_id(id).await.unwrap().unwrap();
+    assert_eq!(source.group_ids, vec![3]);
 }

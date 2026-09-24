@@ -1,8 +1,8 @@
-use super::stubs::{NullConfigFilePersistence, NullConfigRepository};
+use super::stubs::{NullBlockFilterEngine, NullConfigFilePersistence, NullConfigRepository};
 use ferrous_dns_api::BackupUseCases;
 use ferrous_dns_application::ports::{
-    BlocklistSourceCreator, BlocklistSourceRepository, GroupCreator, GroupRepository,
-    LocalRecordCreator,
+    BlockFilterEnginePort, BlocklistSourceCreator, BlocklistSourceRepository, GroupCreator,
+    GroupRepository, LocalRecordCreator,
 };
 use ferrous_dns_application::use_cases::{
     CreateBlocklistSourceUseCase, CreateGroupUseCase, CreateLocalRecordUseCase,
@@ -16,7 +16,12 @@ struct NullGroupRepository;
 
 #[async_trait::async_trait]
 impl GroupRepository for NullGroupRepository {
-    async fn create(&self, _name: String, _comment: Option<String>) -> Result<Group, DomainError> {
+    async fn create(
+        &self,
+        _name: String,
+        _comment: Option<String>,
+        _enabled: bool,
+    ) -> Result<Group, DomainError> {
         Err(DomainError::IoError("test stub".to_string()))
     }
     async fn get_by_id(&self, _id: i64) -> Result<Option<Group>, DomainError> {
@@ -92,11 +97,15 @@ pub fn build_test_backup_use_cases(config: Arc<RwLock<Config>>) -> BackupUseCase
     let blocklist_source_repo: Arc<dyn BlocklistSourceRepository> =
         Arc::new(NullBlocklistSourceRepository);
 
+    let engine: Arc<dyn BlockFilterEnginePort> = Arc::new(NullBlockFilterEngine);
     let group_creator: Arc<dyn GroupCreator> =
         Arc::new(CreateGroupUseCase::new(group_repo.clone()));
-    let blocklist_source_creator: Arc<dyn BlocklistSourceCreator> = Arc::new(
-        CreateBlocklistSourceUseCase::new(blocklist_source_repo.clone(), group_repo.clone()),
-    );
+    let blocklist_source_creator: Arc<dyn BlocklistSourceCreator> =
+        Arc::new(CreateBlocklistSourceUseCase::new(
+            blocklist_source_repo.clone(),
+            group_repo.clone(),
+            engine.clone(),
+        ));
     let local_record_creator: Arc<dyn LocalRecordCreator> = Arc::new(
         CreateLocalRecordUseCase::new(config.clone(), Arc::new(NullConfigRepository)),
     );
@@ -114,6 +123,7 @@ pub fn build_test_backup_use_cases(config: Arc<RwLock<Config>>) -> BackupUseCase
             group_creator,
             blocklist_source_creator,
             local_record_creator,
+            engine,
         )),
     }
 }

@@ -25,7 +25,6 @@ use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
 use tracing::{debug, error, instrument, warn};
 
-use crate::dto::upstream::ip_family_str;
 use crate::state::AppState;
 
 /// Rolling window (hours) for the query-log–derived gauges. Matches the
@@ -172,7 +171,7 @@ pub fn render_metrics(
                 pool: group.pool_name.clone(),
                 server: group.address.clone(),
                 address: ep.address.clone(),
-                family: ip_family_str(ep.family).to_string(),
+                family: ep.family.as_str().to_string(),
             };
             if let Some(up) = endpoint_up(ep.status) {
                 upstream_up.get_or_create(&labels).set(up);

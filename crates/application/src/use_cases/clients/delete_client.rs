@@ -6,20 +6,18 @@ use crate::ports::{BlockFilterEnginePort, ClientRepository};
 
 pub struct DeleteClientUseCase {
     client_repo: Arc<dyn ClientRepository>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl DeleteClientUseCase {
-    pub fn new(client_repo: Arc<dyn ClientRepository>) -> Self {
+    pub fn new(
+        client_repo: Arc<dyn ClientRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
+    ) -> Self {
         Self {
             client_repo,
-            block_filter_engine: None,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
     }
 
     #[instrument(skip(self))]
@@ -41,10 +39,8 @@ impl DeleteClientUseCase {
         );
 
         if had_group {
-            if let Some(ref engine) = self.block_filter_engine {
-                if let Err(e) = engine.load_client_groups().await {
-                    error!(error = %e, "Failed to reload client groups after client deletion");
-                }
+            if let Err(e) = self.block_filter_engine.load_client_groups().await {
+                error!(error = %e, "Failed to reload client groups after client deletion");
             }
         }
 

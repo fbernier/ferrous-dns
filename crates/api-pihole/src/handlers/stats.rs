@@ -78,7 +78,8 @@ pub async fn get_summary(
     };
 
     let cache_hits = stats.source_stats.get("cache").copied().unwrap_or(0);
-    let forwarded = total.saturating_sub(blocked).saturating_sub(cache_hits);
+    // Only upstream answers are forwarded; local records and failures are not.
+    let forwarded = forwarded_count(&stats.source_stats);
 
     let query_types: HashMap<String, u64> = stats
         .queries_by_type
@@ -420,4 +421,12 @@ pub async fn get_recent_blocked(
 /// (`cache`, `local_dns`, block sources) never contain a colon.
 fn is_upstream_key(key: &str) -> bool {
     key.contains(':')
+}
+
+fn forwarded_count(source_stats: &HashMap<String, u64>) -> u64 {
+    source_stats
+        .iter()
+        .filter(|(key, _)| is_upstream_key(key))
+        .map(|(_, count)| count)
+        .sum()
 }

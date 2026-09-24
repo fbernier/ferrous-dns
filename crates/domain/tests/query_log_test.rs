@@ -64,3 +64,43 @@ fn test_query_stats_single_type() {
     assert_eq!(stats.most_queried_type, Some(RecordType::A));
     assert_eq!(stats.record_type_distribution, vec![(RecordType::A, 100.0)]);
 }
+
+#[test]
+fn test_ties_rank_by_type_name_regardless_of_map_order() {
+    // Each HashMap gets a fresh random seed, so repeating exposes any
+    // dependence on iteration order.
+    for _ in 0..32 {
+        let queries_by_type: HashMap<RecordType, u64> = [
+            (RecordType::TXT, 10),
+            (RecordType::MX, 10),
+            (RecordType::AAAA, 10),
+            (RecordType::NS, 10),
+            (RecordType::A, 10),
+            (RecordType::SRV, 3),
+        ]
+        .into_iter()
+        .collect();
+
+        let stats = QueryStats::default().with_analytics(queries_by_type);
+
+        assert_eq!(stats.most_queried_type, Some(RecordType::A));
+        let order: Vec<RecordType> = stats.top_types(6).into_iter().map(|(rt, _)| rt).collect();
+        assert_eq!(
+            order,
+            vec![
+                RecordType::A,
+                RecordType::AAAA,
+                RecordType::MX,
+                RecordType::NS,
+                RecordType::TXT,
+                RecordType::SRV,
+            ]
+        );
+        let distribution: Vec<RecordType> = stats
+            .record_type_distribution
+            .iter()
+            .map(|(rt, _)| *rt)
+            .collect();
+        assert_eq!(distribution, order);
+    }
+}

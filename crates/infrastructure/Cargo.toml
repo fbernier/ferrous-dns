@@ -18,6 +18,7 @@ fuzzing = []
 [dependencies]
 ferrous-dns-domain.workspace = true
 ferrous-dns-application.workspace = true
+ipnetwork = "0.21"
 tokio.workspace = true
 async-trait.workspace = true
 sqlx.workspace = true

@@ -66,8 +66,8 @@ impl Repositories {
         db_config: &DatabaseConfig,
         blocking_enabled: bool,
     ) -> Result<Self, ferrous_dns_domain::DomainError> {
-        let blocklist = SqliteBlocklistRepository::load(write_pool.clone()).await?;
-        let whitelist = SqliteWhitelistRepository::load(write_pool.clone()).await?;
+        let blocklist = SqliteBlocklistRepository::new(write_pool.clone());
+        let whitelist = SqliteWhitelistRepository::new(write_pool.clone());
 
         let default_group_id: i64 =
             match sqlx::query("SELECT id FROM groups WHERE is_default = 1 LIMIT 1")
@@ -92,7 +92,7 @@ impl Repositories {
         )
         .await?;
 
-        let composite = CompositeServiceCatalog::new(ServiceCatalog::load());
+        let composite = CompositeServiceCatalog::new(ServiceCatalog::load()?);
         let service_catalog: Arc<dyn ServiceCatalogPort> = Arc::new(composite);
 
         let custom_service = Arc::new(SqliteCustomServiceRepository::new(write_pool.clone()));

@@ -1,4 +1,5 @@
 use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::{validate_comment, validate_url};
 use ferrous_dns_domain::{DomainError, WhitelistSource};
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -29,11 +30,8 @@ impl CreateWhitelistSourceUseCase {
     ) -> Result<WhitelistSource, DomainError> {
         WhitelistSource::validate_name(&name).map_err(DomainError::InvalidWhitelistSource)?;
 
-        WhitelistSource::validate_url(&url.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidWhitelistSource)?;
-
-        WhitelistSource::validate_comment(&comment.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidWhitelistSource)?;
+        validate_url(url.as_deref()).map_err(DomainError::InvalidWhitelistSource)?;
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidWhitelistSource)?;
 
         for &gid in &group_ids {
             require_group(self.group_repo.as_ref(), gid).await?;

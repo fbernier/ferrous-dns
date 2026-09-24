@@ -63,7 +63,6 @@ fn pihole_status_and_key(err: &DomainError) -> (StatusCode, &'static str) {
         | DomainError::InvalidCidr(_)
         | DomainError::InvalidSafeSearchEngine(_)
         | DomainError::InvalidTimeSlot(_)
-        | DomainError::InvalidTimezone(_)
         | DomainError::InvalidScheduleProfile(_)
         | DomainError::ProtectedGroupCannotBeDisabled
         | DomainError::ProtectedGroupCannotBeDeleted
@@ -71,9 +70,8 @@ fn pihole_status_and_key(err: &DomainError) -> (StatusCode, &'static str) {
         | DomainError::InvalidWhitelistSource(_)
         | DomainError::InvalidManagedDomain(_)
         | DomainError::InvalidRegexFilter(_)
-        | DomainError::InvalidGroupName(_) => (StatusCode::UNPROCESSABLE_ENTITY, "bad_request"),
-
-        DomainError::InvalidInput(_)
+        | DomainError::InvalidGroupName(_)
+        | DomainError::InvalidInput(_)
         | DomainError::InvalidUsername(_)
         | DomainError::InvalidPassword(_)
         | DomainError::MfaNotConfigured
@@ -88,19 +86,17 @@ fn pihole_status_and_key(err: &DomainError) -> (StatusCode, &'static str) {
         | DomainError::DuplicateApiTokenName(_)
         | DomainError::DuplicateUsername(_)
         | DomainError::PasswordAlreadyConfigured
-        | DomainError::MfaAlreadyEnabled => (StatusCode::CONFLICT, "already_exists"),
+        | DomainError::MfaAlreadyEnabled
+        | DomainError::AlreadyExists(_)
+        | DomainError::GroupInUse(_) => (StatusCode::CONFLICT, "already_exists"),
 
         DomainError::AuthRequired
         | DomainError::SessionNotFound
         | DomainError::InvalidCredentials
         | DomainError::InvalidMfaCode
-        | DomainError::PasswordNotConfigured
-        | DomainError::MfaRequired
         | DomainError::MfaChallengeExpired => (StatusCode::UNAUTHORIZED, "unauthorized"),
 
-        DomainError::InsufficientPermissions | DomainError::ProtectedUser => {
-            (StatusCode::FORBIDDEN, "forbidden")
-        }
+        DomainError::ProtectedUser => (StatusCode::FORBIDDEN, "forbidden"),
 
         DomainError::RateLimited
         | DomainError::DnsRateLimited

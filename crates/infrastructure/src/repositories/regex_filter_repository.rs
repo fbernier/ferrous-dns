@@ -1,7 +1,7 @@
 use crate::repositories::{db_err, is_fk_violation, is_unique_violation, parse_db_action, sql_now};
 use async_trait::async_trait;
 use fancy_regex::Regex;
-use ferrous_dns_application::ports::RegexFilterRepository;
+use ferrous_dns_application::ports::{RegexFilterRepository, RegexFilterUpdate};
 use ferrous_dns_domain::{DomainAction, DomainError, RegexFilter};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -83,7 +83,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                DomainError::InvalidRegexFilter(format!("Regex filter '{name}' already exists"))
+                DomainError::AlreadyExists(format!("Regex filter '{name}' already exists"))
             } else if is_fk_violation(&e) {
                 DomainError::GroupNotFound(group_id)
             } else {
@@ -122,16 +122,15 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
     }
 
     #[instrument(skip(self))]
-    async fn update(
-        &self,
-        id: i64,
-        name: Option<String>,
-        pattern: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
-    ) -> Result<RegexFilter, DomainError> {
+    async fn update(&self, id: i64, update: RegexFilterUpdate) -> Result<RegexFilter, DomainError> {
+        let RegexFilterUpdate {
+            name,
+            pattern,
+            action,
+            group_id,
+            comment,
+            enabled,
+        } = update;
         if let Some(p) = &pattern {
             Self::validate_regex_syntax(p)?;
         }
@@ -160,7 +159,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                DomainError::InvalidRegexFilter(format!(
+                DomainError::AlreadyExists(format!(
                     "Regex filter '{}' already exists",
                     name.as_deref().unwrap_or_default()
                 ))

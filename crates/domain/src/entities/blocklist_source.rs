@@ -19,12 +19,4 @@ impl BlocklistSource {
     pub fn validate_name(name: &str) -> Result<(), String> {
         validators::validate_source_name(name, "Blocklist source")
     }
-
-    pub fn validate_url(url: &Option<Arc<str>>) -> Result<(), String> {
-        validators::validate_url(url)
-    }
-
-    pub fn validate_comment(comment: &Option<Arc<str>>) -> Result<(), String> {
-        validators::validate_comment(comment)
-    }
 }

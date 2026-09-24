@@ -1,4 +1,5 @@
 use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::validate_comment;
 use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -36,8 +37,7 @@ impl CreateManagedDomainUseCase {
     ) -> Result<ManagedDomain, DomainError> {
         ManagedDomain::validate_name(&name).map_err(DomainError::InvalidManagedDomain)?;
         ManagedDomain::validate_domain(&domain).map_err(DomainError::InvalidManagedDomain)?;
-        ManagedDomain::validate_comment(&comment.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidManagedDomain)?;
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidManagedDomain)?;
 
         require_group(self.group_repo.as_ref(), group_id).await?;
 

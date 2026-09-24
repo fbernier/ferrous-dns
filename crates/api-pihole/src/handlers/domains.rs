@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use ferrous_dns_application::ports::{ManagedDomainUpdate, RegexFilterUpdate};
 use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain, RegexFilter};
 
 use crate::{
@@ -270,12 +271,14 @@ pub async fn update_domain(
                 .update_managed_domain
                 .execute(
                     id,
-                    None,
-                    Some(body.domain),
-                    action,
-                    group_id,
-                    body.comment,
-                    body.enabled,
+                    ManagedDomainUpdate {
+                        domain: Some(body.domain),
+                        action,
+                        group_id,
+                        comment: body.comment,
+                        enabled: body.enabled,
+                        ..Default::default()
+                    },
                 )
                 .await?;
             Ok(Json(domain_to_entry(&result)?))
@@ -292,12 +295,14 @@ pub async fn update_domain(
                 .update_regex_filter
                 .execute(
                     id,
-                    None,
-                    Some(body.domain),
-                    action,
-                    group_id,
-                    body.comment,
-                    body.enabled,
+                    RegexFilterUpdate {
+                        pattern: Some(body.domain),
+                        action,
+                        group_id,
+                        comment: body.comment,
+                        enabled: body.enabled,
+                        ..Default::default()
+                    },
                 )
                 .await?;
             Ok(Json(regex_to_entry(&result)?))

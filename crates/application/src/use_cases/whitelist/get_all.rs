@@ -1,5 +1,5 @@
 use crate::ports::WhitelistRepository;
-use ferrous_dns_domain::{whitelist::WhitelistedDomain, DomainError};
+use ferrous_dns_domain::{DomainError, WhitelistedDomain};
 use std::sync::Arc;
 
 pub struct GetWhitelistUseCase {

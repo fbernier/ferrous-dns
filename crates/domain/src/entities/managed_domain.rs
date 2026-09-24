@@ -1,3 +1,5 @@
+use crate::errors::domain_error::DomainError;
+use crate::value_objects::validators::exceeds_chars;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -18,13 +20,15 @@ impl DomainAction {
 }
 
 impl std::str::FromStr for DomainAction {
-    type Err = ();
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "allow" => Ok(DomainAction::Allow),
             "deny" => Ok(DomainAction::Deny),
-            _ => Err(()),
+            other => Err(DomainError::InvalidInput(format!(
+                "invalid action '{other}': expected 'allow' or 'deny'"
+            ))),
         }
     }
 }
@@ -48,7 +52,7 @@ impl ManagedDomain {
         if name.is_empty() {
             return Err("Managed domain name cannot be empty".to_string());
         }
-        if name.len() > 200 {
+        if exceeds_chars(name, 200) {
             return Err("Managed domain name cannot exceed 200 characters".to_string());
         }
         Ok(())
@@ -78,15 +82,6 @@ impl ManagedDomain {
             return Err(
                 "Domain contains invalid characters (only alphanumeric, hyphens, dots and underscores are allowed)".to_string(),
             );
-        }
-        Ok(())
-    }
-
-    pub fn validate_comment(comment: &Option<Arc<str>>) -> Result<(), String> {
-        if let Some(c) = comment {
-            if c.len() > 500 {
-                return Err("Comment cannot exceed 500 characters".to_string());
-            }
         }
         Ok(())
     }

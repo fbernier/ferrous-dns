@@ -262,7 +262,7 @@ async fn list_by_type_deny_returns_only_deny_entries() {
 }
 
 #[tokio::test]
-async fn list_by_type_with_invalid_type_returns_unprocessable_entity() {
+async fn list_by_type_with_invalid_type_returns_bad_request() {
     let pool = helpers::create_test_db().await;
     let app = helpers::create_pihole_test_app(pool).await;
 
@@ -276,7 +276,7 @@ async fn list_by_type_with_invalid_type_returns_unprocessable_entity() {
         .await
         .expect("request failed");
 
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

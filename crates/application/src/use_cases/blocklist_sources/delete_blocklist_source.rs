@@ -6,20 +6,18 @@ use crate::ports::{BlockFilterEnginePort, BlocklistSourceRepository};
 
 pub struct DeleteBlocklistSourceUseCase {
     repo: Arc<dyn BlocklistSourceRepository>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl DeleteBlocklistSourceUseCase {
-    pub fn new(repo: Arc<dyn BlocklistSourceRepository>) -> Self {
+    pub fn new(
+        repo: Arc<dyn BlocklistSourceRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
+    ) -> Self {
         Self {
             repo,
-            block_filter_engine: None,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
     }
 
     #[instrument(skip(self))]
@@ -33,10 +31,8 @@ impl DeleteBlocklistSourceUseCase {
 
         info!(source_id = ?id, "Blocklist source deleted successfully");
 
-        if let Some(ref engine) = self.block_filter_engine {
-            if let Err(e) = engine.reload().await {
-                error!(error = %e, "Failed to reload block filter after blocklist source deletion");
-            }
+        if let Err(e) = self.block_filter_engine.reload().await {
+            error!(error = %e, "Failed to reload block filter after blocklist source deletion");
         }
 
         Ok(())

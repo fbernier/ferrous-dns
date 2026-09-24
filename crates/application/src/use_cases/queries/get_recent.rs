@@ -1,5 +1,5 @@
 use crate::ports::{PagedQueryResult, QueryLogRepository};
-use ferrous_dns_domain::query_log::{
+use ferrous_dns_domain::entities::query_log::{
     ClientProtocol, DnssecStatus, QueryCategory, QueryLog, QueryLogFilter,
 };
 use ferrous_dns_domain::{DomainError, RecordType};
@@ -40,6 +40,7 @@ fn normalize_dnssec_status(value: &str) -> Result<String, String> {
     value
         .parse::<DnssecStatus>()
         .map(|status| status.as_str().to_string())
+        .map_err(|_| format!("invalid dnssec status: '{value}'"))
 }
 
 pub struct GetRecentQueriesUseCase {
@@ -73,15 +74,13 @@ impl GetRecentQueriesUseCase {
             .category
             .filter(|c| !c.is_empty())
             .map(|c| c.parse::<QueryCategory>())
-            .transpose()
-            .map_err(DomainError::InvalidInput)?;
+            .transpose()?;
 
         let parsed_record_type = input
             .record_type
             .filter(|t| !t.is_empty())
             .map(|t| t.parse::<RecordType>())
-            .transpose()
-            .map_err(DomainError::InvalidInput)?;
+            .transpose()?;
 
         let parsed_dnssec_status = input
             .dnssec_status
@@ -94,8 +93,7 @@ impl GetRecentQueriesUseCase {
             .protocol
             .filter(|p| !p.is_empty())
             .map(|p| p.to_ascii_lowercase().parse::<ClientProtocol>())
-            .transpose()
-            .map_err(|e| DomainError::InvalidInput(e.to_string()))?;
+            .transpose()?;
 
         let filter = QueryLogFilter {
             domain: input.domain.filter(|d| !d.is_empty()).map(String::from),

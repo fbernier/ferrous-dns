@@ -2,7 +2,6 @@ use ferrous_dns_application::ports::{
     ConfigFilePersistence, DnsCachePort, DnssecStatsPort, TlsCertificatePort, UpstreamHealthPort,
     UpstreamReloadPort,
 };
-use ferrous_dns_application::services::SubnetMatcherService;
 use ferrous_dns_application::use_cases::{
     AssignClientGroupUseCase, AssignScheduleProfileUseCase, AuthenticatePasskeyUseCase,
     BacktestBlocklistsUseCase, BlockServiceUseCase, ChangePasswordUseCase, ConfirmTotpUseCase,
@@ -77,7 +76,6 @@ pub struct ClientUseCases {
     pub get_client_subnets: Arc<GetClientSubnetsUseCase>,
     pub create_client_subnet: Arc<CreateClientSubnetUseCase>,
     pub delete_client_subnet: Arc<DeleteClientSubnetUseCase>,
-    pub subnet_matcher: Arc<SubnetMatcherService>,
 }
 
 #[derive(Clone)]

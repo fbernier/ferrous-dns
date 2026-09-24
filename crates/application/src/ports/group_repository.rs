@@ -3,7 +3,12 @@ use ferrous_dns_domain::{Client, DomainError, Group};
 
 #[async_trait]
 pub trait GroupRepository: Send + Sync {
-    async fn create(&self, name: String, comment: Option<String>) -> Result<Group, DomainError>;
+    async fn create(
+        &self,
+        name: String,
+        comment: Option<String>,
+        enabled: bool,
+    ) -> Result<Group, DomainError>;
     async fn get_by_id(&self, id: i64) -> Result<Option<Group>, DomainError>;
     async fn get_by_name(&self, name: &str) -> Result<Option<Group>, DomainError>;
     async fn get_all(&self) -> Result<Vec<Group>, DomainError>;

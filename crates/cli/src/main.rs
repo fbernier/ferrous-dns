@@ -79,12 +79,6 @@ async fn async_main() -> anyhow::Result<()> {
         dns_services.cache_maintenance.clone(),
     );
 
-    info!("Loading subnet matcher cache");
-    if let Err(e) = use_cases.subnet_matcher.refresh().await {
-        error!(error = %e, "Failed to load subnet matcher cache");
-    }
-    info!("Subnet matcher cache loaded");
-
     let effective_config_path: Option<Arc<str>> =
         cli.config.as_deref().map(Arc::from).or_else(|| {
             ferrous_dns_domain::Config::get_config_path().map(|p| Arc::from(p.as_str()))

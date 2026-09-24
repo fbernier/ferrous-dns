@@ -1,5 +1,6 @@
 use super::block_source::BlockSource;
 use crate::dns_record::RecordType;
+use crate::errors::domain_error::DomainError;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -44,7 +45,7 @@ pub enum QueryCategory {
 }
 
 impl FromStr for QueryCategory {
-    type Err = String;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -54,7 +55,9 @@ impl FromStr for QueryCategory {
             "upstream" => Ok(Self::Upstream),
             "rate-limited" => Ok(Self::RateLimited),
             "malware" => Ok(Self::Malware),
-            other => Err(format!("invalid query category: '{other}'")),
+            other => Err(DomainError::InvalidInput(format!(
+                "invalid query category: '{other}'"
+            ))),
         }
     }
 }
@@ -83,30 +86,17 @@ impl std::fmt::Display for QuerySource {
     }
 }
 
-#[derive(Debug)]
-pub struct ParseQuerySourceError {
-    invalid: String,
-}
-
-impl std::fmt::Display for ParseQuerySourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid query source: '{}'", self.invalid)
-    }
-}
-
-impl std::error::Error for ParseQuerySourceError {}
-
 impl FromStr for QuerySource {
-    type Err = ParseQuerySourceError;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "client" => Ok(QuerySource::Client),
             "internal" => Ok(QuerySource::Internal),
             "dnssec_validation" => Ok(QuerySource::DnssecValidation),
-            _ => Err(ParseQuerySourceError {
-                invalid: s.to_string(),
-            }),
+            other => Err(DomainError::InvalidInput(format!(
+                "invalid query source: '{other}'"
+            ))),
         }
     }
 }
@@ -145,21 +135,8 @@ impl std::fmt::Display for ClientProtocol {
     }
 }
 
-#[derive(Debug)]
-pub struct ParseClientProtocolError {
-    invalid: String,
-}
-
-impl std::fmt::Display for ParseClientProtocolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid client protocol: '{}'", self.invalid)
-    }
-}
-
-impl std::error::Error for ParseClientProtocolError {}
-
 impl FromStr for ClientProtocol {
-    type Err = ParseClientProtocolError;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -168,9 +145,9 @@ impl FromStr for ClientProtocol {
             "dot" => Ok(ClientProtocol::Dot),
             "doh" => Ok(ClientProtocol::Doh),
             "doq" => Ok(ClientProtocol::Doq),
-            _ => Err(ParseClientProtocolError {
-                invalid: s.to_string(),
-            }),
+            other => Err(DomainError::InvalidInput(format!(
+                "invalid client protocol: '{other}'"
+            ))),
         }
     }
 }
@@ -259,18 +236,19 @@ impl DnssecStatus {
 }
 
 impl FromStr for DnssecStatus {
-    type Err = String;
+    type Err = DomainError;
 
-    /// Case-insensitive parse of a status string (accepts both the canonical
-    /// `Secure` casing used in storage and lowercase HTTP filter values).
+    /// Case-insensitive: storage uses `Secure` casing, HTTP filters lowercase.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "secure" => Ok(Self::Secure),
-            "insecure" => Ok(Self::Insecure),
-            "bogus" => Ok(Self::Bogus),
-            "indeterminate" => Ok(Self::Indeterminate),
-            other => Err(format!("invalid dnssec status: '{other}'")),
-        }
+        [
+            Self::Secure,
+            Self::Insecure,
+            Self::Bogus,
+            Self::Indeterminate,
+        ]
+        .into_iter()
+        .find(|status| status.as_str().eq_ignore_ascii_case(s))
+        .ok_or_else(|| DomainError::InvalidInput(format!("invalid dnssec status: '{s}'")))
     }
 }
 
@@ -293,34 +271,26 @@ impl QueryStats {
     pub fn with_analytics(mut self, queries_by_type: HashMap<RecordType, u64>) -> Self {
         self.queries_by_type = queries_by_type;
 
-        self.most_queried_type = self
-            .queries_by_type
-            .iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(record_type, _)| *record_type);
+        let ranked = self.top_types(usize::MAX);
+        self.most_queried_type = ranked.first().map(|(record_type, _)| *record_type);
 
-        let total: u64 = self.queries_by_type.values().sum();
-
-        if total > 0 {
-            let mut distribution: Vec<(RecordType, f64)> = self
-                .queries_by_type
-                .iter()
+        let total: u64 = ranked.iter().map(|(_, count)| count).sum();
+        self.record_type_distribution = if total > 0 {
+            ranked
+                .into_iter()
                 .map(|(record_type, count)| {
-                    let percentage = (*count as f64 / total as f64) * 100.0;
-                    (*record_type, percentage)
+                    let percentage = (count as f64 / total as f64) * 100.0;
+                    (record_type, percentage)
                 })
-                .collect();
-
-            distribution.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-            self.record_type_distribution = distribution;
+                .collect()
         } else {
-            self.record_type_distribution = Vec::new();
-        }
+            Vec::new()
+        };
 
         self
     }
 
+    /// Most queried first; ties break by type name so the order is stable.
     pub fn top_types(&self, n: usize) -> Vec<(RecordType, u64)> {
         let mut types: Vec<(RecordType, u64)> = self
             .queries_by_type
@@ -328,7 +298,7 @@ impl QueryStats {
             .map(|(rt, count)| (*rt, *count))
             .collect();
 
-        types.sort_by_key(|b| std::cmp::Reverse(b.1));
+        types.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
         types.truncate(n);
         types
     }

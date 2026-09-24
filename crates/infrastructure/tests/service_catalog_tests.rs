@@ -19,7 +19,9 @@ fn custom(id: &str) -> ServiceDefinition {
 
 #[test]
 fn test_get_by_id_never_returns_a_different_service_during_reload() {
-    let catalog = Arc::new(CompositeServiceCatalog::new(ServiceCatalog::load()));
+    let catalog = Arc::new(CompositeServiceCatalog::new(
+        ServiceCatalog::load().unwrap(),
+    ));
     let (a, b) = (custom("custom-a"), custom("custom-b"));
     catalog.reload_custom(vec![a.clone(), b.clone()]);
 
@@ -57,7 +59,7 @@ fn test_get_by_id_never_returns_a_different_service_during_reload() {
 
 #[test]
 fn test_static_service_wins_over_custom_with_same_id() {
-    let static_catalog = ServiceCatalog::load();
+    let static_catalog = ServiceCatalog::load().unwrap();
     let builtin = static_catalog.all()[0].clone();
     let catalog = CompositeServiceCatalog::new(static_catalog);
     catalog.reload_custom(vec![custom(&builtin.id)]);
@@ -68,7 +70,7 @@ fn test_static_service_wins_over_custom_with_same_id() {
 
 #[test]
 fn test_reload_custom_replaces_previous_custom_services() {
-    let catalog = CompositeServiceCatalog::new(ServiceCatalog::load());
+    let catalog = CompositeServiceCatalog::new(ServiceCatalog::load().unwrap());
     catalog.reload_custom(vec![custom("custom-old")]);
     catalog.reload_custom(vec![custom("custom-new")]);
 

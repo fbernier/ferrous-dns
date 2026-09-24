@@ -1,3 +1,4 @@
+use crate::errors::domain_error::DomainError;
 use std::fmt;
 use std::str::FromStr;
 
@@ -70,13 +71,13 @@ macro_rules! impl_record_type_conversions {
         }
 
         impl FromStr for RecordType {
-            type Err = String;
+            type Err = DomainError;
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                match s.to_uppercase().as_str() {
-                    $( $str => Ok(RecordType::$variant), )*
-                    _ => Err(format!("Unknown record type: {}", s)),
-                }
+                $( if s.eq_ignore_ascii_case($str) {
+                    return Ok(RecordType::$variant);
+                } )*
+                Err(DomainError::InvalidInput(format!("unknown record type: {s}")))
             }
         }
     };

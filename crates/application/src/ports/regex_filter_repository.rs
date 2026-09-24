@@ -1,6 +1,17 @@
 use async_trait::async_trait;
 use ferrous_dns_domain::{DomainAction, DomainError, RegexFilter};
 
+/// Fields to change on a regex filter; `None` keeps the stored value.
+#[derive(Debug, Clone, Default)]
+pub struct RegexFilterUpdate {
+    pub name: Option<String>,
+    pub pattern: Option<String>,
+    pub action: Option<DomainAction>,
+    pub group_id: Option<i64>,
+    pub comment: Option<String>,
+    pub enabled: Option<bool>,
+}
+
 #[async_trait]
 pub trait RegexFilterRepository: Send + Sync {
     async fn create(
@@ -17,17 +28,7 @@ pub trait RegexFilterRepository: Send + Sync {
 
     async fn get_all(&self) -> Result<Vec<RegexFilter>, DomainError>;
 
-    #[allow(clippy::too_many_arguments)]
-    async fn update(
-        &self,
-        id: i64,
-        name: Option<String>,
-        pattern: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
-    ) -> Result<RegexFilter, DomainError>;
+    async fn update(&self, id: i64, update: RegexFilterUpdate) -> Result<RegexFilter, DomainError>;
 
     async fn delete(&self, id: i64) -> Result<(), DomainError>;
 

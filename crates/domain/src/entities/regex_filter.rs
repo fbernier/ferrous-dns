@@ -1,4 +1,5 @@
 use super::managed_domain::DomainAction;
+use crate::value_objects::validators::exceeds_chars;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ impl RegexFilter {
         if name.is_empty() {
             return Err("Regex filter name cannot be empty".to_string());
         }
-        if name.len() > 200 {
+        if exceeds_chars(name, 200) {
             return Err("Regex filter name cannot exceed 200 characters".to_string());
         }
         Ok(())
@@ -30,17 +31,8 @@ impl RegexFilter {
         if pattern.is_empty() {
             return Err("Pattern cannot be empty".to_string());
         }
-        if pattern.len() > 1000 {
+        if exceeds_chars(pattern, 1000) {
             return Err("Pattern cannot exceed 1000 characters".to_string());
-        }
-        Ok(())
-    }
-
-    pub fn validate_comment(comment: &Option<Arc<str>>) -> Result<(), String> {
-        if let Some(c) = comment {
-            if c.len() > 500 {
-                return Err("Comment cannot exceed 500 characters".to_string());
-            }
         }
         Ok(())
     }

@@ -89,7 +89,7 @@ async fn create_group(
     let group = state
         .groups
         .create_group
-        .execute(req.name, req.comment)
+        .execute(req.name, req.comment, req.enabled.unwrap_or(true))
         .await?;
     Ok((
         StatusCode::CREATED,

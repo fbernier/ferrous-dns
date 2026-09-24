@@ -1,4 +1,5 @@
 use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::{validate_comment, validate_url};
 use ferrous_dns_domain::{DomainError, WhitelistSource};
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -38,14 +39,10 @@ impl UpdateWhitelistSourceUseCase {
         }
 
         if let Some(ref u_opt) = url {
-            WhitelistSource::validate_url(&u_opt.as_deref().map(Arc::from))
-                .map_err(DomainError::InvalidWhitelistSource)?;
+            validate_url(u_opt.as_deref()).map_err(DomainError::InvalidWhitelistSource)?;
         }
 
-        if let Some(ref c) = comment {
-            WhitelistSource::validate_comment(&Some(Arc::from(c.as_str())))
-                .map_err(DomainError::InvalidWhitelistSource)?;
-        }
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidWhitelistSource)?;
 
         if let Some(ref ids) = group_ids {
             for &gid in ids {

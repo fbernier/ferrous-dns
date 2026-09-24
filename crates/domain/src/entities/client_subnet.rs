@@ -1,3 +1,4 @@
+use ipnetwork::IpNetwork;
 use std::cmp::Reverse;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -13,18 +14,9 @@ pub struct ClientSubnet {
 }
 
 impl ClientSubnet {
-    pub fn new(subnet_cidr: String, group_id: i64, comment: Option<String>) -> Self {
-        Self {
-            id: None,
-            subnet_cidr: Arc::from(subnet_cidr.as_str()),
-            group_id,
-            comment: comment.map(|s| Arc::from(s.as_str())),
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
-    pub fn validate_cidr(cidr: &str) -> Result<(), String> {
+    /// Parses a CIDR into its canonical network form (host bits cleared,
+    /// RFC 5952 IPv6 text), so equal networks compare and store equal.
+    pub fn parse_cidr(cidr: &str) -> Result<IpNetwork, String> {
         if cidr.is_empty() {
             return Err("CIDR cannot be empty".to_string());
         }
@@ -33,12 +25,13 @@ impl ClientSubnet {
             return Err("CIDR must include prefix (e.g., 192.168.1.0/24)".to_string());
         }
 
-        Ok(())
+        let parsed: IpNetwork = cidr.parse().map_err(|e| format!("{cidr}: {e}"))?;
+        IpNetwork::new(parsed.network(), parsed.prefix()).map_err(|e| format!("{cidr}: {e}"))
     }
 }
 
 pub struct SubnetMatcher {
-    subnets: Vec<(ipnetwork::IpNetwork, i64)>,
+    subnets: Vec<(IpNetwork, i64)>,
 }
 
 impl SubnetMatcher {
@@ -46,7 +39,7 @@ impl SubnetMatcher {
         let mut networks = Vec::new();
 
         for subnet in subnets {
-            let network: ipnetwork::IpNetwork = subnet
+            let network: IpNetwork = subnet
                 .subnet_cidr
                 .parse()
                 .map_err(|e| format!("Invalid CIDR {}: {}", subnet.subnet_cidr, e))?;

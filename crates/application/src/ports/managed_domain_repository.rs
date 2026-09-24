@@ -1,6 +1,17 @@
 use async_trait::async_trait;
 use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain};
 
+/// Fields to change on a managed domain; `None` keeps the stored value.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedDomainUpdate {
+    pub name: Option<String>,
+    pub domain: Option<String>,
+    pub action: Option<DomainAction>,
+    pub group_id: Option<i64>,
+    pub comment: Option<String>,
+    pub enabled: Option<bool>,
+}
+
 #[async_trait]
 pub trait ManagedDomainRepository: Send + Sync {
     async fn create(
@@ -23,16 +34,10 @@ pub trait ManagedDomainRepository: Send + Sync {
         offset: u32,
     ) -> Result<(Vec<ManagedDomain>, u64), DomainError>;
 
-    #[allow(clippy::too_many_arguments)]
     async fn update(
         &self,
         id: i64,
-        name: Option<String>,
-        domain: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
+        update: ManagedDomainUpdate,
     ) -> Result<ManagedDomain, DomainError>;
 
     async fn delete(&self, id: i64) -> Result<(), DomainError>;

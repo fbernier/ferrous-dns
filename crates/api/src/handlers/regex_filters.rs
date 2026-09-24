@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use ferrous_dns_application::ports::RegexFilterUpdate;
 use ferrous_dns_domain::DomainError;
 use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -138,12 +139,14 @@ async fn update_regex_filter(
         .update_regex_filter
         .execute(
             id,
-            req.name,
-            req.pattern,
-            action,
-            req.group_id,
-            req.comment,
-            req.enabled,
+            RegexFilterUpdate {
+                name: req.name,
+                pattern: req.pattern,
+                action,
+                group_id: req.group_id,
+                comment: req.comment,
+                enabled: req.enabled,
+            },
         )
         .await?;
 

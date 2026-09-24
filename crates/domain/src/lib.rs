@@ -4,12 +4,6 @@ pub mod entities;
 pub mod errors;
 pub mod value_objects;
 
-pub use entities::blocklist;
-pub use entities::client;
-pub use entities::query_log;
-pub use entities::schedule;
-pub use entities::whitelist;
-
 pub use config::{
     AdminConfig, AuthConfig, BlockResponseMode, CliOverrides, Config, ConfigError,
     DgaDetectionAction, DgaDetectionConfig, Dns64Config, DnsConfig, DnsCookiesConfig, DnssecMode,
@@ -40,7 +34,7 @@ pub use entities::query_log::{
 pub use entities::regex_filter::RegexFilter;
 pub use entities::safe_search::{SafeSearchConfig, SafeSearchEngine, YouTubeMode};
 pub use entities::schedule::{
-    evaluate_slots, GroupOverride, ScheduleAction, ScheduleProfile, TimeSlot, UnknownScheduleAction,
+    evaluate_slots, GroupOverride, ScheduleAction, ScheduleProfile, TimeSlot,
 };
 pub use entities::service_catalog::ServiceDefinition;
 pub use entities::user::{User, UserRole, UserSource};

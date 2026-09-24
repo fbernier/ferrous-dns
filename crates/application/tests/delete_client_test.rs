@@ -3,7 +3,7 @@ use ferrous_dns_domain::{Client, DomainError};
 use std::sync::Arc;
 
 mod helpers;
-use helpers::MockClientRepository;
+use helpers::{MockBlockFilterEngine, MockClientRepository};
 
 fn create_test_client(id: i64, ip: &str) -> Client {
     let now = chrono::Utc::now().to_rfc3339();
@@ -54,7 +54,8 @@ async fn test_delete_existing_client() {
     );
 
     let repository = Arc::new(MockClientRepository::with_clients(vec![client]).await);
-    let use_case = DeleteClientUseCase::new(repository.clone());
+    let use_case =
+        DeleteClientUseCase::new(repository.clone(), Arc::new(MockBlockFilterEngine::new()));
 
     assert_eq!(repository.count().await, 1);
 
@@ -67,7 +68,7 @@ async fn test_delete_existing_client() {
 #[tokio::test]
 async fn test_delete_nonexistent_client() {
     let repository = Arc::new(MockClientRepository::new());
-    let use_case = DeleteClientUseCase::new(repository);
+    let use_case = DeleteClientUseCase::new(repository, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(999).await;
 
@@ -88,7 +89,8 @@ async fn test_delete_client_from_multiple() {
     ];
 
     let repository = Arc::new(MockClientRepository::with_clients(clients).await);
-    let use_case = DeleteClientUseCase::new(repository.clone());
+    let use_case =
+        DeleteClientUseCase::new(repository.clone(), Arc::new(MockBlockFilterEngine::new()));
 
     assert_eq!(repository.count().await, 3);
 
@@ -111,7 +113,8 @@ async fn test_delete_all_clients_sequentially() {
     ];
 
     let repository = Arc::new(MockClientRepository::with_clients(clients).await);
-    let use_case = DeleteClientUseCase::new(repository.clone());
+    let use_case =
+        DeleteClientUseCase::new(repository.clone(), Arc::new(MockBlockFilterEngine::new()));
 
     assert_eq!(repository.count().await, 2);
 
@@ -127,7 +130,8 @@ async fn test_delete_client_idempotency() {
     let client = create_test_client(1, "192.168.1.100");
 
     let repository = Arc::new(MockClientRepository::with_clients(vec![client]).await);
-    let use_case = DeleteClientUseCase::new(repository.clone());
+    let use_case =
+        DeleteClientUseCase::new(repository.clone(), Arc::new(MockBlockFilterEngine::new()));
 
     let result1 = use_case.execute(1).await;
     assert!(result1.is_ok());
@@ -151,7 +155,8 @@ async fn test_delete_client_with_complete_data() {
     client.group_id = Some(5);
 
     let repository = Arc::new(MockClientRepository::with_clients(vec![client]).await);
-    let use_case = DeleteClientUseCase::new(repository.clone());
+    let use_case =
+        DeleteClientUseCase::new(repository.clone(), Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(42).await;
 
@@ -162,7 +167,7 @@ async fn test_delete_client_with_complete_data() {
 #[tokio::test]
 async fn test_delete_client_validates_existence_first() {
     let repository = Arc::new(MockClientRepository::new());
-    let use_case = DeleteClientUseCase::new(repository);
+    let use_case = DeleteClientUseCase::new(repository, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(1).await;
 
@@ -178,7 +183,7 @@ async fn test_delete_client_validates_existence_first() {
 #[tokio::test]
 async fn test_delete_with_zero_id() {
     let repository = Arc::new(MockClientRepository::new());
-    let use_case = DeleteClientUseCase::new(repository);
+    let use_case = DeleteClientUseCase::new(repository, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(0).await;
 
@@ -189,7 +194,7 @@ async fn test_delete_with_zero_id() {
 #[tokio::test]
 async fn test_delete_with_negative_id() {
     let repository = Arc::new(MockClientRepository::new());
-    let use_case = DeleteClientUseCase::new(repository);
+    let use_case = DeleteClientUseCase::new(repository, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(-1).await;
 
@@ -200,7 +205,7 @@ async fn test_delete_with_negative_id() {
 #[tokio::test]
 async fn test_delete_with_very_large_id() {
     let repository = Arc::new(MockClientRepository::new());
-    let use_case = DeleteClientUseCase::new(repository);
+    let use_case = DeleteClientUseCase::new(repository, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(i64::MAX).await;
 
@@ -217,7 +222,10 @@ async fn test_concurrent_deletes_different_clients() {
     ];
 
     let repository = Arc::new(MockClientRepository::with_clients(clients).await);
-    let use_case = Arc::new(DeleteClientUseCase::new(repository.clone()));
+    let use_case = Arc::new(DeleteClientUseCase::new(
+        repository.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    ));
 
     let uc1 = Arc::clone(&use_case);
     let uc2 = Arc::clone(&use_case);
@@ -240,7 +248,10 @@ async fn test_concurrent_delete_same_client() {
     let client = create_test_client(1, "192.168.1.100");
 
     let repository = Arc::new(MockClientRepository::with_clients(vec![client]).await);
-    let use_case = Arc::new(DeleteClientUseCase::new(repository.clone()));
+    let use_case = Arc::new(DeleteClientUseCase::new(
+        repository.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    ));
 
     let uc1 = Arc::clone(&use_case);
     let uc2 = Arc::clone(&use_case);

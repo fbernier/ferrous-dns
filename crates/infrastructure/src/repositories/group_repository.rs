@@ -36,15 +36,21 @@ impl SqliteGroupRepository {
 #[async_trait]
 impl GroupRepository for SqliteGroupRepository {
     #[instrument(skip(self))]
-    async fn create(&self, name: String, comment: Option<String>) -> Result<Group, DomainError> {
+    async fn create(
+        &self,
+        name: String,
+        comment: Option<String>,
+        enabled: bool,
+    ) -> Result<Group, DomainError> {
         let now = sql_now();
 
         let row = sqlx::query_as::<_, GroupRow>(
             "INSERT INTO groups (name, enabled, comment, is_default, created_at, updated_at)
-             VALUES (?, 1, ?, 0, ?, ?)
+             VALUES (?, ?, ?, 0, ?, ?)
              RETURNING id, name, enabled, comment, is_default, created_at, updated_at",
         )
         .bind(&name)
+        .bind(enabled)
         .bind(&comment)
         .bind(&now)
         .bind(&now)
@@ -52,7 +58,7 @@ impl GroupRepository for SqliteGroupRepository {
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                DomainError::InvalidGroupName(format!("Group '{name}' already exists"))
+                DomainError::AlreadyExists(format!("Group '{name}' already exists"))
             } else {
                 db_err("Failed to create group")(e)
             }
@@ -158,7 +164,7 @@ impl GroupRepository for SqliteGroupRepository {
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                DomainError::InvalidGroupName(format!(
+                DomainError::AlreadyExists(format!(
                     "Group '{}' already exists",
                     name.as_deref().unwrap_or_default()
                 ))
@@ -179,7 +185,9 @@ impl GroupRepository for SqliteGroupRepository {
             .await
             .map_err(|e| {
                 if is_fk_violation(&e) {
-                    DomainError::GroupHasAssignedClients(0)
+                    DomainError::GroupInUse(format!(
+                        "group {id} is still referenced by rules or list sources"
+                    ))
                 } else {
                     db_err("Failed to delete group")(e)
                 }

@@ -91,23 +91,7 @@ pub async fn backtest_blocklists(
     State(state): State<AppState>,
     Json(req): Json<BacktestRequestDto>,
 ) -> Result<Json<BacktestResponse>, ApiError> {
-    let action = if req.action.eq_ignore_ascii_case("deny") {
-        CandidateAction::Deny
-    } else if req.action.eq_ignore_ascii_case("allow") {
-        CandidateAction::Allow
-    } else {
-        return Err(ApiError(DomainError::InvalidInput(format!(
-            "invalid action '{}': must be 'deny' or 'allow'",
-            req.action
-        ))));
-    };
-    let has_candidate = req.list.iter().any(|l| !l.trim().is_empty())
-        || req.regexes.iter().any(|r| !r.trim().is_empty());
-    if !has_candidate {
-        return Err(ApiError(DomainError::InvalidInput(
-            "provide at least one domain/list line or regex".to_string(),
-        )));
-    }
+    let action: CandidateAction = req.action.parse()?;
     let report = state
         .blocking
         .backtest

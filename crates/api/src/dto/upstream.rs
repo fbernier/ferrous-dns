@@ -1,33 +1,6 @@
-use ferrous_dns_application::ports::{
-    AggregateStatus, IpFamily, ResolvedEndpointHealth, UpstreamGroupHealth, UpstreamStatus,
-};
+use ferrous_dns_application::ports::{ResolvedEndpointHealth, UpstreamGroupHealth};
 use serde::Serialize;
 use utoipa::ToSchema;
-
-pub fn upstream_status_str(status: UpstreamStatus) -> &'static str {
-    match status {
-        UpstreamStatus::Healthy => "Healthy",
-        UpstreamStatus::Unhealthy => "Unhealthy",
-        UpstreamStatus::Unknown => "Unknown",
-    }
-}
-
-fn aggregate_status_str(status: AggregateStatus) -> &'static str {
-    match status {
-        AggregateStatus::Healthy => "Healthy",
-        AggregateStatus::Partial => "Partial",
-        AggregateStatus::Unhealthy => "Unhealthy",
-        AggregateStatus::Unknown => "Unknown",
-    }
-}
-
-pub fn ip_family_str(family: IpFamily) -> &'static str {
-    match family {
-        IpFamily::Ipv4 => "ipv4",
-        IpFamily::Ipv6 => "ipv6",
-        IpFamily::Unknown => "unknown",
-    }
-}
 
 /// Per-IP endpoint detail within a server group.
 #[derive(Debug, Serialize, ToSchema)]
@@ -48,8 +21,8 @@ impl From<ResolvedEndpointHealth> for ResolvedEndpointResponse {
     fn from(r: ResolvedEndpointHealth) -> Self {
         Self {
             address: r.address,
-            family: ip_family_str(r.family),
-            status: upstream_status_str(r.status),
+            family: r.family.as_str(),
+            status: r.status.as_str(),
             latency_ms: r.latency_ms,
             last_error: r.last_error,
             consecutive_failures: r.consecutive_failures,
@@ -74,7 +47,7 @@ impl From<UpstreamGroupHealth> for UpstreamGroupResponse {
     fn from(g: UpstreamGroupHealth) -> Self {
         Self {
             address: g.address,
-            status: aggregate_status_str(g.status),
+            status: g.status.as_str(),
             resolved: g
                 .resolved
                 .into_iter()

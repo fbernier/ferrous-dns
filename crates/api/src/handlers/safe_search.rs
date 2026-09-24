@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use ferrous_dns_domain::{DomainError, SafeSearchEngine, YouTubeMode};
+use ferrous_dns_domain::{SafeSearchEngine, YouTubeMode};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -83,16 +83,12 @@ async fn toggle_config(
     Path(group_id): Path<i64>,
     Json(req): Json<ToggleSafeSearchRequest>,
 ) -> Result<Json<SafeSearchConfigResponse>, ApiError> {
-    let engine = req
-        .engine
-        .parse::<SafeSearchEngine>()
-        .map_err(|e| DomainError::InvalidSafeSearchEngine(e.0))?;
+    let engine = req.engine.parse::<SafeSearchEngine>()?;
     let youtube_mode = req
         .youtube_mode
         .as_deref()
         .map(str::parse::<YouTubeMode>)
-        .transpose()
-        .map_err(|e| DomainError::InvalidInput(e.to_string()))?
+        .transpose()?
         .unwrap_or_default();
 
     let config = state
