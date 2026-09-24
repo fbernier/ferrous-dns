@@ -131,6 +131,19 @@ write("upstream_relay", "mx_glue_opt_first", upstream(15, MX, COOKIE_OPT + GLUE,
 write("upstream_relay", "badcookie_extended_rcode",
       upstream(1, b"", b"\x00" + struct.pack(">HHBBHH", 41, 1232, 1, 0, 0, 0), an=0, ar=1,
                flags=0x8187))
+# TSIG and SIG(0) must stay last (RFC 8945 §5.1, RFC 2931 §3.1); the relay drops them.
+# TSIG: key name, class ANY, hmac-sha256, 32-byte MAC.
+TSIG_RDATA = (name_wire([b"hmac-sha256"]) + struct.pack(">HIHH", 0, 0x6700_0000, 300, 32)
+              + bytes(32) + struct.pack(">HHH", 0, 0, 0))
+write("upstream_relay", "tsig_last",
+      upstream(1, b"", name_wire([b"key"]) + struct.pack(">HHIH", 250, 255, 0, len(TSIG_RDATA))
+               + TSIG_RDATA, an=0, ar=1))
+# SIG(0): type covered 0, algo 13, 0 labels, TTL 0, expiry, inception, tag, signer, signature.
+SIG0_RDATA = (struct.pack(">HBBIIIH", 0, 13, 0, 0, 0x6800_0000, 0x6700_0000, 0x1234)
+              + name_wire([b"example", b"com"]) + bytes(64))
+write("upstream_relay", "sig0_last",
+      upstream(1, b"", b"\x00" + struct.pack(">HHIH", 24, 255, 0, len(SIG0_RDATA)) + SIG0_RDATA,
+               an=0, ar=1))
 
 # ------------------------------------------------------------------ dnssec_records
 # RRSIG rdata: type covered A, algo 13, 2 labels, TTL, expiry, inception, tag,

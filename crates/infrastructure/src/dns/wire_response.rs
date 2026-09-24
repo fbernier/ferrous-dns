@@ -125,11 +125,13 @@ fn write_address_rr(out: &mut [u8], addr: &IpAddr, ttl: u32) -> usize {
 
 const CLASS_IN: u16 = 1;
 const TYPE_SOA: u16 = 6;
+const TYPE_SIG: u16 = 24;
 const TYPE_OPT: u16 = 41;
 const TYPE_RRSIG: u16 = 46;
 const TYPE_NSEC: u16 = 47;
 const TYPE_NSEC3: u16 = 50;
 const TYPE_ANY: u16 = 255;
+const TYPE_TSIG: u16 = 250;
 /// EDNS option code of the DNS Cookie (RFC 7873 §4).
 pub(crate) const COOKIE_OPTION_CODE: u16 = 10;
 /// UDP payload size advertised in every OPT this server writes.
@@ -316,10 +318,11 @@ fn write_header(out: &mut Vec<u8>, id: u16, flags: [u8; 2], qd: u16, an: u16, ns
 }
 
 /// Re-issues an upstream response under the client's header and OPT: ID and
-/// RD from the client, AD as given, the upstream OPT dropped and `edns`
-/// appended in its place, carrying the upstream's extended RCODE bits. A
-/// client without DO (no `edns`, or `dnssec_ok` clear) gets no authenticating
-/// DNSSEC RRs it did not ask for (RFC 4035 §3.2.1). `None` if `upstream` is
+/// RD from the client, AD as given, the upstream OPT and any transaction
+/// signature dropped and `edns` appended in their place, carrying the
+/// upstream's extended RCODE bits. A client without DO (no `edns`, or
+/// `dnssec_ok` clear) gets no authenticating DNSSEC RRs it did not ask for
+/// (RFC 4035 §3.2.1). `None` if `upstream` is
 /// not a well-formed sequence of sections, holds two OPTs or an OPT outside
 /// the additional section, or has an extended RCODE that `edns: None` cannot
 /// carry.
@@ -345,9 +348,10 @@ const CACHE_OPTION_CODE: u16 = 65_001;
 const CACHE_OPT_HEAD: usize = OPT_RECORD.len() + 4 + 4;
 
 /// Re-sections an upstream response into the form the cache stores for an
-/// entry of `entry_ttl` seconds: every record but the OPT, its TTL clamped
-/// into `ttls`, then an OPT of ours holding the upstream's extended RCODE,
-/// with DO set iff the message carries authenticating DNSSEC RRs. That OPT's
+/// entry of `entry_ttl` seconds: every record but the OPT and any transaction
+/// signature, its TTL clamped into `ttls`, then an OPT of ours holding the
+/// upstream's extended RCODE, with DO set iff the message carries
+/// authenticating DNSSEC RRs. That OPT's
 /// one option carries `entry_ttl`, then the offset of every record's TTL
 /// field and, last, their count. It is what lets [`relay_cached`] answer a
 /// client without walking the message. The upstream's options, among them
@@ -595,6 +599,21 @@ fn is_authenticating(rtype: u16, qtype: Option<u16>) -> bool {
         && !qtype.is_some_and(|q| q == rtype || q == TYPE_ANY)
 }
 
+/// Whether the additional record of `rtype` at `pos`, ending at `end`, is a
+/// TSIG or a SIG(0): it signs the upstream's transaction with us, whose
+/// receiver removes it (RFC 8945 §5.3, RFC 2931 §3), and it must stay the
+/// last record, where our OPT goes.
+fn is_transaction_signature(msg: &[u8], pos: usize, end: usize, rtype: u16) -> bool {
+    match rtype {
+        TYPE_TSIG => true,
+        // SIG(0) covers type 0, the first field of its RDATA.
+        TYPE_SIG => skip_name(msg, pos)
+            .and_then(|fixed| msg.get(fixed + 10..end))
+            .is_some_and(|rdata| rdata.starts_with(&[0, 0])),
+        _ => false,
+    }
+}
+
 /// A message re-sectioned without its OPT.
 struct Sections {
     /// Header and every kept record; the header's counts match them.
@@ -605,8 +624,9 @@ struct Sections {
     authenticating: bool,
 }
 
-/// Copies `upstream` without its OPT and, when `strip`, without its
-/// authenticating DNSSEC RRs. See [`relay_with_edns`] for `None`.
+/// Copies `upstream` without its OPT and transaction signature and, when
+/// `strip`, without its authenticating DNSSEC RRs. See [`relay_with_edns`]
+/// for `None`.
 fn resection(upstream: &[u8], strip: bool) -> Option<Sections> {
     let header = upstream.get(..12)?;
     let count = |i: usize| u16::from_be_bytes([header[i], header[i + 1]]);
@@ -633,6 +653,8 @@ fn resection(upstream: &[u8], strip: bool) -> Option<Sections> {
                 }
                 // The upper eight RCODE bits open the OPT's TTL field.
                 extended_rcode = Some(*upstream.get(skip_name(upstream, pos)? + 4)?);
+                true
+            } else if section == 2 && is_transaction_signature(upstream, pos, end, rtype) {
                 true
             } else if is_authenticating(rtype, qtype) {
                 authenticating = true;

@@ -340,3 +340,52 @@ fn relay_keeps_the_upstream_extended_rcode() {
     // Without an OPT of our own the extended bits have nowhere to go.
     assert!(wire_response::relay_with_edns(upstream, 1, true, false, None).is_none());
 }
+
+/// `crash-53ce8e0a` from the `upstream_relay` target: an NXDOMAIN whose only
+/// additional record is a TSIG. The relay appended our OPT behind it, and
+/// hickory rejects any record after a TSIG (`RecordAfterSig`, RFC 8945 §5.1).
+/// The TSIG signs the upstream's transaction with us, so neither the client
+/// nor the cache gets it (RFC 8945 §5.3).
+#[test]
+fn relay_drops_a_tsig_rather_than_append_an_opt_behind_it() {
+    let upstream = b"\x00\x00\x81\x83\x00\x01\x00\x00\x00\x00\x00\x01\x04nope\x03com\x00\
+                     \x00\x01\x00\x01\
+                     \x00\x00\xfa\x00\xff\x00\x00\x00\x00\x00\x11\
+                     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    assert!(Message::from_vec(upstream).unwrap().signature.is_some());
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: Some(&[0x55; 16]),
+        ede: None,
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours))
+        .expect("re-sectioned");
+    let cached = wire_response::cache_form(upstream, 60, 0..=u32::MAX).expect("cacheable");
+    let served = wire_response::relay_cached(&cached, 1, true, Some(&ours), 60).expect("served");
+    for reply in [relayed, served] {
+        let msg = Message::from_vec(&reply).expect("relayed message decodes");
+        assert_eq!(u16::from(msg.metadata.response_code), 3);
+        assert!(msg.signature.is_none() && msg.additionals.is_empty());
+        assert!(msg.edns.is_some());
+    }
+}
+
+/// `crash-11436e02` from the `upstream_relay` target: a SIG with an empty
+/// RDATA. Telling SIG(0) apart read its type-covered field past the record,
+/// from whatever follows it: garbage upstream, our OPT once relayed, which
+/// opens with the two zero bytes of SIG(0). So a second pass over our own
+/// output, as serving a cache form takes, dropped the record the first kept.
+#[test]
+fn relay_reads_a_sig_type_covered_field_inside_its_rdata() {
+    let upstream = b"\x00\x00\x81\x80\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\
+                     \x00\x01\x00\x01\
+                     \x00\x00\x18\x00\x01\x00\x00\x00\x00\x00\x00";
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: None,
+        ede: None,
+    };
+    let once = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours)).unwrap();
+    let twice = wire_response::relay_with_edns(&once, 1, true, false, Some(&ours));
+    assert_eq!(twice.as_deref(), Some(&once[..]));
+}

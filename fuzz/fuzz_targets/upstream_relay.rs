@@ -1,8 +1,9 @@
 //! `wire_response::relay_with_edns` re-sections a cached upstream answer to
-//! swap its OPT for ours and, for a client without DO, drop the DNSSEC RRs
-//! it did not ask for (`server.rs`). `cache_form` stores an upstream answer
-//! for `relay_cached`, the fast path's relay. The bytes come from the
-//! upstream, or from an off-path spoofer that won the race.
+//! swap its OPT for ours, drop any TSIG or SIG(0) and, for a client without
+//! DO, drop the DNSSEC RRs it did not ask for (`server.rs`). `cache_form`
+//! stores an upstream answer for `relay_cached`, the fast path's relay. The
+//! bytes come from the upstream, or from an off-path spoofer that won the
+//! race.
 //!
 //! Beyond not panicking: relaying our own output again is a no-op, and when
 //! hickory decodes the upstream message it decodes the relayed one to the same
@@ -17,8 +18,9 @@
 #![no_main]
 
 use ferrous_dns_infrastructure::dns::wire_response::{self, EdnsReply};
+use hickory_proto::dnssec::rdata::DNSSECRData;
 use hickory_proto::op::Message;
-use hickory_proto::rr::{Record, RecordType};
+use hickory_proto::rr::{RData, Record, RecordType};
 use libfuzzer_sys::fuzz_target;
 
 const ID: u16 = 0xABCD;
@@ -26,18 +28,24 @@ const ID: u16 = 0xABCD;
 const STALE_SERVE_TTL: u32 = 2;
 
 /// The records a client with DO as given gets from `records`, answering a
-/// `qtype` query (RFC 4035 §3.2.1, RFC 3225 §3).
+/// `qtype` query (RFC 4035 §3.2.1, RFC 3225 §3). A TSIG or SIG(0) signs the
+/// upstream's transaction with us and is never relayed (RFC 8945 §5.3, RFC
+/// 2931 §3); hickory leaves one here as a SIG, or as an UPDATE's empty TSIG.
 fn kept(records: &[Record], dnssec_ok: bool, qtype: Option<RecordType>) -> Vec<Record> {
     records
         .iter()
         .filter(|r| {
             let rtype = r.record_type();
-            dnssec_ok
-                || !matches!(
-                    rtype,
-                    RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3
-                )
-                || qtype.is_some_and(|q| q == rtype || q == RecordType::ANY)
+            let signature = rtype == RecordType::TSIG
+                || matches!(&r.data, RData::DNSSEC(DNSSECRData::SIG(sig))
+                    if sig.input().type_covered == RecordType::ZERO);
+            !signature
+                && (dnssec_ok
+                    || !matches!(
+                        rtype,
+                        RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3
+                    )
+                    || qtype.is_some_and(|q| q == rtype || q == RecordType::ANY))
         })
         .cloned()
         .collect()
