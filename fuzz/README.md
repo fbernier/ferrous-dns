@@ -47,7 +47,10 @@ hickory rejects it.
 `upstream_relay` is differential too: whenever hickory decodes the upstream
 message, the relayed one must decode to the same records under our header and
 OPT. Cutting the upstream OPT out shifts every byte behind it, so this is what
-catches a relay that breaks compression pointers into that region.
+catches a relay that breaks compression pointers into that region. Its blind
+spot is the RDATA of types whose names the relay decompresses but hickory
+keeps as raw bytes (RP, AFSDB, MINFO and the like): a rewritten pointer there
+changes the bytes, not the name, so those RDATA are not compared.
 
 Parsers that are crate-private in a normal build are reached through
 `ferrous_dns_infrastructure::dns::fuzz_api`, a wrapper module compiled only

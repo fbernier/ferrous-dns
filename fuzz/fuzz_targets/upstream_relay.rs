@@ -17,9 +17,11 @@
 //! anyway, so corpus entries stay plain DNS packets.
 #![no_main]
 
+use ferrous_dns_infrastructure::dns::fuzz_api;
 use ferrous_dns_infrastructure::dns::wire_response::{self, EdnsReply};
 use hickory_proto::dnssec::rdata::DNSSECRData;
 use hickory_proto::op::Message;
+use hickory_proto::rr::rdata::NULL;
 use hickory_proto::rr::{RData, Record, RecordType};
 use libfuzzer_sys::fuzz_target;
 
@@ -51,6 +53,24 @@ fn kept(records: &[Record], dnssec_ok: bool, qtype: Option<RecordType>) -> Vec<R
         .collect()
 }
 
+/// Blanks the RDATA hickory leaves as raw bytes (RP, AFSDB, MINFO, ...) for a
+/// type whose names the relay decompresses: a pointer it re-aimed or inlined
+/// names the same labels in other bytes.
+fn blank_opaque_names(msg: &mut Message) {
+    for record in msg
+        .answers
+        .iter_mut()
+        .chain(&mut msg.authorities)
+        .chain(&mut msg.additionals)
+    {
+        if let RData::Unknown { code, rdata } = &mut record.data {
+            if fuzz_api::rdata_has_names(u16::from(*code)) {
+                *rdata = NULL::new();
+            }
+        }
+    }
+}
+
 fuzz_target!(|upstream: &[u8]| {
     let Some(&[hi, lo]) = upstream.get(..2) else {
         return;
@@ -78,14 +98,16 @@ fuzz_target!(|upstream: &[u8]| {
     let points_into_header = upstream
         .windows(2)
         .any(|w| w[0] >= 0xC0 && (u16::from(w[0] & 0x3F) << 8 | u16::from(w[1])) < 12);
-    let Ok(source) = Message::from_vec(upstream) else {
+    let Ok(mut source) = Message::from_vec(upstream) else {
         return;
     };
     if points_into_header {
         return;
     }
+    blank_opaque_names(&mut source);
     let qtype = source.queries.first().map(|q| q.query_type());
-    let got = Message::from_vec(&relayed).expect("relay made a valid message invalid");
+    let mut got = Message::from_vec(&relayed).expect("relay made a valid message invalid");
+    blank_opaque_names(&mut got);
     assert_eq!((got.metadata.id, got.metadata.recursion_desired), (ID, rd));
     assert_eq!(got.metadata.authentic_data, ad);
     assert_eq!(got.metadata.response_code, source.metadata.response_code);
@@ -108,7 +130,8 @@ fuzz_target!(|upstream: &[u8]| {
         wire_response::cache_form(upstream, u32::MAX, 0..=u32::MAX).expect("relayed but not cacheable");
     let served = wire_response::relay_cached(&cached, ID, rd, edns, u32::MAX)
         .expect("relayed but not served from the cache");
-    let served = Message::from_vec(&served).expect("the cache form served an invalid message");
+    let mut served = Message::from_vec(&served).expect("the cache form served an invalid message");
+    blank_opaque_names(&mut served);
     let mut expected = got;
     for record in expected
         .answers

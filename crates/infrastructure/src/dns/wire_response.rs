@@ -707,6 +707,12 @@ enum Field {
     Name,
 }
 
+/// Whether re-sectioning may rewrite the names inside the RDATA of `rtype`.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn rdata_has_names(rtype: u16) -> bool {
+    !rdata_fields(rtype).is_empty()
+}
+
 /// The leading RDATA fields of `rtype` up to its last domain name: the types
 /// whose names a compressor may point at or into (RFC 3597 §4), with the
 /// DNSSEC and SVCB names that must not be compressed but might be. The rest
