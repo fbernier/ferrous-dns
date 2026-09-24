@@ -4,7 +4,7 @@
 //! minimized input, so the bug stays fixed even if the corpus is lost.
 
 use ferrous_dns_infrastructure::dns::fast_path::{self, FastPathKind};
-use ferrous_dns_infrastructure::dns::wire_response;
+use ferrous_dns_infrastructure::dns::wire_response::{self, EdnsReply};
 use hickory_proto::op::{Message, Query};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use std::net::{IpAddr, Ipv4Addr};
@@ -320,4 +320,23 @@ fn query_fast_path_seed_corpus_is_clean() {
     }
 
     assert!(seeds > 0, "no seeds found in {}", corpus.display());
+}
+
+/// BADCOOKIE is RCODE 23: header 7 plus 1 in the OPT's extended-RCODE byte.
+/// Swapping in our OPT used to zero that byte, turning it into YXRRSET.
+#[test]
+fn relay_keeps_the_upstream_extended_rcode() {
+    let upstream = b"\x00\x08\x81\x87\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\
+                     \x00\x01\x00\x01\x00\x00\x29\x04\xd0\x01\x00\x00\x00\x00\x00";
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: Some(&[0x55; 16]),
+        ede: None,
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours)).unwrap();
+    let rcode = Message::from_vec(&relayed).unwrap().metadata.response_code;
+    assert_eq!(u16::from(rcode), 23);
+
+    // Without an OPT of our own the extended bits have nowhere to go.
+    assert!(wire_response::relay_with_edns(upstream, 1, true, false, None).is_none());
 }

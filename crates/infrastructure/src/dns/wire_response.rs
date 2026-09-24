@@ -328,9 +328,12 @@ fn write_header(out: &mut Vec<u8>, id: u16, flags: [u8; 2], qd: u16, an: u16, ns
 }
 
 /// Re-issues a cached upstream response under the client's header and OPT:
-/// ID and RD from the client, AD as given, every upstream OPT dropped and
-/// `edns` appended in its place. `None` if `upstream` is not a well-formed
-/// sequence of sections.
+/// ID and RD from the client, AD as given, the upstream OPT dropped and
+/// `edns` appended in its place, carrying the upstream's extended RCODE bits.
+/// `None` if `upstream` is not a well-formed sequence of sections, holds two
+/// OPTs, has records after its OPT (their compression pointers may target
+/// bytes that move once the OPT is cut out), or has an extended RCODE that
+/// `edns: None` cannot carry.
 pub fn relay_with_edns(
     upstream: &[u8],
     id: u16,
@@ -355,17 +358,34 @@ pub fn relay_with_edns(
     let mut out = Vec::with_capacity(upstream.len() + 64);
     out.extend_from_slice(&upstream[..sections_end]);
     let mut kept_ar = 0u16;
+    let mut extended_rcode: Option<u8> = None;
     for _ in 0..ar {
         let (rtype, end) = skip_rr(upstream, pos)?;
-        if rtype != TYPE_OPT {
+        if rtype == TYPE_OPT {
+            if extended_rcode.is_some() {
+                return None;
+            }
+            // The upper eight RCODE bits open the OPT's TTL field (RFC 6891 §6.1.3).
+            extended_rcode = Some(upstream[skip_name(upstream, pos)? + 4]);
+        } else if extended_rcode.is_some() {
+            return None;
+        } else {
             out.extend_from_slice(&upstream[pos..end]);
             kept_ar += 1;
         }
         pos = end;
     }
-    if let Some(edns) = edns {
-        edns.write(&mut out);
-        kept_ar += 1;
+    let extended_rcode = extended_rcode.unwrap_or(0);
+    match edns {
+        Some(edns) => {
+            let opt = out.len();
+            edns.write(&mut out);
+            // Root owner (1), TYPE (2), CLASS (2), then the TTL's first byte.
+            out[opt + 5] = extended_rcode;
+            kept_ar += 1;
+        }
+        None if extended_rcode != 0 => return None,
+        None => {}
     }
 
     out[0..2].copy_from_slice(&id.to_be_bytes());
@@ -632,5 +652,39 @@ mod tests {
         let mut wire = upstream.to_vec().unwrap();
         wire[7] = 1; // ANCOUNT claims a record the message does not hold
         assert!(relay_with_edns(&wire, 1, true, false, None).is_none());
+    }
+
+    /// RFC 6891 does not require OPT to be the last additional record. A
+    /// record after it may compress its owner against another post-OPT name,
+    /// and those offsets move when the OPT is cut out.
+    #[test]
+    fn relay_never_breaks_compression_behind_a_dropped_opt() {
+        let mut wire = vec![0x11, 0x11, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 3];
+        wire.extend_from_slice(b"\x07example\x03com\x00\x00\x10\x00\x01"); // question @12
+        wire.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]); // OPT first
+        let glue = wire.len() as u8;
+        wire.extend_from_slice(b"\x03ns1\xC0\x0C\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04");
+        wire.extend_from_slice(&[192, 0, 2, 53]);
+        wire.extend_from_slice(&[0xC0, glue, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]); // -> glue owner
+        wire.extend_from_slice(&[
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35,
+        ]);
+        let upstream = Message::from_vec(&wire).expect("hickory accepts the upstream message");
+        let owners = |m: &Message| {
+            m.additionals
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let ours = EdnsReply {
+            dnssec_ok: false,
+            cookie: Some(&[0x55; 16]),
+            ede: None,
+        };
+        if let Some(relayed) = relay_with_edns(&wire, 1, true, false, Some(&ours)) {
+            let relayed = Message::from_vec(&relayed).expect("relayed message decodes");
+            assert_eq!(owners(&relayed), owners(&upstream));
+        }
     }
 }

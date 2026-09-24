@@ -156,12 +156,12 @@ impl DnsServerHandler {
                         return Some(maybe_truncate(bytes));
                     }
                 }
-                // No cookie to inject (or an upstream message too malformed to
-                // re-section): relay it with the ID and AD patched. This hands
-                // the upstream's own OPT to the client verbatim, including the
-                // COOKIE echoed back at us. Harmless (RFC 7873 §5.3 has clients
-                // ignore unsolicited cookies; ours is random per query and the
-                // server cookie is bound to our IP).
+                // No cookie to inject, or an upstream message `relay_with_edns`
+                // cannot re-section safely: relay it with the ID and AD
+                // patched. This hands the upstream's own OPT to the client
+                // verbatim, including the COOKIE echoed back at us. Harmless
+                // (RFC 7873 §5.3 has clients ignore unsolicited cookies; ours
+                // is random per query and the server cookie is bound to our IP).
                 let mut response = wire_data.to_vec();
                 if response.len() >= 2 {
                     response[0..2].copy_from_slice(&query.id.to_be_bytes());
