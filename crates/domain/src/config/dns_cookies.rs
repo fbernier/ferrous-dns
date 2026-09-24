@@ -53,8 +53,8 @@ fn parse_server_secret(text: &str) -> Result<Option<[u8; 32]>, String> {
         ));
     }
     let mut secret = [0u8; 32];
-    for (byte, pair) in secret.iter_mut().zip(hex.chunks_exact(2)) {
-        let (Some(high), Some(low)) = (hex_digit(pair[0]), hex_digit(pair[1])) else {
+    for (byte, &[high, low]) in secret.iter_mut().zip(hex.as_chunks::<2>().0) {
+        let (Some(high), Some(low)) = (hex_digit(high), hex_digit(low)) else {
             return Err("dns_cookies.server_secret contains invalid hex characters".to_string());
         };
         *byte = high << 4 | low;

@@ -463,8 +463,8 @@ pub fn relay_aged(
 /// 16-bit offsets in `offsets`. `None` if one lies outside `msg`.
 #[inline]
 fn age_ttls(msg: &mut [u8], offsets: &[u8], entry_ttl: u32, remaining: u32) -> Option<()> {
-    for at in offsets.chunks_exact(2) {
-        let at = usize::from(u16::from_be_bytes([at[0], at[1]]));
+    for &at in offsets.as_chunks::<2>().0 {
+        let at = usize::from(u16::from_be_bytes(at));
         let ttl: &mut [u8; 4] = msg.get_mut(at..at + 4)?.try_into().ok()?;
         *ttl = aged_ttl(u32::from_be_bytes(*ttl), entry_ttl, remaining).to_be_bytes();
     }
