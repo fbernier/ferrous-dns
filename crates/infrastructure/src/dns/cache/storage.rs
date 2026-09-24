@@ -13,7 +13,7 @@ use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -111,7 +111,6 @@ pub struct DnsCache {
     pub(super) eviction_sample_size: usize,
     pub(super) refresh_sample_period: u64,
     pub(super) negative: NegativeDnsCache,
-    pub(crate) eviction_pending: AtomicBool,
     permanent_records: DashMap<CompactString, SmallVec<[RecordType; 2]>, FxBuildHasher>,
     min_ttl: u32,
     max_ttl: u32,
@@ -162,7 +161,6 @@ impl DnsCache {
                 (1.0 / r).ceil() as u64
             },
             negative: NegativeDnsCache::new(config.max_entries),
-            eviction_pending: AtomicBool::new(false),
             permanent_records: DashMap::with_hasher(FxBuildHasher),
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
@@ -193,6 +191,12 @@ impl DnsCache {
         self.cache.is_empty()
     }
 
+    /// Locks every shard in turn, so it belongs on the maintenance cycle, never
+    /// on a per-query path.
+    pub(crate) fn is_over_capacity(&self) -> bool {
+        self.cache.len() >= self.max_entries
+    }
+
     pub fn get(
         &self,
         domain: &str,
@@ -200,11 +204,11 @@ impl DnsCache {
     ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
-        let borrowed = BorrowedKey::new(domain, *record_type);
 
+        // Hits leave the bloom alone: `rotate_bloom` re-seeds every live key,
+        // so reads never decide membership.
         if let Some((arc_data, dnssec_status, remaining_ttl)) = l1_get(domain, record_type) {
             self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
-            self.bloom.refresh(&borrowed);
             return Some((
                 CachedData::IpAddresses(super::data::CachedAddresses {
                     addresses: arc_data,
@@ -214,6 +218,7 @@ impl DnsCache {
             ));
         }
 
+        let borrowed = BorrowedKey::new(domain, *record_type);
         let in_bloom = self.bloom.check(&borrowed);
 
         if !in_bloom {
@@ -238,7 +243,6 @@ impl DnsCache {
                     .stale_hits
                     .fetch_add(1, AtomicOrdering::Relaxed);
                 record.record_hit();
-                self.bloom.refresh(&borrowed);
                 if let Some(senders) = self.refresh_senders.get() {
                     if record.try_set_refreshing()
                         && senders
@@ -268,7 +272,6 @@ impl DnsCache {
             } else {
                 self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
                 record.record_hit();
-                self.bloom.refresh(&borrowed);
                 // A permanent entry never expires, so the distance to
                 // `expires_at_secs` (u64::MAX) is meaningless — serve the TTL the
                 // record was configured with instead, or the client is told to
@@ -321,10 +324,6 @@ impl DnsCache {
 
         let ttl = self.clamp_ttl(ttl);
         let key = CacheKey::new(domain, record_type);
-
-        if self.cache.len() >= self.max_entries {
-            self.eviction_pending.store(true, AtomicOrdering::Relaxed);
-        }
 
         let maybe_l1_addresses = if let CachedData::IpAddresses(ref entry) = data {
             Some(Arc::clone(&entry.addresses))

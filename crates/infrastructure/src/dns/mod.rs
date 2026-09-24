@@ -4,7 +4,6 @@ pub mod cache_maintenance;
 pub mod dga_detection;
 pub mod dnssec;
 pub mod ede;
-pub mod events;
 pub mod fast_path;
 pub mod forwarding;
 #[cfg(feature = "fuzzing")]
@@ -12,7 +11,6 @@ pub mod fuzz_api;
 pub mod load_balancer;
 pub mod nxdomain_hijack;
 pub mod proxy_protocol;
-pub mod query_logger;
 pub mod resolver;
 pub mod response_ip_filter;
 pub mod safe_search;
@@ -29,14 +27,12 @@ pub use cache::{
 };
 pub use cache_maintenance::{DnsCacheMaintenance, RefreshPace};
 pub use dga_detection::DgaDetector;
-pub use events::{QueryEvent, QueryEventEmitter};
 pub use load_balancer::{
     BalancedStrategy, FailoverStrategy, HealthChecker, ParallelStrategy, PoolManager, ServerHealth,
     ServerStatus, UpstreamHealthAdapter, UpstreamReloadAdapter,
 };
 pub use nxdomain_hijack::NxdomainHijackDetector;
 pub use proxy_protocol::read_proxy_v2_client_ip;
-pub use query_logger::QueryEventLogger;
 pub use resolver::HickoryDnsResolver;
 pub use response_ip_filter::ResponseIpFilterDetector;
 pub use safe_search::SafeSearchEnforcer;

@@ -2,6 +2,7 @@ use crate::dns::forwarding::{MessageBuilder, ResponseParser};
 use crate::dns::transport;
 use dashmap::DashMap;
 use ferrous_dns_domain::{DnsProtocol, RecordType};
+use rustc_hash::FxBuildHasher;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +38,7 @@ impl Default for ServerHealth {
 }
 
 pub struct HealthChecker {
-    health_map: Arc<DashMap<Arc<DnsProtocol>, ServerHealth>>,
+    health_map: Arc<DashMap<Arc<DnsProtocol>, ServerHealth, FxBuildHasher>>,
     failure_threshold: u8,
     success_threshold: u8,
 }
@@ -45,7 +46,7 @@ pub struct HealthChecker {
 impl HealthChecker {
     pub fn new(failure_threshold: u8, success_threshold: u8) -> Self {
         Self {
-            health_map: Arc::new(DashMap::new()),
+            health_map: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             failure_threshold,
             success_threshold,
         }

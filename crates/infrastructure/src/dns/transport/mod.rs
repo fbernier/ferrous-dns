@@ -12,6 +12,7 @@ pub mod udp_pool;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use ferrous_dns_domain::{DnsProtocol, DomainError};
+use rustc_hash::FxBuildHasher;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -93,8 +94,8 @@ impl Transport {
     }
 }
 
-static TRANSPORT_CACHE: LazyLock<DashMap<DnsProtocol, Arc<Transport>>> =
-    LazyLock::new(DashMap::new);
+static TRANSPORT_CACHE: LazyLock<DashMap<DnsProtocol, Arc<Transport>, FxBuildHasher>> =
+    LazyLock::new(|| DashMap::with_hasher(FxBuildHasher));
 
 pub fn get_or_create_transport(protocol: &DnsProtocol) -> Result<Arc<Transport>, DomainError> {
     if let Some(t) = TRANSPORT_CACHE.get(protocol) {

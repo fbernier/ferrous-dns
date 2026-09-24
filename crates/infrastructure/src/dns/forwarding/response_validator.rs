@@ -20,8 +20,8 @@ const COOKIE_OPTION_CODE: u16 = 10;
 /// question (name/type) matching always apply, across every transport.
 pub struct ResponseValidator {
     id: u16,
-    /// Case-preserving label bytes of the question name we sent.
-    expected_labels: Vec<Vec<u8>>,
+    /// Case-preserving wire-format question name we sent (uncompressed).
+    expected_qname: Box<[u8]>,
     expected_qtype: HickoryRecordType,
     /// `Some` only when a client cookie (EDNS option 10) was sent.
     client_cookie: Option<[u8; CLIENT_COOKIE_LEN]>,
@@ -32,14 +32,14 @@ pub struct ResponseValidator {
 impl ResponseValidator {
     pub fn new(
         id: u16,
-        expected_labels: Vec<Vec<u8>>,
+        expected_qname: &[u8],
         expected_qtype: HickoryRecordType,
         client_cookie: Option<[u8; CLIENT_COOKIE_LEN]>,
         case_sensitive: bool,
     ) -> Self {
         Self {
             id,
-            expected_labels,
+            expected_qname: expected_qname.into(),
             expected_qtype,
             client_cookie,
             case_sensitive,
@@ -99,24 +99,26 @@ impl ResponseValidator {
     /// (encrypted transports are TLS-authenticated, so we tolerate upstreams that
     /// normalize QNAME case); otherwise ASCII-case-insensitively.
     fn qname_matches(&self, name: &Name, protocol: &DnsProtocol) -> bool {
-        let mut got = name.iter();
-        let mut want = self.expected_labels.iter();
-        loop {
-            match (got.next(), want.next()) {
-                (Some(g), Some(w)) => {
-                    let eq = if self.case_sensitive && is_do53(protocol) {
-                        g == w.as_slice()
-                    } else {
-                        g.eq_ignore_ascii_case(w)
-                    };
-                    if !eq {
-                        return false;
-                    }
-                }
-                (None, None) => return true,
-                _ => return false,
+        let case_sensitive = self.case_sensitive && is_do53(protocol);
+        let mut want = &self.expected_qname[..];
+        for got in name.iter() {
+            let Some((&len, rest)) = want.split_first() else {
+                return false;
+            };
+            let Some(label) = rest.get(..usize::from(len)).filter(|_| len != 0) else {
+                return false;
+            };
+            let eq = if case_sensitive {
+                got == label
+            } else {
+                got.eq_ignore_ascii_case(label)
+            };
+            if !eq {
+                return false;
             }
+            want = &rest[usize::from(len)..];
         }
+        want == [0]
     }
 
     fn validate_cookie(

@@ -4,7 +4,6 @@ use ferrous_dns_infrastructure::dns::dnssec::{
     DnskeyRecord, DnssecValidator, DnssecValidatorPool, ValidationResult,
 };
 use ferrous_dns_infrastructure::dns::PoolManager;
-use ferrous_dns_infrastructure::dns::QueryEventEmitter;
 use hickory_proto::op::{Message, MessageType, OpCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record};
@@ -24,11 +23,7 @@ async fn make_pool_manager(server: String) -> Arc<PoolManager> {
         servers: vec![server],
         weight: None,
     };
-    Arc::new(
-        PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
-            .await
-            .unwrap(),
-    )
+    Arc::new(PoolManager::new(vec![pool], None).await.unwrap())
 }
 
 fn make_validator() -> DnssecValidator {

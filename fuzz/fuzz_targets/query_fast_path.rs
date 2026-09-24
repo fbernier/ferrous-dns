@@ -5,7 +5,7 @@
 //! Two properties are checked:
 //!
 //! 1. **No panic / no out-of-bounds.** `build_cache_hit_response` writes into a
-//!    fixed 523-byte stack buffer and has already had an overflow bug (see the
+//!    fixed 523-byte buffer and has already had an overflow bug (see the
 //!    comment on `RESPONSE_BUF_LEN` in `wire_response.rs`).
 //! 2. **The fast path and the slow path agree on the name.** A cache hit is
 //!    keyed on `FastPathQuery::domain()`, while the slow path keys on
@@ -84,9 +84,14 @@ fuzz_target!(|packet: &[u8]| {
         addresses.push(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)));
     }
 
-    if let Some((buf, len)) = wire_response::build_cache_hit_response(&query, packet, &addresses, 300)
+    let mut buf = [0u8; wire_response::RESPONSE_BUF_LEN];
+    if let Some(len) = wire_response::build_cache_hit_response(&query, packet, &addresses, 300, &mut buf)
     {
         assert!(len <= buf.len(), "response length escaped the fixed buffer");
+        // The UDP worker reuses its buffers, so no byte may depend on prior contents.
+        let mut dirty = [0xA5u8; wire_response::RESPONSE_BUF_LEN];
+        let dirty_len = wire_response::build_cache_hit_response(&query, packet, &addresses, 300, &mut dirty);
+        assert_eq!(dirty_len.map(|l| &dirty[..l]), Some(&buf[..len]), "response depends on buffer contents");
         assert!(
             wire_response::wire_fits_udp_buffer(len, query.client_max_size),
             "response exceeds the buffer the client advertised"

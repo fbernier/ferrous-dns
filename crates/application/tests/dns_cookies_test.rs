@@ -97,7 +97,7 @@ async fn should_allow_query_with_only_client_cookie_when_require_valid_cookie_fa
 
     // Only client cookie present (bootstrapping handshake).
     let request =
-        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie([0xBBu8; 8].to_vec());
+        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(&[0xBBu8; 8]);
     let result = use_case.execute(&request).await;
     assert!(
         result.is_ok(),
@@ -115,7 +115,7 @@ async fn should_allow_query_with_valid_server_cookie() {
     let (use_case, _log) = make_use_case(resolver, guard);
 
     let request = DnsRequest::new("example.com", RecordType::A, CLIENT_IP)
-        .with_cookie(valid_cookie_for(CLIENT_IP));
+        .with_cookie(&valid_cookie_for(CLIENT_IP));
     let result = use_case.execute(&request).await;
     assert!(result.is_ok(), "valid cookie must be accepted");
 }
@@ -132,8 +132,7 @@ async fn should_reject_query_with_invalid_server_cookie() {
     bad_cookie[..8].copy_from_slice(&[0xAAu8; 8]); // client cookie
     bad_cookie[8..].copy_from_slice(&[0xFFu8; 8]); // wrong server cookie
 
-    let request =
-        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(bad_cookie.to_vec());
+    let request = DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(&bad_cookie);
     let result = use_case.execute(&request).await;
     assert!(
         matches!(result, Err(DomainError::DnsCookieInvalid)),
@@ -167,7 +166,7 @@ async fn should_reject_query_with_only_client_cookie_when_require_valid_cookie_t
     // Only the 8-byte client cookie — bootstrapping handshake is not enough in strict mode
     // (RFC 7873 §5.2.3: the client must supply a valid server cookie).
     let request =
-        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie([0xBBu8; 8].to_vec());
+        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(&[0xBBu8; 8]);
     let result = use_case.execute(&request).await;
     assert!(
         matches!(result, Err(DomainError::DnsCookieInvalid)),

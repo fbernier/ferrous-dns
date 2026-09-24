@@ -131,9 +131,15 @@ fn test_fast_path_response_includes_opt_when_client_sent_edns() {
 
     let addresses: Vec<IpAddr> = vec!["1.2.3.4".parse().unwrap()];
 
-    let (wire, wire_len) =
-        wire_response::build_cache_hit_response(&fast_query, &query_bytes, &addresses, 300)
-            .expect("build_cache_hit_response should succeed");
+    let mut wire = [0u8; wire_response::RESPONSE_BUF_LEN];
+    let wire_len = wire_response::build_cache_hit_response(
+        &fast_query,
+        &query_bytes,
+        &addresses,
+        300,
+        &mut wire,
+    )
+    .expect("build_cache_hit_response should succeed");
 
     let arcount = u16::from_be_bytes([wire[10], wire[11]]);
     assert_eq!(
@@ -211,9 +217,15 @@ fn test_fast_path_response_no_opt_when_client_has_no_edns() {
     );
 
     let addresses: Vec<IpAddr> = vec!["1.2.3.4".parse().unwrap()];
-    let (wire, _wire_len) =
-        wire_response::build_cache_hit_response(&fast_query, &query_bytes, &addresses, 300)
-            .expect("build_cache_hit_response should succeed");
+    let mut wire = [0u8; wire_response::RESPONSE_BUF_LEN];
+    let _wire_len = wire_response::build_cache_hit_response(
+        &fast_query,
+        &query_bytes,
+        &addresses,
+        300,
+        &mut wire,
+    )
+    .expect("build_cache_hit_response should succeed");
 
     let arcount = u16::from_be_bytes([wire[10], wire[11]]);
     assert_eq!(arcount, 0, "ARCOUNT must be 0 when client did not send OPT");

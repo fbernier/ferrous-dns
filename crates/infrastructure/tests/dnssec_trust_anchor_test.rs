@@ -10,7 +10,7 @@ use ferrous_dns_domain::{RecordType, UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::dnssec::{
     ChainVerifier, DnskeyRecord, DnssecCache, TrustAnchorKey, TrustAnchorStore, ValidationResult,
 };
-use ferrous_dns_infrastructure::dns::{PoolManager, QueryEventEmitter};
+use ferrous_dns_infrastructure::dns::PoolManager;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -257,11 +257,7 @@ async fn live_root_chain_verifier() -> ChainVerifier {
         weight: None,
     };
 
-    let pool_manager = Arc::new(
-        PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
-            .await
-            .unwrap(),
-    );
+    let pool_manager = Arc::new(PoolManager::new(vec![pool], None).await.unwrap());
 
     ChainVerifier::new(
         pool_manager,

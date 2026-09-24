@@ -5,7 +5,6 @@
 
 use ferrous_dns_application::ports::DnsResolver;
 use ferrous_dns_domain::{DnsQuery, RecordType, UpstreamPool, UpstreamStrategy};
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::forwarding::HardeningOpts;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 use ferrous_dns_infrastructure::dns::resolver::{CachedResolver, CoreResolver};
@@ -80,7 +79,7 @@ async fn manager(addr: SocketAddr, qname_0x20: bool) -> Arc<PoolManager> {
         weight: None,
     };
     Arc::new(
-        PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+        PoolManager::new(vec![pool], None)
             .await
             .unwrap()
             .with_hardening(HardeningOpts {

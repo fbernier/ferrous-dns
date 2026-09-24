@@ -59,7 +59,7 @@ impl WildcardAnswer {
 /// It sits above the cache, so its answers are never stored under a concrete
 /// name — a cache key is matched exactly and an expansion of `*.home.lan` could
 /// not be found again for invalidation when the wildcard is deleted. The price
-/// is one index lookup per query, skipped entirely while no wildcard exists.
+/// is one index probe per parent label of each query name.
 pub struct LocalWildcardResolver {
     inner: Arc<dyn DnsResolver>,
     /// Live index of covered suffix → answers.
@@ -186,10 +186,8 @@ impl DnsResolver for LocalWildcardResolver {
     }
 
     async fn resolve(&self, query: &DnsQuery) -> Result<DnsResolution, DomainError> {
-        if self.map.is_empty() {
-            return self.inner.resolve(query).await;
-        }
-
+        // No `map.is_empty()` shortcut: DashMap computes it by locking every
+        // shard, which costs more than the per-label probes it would skip.
         let Some(answer) = self.lookup(&query.domain) else {
             return self.inner.resolve(query).await;
         };

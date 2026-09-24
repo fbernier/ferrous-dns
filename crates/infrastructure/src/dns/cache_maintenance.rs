@@ -333,11 +333,7 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
     async fn run_refresh_cycle(&self) -> Result<CacheRefreshOutcome, DomainError> {
         coarse_clock::tick();
 
-        if self
-            .cache
-            .eviction_pending
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.cache.is_over_capacity() {
             let cache_for_evict = Arc::clone(&self.cache);
             if let Err(e) =
                 tokio::task::spawn_blocking(move || cache_for_evict.evict_entries()).await

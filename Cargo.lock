@@ -1089,6 +1089,7 @@ dependencies = [
  "ferrous-dns-application",
  "ferrous-dns-domain",
  "futures",
+ "getrandom 0.3.4",
  "h3",
  "h3-quinn",
  "hickory-proto",

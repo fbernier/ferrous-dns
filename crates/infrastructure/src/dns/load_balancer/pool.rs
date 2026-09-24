@@ -2,8 +2,7 @@ use super::balanced::BalancedStrategy;
 use super::failover::FailoverStrategy;
 use super::health::HealthChecker;
 use super::parallel::ParallelStrategy;
-use super::strategy::{QueryContext, Strategy, UpstreamResult};
-use crate::dns::events::QueryEventEmitter;
+use super::strategy::{QueryContext, ServerDisplays, Strategy, UpstreamResult};
 use crate::dns::forwarding::{HardeningOpts, MessageBuilder, ResponseParser};
 use crate::dns::transport::resolver;
 use arc_swap::ArcSwap;
@@ -11,7 +10,6 @@ use ferrous_dns_domain::{
     Config, DnsProtocol, DomainError, RecordType, UpstreamPool, UpstreamStrategy,
 };
 use smallvec::SmallVec;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +19,6 @@ pub struct PoolManager {
     /// Live set of pools, swappable at runtime so upstream changes apply without a restart.
     pools: ArcSwap<Vec<PoolWithStrategy>>,
     health_checker: Option<Arc<HealthChecker>>,
-    emitter: QueryEventEmitter,
     /// Anti-spoofing hardening applied to upstream queries of every record type
     /// (DNS Cookies + 0x20).
     hardening: HardeningOpts,
@@ -39,7 +36,7 @@ struct PoolWithStrategy {
     server_protocols: Vec<Arc<DnsProtocol>>,
     server_groups: Vec<ServerGroup>,
     name_arc: Arc<str>,
-    server_displays: Arc<HashMap<Arc<DnsProtocol>, Arc<str>>>,
+    server_displays: Arc<ServerDisplays>,
 }
 
 /// An opaque, fully-rebuilt pool set produced by [`PoolManager::prepare`] and ready
@@ -50,14 +47,12 @@ impl PoolManager {
     pub async fn new(
         pools: Vec<UpstreamPool>,
         health_checker: Option<Arc<HealthChecker>>,
-        emitter: QueryEventEmitter,
     ) -> Result<Self, DomainError> {
         let pools_with_strategy = Self::build_pools(pools).await?;
 
         Ok(Self {
             pools: ArcSwap::from_pointee(pools_with_strategy),
             health_checker,
-            emitter,
             // Cookie echo validation is always-on (safe + graceful); 0x20 case
             // randomization is opt-in via `with_hardening`.
             hardening: HardeningOpts {
@@ -144,7 +139,7 @@ impl PoolManager {
                 .iter()
                 .flat_map(|g| g.protocols.iter().cloned())
                 .collect();
-            let server_displays: Arc<HashMap<Arc<DnsProtocol>, Arc<str>>> = Arc::new(
+            let server_displays: Arc<ServerDisplays> = Arc::new(
                 server_protocols
                     .iter()
                     .map(|p| (Arc::clone(p), Arc::from(p.to_string())))
@@ -289,12 +284,7 @@ impl PoolManager {
     }
 
     pub async fn from_config(config: &Config) -> Result<Self, DomainError> {
-        Self::new(
-            config.dns.pools.clone(),
-            None,
-            QueryEventEmitter::new_disabled(),
-        )
-        .await
+        Self::new(config.dns.pools.clone(), None).await
     }
 
     pub async fn query(
@@ -336,11 +326,9 @@ impl PoolManager {
             let ctx = QueryContext {
                 servers: &healthy_refs,
                 domain,
-                record_type,
                 timeout_ms,
                 query_bytes: Arc::clone(&query_bytes),
                 validator: &validator,
-                emitter: &self.emitter,
                 pool_name: &pool.name_arc,
                 server_displays: &pool.server_displays,
             };

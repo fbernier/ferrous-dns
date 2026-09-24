@@ -124,8 +124,7 @@ async fn run_udp_worker_batch(
     // Pre-allocate batch state once per worker — reused across all iterations.
     let mut batch = pktinfo::RecvBatch::new(pktinfo::BATCH_SIZE);
     let mut send_batch = pktinfo::SendBatch::new(pktinfo::BATCH_SIZE);
-    // Pre-allocate response queues — cleared between batches, never reallocated.
-    let mut pending: Vec<pktinfo::PendingResponse> = Vec::with_capacity(pktinfo::BATCH_SIZE);
+    // Pre-allocated wire-data queue — cleared between batches, never reallocated.
     let mut pending_wire: Vec<pktinfo::PendingWireResponse> =
         Vec::with_capacity(pktinfo::BATCH_SIZE);
 
@@ -158,7 +157,6 @@ async fn run_udp_worker_batch(
             };
 
             // Process each received packet in the batch.
-            pending.clear();
             pending_wire.clear();
             for i in 0..n {
                 let msg = batch.get_msg(i);
@@ -175,21 +173,16 @@ async fn run_udp_worker_batch(
                                 client_ip,
                                 ClientProtocol::Udp,
                             ) {
-                                if let Some((wire, wire_len)) =
+                                // Encoded straight into the sendmmsg buffer.
+                                if send_batch.stage(msg.src, msg.dst_ip, |out| {
                                     wire_response::build_cache_hit_response(
                                         &fast_query,
                                         msg.data,
                                         &addresses,
                                         ttl,
+                                        out,
                                     )
-                                {
-                                    // Fast path: inline wire buf — zero extra heap allocation.
-                                    pending.push(pktinfo::PendingResponse {
-                                        wire,
-                                        len: wire_len,
-                                        to: msg.src,
-                                        src_ip: msg.dst_ip,
-                                    });
+                                }) {
                                     continue;
                                 }
                             }
@@ -218,11 +211,9 @@ async fn run_udp_worker_batch(
             }
 
             // Flush A/AAAA responses via sendmmsg (pre-allocated, single syscall).
-            if !pending.is_empty() {
-                if let Err(e) = send_batch.send(fd, &pending) {
-                    if e.kind() != io::ErrorKind::WouldBlock {
-                        error!(worker = worker_id, error = %e, "UDP sendmmsg error");
-                    }
+            if let Err(e) = send_batch.flush(fd) {
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    error!(worker = worker_id, error = %e, "UDP sendmmsg error");
                 }
             }
 
@@ -241,6 +232,15 @@ async fn run_udp_worker_batch(
             if processed >= PACKETS_BEFORE_YIELD {
                 tokio::task::yield_now().await;
                 processed = 0;
+            }
+
+            // A short batch drained the queue as of that syscall, so skip the
+            // recvmmsg that would only return EAGAIN. Safe under edge
+            // triggering: a datagram arriving after it re-arms epoll, and
+            // clear_ready is a no-op if the driver has already seen one.
+            if n < pktinfo::BATCH_SIZE {
+                guard.clear_ready();
+                break;
             }
         }
     }
@@ -286,14 +286,14 @@ async fn run_udp_worker_single(
                                     client_ip,
                                     ClientProtocol::Udp,
                                 ) {
-                                    if let Some((wire, wire_len)) =
-                                        wire_response::build_cache_hit_response(
-                                            &fast_query,
-                                            query_buf,
-                                            &addresses,
-                                            ttl,
-                                        )
-                                    {
+                                    let mut wire = [0u8; wire_response::RESPONSE_BUF_LEN];
+                                    if let Some(wire_len) = wire_response::build_cache_hit_response(
+                                        &fast_query,
+                                        query_buf,
+                                        &addresses,
+                                        ttl,
+                                        &mut wire,
+                                    ) {
                                         let _ = pktinfo::try_send_with_src_ip(
                                             socket.get_ref(),
                                             &wire[..wire_len],

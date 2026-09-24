@@ -112,7 +112,7 @@ Upstream UDP sockets are pooled, retaining up to 4 idle sockets per upstream ser
 
 ## EDNS buffer size and truncation
 
-Upstream queries advertise a 1232-byte EDNS UDP payload — small enough to avoid IP fragmentation on nearly every path, which is itself a spoofing vector. Oversized answers come back with `TC=1` and are retried over TCP, and client-advertised buffer sizes are honoured with correct truncation on the way back (RFC 6891 §6.2.5 / RFC 7766).
+Upstream queries advertise a 1232-byte EDNS UDP payload — small enough to avoid IP fragmentation on nearly every path, which is itself a spoofing vector. Oversized answers come back with `TC=1` and are retried over TCP, and client-advertised buffer sizes are honoured with correct truncation on the way back (RFC 6891 §6.2.5 / RFC 7766). Answers the server builds (addresses, blocks, errors) carry an OPT record only when the query did (RFC 6891 §7) and copy the query's DO bit into it (RFC 3225 §3); cached answers of other types are relayed with the upstream's OPT unless a client cookie has to be added.
 
 ---
 

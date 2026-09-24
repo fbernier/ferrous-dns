@@ -681,7 +681,11 @@ impl HandleDnsQueryUseCase {
             .and_then(|ss| ss.cname_for(&request.domain, group_id))
         {
             let safe_query = DnsQuery::new(Arc::from(cname_target), request.record_type);
-            let resolution = self.resolver.resolve(&safe_query).await?;
+            // `resolve` expects the caller to have probed the cache already.
+            let resolution = match self.resolver.try_cache(&safe_query) {
+                Some(cached) if cached.has_response_data() => cached,
+                _ => self.resolver.resolve(&safe_query).await?,
+            };
             self.log(&QueryLog {
                 cache_hit: resolution.cache_hit,
                 upstream_server: resolution.upstream_server.clone(),

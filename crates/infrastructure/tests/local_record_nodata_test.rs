@@ -286,9 +286,9 @@ async fn test_coalesced_followers_keep_local_nodata() {
 
         fn local_record_status(&self, domain: &str, kind: &RecordType) -> LocalRecordStatus {
             match self.checks.fetch_add(1, Ordering::SeqCst) {
-                // Hide ownership until the follower subscribes to the paused leader.
-                0 | 2 => LocalRecordStatus::NotLocal,
-                1 => {
+                // The leader's in-flight check: pause it until the follower
+                // has subscribed.
+                0 => {
                     self.checkpoint.notify_one();
                     self.release
                         .lock()

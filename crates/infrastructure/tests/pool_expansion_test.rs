@@ -1,5 +1,4 @@
 use ferrous_dns_domain::{DnsProtocol, UpstreamPool, UpstreamStrategy};
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 
 #[tokio::test]
@@ -12,7 +11,7 @@ async fn test_pool_manager_expands_hostnames() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 
@@ -46,7 +45,7 @@ async fn test_pool_manager_expansion_includes_ipv6() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 
@@ -72,7 +71,7 @@ async fn test_pool_manager_keeps_literal_ips_unchanged() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 
@@ -95,7 +94,7 @@ async fn test_pool_manager_mixed_literal_and_hostname() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 
@@ -123,7 +122,7 @@ async fn test_pool_manager_tls_hostname_expansion() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 
@@ -159,7 +158,7 @@ async fn test_pool_manager_https_not_expanded_but_preresolved() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 
@@ -190,7 +189,7 @@ async fn test_pool_manager_preresolves_h3_hostnames() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 
@@ -221,7 +220,7 @@ async fn test_pool_manager_https_ip_no_resolution() {
         weight: None,
     };
 
-    let pm = PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+    let pm = PoolManager::new(vec![pool], None)
         .await
         .expect("PoolManager should create successfully");
 

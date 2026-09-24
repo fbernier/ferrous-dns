@@ -25,15 +25,55 @@ pub struct FastPathQuery {
     /// bit / validation to be honoured. Such queries skip the inline cache fast
     /// path (which cannot set AD) and take the full resolver path instead.
     pub wants_dnssec: bool,
+    pub recursion_desired: bool,
+    pub checking_disabled: bool,
+    /// `(offset, len)` of the OPT RDATA in the query buffer; bounds unchecked.
+    opt_rdata: Option<(usize, usize)>,
     domain_buf: [u8; MAX_DOMAIN_LEN + 1],
     domain_len: usize,
 }
 
+/// The OPT RDATA does not decode as a sequence of EDNS options (RFC 6891 §6.1.2).
+#[derive(Debug, PartialEq, Eq)]
+pub struct MalformedEdnsOptions;
+
 impl FastPathQuery {
     pub fn domain(&self) -> &str {
-        core::str::from_utf8(&self.domain_buf[..self.domain_len]).unwrap_or_default()
+        // SAFETY: `parse_query` only copies ASCII alphanumerics, `_`, `-`, `*`
+        // and `.` into `domain_buf[..domain_len]`, so it is valid UTF-8.
+        unsafe { core::str::from_utf8_unchecked(&self.domain_buf[..self.domain_len]) }
+    }
+
+    /// The question section, `buf[12..question_end]`, for echoing in a response.
+    pub fn question<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        &buf[12..self.question_end]
+    }
+
+    /// The DNS Cookie option (RFC 7873, code 10) of the query in `buf`, the
+    /// packet this was parsed from. Walks the OPT options only when asked, so
+    /// cache hits never pay for it.
+    pub fn edns_cookie<'a>(&self, buf: &'a [u8]) -> Result<Option<&'a [u8]>, MalformedEdnsOptions> {
+        let Some((start, len)) = self.opt_rdata else {
+            return Ok(None);
+        };
+        let mut options = buf.get(start..start + len).ok_or(MalformedEdnsOptions)?;
+        let mut cookie = None;
+        while !options.is_empty() {
+            let [c0, c1, l0, l1, rest @ ..] = options else {
+                return Err(MalformedEdnsOptions);
+            };
+            let data_len = usize::from(u16::from_be_bytes([*l0, *l1]));
+            let data = rest.get(..data_len).ok_or(MalformedEdnsOptions)?;
+            if u16::from_be_bytes([*c0, *c1]) == COOKIE_OPTION_CODE && cookie.is_none() {
+                cookie = Some(data);
+            }
+            options = &rest[data_len..];
+        }
+        Ok(cookie)
     }
 }
+
+const COOKIE_OPTION_CODE: u16 = 10;
 
 pub fn parse_query(buf: &[u8]) -> Option<FastPathQuery> {
     if buf.len() < 17 {
@@ -148,6 +188,7 @@ pub fn parse_query(buf: &[u8]) -> Option<FastPathQuery> {
     let mut client_max_size: u16 = 512;
     let mut has_edns = false;
     let mut wants_dnssec = false;
+    let mut opt_rdata = None;
 
     if arcount > 0 {
         let mut ar_pos = question_end;
@@ -168,6 +209,10 @@ pub fn parse_query(buf: &[u8]) -> Option<FastPathQuery> {
             ar_pos += 2;
 
             if rr_type == 41 {
+                // RFC 6891 §6.1.1: a second OPT is a FORMERR; hickory rejects it too.
+                if has_edns {
+                    return None;
+                }
                 has_edns = true;
                 let udp_size = u16::from_be_bytes([buf[ar_pos], buf[ar_pos + 1]]);
                 client_max_size = udp_size.max(512);
@@ -187,6 +232,7 @@ pub fn parse_query(buf: &[u8]) -> Option<FastPathQuery> {
                     return None;
                 }
                 let rdlen = u16::from_be_bytes([buf[ar_pos], buf[ar_pos + 1]]) as usize;
+                opt_rdata = Some((ar_pos + 2, rdlen));
                 ar_pos += 2 + rdlen;
             } else {
                 ar_pos += 2;
@@ -208,6 +254,9 @@ pub fn parse_query(buf: &[u8]) -> Option<FastPathQuery> {
         client_max_size,
         has_edns,
         wants_dnssec,
+        recursion_desired: flags & 0x0100 != 0,
+        checking_disabled: flags & 0x0010 != 0,
+        opt_rdata,
         domain_buf,
         domain_len,
     })

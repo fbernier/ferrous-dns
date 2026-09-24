@@ -1,16 +1,13 @@
 use super::record_type_map::RecordTypeMapper;
 use super::response_validator::ResponseValidator;
 use ferrous_dns_domain::{DomainError, RecordType};
-use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
-use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::Name;
-use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use ring::rand::{SecureRandom, SystemRandom};
 use std::str::FromStr;
-use std::sync::LazyLock;
 
 const CLIENT_COOKIE_LEN: usize = 8;
 const COOKIE_OPTION_CODE: u16 = 10;
+/// RFC 1035 §3.1: a wire-format name is at most 255 octets.
+const MAX_QNAME_LEN: usize = 255;
 
 /// EDNS0 UDP payload size advertised on every outgoing upstream query.
 ///
@@ -59,17 +56,12 @@ impl MessageBuilder {
         record_type: &RecordType,
         dnssec_ok: bool,
     ) -> Result<(u16, Vec<u8>), DomainError> {
-        let name = Name::from_str(domain).map_err(|e| {
-            DomainError::InvalidDomainName(format!("Invalid domain '{}': {}", domain, e))
-        })?;
-        let id = Self::secure_random_id();
-        let bytes = Self::assemble_query(
-            id,
-            name,
-            RecordTypeMapper::to_hickory(record_type),
-            Self::build_edns(dnssec_ok),
-        )?;
-        Ok((id, bytes))
+        let qname = QName::encode(domain)?;
+        let mut id = [0u8; 2];
+        Self::fill_random(&mut id);
+        let id = u16::from_be_bytes(id);
+        let qtype = u16::from(RecordTypeMapper::to_hickory(record_type));
+        Ok((id, assemble_query(id, &qname, qtype, dnssec_ok, None)))
     }
 
     /// Builds an upstream query with optional anti-spoofing hardening and returns
@@ -86,142 +78,252 @@ impl MessageBuilder {
         dnssec_ok: bool,
         opts: HardeningOpts,
     ) -> Result<(Vec<u8>, ResponseValidator), DomainError> {
-        let use_cookie = opts.cookie;
-        let use_0x20 = opts.qname_0x20;
-
-        let name = if use_0x20 {
-            Self::randomized_case_name(domain)?
-        } else {
-            Name::from_str(domain).map_err(|e| {
-                DomainError::InvalidDomainName(format!("Invalid domain '{}': {}", domain, e))
-            })?
-        };
-
+        let mut qname = QName::encode(domain)?;
+        if opts.qname_0x20 {
+            qname.randomize_case();
+        }
         let hickory_type = RecordTypeMapper::to_hickory(record_type);
-        let id = Self::secure_random_id();
 
-        let mut edns = Self::build_edns(dnssec_ok);
-        let client_cookie = if use_cookie {
+        // One draw for both secrets: each OS RNG call is a syscall where the
+        // vDSO getrandom is unavailable.
+        let mut secrets = [0u8; 2 + CLIENT_COOKIE_LEN];
+        let drawn = if opts.cookie { secrets.len() } else { 2 };
+        Self::fill_random(&mut secrets[..drawn]);
+        let id = u16::from_be_bytes([secrets[0], secrets[1]]);
+        let client_cookie = opts.cookie.then(|| {
             let mut cookie = [0u8; CLIENT_COOKIE_LEN];
-            Self::fill_random(&mut cookie);
-            edns.options_mut()
-                .insert(EdnsOption::Unknown(COOKIE_OPTION_CODE, cookie.to_vec()));
-            Some(cookie)
-        } else {
-            None
-        };
+            cookie.copy_from_slice(&secrets[2..]);
+            cookie
+        });
 
-        let bytes = Self::assemble_query(id, name.clone(), hickory_type, edns)?;
-
-        let expected_labels = name.iter().map(|label| label.to_vec()).collect();
-        let validator =
-            ResponseValidator::new(id, expected_labels, hickory_type, client_cookie, use_0x20);
-
+        let bytes = assemble_query(
+            id,
+            &qname,
+            u16::from(hickory_type),
+            dnssec_ok,
+            client_cookie.as_ref(),
+        );
+        let validator = ResponseValidator::new(
+            id,
+            qname.wire(),
+            hickory_type,
+            client_cookie,
+            opts.qname_0x20,
+        );
         Ok((bytes, validator))
     }
 
-    /// Builds a `Name` whose ASCII letters have randomized case (0x20). Built from
-    /// raw label bytes via `Name::from_labels` because `Name::from_str` lowercases.
-    fn randomized_case_name(domain: &str) -> Result<Name, DomainError> {
-        // Parse first, then randomize the parsed labels. Splitting the input on
-        // raw '.' instead would disagree with the non-randomized path on any name
-        // where a dot is not a separator: `to_utf8` hands us DNS escapes, so
-        // `a\.b.com` is two labels there and three here, and an IDN arrives as
-        // punycode only through the parser. Querying a *different* name than the
-        // caller asked for is invisible — the echo check compares against the same
-        // wrong name, so it passes, and the answer is cached under the right key.
-        let parsed = Name::from_str(domain).map_err(|e| {
-            DomainError::InvalidDomainName(format!("Invalid domain '{}': {}", domain, e))
-        })?;
-        // The root has no labels to randomize, and `from_labels` rejects the empty
-        // label a naive walk would produce. That matters more than it looks: the
-        // DNSSEC chain bootstraps with a DNSKEY query for ".", so failing here
-        // disables validation outright.
-        if parsed.is_root() {
-            return Ok(parsed);
-        }
-
-        let total: usize = parsed.iter().map(<[u8]>::len).sum();
-        let mut rnd = vec![0u8; (total / 8) + 1];
-        Self::fill_random(&mut rnd);
-
-        let mut bit = 0usize;
-        let mut labels: Vec<Vec<u8>> = Vec::new();
-        for label in parsed.iter() {
-            let mut current: Vec<u8> = Vec::with_capacity(label.len());
-            for &b in label {
-                if b.is_ascii_alphabetic() {
-                    let uppercase = (rnd[bit / 8] >> (bit % 8)) & 1 == 1;
-                    bit += 1;
-                    current.push(if uppercase {
-                        b.to_ascii_uppercase()
-                    } else {
-                        b.to_ascii_lowercase()
-                    });
-                } else {
-                    current.push(b);
-                }
-            }
-            labels.push(current);
-        }
-
-        Name::from_labels(labels).map_err(|e| {
-            DomainError::InvalidDomainName(format!("Invalid domain '{}': {}", domain, e))
-        })
-    }
-
     fn fill_random(buf: &mut [u8]) {
-        static SECURE_RNG: LazyLock<SystemRandom> = LazyLock::new(SystemRandom::new);
-        if SECURE_RNG.fill(buf).is_err() {
+        // getrandom 0.3 goes through libc, which serves it from the vDSO on
+        // glibc >= 2.41 / Linux >= 6.11 (~25 ns vs ~200 ns for the syscall).
+        if getrandom::fill(buf).is_err() {
             for b in buf.iter_mut() {
                 *b = fastrand::u8(..);
             }
         }
     }
+}
 
-    fn secure_random_id() -> u16 {
-        let mut bytes = [0u8; 2];
-        Self::fill_random(&mut bytes);
-        u16::from_be_bytes(bytes)
+/// An uncompressed wire-format QNAME.
+struct QName {
+    buf: [u8; MAX_QNAME_LEN],
+    len: usize,
+}
+
+impl QName {
+    /// Encodes `domain` (presentation form, trailing dot optional), lowercased.
+    /// Plain LDH names are encoded directly; anything else — escapes, Unicode
+    /// (IDN to punycode) — goes through hickory's parser so both agree on
+    /// which labels a name has.
+    fn encode(domain: &str) -> Result<Self, DomainError> {
+        if let Some(qname) = Self::encode_plain(domain) {
+            return Ok(qname);
+        }
+        let name = Name::from_str(domain).map_err(|e| {
+            DomainError::InvalidDomainName(format!("Invalid domain '{}': {}", domain, e))
+        })?;
+        let mut qname = Self {
+            buf: [0; MAX_QNAME_LEN],
+            len: 0,
+        };
+        for label in name.iter() {
+            qname.push_label(label)?;
+        }
+        qname.finish()?;
+        Ok(qname)
     }
 
-    fn build_edns(dnssec_ok: bool) -> Edns {
+    /// `None` for anything outside `[A-Za-z0-9_*-]` labels of 1..=63 bytes.
+    fn encode_plain(domain: &str) -> Option<Self> {
+        let trimmed = domain.strip_suffix('.').unwrap_or(domain);
+        let mut qname = Self {
+            buf: [0; MAX_QNAME_LEN],
+            len: 0,
+        };
+        if !trimmed.is_empty() {
+            for label in trimmed.split('.') {
+                let plain = !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'*'));
+                if !plain {
+                    return None;
+                }
+                qname.push_label(label.as_bytes()).ok()?;
+            }
+        }
+        qname.finish().ok()?;
+        qname.buf[..qname.len].make_ascii_lowercase();
+        Some(qname)
+    }
+
+    fn push_label(&mut self, label: &[u8]) -> Result<(), DomainError> {
+        let end = self.len + 1 + label.len();
+        if label.is_empty() || label.len() > 63 || end >= MAX_QNAME_LEN {
+            return Err(DomainError::InvalidDomainName(
+                "label empty, over 63 bytes, or name over 255 bytes".into(),
+            ));
+        }
+        self.buf[self.len] = label.len() as u8;
+        self.buf[self.len + 1..end].copy_from_slice(label);
+        self.len = end;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), DomainError> {
+        if self.len >= MAX_QNAME_LEN {
+            return Err(DomainError::InvalidDomainName("name over 255 bytes".into()));
+        }
+        self.buf[self.len] = 0;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn wire(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Randomizes the case of every ASCII letter (draft-vixie-dns-0x20). Length
+    /// bytes are at most 63, below `A`, so they are never mistaken for letters.
+    fn randomize_case(&mut self) {
+        let mut bits = [0u8; MAX_QNAME_LEN.div_ceil(8)];
+        MessageBuilder::fill_random(&mut bits[..self.len.div_ceil(8)]);
+        for (i, b) in self.buf[..self.len].iter_mut().enumerate() {
+            if b.is_ascii_alphabetic() && (bits[i / 8] >> (i % 8)) & 1 == 1 {
+                *b ^= 0x20;
+            }
+        }
+    }
+}
+
+/// A recursion-desired query for `qname`/`qtype` class IN with one OPT
+/// advertising [`EDNS_MAX_PAYLOAD`], DO as given, and the client cookie if any.
+fn assemble_query(
+    id: u16,
+    qname: &QName,
+    qtype: u16,
+    dnssec_ok: bool,
+    cookie: Option<&[u8; CLIENT_COOKIE_LEN]>,
+) -> Vec<u8> {
+    let options_len = cookie.map_or(0, |c| 4 + c.len());
+    let mut out = Vec::with_capacity(12 + qname.len + 4 + 11 + options_len);
+    out.extend_from_slice(&id.to_be_bytes());
+    // RD set; one question, one additional (the OPT).
+    out.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1]);
+    out.extend_from_slice(qname.wire());
+    out.extend_from_slice(&qtype.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&[0, 0, 41]);
+    out.extend_from_slice(&EDNS_MAX_PAYLOAD.to_be_bytes());
+    // Extended RCODE 0, version 0, then the flags word with DO in the top bit.
+    out.extend_from_slice(&[0, 0, u8::from(dnssec_ok) << 7, 0]);
+    out.extend_from_slice(&(options_len as u16).to_be_bytes());
+    if let Some(cookie) = cookie {
+        out.extend_from_slice(&COOKIE_OPTION_CODE.to_be_bytes());
+        out.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+        out.extend_from_slice(cookie);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::opt::EdnsOption;
+
+    /// The hickory encoding the wire builder replaced, as the reference.
+    fn hickory_query(
+        id: u16,
+        domain: &str,
+        rt: RecordType,
+        dnssec_ok: bool,
+        cookie: Option<[u8; 8]>,
+    ) -> Vec<u8> {
+        let mut query = Query::new();
+        query.set_name(Name::from_str(domain).unwrap());
+        query.set_query_type(RecordTypeMapper::to_hickory(&rt));
+        query.set_query_class(hickory_proto::rr::DNSClass::IN);
         let mut edns = Edns::new();
         edns.set_max_payload(EDNS_MAX_PAYLOAD);
         edns.set_dnssec_ok(dnssec_ok);
         edns.set_version(0);
-        edns
-    }
-
-    /// Assembles and serializes a recursion-desired query for `name`/`hickory_type`
-    /// with the given EDNS. Shared boilerplate between the plain and hardened builders.
-    fn assemble_query(
-        id: u16,
-        name: Name,
-        hickory_type: hickory_proto::rr::RecordType,
-        edns: Edns,
-    ) -> Result<Vec<u8>, DomainError> {
-        let mut query = Query::new();
-        query.set_name(name);
-        query.set_query_type(hickory_type);
-        query.set_query_class(hickory_proto::rr::DNSClass::IN);
-
+        if let Some(cookie) = cookie {
+            edns.options_mut()
+                .insert(EdnsOption::Unknown(COOKIE_OPTION_CODE, cookie.to_vec()));
+        }
         let mut message = Message::new(id, MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = true;
         message.add_query(query);
         message.set_edns(edns);
-
-        Self::serialize_message(&message)
+        message.to_vec().unwrap()
     }
 
-    fn serialize_message(message: &Message) -> Result<Vec<u8>, DomainError> {
-        let mut buf = Vec::with_capacity(512);
-        let mut encoder = BinEncoder::new(&mut buf);
+    #[test]
+    fn wire_query_matches_hickory_encoding() {
+        let cases = [
+            ("example.com", RecordType::A, false, None),
+            ("www.Example.COM.", RecordType::AAAA, true, Some([7u8; 8])),
+            (".", RecordType::DNSKEY, true, None),
+            (
+                "_dmarc.sub-1.example.org",
+                RecordType::TXT,
+                false,
+                Some([1, 2, 3, 4, 5, 6, 7, 8]),
+            ),
+            ("bücher.example", RecordType::A, false, None),
+            (r"a\.b.example", RecordType::A, false, None),
+        ];
+        for (domain, rt, dnssec_ok, cookie) in cases {
+            let qname = QName::encode(domain).unwrap();
+            let qtype = u16::from(RecordTypeMapper::to_hickory(&rt));
+            assert_eq!(
+                assemble_query(0x1234, &qname, qtype, dnssec_ok, cookie.as_ref()),
+                hickory_query(0x1234, domain, rt, dnssec_ok, cookie),
+                "{domain}"
+            );
+        }
+    }
 
-        message.emit(&mut encoder).map_err(|e| {
-            DomainError::InvalidDomainName(format!("Failed to serialize DNS message: {}", e))
-        })?;
+    #[test]
+    fn randomized_case_only_flips_letters() {
+        let mut qname = QName::encode("a1-b.example.com").unwrap();
+        let plain = qname.wire().to_vec();
+        qname.randomize_case();
+        assert_eq!(qname.wire().len(), plain.len());
+        assert!(qname.wire().eq_ignore_ascii_case(&plain));
+        for (got, want) in qname.wire().iter().zip(&plain) {
+            if !want.is_ascii_alphabetic() {
+                assert_eq!(got, want);
+            }
+        }
+    }
 
-        Ok(buf)
+    #[test]
+    fn over_long_names_are_rejected() {
+        let label = "a".repeat(63);
+        let too_long = [label.as_str(); 4].join(".");
+        assert!(QName::encode(&too_long).is_err());
+        assert!(QName::encode(&"b".repeat(64)).is_err());
     }
 }

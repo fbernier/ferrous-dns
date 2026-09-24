@@ -82,8 +82,8 @@ impl DnsRequest {
     }
 
     /// Attaches raw EDNS cookie option data (option code 10) to this request.
-    pub fn with_cookie(mut self, data: Vec<u8>) -> Self {
-        self.edns_cookie = Some(EdnsCookie::from_bytes(&data));
+    pub fn with_cookie(mut self, data: &[u8]) -> Self {
+        self.edns_cookie = Some(EdnsCookie::from_bytes(data));
         self
     }
 

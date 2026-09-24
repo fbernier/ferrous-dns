@@ -412,9 +412,8 @@ async fn create_test_app(pool: sqlx::SqlitePool) -> (Router, Arc<DnsCache>) {
     ));
 
     use ferrous_dns_domain::config::upstream::{UpstreamPool, UpstreamStrategy};
-    use ferrous_dns_infrastructure::dns::{PoolManager, QueryEventEmitter};
+    use ferrous_dns_infrastructure::dns::PoolManager;
 
-    let event_emitter = QueryEventEmitter::new_disabled();
     let test_pool = UpstreamPool {
         name: "test".to_string(),
         strategy: UpstreamStrategy::Parallel,
@@ -423,7 +422,7 @@ async fn create_test_app(pool: sqlx::SqlitePool) -> (Router, Arc<DnsCache>) {
         weight: None,
     };
     let pool_manager = Arc::new(
-        PoolManager::new(vec![test_pool], None, event_emitter)
+        PoolManager::new(vec![test_pool], None)
             .await
             .expect("Failed to create PoolManager"),
     );

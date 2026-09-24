@@ -97,14 +97,8 @@ pub struct FqdnFilter;
 
 impl FqdnFilter {
     pub fn is_fqdn(domain: &str) -> bool {
-        let has_dot = domain.contains('.');
-
-        let no_trailing_dot = !domain.ends_with('.');
-
-        let parts: Vec<&str> = domain.split('.').collect();
-        let multi_label = parts.len() >= 2;
-
-        has_dot && no_trailing_dot && multi_label
+        // A dot anywhere but the end already implies at least two labels.
+        domain.contains('.') && !domain.ends_with('.')
     }
 
     pub fn is_local_hostname(domain: &str) -> bool {

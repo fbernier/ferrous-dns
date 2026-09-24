@@ -17,7 +17,6 @@ use ferrous_dns_infrastructure::dns::{
     cache::DnsCache,
     cache_maintenance::DnsCacheMaintenance,
     dnssec::DnssecStatsAdapter,
-    events::QueryEventEmitter,
     resolver::{LocalPtrResolver, LocalWildcardResolver, WildcardRegistry},
     DgaDetector, HealthChecker, HickoryDnsResolver, NxdomainHijackDetector, PoolManager,
     RefreshScanOptions, RefreshSenders, ResponseIpFilterDetector, TunnelingDetector,
@@ -62,10 +61,8 @@ impl DnsServices {
         info!("Initializing DNS services with load balancing");
         tsc_timer::init();
 
-        let emitter = pool::setup_event_logger(repos);
         let health_checker = pool::setup_health_checker(config);
-        let pool_manager =
-            pool::setup_pool_manager(config, health_checker.clone(), emitter.clone()).await?;
+        let pool_manager = pool::setup_pool_manager(config, health_checker.clone()).await?;
 
         pool::start_health_checker_task(health_checker.clone(), &pool_manager, config);
         let stored_health_checker = health_checker.clone();
@@ -73,20 +70,15 @@ impl DnsServices {
         let timeout_ms = config.dns.query_timeout * 1000;
         let pool_manager_clone = Arc::clone(&pool_manager);
 
-        // The DNSSEC validator walks the chain of trust on its own pool manager
-        // (so its DS/DNSKEY probes don't pollute query stats). It needs its own
-        // health checker + probe task, otherwise its upstreams are never marked
-        // healthy and every chain lookup fails "unreachable" — which would make
-        // Strict mode SERVFAIL even correctly-signed domains.
+        // The DNSSEC validator walks the chain of trust on its own pool manager.
+        // It needs its own health checker + probe task, otherwise its upstreams
+        // are never marked healthy and every chain lookup fails "unreachable" —
+        // which would make Strict mode SERVFAIL even correctly-signed domains.
         let dnssec_health_checker = pool::setup_health_checker(config);
         let pool_manager_for_dnssec = Arc::new(
-            PoolManager::new(
-                config.dns.pools.clone(),
-                dnssec_health_checker.clone(),
-                QueryEventEmitter::new_disabled(),
-            )
-            .await?
-            .with_hardening(pool::hardening_opts(config)),
+            PoolManager::new(config.dns.pools.clone(), dnssec_health_checker.clone())
+                .await?
+                .with_hardening(pool::hardening_opts(config)),
         );
         pool::start_health_checker_task(dnssec_health_checker, &pool_manager_for_dnssec, config);
         let dnssec_pool_manager_clone = Arc::clone(&pool_manager_for_dnssec);
@@ -427,13 +419,9 @@ impl DnsServices {
         };
 
         let pool_manager_for_maintenance = Arc::new(
-            PoolManager::new(
-                config.dns.pools.clone(),
-                health_checker,
-                QueryEventEmitter::new_disabled(),
-            )
-            .await?
-            .with_hardening(pool::hardening_opts(config)),
+            PoolManager::new(config.dns.pools.clone(), health_checker)
+                .await?
+                .with_hardening(pool::hardening_opts(config)),
         );
         // Keep a handle so hot upstream reloads also reach this resolver.
         let maintenance_pool_manager = Arc::clone(&pool_manager_for_maintenance);

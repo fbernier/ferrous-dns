@@ -3,7 +3,6 @@
 //! Cookie) are rejected while a faithful echo is accepted.
 
 use ferrous_dns_domain::{RecordType, UpstreamPool, UpstreamStrategy};
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::forwarding::HardeningOpts;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
@@ -90,11 +89,7 @@ async fn manager(addr: SocketAddr) -> Arc<PoolManager> {
         servers: vec![format!("udp://{addr}")],
         weight: None,
     };
-    Arc::new(
-        PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
-            .await
-            .unwrap(),
-    )
+    Arc::new(PoolManager::new(vec![pool], None).await.unwrap())
 }
 
 /// Like [`manager`], but with 0x20 QNAME case randomization enabled so the
@@ -108,7 +103,7 @@ async fn manager_hardened(addr: SocketAddr) -> Arc<PoolManager> {
         weight: None,
     };
     Arc::new(
-        PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
+        PoolManager::new(vec![pool], None)
             .await
             .unwrap()
             .with_hardening(HardeningOpts {

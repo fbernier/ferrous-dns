@@ -72,6 +72,9 @@ impl DnsResolution {
 
 #[async_trait]
 pub trait DnsResolver: Send + Sync {
+    /// Resolves `query`. Callers probe [`try_cache`](Self::try_cache) first: a
+    /// cache layer skips its own probe and goes straight to in-flight
+    /// coalescing, re-checking the cache only once elected leader.
     async fn resolve(&self, query: &DnsQuery) -> Result<DnsResolution, DomainError>;
 
     fn try_cache(&self, _query: &DnsQuery) -> Option<DnsResolution> {

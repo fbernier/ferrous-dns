@@ -10,7 +10,6 @@
 
 use ferrous_dns_application::ports::DnsResolver;
 use ferrous_dns_domain::{DnsQuery, RecordType, UpstreamPool, UpstreamStrategy};
-use ferrous_dns_infrastructure::dns::events::QueryEventEmitter;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 use ferrous_dns_infrastructure::dns::resolver::CoreResolver;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
@@ -81,11 +80,7 @@ async fn manager(addr: SocketAddr) -> Arc<PoolManager> {
         servers: vec![format!("udp://{addr}")],
         weight: None,
     };
-    Arc::new(
-        PoolManager::new(vec![pool], None, QueryEventEmitter::new_disabled())
-            .await
-            .unwrap(),
-    )
+    Arc::new(PoolManager::new(vec![pool], None).await.unwrap())
 }
 
 async fn resolver_with_local_server(addr: SocketAddr) -> CoreResolver {
