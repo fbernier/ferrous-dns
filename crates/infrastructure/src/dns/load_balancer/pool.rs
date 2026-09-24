@@ -6,9 +6,7 @@ use super::strategy::{QueryContext, ServerDisplays, Strategy, UpstreamResult};
 use crate::dns::forwarding::{HardeningOpts, MessageBuilder, ResponseParser};
 use crate::dns::transport::resolver;
 use arc_swap::ArcSwap;
-use ferrous_dns_domain::{
-    Config, DnsProtocol, DomainError, RecordType, UpstreamPool, UpstreamStrategy,
-};
+use ferrous_dns_domain::{DnsProtocol, DomainError, RecordType, UpstreamPool, UpstreamStrategy};
 use smallvec::SmallVec;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -281,10 +279,6 @@ impl PoolManager {
             .rsplit_once(':')
             .and_then(|(_, p)| p.parse::<u16>().ok())
             .unwrap_or(default)
-    }
-
-    pub async fn from_config(config: &Config) -> Result<Self, DomainError> {
-        Self::new(config.dns.pools.clone(), None).await
     }
 
     pub async fn query(
