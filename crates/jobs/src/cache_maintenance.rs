@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-/// How often the cache refresh cycle runs.
+/// How often the eviction and refresh cycle runs.
 ///
 /// Shared rather than repeated at each call site: the optimistic pacer divides
 /// this interval by the backlog to spread a cycle's work across it, so a copy
@@ -39,12 +39,15 @@ impl CacheMaintenanceJob {
             compaction_interval_secs,
         } = self;
 
-        let refresh = Arc::clone(&maintenance);
+        let cycle = Arc::clone(&maintenance);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(refresh_interval_secs));
             loop {
                 interval.tick().await;
-                match refresh.run_refresh_cycle().await {
+                if let Err(e) = cycle.run_eviction_cycle().await {
+                    error!(error = %e, "Cache eviction cycle failed");
+                }
+                match cycle.run_refresh_cycle().await {
                     Ok(outcome) => {
                         // Losing candidates is not routine: it means the
                         // eligible working set no longer fits the queue,

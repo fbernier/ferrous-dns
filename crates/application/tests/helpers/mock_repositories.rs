@@ -1286,7 +1286,7 @@ impl ManagedDomainRepository for MockManagedDomainRepository {
             managed.group_id = gid;
         }
         if let Some(c) = update.comment {
-            managed.comment = Some(Arc::from(c.as_str()));
+            managed.comment = c.as_deref().map(Arc::from);
         }
         if let Some(e) = update.enabled {
             managed.enabled = e;

@@ -1,7 +1,7 @@
 use ferrous_dns_domain::value_objects::validators::{
     validate_comment, validate_source_name, validate_url,
 };
-use ferrous_dns_domain::{BlocklistSource, Group, ManagedDomain, RegexFilter};
+use ferrous_dns_domain::{BlocklistSource, Group, ManagedDomain, RegexFilter, ScheduleProfile};
 
 #[test]
 fn test_validate_url_accepts_http_and_https() {
@@ -47,6 +47,8 @@ fn test_length_limits_count_characters_not_bytes() {
     assert!(RegexFilter::validate_name(&"日".repeat(200)).is_ok());
     assert!(RegexFilter::validate_pattern(&"é".repeat(1000)).is_ok());
     assert!(RegexFilter::validate_pattern(&"é".repeat(1001)).is_err());
+    assert!(ScheduleProfile::validate_name(&"é".repeat(100)).is_ok());
+    assert!(ScheduleProfile::validate_name(&"é".repeat(101)).is_err());
 
     let url = format!(
         "https://x.com/{}",

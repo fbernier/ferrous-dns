@@ -166,13 +166,15 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
             comment,
             enabled,
         } = update;
+        let replace_comment = comment.is_some();
+        let comment = comment.flatten();
         let row = sqlx::query_as::<_, ManagedDomainRow>(
             "UPDATE managed_domains
              SET name = COALESCE(?, name),
                  domain = COALESCE(?, domain),
                  action = COALESCE(?, action),
                  group_id = COALESCE(?, group_id),
-                 comment = COALESCE(?, comment),
+                 comment = CASE WHEN ? THEN ? ELSE comment END,
                  enabled = COALESCE(?, enabled),
                  updated_at = ?
              WHERE id = ?
@@ -182,6 +184,7 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         .bind(&domain)
         .bind(action.map(|a| a.to_str()))
         .bind(group_id)
+        .bind(replace_comment)
         .bind(&comment)
         .bind(enabled)
         .bind(sql_now())

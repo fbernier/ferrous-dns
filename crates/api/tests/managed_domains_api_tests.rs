@@ -320,6 +320,45 @@ async fn test_update_managed_domain_toggle_enabled() {
     assert_eq!(json["enabled"], false);
 }
 
+async fn send_json(app: axum::Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .method(method)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn test_update_managed_domain_null_comment_clears_it_and_absent_keeps_it() {
+    let app = test_app().await.router;
+    let (_, created) = send_json(
+        app.clone(),
+        "POST",
+        "/managed-domains",
+        json!({ "name": "Commented", "domain": "ads.example.com", "action": "deny",
+                "comment": "temporary" }),
+    )
+    .await;
+    let uri = format!("/managed-domains/{}", created["id"].as_i64().unwrap());
+
+    let (status, kept) = send_json(app.clone(), "PUT", &uri, json!({ "enabled": false })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(kept["comment"], "temporary");
+
+    let (status, cleared) = send_json(app, "PUT", &uri, json!({ "comment": null })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(cleared["comment"].is_null(), "got {}", cleared["comment"]);
+}
+
 #[tokio::test]
 async fn test_update_managed_domain_not_found() {
     let app = test_app().await.router;

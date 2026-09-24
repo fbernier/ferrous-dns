@@ -20,7 +20,7 @@ FERROUS_CONFIG=path/to/ferrous-dns.toml ferrous-dns
     Every section and every key has a built-in default. You only need to include what you want to override.
 
 !!! warning "Invalid values stop startup"
-    The file is parsed and validated once, at startup (and again on a reload or an API save), and a bad value is reported with the key it came from instead of surfacing later as a crashed background task. Rejected values include: a bind address that is not an IP literal, a `trusted_proxies` entry that is not a CIDR or address, a `server_secret` that is neither empty nor 64 hex digits, an unknown `block_mode`, a `local_dns_server` that is not `IP:port`, `cache_shard_amount` / `cache_inflight_shards` that are not a power of two of at least 2, `cache_min_ttl` above `cache_max_ttl`, and **0** for any interval, timeout, TTL or capacity whose zero would panic, spin or silently disable a component: `query_timeout`, `cache_max_entries`, `cache_compaction_interval`, `cache_eviction_sample_size`, `health_check.interval` / `timeout`, `rate_limit.queries_per_second` / `burst_size` / `stale_entry_ttl_secs`, the tunneling and DGA `stale_entry_ttl_secs`, `nxdomain_hijack.probe_interval_secs` / `probe_timeout_ms` / `hijack_ip_ttl_secs`, `response_ip_filter.refresh_interval_secs` / `ip_ttl_secs`, `queries_log_stored`, `query_log_channel_capacity` / `query_log_max_batch_size` / `query_log_flush_interval_ms`, `client_channel_capacity`, the three `*_pool_max_connections`, `write_busy_timeout_secs`, `read_acquire_timeout_secs`, `wal_checkpoint_interval_secs`, `session_ttl_hours`, `remember_me_days`, `login_rate_limit_window_secs` and `mfa_challenge_ttl_secs`. Zeros that have a documented meaning (`cache_min_ttl`, `slip_ratio`, the `*_max_connections_per_ip` limits, `wal_autocheckpoint`, `sqlite_mmap_size_mb`, `read_busy_timeout_secs`, `login_rate_limit_attempts`, `block_ttl`) stay allowed.
+    The file is parsed and validated once, at startup (and again on a reload or an API save), and a bad value is reported with the key it came from instead of surfacing later as a crashed background task. Rejected values include: a bind address that is not an IP literal, a `trusted_proxies` entry that is not a CIDR or address, a `server_secret` that is neither empty nor 64 hex digits, an unknown `block_mode`, a `local_dns_server` that is not `IP:port`, `cache_shard_amount` / `cache_inflight_shards` that are not a power of two of at least 2, `cache_min_ttl` above `cache_max_ttl`, and **0** for any interval, timeout, TTL or capacity whose zero would panic, spin or silently disable a component: `query_timeout`, `cache_max_entries`, `cache_compaction_interval`, `cache_eviction_sample_size`, `health_check.interval` / `timeout`, `rate_limit.queries_per_second` / `burst_size` / `stale_entry_ttl_secs`, the tunneling and DGA `stale_entry_ttl_secs`, `nxdomain_hijack.probe_interval_secs` / `probe_timeout_ms` / `hijack_ip_ttl_secs`, `response_ip_filter.refresh_interval_secs` / `ip_ttl_secs`, `queries_log_stored`, `query_log_channel_capacity` / `query_log_max_batch_size` / `query_log_flush_interval_ms`, `client_channel_capacity`, the three `*_pool_max_connections`, `write_busy_timeout_secs`, `read_acquire_timeout_secs`, `wal_checkpoint_interval_secs`, `session_ttl_hours`, `remember_me_days`, `login_rate_limit_window_secs` and `mfa_challenge_ttl_secs`. Zeros that have a documented meaning (`cache_min_ttl`, `slip_ratio`, the `*_max_connections_per_ip` limits, `wal_autocheckpoint`, `sqlite_mmap_size_mb`, `read_busy_timeout_secs`, `login_rate_limit_attempts`, `block_ttl`) stay allowed. Values too large to use are rejected too: a `session_ttl_hours`, `remember_me_days` or `mfa_challenge_ttl_secs` whose expiry, counted from now, lies past the latest date the server can represent (hundreds of thousands of years out), and a `query_timeout` that overflows when converted to milliseconds.
 
 !!! info "Saves are atomic"
     Dashboard and API saves write a synced temp file next to the config and rename it over the original, so a crash leaves either the old or the new file. A symlinked config is followed and its target rewritten. When the file cannot be replaced — a Docker single-file bind mount, or a directory the server cannot write — it is rewritten in place instead.
@@ -425,7 +425,7 @@ stale_entry_ttl_secs       = 300
 | `ipv4_prefix_len` | `int` | `24` | Group IPv4 clients by this prefix length (e.g. `/24` subnet) |
 | `ipv6_prefix_len` | `int` | `48` | Group IPv6 clients by this prefix length (e.g. `/48` subnet) |
 | `whitelist` | `list` | `[]` | CIDRs exempt from rate limiting |
-| `nxdomain_per_second` | `int` | `50` | Stricter budget applied specifically to NXDOMAIN responses |
+| `nxdomain_per_second` | `int` | `50` | Stricter per-subnet budget charged for NXDOMAIN answers; a subnet that spends it is rate-limited until it refills. `0` = no NXDOMAIN budget |
 | `slip_ratio` | `int` | `2` | 1 in N rate-limited responses sends `TC=1` to force a TCP retry |
 | `dry_run` | `bool` | `false` | Log rate limit events without enforcing them |
 | `tcp_max_connections_per_ip` | `int` | `30` | Maximum concurrent TCP DNS connections per client IP |
@@ -474,7 +474,7 @@ client_whitelist             = []
 | `confidence_threshold` | `float` | `0.7` | Phase 2: minimum combined confidence score (0–1) required to act |
 | `stale_entry_ttl_secs` | `int` | `300` | Seconds of inactivity before a tracking entry is evicted |
 | `domain_whitelist` | `list` | `[]` | Domains exempt from tunneling detection |
-| `client_whitelist` | `list` | `[]` | Client CIDRs exempt from tunneling detection |
+| `client_whitelist` | `list` | `[]` | Client CIDRs or bare IPs exempt from tunneling detection; invalid entries are skipped with a warning |
 
 See [Malware Detection](../features/malware-detection.md#dns-tunneling-detection).
 
@@ -515,7 +515,7 @@ client_whitelist              = []
 | `confidence_threshold` | `float` | `0.65` | Phase 2: minimum combined confidence score required to act |
 | `stale_entry_ttl_secs` | `int` | `300` | Seconds of inactivity before a tracking entry is evicted |
 | `domain_whitelist` | `list` | `[]` | Domains exempt from DGA detection |
-| `client_whitelist` | `list` | `[]` | Client CIDRs exempt from DGA detection |
+| `client_whitelist` | `list` | `[]` | Client CIDRs or bare IPs exempt from DGA detection; invalid entries are skipped with a warning |
 
 See [Malware Detection](../features/malware-detection.md#dga-detection).
 

@@ -131,6 +131,8 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
             comment,
             enabled,
         } = update;
+        let replace_comment = comment.is_some();
+        let comment = comment.flatten();
         if let Some(p) = &pattern {
             Self::validate_regex_syntax(p)?;
         }
@@ -141,7 +143,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
                  pattern = COALESCE(?, pattern),
                  action = COALESCE(?, action),
                  group_id = COALESCE(?, group_id),
-                 comment = COALESCE(?, comment),
+                 comment = CASE WHEN ? THEN ? ELSE comment END,
                  enabled = COALESCE(?, enabled),
                  updated_at = ?
              WHERE id = ?
@@ -151,6 +153,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
         .bind(&pattern)
         .bind(action.map(|a| a.to_str()))
         .bind(group_id)
+        .bind(replace_comment)
         .bind(&comment)
         .bind(enabled)
         .bind(sql_now())

@@ -480,24 +480,15 @@ pub async fn update_settings(
 pub async fn reload_config(State(state): State<AppState>) -> Json<ConfigSaveResponse> {
     info!("Config reload requested");
 
-    let Some(config_path) = state.config_path.as_deref() else {
+    let Some(reload) = state.reload_config.as_deref() else {
         error!("No config file found");
         return Json(ConfigSaveResponse::failure("No config file found"));
     };
 
-    let _writer = state.config_writer.lock().await;
-    let loaded = state
-        .config_file_persistence
-        .load_config_from_file(config_path)
-        .and_then(|config| config.validate().map(|()| config));
-    match loaded {
-        Ok(new_config) => {
-            *state.config.write().await = new_config;
-            info!("Configuration reloaded successfully");
-            Json(ConfigSaveResponse::success(
-                "Configuration reloaded successfully",
-            ))
-        }
+    match reload.execute().await {
+        Ok(()) => Json(ConfigSaveResponse::success(
+            "Configuration reloaded successfully",
+        )),
         Err(e) => {
             error!(error = %e, "Failed to reload configuration");
             Json(ConfigSaveResponse::failure(format!(

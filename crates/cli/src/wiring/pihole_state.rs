@@ -6,8 +6,8 @@ use ferrous_dns_api_pihole::{
     PiholeAppState,
 };
 use ferrous_dns_application::ports::BlockFilterEnginePort;
+use ferrous_dns_application::use_cases::ReloadConfigUseCase;
 use ferrous_dns_domain::Config;
-use ferrous_dns_infrastructure::repositories::TomlConfigFilePersistence;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -21,7 +21,7 @@ pub fn build_pihole_state(
     auth: &AuthServices,
     block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     config: Arc<RwLock<Config>>,
-    config_path: Option<Arc<str>>,
+    reload_config: Option<Arc<ReloadConfigUseCase>>,
 ) -> PiholeAppState {
     PiholeAppState {
         query: PiholeQueryState {
@@ -69,8 +69,7 @@ pub fn build_pihole_state(
         system: PiholeSystemState {
             cleanup_query_logs: use_cases.cleanup_query_logs.clone(),
             config,
-            config_file_persistence: Arc::new(TomlConfigFilePersistence),
-            config_path,
+            reload_config,
             process_start: std::time::Instant::now(),
         },
         auth: PiholeAuthState {

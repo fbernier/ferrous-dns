@@ -36,7 +36,11 @@ impl TunnelingGuard {
             max_fqdn_length: config.max_fqdn_length,
             max_label_length: config.max_label_length,
             block_null_queries: config.block_null_queries,
-            whitelist: GuardWhitelist::new(&config.domain_whitelist, &config.client_whitelist),
+            whitelist: GuardWhitelist::new(
+                "dns.tunneling_detection",
+                &config.domain_whitelist,
+                &config.client_whitelist,
+            ),
         }
     }
 
@@ -47,7 +51,7 @@ impl TunnelingGuard {
             max_fqdn_length: 120,
             max_label_length: 50,
             block_null_queries: true,
-            whitelist: GuardWhitelist::new(&[], &[]),
+            whitelist: GuardWhitelist::new("dns.tunneling_detection", &[], &[]),
         }
     }
 

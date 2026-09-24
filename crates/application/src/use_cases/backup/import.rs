@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, instrument, warn};
 
 use crate::ports::{
@@ -18,10 +18,17 @@ fn is_duplicate_error(e: &DomainError) -> bool {
     matches!(e, DomainError::AlreadyExists(_))
 }
 
+/// The live config an import restores into, and the file it is saved to.
+/// `writer` is the lock every config writer holds for its read-modify-write.
+pub struct ConfigDestination {
+    pub config: Arc<RwLock<Config>>,
+    pub writer: Arc<Mutex<()>>,
+    pub persistence: Arc<dyn ConfigFilePersistence>,
+    pub path: Option<String>,
+}
+
 pub struct ImportConfigUseCase {
-    config: Arc<RwLock<Config>>,
-    config_file_persistence: Arc<dyn ConfigFilePersistence>,
-    config_path: Option<String>,
+    destination: ConfigDestination,
     group_creator: Arc<dyn GroupCreator>,
     blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
     local_record_creator: Arc<dyn LocalRecordCreator>,
@@ -30,18 +37,14 @@ pub struct ImportConfigUseCase {
 
 impl ImportConfigUseCase {
     pub fn new(
-        config: Arc<RwLock<Config>>,
-        config_file_persistence: Arc<dyn ConfigFilePersistence>,
-        config_path: Option<String>,
+        destination: ConfigDestination,
         group_creator: Arc<dyn GroupCreator>,
         blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
         local_record_creator: Arc<dyn LocalRecordCreator>,
         block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
         Self {
-            config,
-            config_file_persistence,
-            config_path,
+            destination,
             group_creator,
             blocklist_source_creator,
             local_record_creator,
@@ -103,14 +106,18 @@ impl ImportConfigUseCase {
     }
 
     async fn apply_config(&self, snapshot: &BackupSnapshot, errors: &mut Vec<String>) -> bool {
-        let Some(path) = &self.config_path else {
+        let Some(path) = &self.destination.path else {
             let msg = "No config file path available — config section not restored.";
             warn!(msg);
             errors.push(msg.to_string());
             return false;
         };
 
-        let mut new_config = self.config.read().await.clone();
+        // Merged and stored under the write guard: a writer that slipped in
+        // between reading and storing would be overwritten.
+        let _writer = self.destination.writer.lock().await;
+        let mut config = self.destination.config.write().await;
+        let mut new_config = config.clone();
 
         let sc = &snapshot.config;
         new_config.server.dns_port = sc.server.dns_port;
@@ -186,11 +193,12 @@ impl ImportConfigUseCase {
         }
 
         match self
-            .config_file_persistence
+            .destination
+            .persistence
             .save_config_to_file(&new_config, path)
         {
             Ok(_) => {
-                *self.config.write().await = new_config;
+                *config = new_config;
                 true
             }
             Err(e) => {
@@ -276,7 +284,7 @@ impl ImportConfigUseCase {
 
         for record in &snapshot.data.local_records {
             {
-                let config = self.config.read().await;
+                let config = self.destination.config.read().await;
                 let already_exists = config.dns.local_records.iter().any(|r| {
                     r.hostname == record.hostname
                         && r.domain.as_deref().unwrap_or("")

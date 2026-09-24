@@ -1,4 +1,5 @@
 use crate::errors::domain_error::DomainError;
+use crate::value_objects::validators::exceeds_chars;
 use chrono::{Datelike, NaiveDateTime, NaiveTime};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -49,11 +50,8 @@ impl ScheduleProfile {
         if name.is_empty() {
             return Err("name cannot be empty".into());
         }
-        if name.len() > 100 {
-            return Err(format!(
-                "name cannot exceed 100 characters, got {}",
-                name.len()
-            ));
+        if exceeds_chars(name, 100) {
+            return Err("name cannot exceed 100 characters".into());
         }
         Ok(())
     }
@@ -64,18 +62,6 @@ impl ScheduleProfile {
         }
         tz.parse::<Tz>()
             .map_err(|_| format!("unknown IANA timezone '{tz}'"))
-    }
-
-    pub fn validate_comment(comment: &Option<Arc<str>>) -> Result<(), String> {
-        if let Some(c) = comment {
-            if c.len() > 500 {
-                return Err(format!(
-                    "comment cannot exceed 500 characters, got {}",
-                    c.len()
-                ));
-            }
-        }
-        Ok(())
     }
 }
 

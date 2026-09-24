@@ -32,7 +32,8 @@ async fn async_main() -> anyhow::Result<()> {
     let cli = args::Cli::parse();
 
     let config_path = bootstrap::resolve_config_path(cli.config.as_deref());
-    let config = bootstrap::load_config(config_path.as_deref(), &cli)?;
+    let overrides = bootstrap::config_overrides(&cli);
+    let config = bootstrap::load_config(config_path.as_deref(), &overrides)?;
 
     bootstrap::init_logging(&config);
 
@@ -71,6 +72,12 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     let effective_config_path: Option<Arc<str>> = config_path.as_deref().map(Arc::from);
+    let config_services = wiring::app_state::build_config_services(
+        &dns_services,
+        config_arc.clone(),
+        effective_config_path.clone(),
+        overrides,
+    );
 
     let auth =
         wiring::build_auth_services(&repos, config_arc.clone(), effective_config_path.as_deref())
@@ -82,7 +89,7 @@ async fn async_main() -> anyhow::Result<()> {
             &auth,
             repos.block_filter_engine.clone(),
             config_arc.clone(),
-            effective_config_path.clone(),
+            config_services.reload.clone(),
         )
     });
 
@@ -106,8 +113,7 @@ async fn async_main() -> anyhow::Result<()> {
         auth.use_cases,
         &repos,
         &dns_services,
-        config_arc,
-        effective_config_path,
+        &config_services,
         web_tls_config.is_some(),
     )
     .await;

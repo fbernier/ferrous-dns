@@ -398,13 +398,16 @@ async fn build_pihole_state(
             create_whitelist_source: Arc::new(CreateWhitelistSourceUseCase::new(
                 whitelist_source_repo.clone(),
                 group_repo.clone(),
+                block_filter_engine.clone(),
             )),
             update_whitelist_source: Arc::new(UpdateWhitelistSourceUseCase::new(
                 whitelist_source_repo.clone(),
                 group_repo.clone(),
+                block_filter_engine.clone(),
             )),
             delete_whitelist_source: Arc::new(DeleteWhitelistSourceUseCase::new(
                 whitelist_source_repo,
+                block_filter_engine.clone(),
             )),
         },
         groups: PiholeGroupState {
@@ -433,10 +436,7 @@ async fn build_pihole_state(
         system: PiholeSystemState {
             cleanup_query_logs: Arc::new(CleanupOldQueryLogsUseCase::new(query_log_repo)),
             config: Arc::new(RwLock::new(config)),
-            config_file_persistence: Arc::new(
-                ferrous_dns_infrastructure::repositories::TomlConfigFilePersistence,
-            ),
-            config_path: None,
+            reload_config: None,
             process_start: std::time::Instant::now(),
         },
         auth: auth::build_auth_state(totp_enrolled).await,

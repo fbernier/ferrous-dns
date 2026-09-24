@@ -691,6 +691,39 @@ async fn test_update_config_rejects_a_zero_compaction_interval() {
 }
 
 #[tokio::test]
+async fn test_update_config_rejects_session_ttls_past_the_representable_date() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, path) = test_app(pool).await;
+    let before = config.read().await.auth.clone();
+
+    for (key, body) in [
+        (
+            "auth.session_ttl_hours",
+            serde_json::json!({ "auth": { "session_ttl_hours": u32::MAX } }),
+        ),
+        (
+            "auth.remember_me_days",
+            serde_json::json!({ "auth": { "remember_me_days": u32::MAX } }),
+        ),
+    ] {
+        let (status, json) = post_config(router.clone(), body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}");
+        assert!(
+            json["error"].as_str().unwrap_or_default().contains(key),
+            "error should name {key}, got: {}",
+            json["error"]
+        );
+    }
+    let after = config.read().await.auth.clone();
+    assert_eq!(
+        (after.session_ttl_hours, after.remember_me_days),
+        (before.session_ttl_hours, before.remember_me_days)
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+}
+
+#[tokio::test]
 async fn test_update_config_rejects_an_unknown_block_mode() {
     let pool = create_test_db().await;
     let (TestApp { router, config, .. }, _path) = test_app(pool).await;
@@ -807,5 +840,88 @@ async fn test_reload_keeps_the_running_config_when_the_file_fails_validation() {
     assert_eq!(
         config.read().await.database.wal_checkpoint_interval_secs,
         before
+    );
+}
+
+async fn post_reload(app: Router) -> Value {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/config/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+const RELOADED_FILE: &str = "[server]\ndns_port = 53\nweb_port = 8080\nbind_address = \"0.0.0.0\"\n\
+     [dns]\nupstream_servers = []\n\
+     [[dns.pools]]\nname = \"p1\"\nstrategy = \"Parallel\"\npriority = 1\nservers = [\"udp://9.9.9.9:53\"]\n\
+     [blocking]\nenabled = true\n[logging]\nlevel = \"info\"\n[database]\n";
+
+/// A reload loads the file the way startup does: the command-line overrides
+/// still win, and changed upstream pools go live without a restart.
+#[tokio::test]
+async fn test_reload_hot_applies_pools_and_keeps_command_line_overrides() {
+    let (_, path) = test_app(create_test_db().await).await;
+    std::fs::write(&path, RELOADED_FILE).unwrap();
+    let TestApp {
+        router,
+        config,
+        pool_manager,
+        ..
+    } = TestApp::builder()
+        .config_path(&path)
+        .overrides(ferrous_dns_application::use_cases::ConfigOverrides {
+            dns_port: Some(5353),
+            ..Default::default()
+        })
+        .build()
+        .await;
+
+    let json = post_reload(router).await;
+
+    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(config.read().await.server.dns_port, 5353);
+    let servers = live_servers(&pool_manager);
+    assert!(
+        servers.iter().any(|s| s == "9.9.9.9:53") && !servers.iter().any(|s| s == "8.8.8.8:53"),
+        "the reloaded pools must be live: {servers:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_reload_waits_for_an_in_flight_config_save() {
+    let (
+        TestApp {
+            router,
+            state,
+            config,
+            ..
+        },
+        path,
+    ) = test_app(create_test_db().await).await;
+    std::fs::write(&path, RELOADED_FILE).unwrap();
+
+    let save_in_flight = state.config_writer.lock().await;
+    let mut reload = tokio::spawn(post_reload(router));
+    let finished_early = tokio::time::timeout(Duration::from_millis(100), &mut reload)
+        .await
+        .is_ok();
+    assert!(!finished_early, "a reload must not interleave with a save");
+    assert_ne!(
+        config.read().await.dns.pools[0].servers,
+        ["udp://9.9.9.9:53"]
+    );
+    drop(save_in_flight);
+
+    assert_eq!(reload.await.unwrap()["success"], true);
+    assert_eq!(
+        config.read().await.dns.pools[0].servers,
+        ["udp://9.9.9.9:53"]
     );
 }

@@ -78,7 +78,7 @@ Subnet 10.0.0.0/24:
 | `ipv4_prefix_len` | `u8` | `24` | IPv4 prefix length used to group clients into subnet buckets. `24` groups a `/24` subnet |
 | `ipv6_prefix_len` | `u8` | `48` | IPv6 prefix length used to group clients into subnet buckets. `48` covers a standard home delegation |
 | `whitelist` | `[str]` | `[]` | List of CIDRs that bypass rate limiting entirely |
-| `nxdomain_per_second` | `u32` | `50` | Separate budget for NXDOMAIN responses. Catches random-subdomain attacks |
+| `nxdomain_per_second` | `u32` | `50` | Separate budget for NXDOMAIN answers. Catches random-subdomain attacks. `0` = no NXDOMAIN budget |
 | `slip_ratio` | `u32` | `0` | Every Nth rate-limited response is TC=1 instead of REFUSED. `0` = disabled |
 | `dry_run` | `bool` | `false` | Log rate-limit events without refusing queries |
 | `stale_entry_ttl_secs` | `u64` | `300` | Seconds before an idle subnet bucket is evicted from memory |
@@ -114,13 +114,15 @@ TC=1 forces clients to retry over TCP, which:
 
 ## NXDOMAIN Budget
 
-The NXDOMAIN budget is a separate, stricter token bucket that only applies to queries resulting in NXDOMAIN responses. This catches:
+The NXDOMAIN budget is a separate, stricter token bucket per subnet that is charged for every NXDOMAIN answer sent to it (upstream, cached, or local). This catches:
 
 - **Random subdomain attacks** — bots generating `abc123.example.com` queries
 - **IoT scanning** — devices probing many non-existent subdomains
 - **DGA malware** — domain generation algorithm traffic
 
-The NXDOMAIN burst capacity is `nxdomain_per_second * 2`. The general query budget is not affected by NXDOMAIN traffic.
+Whether an answer is NXDOMAIN is only known after resolution, so the budget is enforced on the next query: once a subnet has spent it, every query from that subnet is handled like one over the general budget — REFUSED or TC=1 per `slip_ratio`, or only logged under `dry_run` — until the budget refills. Whitelisted clients are never charged.
+
+The NXDOMAIN burst capacity is `nxdomain_per_second * 2` and it refills at `nxdomain_per_second`. Answers that resolve do not spend it, and NXDOMAIN answers do not spend the general query budget. `nxdomain_per_second = 0` disables the NXDOMAIN budget.
 
 ---
 

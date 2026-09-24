@@ -42,6 +42,19 @@ pub enum TimeGranularity {
     Day,
 }
 
+impl TimeGranularity {
+    /// Canonical name the API reports for this granularity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimeGranularity::Minute => "minute",
+            TimeGranularity::TenMinutes => "10min",
+            TimeGranularity::QuarterHour => "15min",
+            TimeGranularity::Hour => "hour",
+            TimeGranularity::Day => "day",
+        }
+    }
+}
+
 /// Aggregated query counts for a single time window in the timeline chart.
 #[derive(Debug, Clone)]
 pub struct TimelineBucket {

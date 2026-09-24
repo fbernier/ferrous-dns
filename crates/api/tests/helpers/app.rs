@@ -12,6 +12,7 @@ use ferrous_dns_api::{
 };
 use ferrous_dns_application::ports::{
     BlockFilterEnginePort, DnsCachePort, SafeSearchConfigRepository, SafeSearchEnginePort,
+    UpstreamReloadPort,
 };
 use ferrous_dns_application::use_cases::*;
 use ferrous_dns_domain::config::upstream::{UpstreamPool, UpstreamStrategy};
@@ -79,6 +80,7 @@ pub struct TestAppBuilder {
     config_path: Option<Arc<str>>,
     sqlite_safe_search: bool,
     sqlite_backup: bool,
+    overrides: ConfigOverrides,
 }
 
 impl TestAppBuilder {
@@ -119,6 +121,12 @@ impl TestAppBuilder {
     /// Backs export/import with the SQLite group and blocklist-source repositories.
     pub fn sqlite_backup(mut self) -> Self {
         self.sqlite_backup = true;
+        self
+    }
+
+    /// Command-line overrides the reload use case re-applies.
+    pub fn overrides(mut self, overrides: ConfigOverrides) -> Self {
+        self.overrides = overrides;
         self
     }
 
@@ -188,11 +196,27 @@ impl TestAppBuilder {
                 .expect("Failed to create PoolManager"),
         );
 
+        let config_writer: Arc<tokio::sync::Mutex<()>> = Arc::default();
         let backup = if self.sqlite_backup {
-            sqlite_backup_use_cases(&config, &group_repo, &blocklist_source_repo)
+            sqlite_backup_use_cases(&config, &config_writer, &group_repo, &blocklist_source_repo)
         } else {
-            build_test_backup_use_cases(config.clone())
+            build_test_backup_use_cases(config.clone(), config_writer.clone())
         };
+        let reload_upstream: Arc<dyn UpstreamReloadPort> =
+            Arc::new(UpstreamReloadAdapter::new(vec![
+                pool_manager.clone(),
+                pool_manager.clone(),
+            ]));
+        let reload_config = self.config_path.clone().map(|path| {
+            Arc::new(ReloadConfigUseCase::new(
+                config.clone(),
+                config_writer.clone(),
+                Arc::new(TomlConfigFilePersistence),
+                path,
+                reload_upstream.clone(),
+                self.overrides.clone(),
+            ))
+        });
 
         let state = AppState {
             query: QueryUseCases {
@@ -225,10 +249,7 @@ impl TestAppBuilder {
                 )),
                 dnssec_stats: Arc::new(DnssecStatsAdapter::disabled()),
                 upstream_health: Arc::new(UpstreamHealthAdapter::new(pool_manager.clone(), None)),
-                reload_upstream: Arc::new(UpstreamReloadAdapter::new(vec![
-                    pool_manager.clone(),
-                    pool_manager.clone(),
-                ])),
+                reload_upstream,
             },
             groups: GroupUseCases {
                 get_groups: Arc::new(GetGroupsUseCase::new(group_repo.clone())),
@@ -299,13 +320,16 @@ impl TestAppBuilder {
                 create_whitelist_source: Arc::new(CreateWhitelistSourceUseCase::new(
                     whitelist_source_repo.clone(),
                     group_repo.clone(),
+                    null_engine.clone(),
                 )),
                 update_whitelist_source: Arc::new(UpdateWhitelistSourceUseCase::new(
                     whitelist_source_repo.clone(),
                     group_repo.clone(),
+                    null_engine.clone(),
                 )),
                 delete_whitelist_source: Arc::new(DeleteWhitelistSourceUseCase::new(
                     whitelist_source_repo.clone(),
+                    null_engine.clone(),
                 )),
                 get_managed_domains: Arc::new(GetManagedDomainsUseCase::new(
                     managed_domain_repo.clone(),
@@ -429,9 +453,10 @@ impl TestAppBuilder {
             auth: build_test_auth_use_cases(),
             backup,
             config: config.clone(),
-            config_writer: Default::default(),
+            config_writer,
             config_file_persistence: Arc::new(TomlConfigFilePersistence),
             config_path: self.config_path,
+            reload_config,
             tls_cert: Arc::new(MockTlsCertificateService),
             webauthn_configured: false,
             tls_enabled: false,
@@ -452,6 +477,7 @@ impl TestAppBuilder {
 
 fn sqlite_backup_use_cases(
     config: &Arc<RwLock<Config>>,
+    config_writer: &Arc<tokio::sync::Mutex<()>>,
     group_repo: &Arc<SqliteGroupRepository>,
     blocklist_source_repo: &Arc<SqliteBlocklistSourceRepository>,
 ) -> BackupUseCases {
@@ -463,9 +489,12 @@ fn sqlite_backup_use_cases(
             blocklist_source_repo.clone(),
         )),
         import: Arc::new(ImportConfigUseCase::new(
-            config.clone(),
-            Arc::new(NullConfigFilePersistence),
-            Some("ferrous-dns.toml".to_string()),
+            ConfigDestination {
+                config: config.clone(),
+                writer: config_writer.clone(),
+                persistence: Arc::new(NullConfigFilePersistence),
+                path: Some("ferrous-dns.toml".to_string()),
+            },
             Arc::new(CreateGroupUseCase::new(group_repo.clone())),
             Arc::new(CreateBlocklistSourceUseCase::new(
                 blocklist_source_repo.clone(),

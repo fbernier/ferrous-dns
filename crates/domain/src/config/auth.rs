@@ -39,6 +39,23 @@ pub struct AuthConfig {
     pub webauthn: WebauthnConfig,
 }
 
+impl AuthConfig {
+    /// Lifetime of a new session in seconds; `u32` hours or days always fit.
+    pub fn session_ttl_secs(&self, remember_me: bool) -> i64 {
+        if remember_me {
+            i64::from(self.remember_me_days) * 86_400
+        } else {
+            i64::from(self.session_ttl_hours) * 3_600
+        }
+    }
+}
+
+/// The instant `ttl_secs` from now, or `None` when chrono cannot represent it.
+pub fn expiry_from_now(ttl_secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::TimeDelta::try_seconds(ttl_secs)
+        .and_then(|ttl| chrono::Utc::now().checked_add_signed(ttl))
+}
+
 /// WebAuthn relying-party configuration, `[auth.webauthn]`.
 ///
 /// WebAuthn requires a secure context: `rp_origin` must be HTTPS (or

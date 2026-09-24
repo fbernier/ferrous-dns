@@ -159,7 +159,7 @@ As in Pi-hole v6, `{list}` is the list's URL-encoded address, and `type` says wh
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
 | `POST` | `/api/action/gravity` | Trigger a blocklist (gravity) reload |
-| `POST` | `/api/action/restartdns` | Reload configuration in-memory (no process restart) |
+| `POST` | `/api/action/restartdns` | Reload configuration in-memory (no process restart), like `POST /api/config/reload`: upstream pools hot-reloaded, command-line overrides kept |
 | `POST` | `/api/action/flush/logs` | Clean up old query logs |
 
 ---
@@ -264,6 +264,6 @@ If you have tools pointing to Pi-hole's API:
 ## Limitations
 
 - Management is exposed (domains, lists, groups, clients, blocking toggle, gravity/restartdns/flush actions), but not every niche Pi-hole v6 endpoint is implemented — request payloads and field names track Pi-hole closely but may differ in edge cases
-- `restartdns` reloads configuration in-memory; it does not restart the process, and `gravity` reloads blocklists rather than re-downloading via Pi-hole's gravity pipeline
+- `restartdns` reloads configuration in-memory (upstream pools included, command-line overrides kept); it does not restart the process, and `gravity` reloads blocklists rather than re-downloading via Pi-hole's gravity pipeline
 - Gravity Sync is not supported (different database format)
 - The Pi-hole web interface is not included — use the Ferrous DNS dashboard

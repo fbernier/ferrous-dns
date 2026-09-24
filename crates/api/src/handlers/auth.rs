@@ -75,11 +75,15 @@ fn session_established(state: &AppState, session: AuthSession) -> Response {
         .into_response()
 }
 
+/// Session named by the request's session cookie, or 401.
+async fn current_session(state: &AppState, headers: &HeaderMap) -> Result<AuthSession, ApiError> {
+    let session_id = extract_session_cookie(headers).ok_or(ApiError(DomainError::AuthRequired))?;
+    Ok(state.auth.validate_session.execute(session_id).await?)
+}
+
 /// Username of the session named by the request's session cookie, or 401.
 async fn session_username(state: &AppState, headers: &HeaderMap) -> Result<Arc<str>, ApiError> {
-    let session_id = extract_session_cookie(headers).ok_or(ApiError(DomainError::AuthRequired))?;
-    let session = state.auth.validate_session.execute(session_id).await?;
-    Ok(session.username)
+    Ok(current_session(state, headers).await?.username)
 }
 
 /// Reads and JSON-decodes a request body (16 KiB cap), mapping failures to 400.
@@ -386,16 +390,21 @@ async fn change_password(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<StatusCode, ApiError> {
-    let username = session_username(&state, request.headers()).await?;
+    let session = current_session(&state, request.headers()).await?;
     let req: ChangePasswordRequest = read_json(request).await?;
 
     state
         .auth
         .change_password
-        .execute(&username, &req.current_password, &req.new_password)
+        .execute(
+            &session.username,
+            &session.id,
+            &req.current_password,
+            &req.new_password,
+        )
         .await?;
 
-    debug!(username = %username, "Password changed via API");
+    debug!(username = %session.username, "Password changed via API");
     Ok(StatusCode::NO_CONTENT)
 }
 

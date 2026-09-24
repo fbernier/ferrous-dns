@@ -3,7 +3,6 @@ use super::response_parser::{DnsResponse, ResponseParser};
 use super::response_validator::ResponseValidator;
 use crate::dns::transport;
 use ferrous_dns_domain::{DnsProtocol, DomainError, RecordType, UpstreamAddr};
-use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -50,20 +49,20 @@ impl DnsForwarder {
 }
 
 /// One validated round trip over `protocol`, retried over TCP when a UDP answer
-/// comes back truncated. Also returns the protocol that produced the answer.
-pub(crate) async fn exchange_with_tc_retry<'p>(
-    protocol: &'p DnsProtocol,
+/// comes back truncated. Also returns whether the TCP retry produced the answer.
+pub(crate) async fn exchange_with_tc_retry(
+    protocol: &DnsProtocol,
     query_bytes: &[u8],
     validator: &ResponseValidator,
     timeout: Duration,
-) -> Result<(DnsResponse, Cow<'p, DnsProtocol>), DomainError> {
+) -> Result<(DnsResponse, bool), DomainError> {
     let start = Instant::now();
     let response = exchange(protocol, query_bytes, validator, timeout).await?;
     let DnsProtocol::Udp { addr } = protocol else {
-        return Ok((response, Cow::Borrowed(protocol)));
+        return Ok((response, false));
     };
     if !response.truncated {
-        return Ok((response, Cow::Borrowed(protocol)));
+        return Ok((response, false));
     }
 
     let tcp = DnsProtocol::Tcp { addr: addr.clone() };
@@ -71,7 +70,7 @@ pub(crate) async fn exchange_with_tc_retry<'p>(
         .checked_sub(start.elapsed())
         .unwrap_or(TC_RETRY_FLOOR);
     let response = exchange(&tcp, query_bytes, validator, remaining).await?;
-    Ok((response, Cow::Owned(tcp)))
+    Ok((response, true))
 }
 
 /// One round trip over `protocol`. Validation runs before anything reads the

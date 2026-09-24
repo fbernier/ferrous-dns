@@ -62,10 +62,13 @@ async fn recv_matching(
                 Ok(Ok(v)) => v,
             };
 
-        if from_addr.ip() != server_addr.ip() {
+        // Port too: any other socket on the server's host is off-path; canonical IPs absorb v4-mapped peers.
+        if from_addr.ip().to_canonical() != server_addr.ip().to_canonical()
+            || from_addr.port() != server_addr.port()
+        {
             debug!(
                 server = %server_addr,
-                actual = %from_addr.ip(),
+                actual = %from_addr,
                 "Draining UDP datagram from unexpected source (anti-spoofing)"
             );
             continue;

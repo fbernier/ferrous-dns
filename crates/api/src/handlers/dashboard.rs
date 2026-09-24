@@ -61,7 +61,7 @@ pub async fn get_dashboard(
             Some(TimelineResponse {
                 total_buckets: buckets.len(),
                 period: params.period,
-                granularity: "15min".to_string(),
+                granularity: TimeGranularity::QuarterHour.as_str().to_string(),
                 buckets,
             })
         }

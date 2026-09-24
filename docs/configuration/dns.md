@@ -327,7 +327,7 @@ doq_max_connections_per_ip = 15
 | `ipv4_prefix_len` | `24` | IPv4 prefix length for subnet grouping (e.g. 24 = /24) |
 | `ipv6_prefix_len` | `48` | IPv6 prefix length for subnet grouping (e.g. 48 = /48) |
 | `whitelist` | `[]` | CIDRs that bypass rate limiting entirely |
-| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN responses per subnet |
+| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN answers per subnet; a subnet that spends it is rate-limited until it refills. 0 = no NXDOMAIN budget |
 | `slip_ratio` | `0` | Every Nth rate-limited UDP response sends TC=1 (forcing TCP retry). 0 = disabled |
 | `dry_run` | `false` | Log rate-limit events without refusing queries |
 | `stale_entry_ttl_secs` | `300` | Seconds before an idle subnet bucket is evicted from memory |
@@ -522,7 +522,7 @@ client_whitelist              = []
 | `confidence_threshold` | `0.65` | Minimum combined weighted score for Phase 2 background analysis to flag an SLD (0.0–1.0) |
 | `stale_entry_ttl_secs` | `300` | Seconds before idle tracking entries are evicted from memory |
 | `domain_whitelist` | `[]` | Domains that bypass DGA detection entirely |
-| `client_whitelist` | `[]` | Client CIDRs (e.g. `10.0.0.0/8`) that bypass DGA detection |
+| `client_whitelist` | `[]` | Client CIDRs (e.g. `10.0.0.0/8`) or bare IPs (a single host) that bypass DGA detection. Invalid entries are skipped with a warning |
 
 ---
 

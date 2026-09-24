@@ -17,7 +17,7 @@ pub(super) async fn query_server(
     protocol: &DnsProtocol,
 ) -> Result<UpstreamResult, DomainError> {
     let start = Instant::now();
-    let (response, answered_by) = exchange_with_tc_retry(
+    let (response, tcp_retry) = exchange_with_tc_retry(
         protocol,
         ctx.query_bytes,
         ctx.validator,
@@ -25,10 +25,16 @@ pub(super) async fn query_server(
     )
     .await?;
 
+    let display = get_display(protocol, ctx.server_displays);
     Ok(UpstreamResult {
         response,
         latency_ms: start.elapsed().as_millis() as u64,
         pool_name: Arc::clone(ctx.pool_name),
-        server_display: get_display(&answered_by, ctx.server_displays),
+        // Keeps the configured name: the TCP retry reaches the same server.
+        server_display: if tcp_retry {
+            Arc::from(format!("{display} (tcp retry)"))
+        } else {
+            display
+        },
     })
 }

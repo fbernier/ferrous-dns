@@ -178,7 +178,7 @@ nxdomain_ratio_threshold = 0.20         # Phase 2: NXDOMAIN > 20% for a client+a
 confidence_threshold = 0.7              # Phase 2: minimum score to flag (0.0-1.0)
 stale_entry_ttl_secs = 300              # Eviction of idle tracking entries (seconds)
 domain_whitelist = []                   # Domains exempt from detection
-client_whitelist = []                   # Client CIDRs exempt from detection
+client_whitelist = []                   # Client CIDRs or IPs exempt from detection
 
 
 # ── DGA Detection (Domain Generation Algorithm) ────────────────────────────

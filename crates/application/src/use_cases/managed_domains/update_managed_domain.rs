@@ -46,7 +46,8 @@ impl UpdateManagedDomainUseCase {
             ManagedDomain::validate_domain(d).map_err(DomainError::InvalidManagedDomain)?;
         }
 
-        validate_comment(update.comment.as_deref()).map_err(DomainError::InvalidManagedDomain)?;
+        validate_comment(update.comment.as_ref().and_then(Option::as_deref))
+            .map_err(DomainError::InvalidManagedDomain)?;
 
         if let Some(gid) = update.group_id {
             require_group(self.group_repo.as_ref(), gid).await?;

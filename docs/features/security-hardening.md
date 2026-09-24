@@ -32,7 +32,7 @@ Ferrous DNS validates every upstream response at two layers. A response that fai
 
 Implemented in the UDP transport, before a single byte is parsed as a DNS message:
 
-- **Source address** — the datagram must come from the IP of the upstream that was queried.
+- **Source address** — the datagram must come from the IP *and port* of the upstream that was queried (an IPv4 peer reported as IPv4-mapped IPv6 still matches).
 - **Message ID** — the first two bytes must match the transaction ID that was sent.
 - **Size cap** — responses larger than 4096 bytes are not read.
 

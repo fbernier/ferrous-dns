@@ -199,3 +199,34 @@ async fn test_dashboard_includes_top_blocked_and_clients() {
     assert_eq!(json["top_blocked_domains"][0]["count"], 1);
     assert!(!json["top_clients"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn test_timeline_reports_the_granularity_it_used() {
+    let app = TestApp::builder().build().await.router;
+
+    for (requested, effective) in [
+        ("minute", "minute"),
+        ("quarter_hour", "15min"),
+        ("day", "day"),
+        // An unknown value falls back to hourly buckets; the response must say so.
+        ("fortnight", "hour"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/queries/timeline?period=24h&granularity={requested}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["granularity"], effective, "requested {requested}");
+    }
+}

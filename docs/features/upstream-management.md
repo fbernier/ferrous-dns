@@ -254,6 +254,10 @@ Server A: probe every 30s
 
 The health checker runs independently of query traffic, so a flaky server is detected and removed without clients ever seeing a failed response — the pool routes around it transparently.
 
+If every server in every pool is marked unhealthy at once, Ferrous DNS fails open and queries them anyway, in pool priority order, until a probe marks one healthy again. The checker can lag reality — a network change after boot, or probes that fail while real queries would succeed — and refusing every query would turn a stale verdict into a total outage. Entering and leaving this state is logged once each (`No upstream server is marked healthy; querying all servers anyway`).
+
+An answer that came back truncated over UDP and was retried over TCP is attributed to the configured server with a `(tcp retry)` suffix, e.g. `udp://9.9.9.9:53 (tcp retry)`, in the query log and upstream statistics.
+
 The current state of every pool and server is shown on the dashboard under
 **Settings > System Status**:
 

@@ -188,13 +188,17 @@ pub(super) async fn get_recent_paged(
             // Every page orders by `(created_at, id)`: `id` breaks the ties of a
             // flush, which stamps its whole batch alike. A cursor page continues
             // after the cursor row's key, not its id alone, since a backwards
-            // clock step gives newer rows (higher ids) older timestamps.
+            // clock step gives newer rows (higher ids) older timestamps. A cursor
+            // row deleted by retention has no key left, so the page continues
+            // below its id, which is monotonic.
             match page {
                 PageAt::Cursor(cursor_id) => {
                     let sql = format!(
                         select_query_log!(
-                            " WHERE (q.created_at, q.id) <
-                                    (SELECT c.created_at, c.id FROM query_log c WHERE c.id = ?)
+                            " WHERE CASE WHEN EXISTS (SELECT 1 FROM query_log c WHERE c.id = ?)
+                                    THEN (q.created_at, q.id) <
+                                         (SELECT c.created_at, c.id FROM query_log c WHERE c.id = ?)
+                                    ELSE q.id < ? END
                                 AND q.query_source = 'client'
                                 AND q.created_at >= ?{filters}
                               ORDER BY q.created_at DESC, q.id DESC
@@ -202,7 +206,11 @@ pub(super) async fn get_recent_paged(
                         ),
                         filters = filters
                     );
-                    let q = sqlx::query(&sql).bind(cursor_id).bind(&cutoff);
+                    let q = sqlx::query(&sql)
+                        .bind(cursor_id)
+                        .bind(cursor_id)
+                        .bind(cursor_id)
+                        .bind(&cutoff);
                     bind_filters!(q).bind(fetch_limit).fetch_all(pool).await
                 }
                 PageAt::Offset(offset) => {

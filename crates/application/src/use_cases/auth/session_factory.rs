@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use ring::rand::SecureRandom;
 
+use ferrous_dns_domain::config::auth::expiry_from_now;
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, UserRole};
 
 /// UTC storage format of every auth timestamp; lexicographic order matches time order.
@@ -25,9 +26,14 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     hex
 }
 
-/// Timestamp `ttl` from now, in [`TIMESTAMP_FMT`].
-pub(crate) fn expires_in(ttl: chrono::Duration) -> String {
-    (chrono::Utc::now() + ttl).format(TIMESTAMP_FMT).to_string()
+/// Timestamp `ttl_secs` from now, in [`TIMESTAMP_FMT`]. Config validation
+/// rejects TTLs past chrono's range; this refuses the login instead of panicking.
+pub(crate) fn expires_in(ttl_secs: i64) -> Result<String, DomainError> {
+    expiry_from_now(ttl_secs)
+        .map(|at| at.format(TIMESTAMP_FMT).to_string())
+        .ok_or_else(|| {
+            DomainError::ConfigError(format!("an expiry {ttl_secs}s from now is out of range"))
+        })
 }
 
 /// Whether a [`TIMESTAMP_FMT`] timestamp has passed; unparseable values count as expired.
@@ -51,7 +57,7 @@ pub(crate) fn build_session(
 ) -> Result<AuthSession, DomainError> {
     let session_id = random_hex_256()?;
     let created_at = chrono::Utc::now().format(TIMESTAMP_FMT).to_string();
-    let expires_at = expires_in(session_ttl(remember_me, config));
+    let expires_at = expires_in(config.session_ttl_secs(remember_me))?;
 
     Ok(AuthSession {
         id: Arc::from(session_id.as_str()),
@@ -64,21 +70,4 @@ pub(crate) fn build_session(
         created_at,
         expires_at,
     })
-}
-
-/// Cookie `max_age` in seconds for the session.
-pub(crate) fn session_max_age(remember_me: bool, config: &AuthConfig) -> i64 {
-    if remember_me {
-        i64::from(config.remember_me_days) * 86400
-    } else {
-        i64::from(config.session_ttl_hours) * 3600
-    }
-}
-
-fn session_ttl(remember_me: bool, config: &AuthConfig) -> chrono::Duration {
-    if remember_me {
-        chrono::Duration::days(i64::from(config.remember_me_days))
-    } else {
-        chrono::Duration::hours(i64::from(config.session_ttl_hours))
-    }
 }

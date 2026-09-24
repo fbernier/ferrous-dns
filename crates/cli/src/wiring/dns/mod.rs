@@ -46,6 +46,8 @@ pub struct DnsServices {
     /// path is enabled. Kept so hot upstream reloads also reach it.
     pub maintenance_pool_manager: Option<Arc<PoolManager>>,
     pub health_checker: Arc<HealthChecker>,
+    /// Present whenever the cache is enabled; refresh is on only with
+    /// `cache_optimistic_refresh`.
     pub cache_maintenance: Option<Arc<dyn CacheMaintenancePort>>,
     /// Live PTR map for local records. Always present, so a record added from
     /// the admin UI reverse-resolves without a restart.
@@ -366,8 +368,17 @@ impl DnsServices {
         Option<Arc<dyn CacheMaintenancePort>>,
         Option<Arc<PoolManager>>,
     )> {
-        if !config.dns.cache_enabled || !config.dns.cache_optimistic_refresh {
+        if !config.dns.cache_enabled {
             return Ok((None, None));
+        }
+
+        // Eviction and compaction run regardless: nothing else bounds the cache.
+        let maintenance = DnsCacheMaintenance::new(cache.clone(), DEFAULT_REFRESH_INTERVAL_SECS);
+        if !config.dns.cache_optimistic_refresh {
+            return Ok((
+                Some(Arc::new(maintenance) as Arc<dyn CacheMaintenancePort>),
+                None,
+            ));
         }
 
         // The optimistic queue holds one cycle's backlog. A cycle produces
@@ -415,12 +426,10 @@ impl DnsServices {
         );
 
         Ok((
-            Some(Arc::new(DnsCacheMaintenance::new(
-                cache.clone(),
-                DEFAULT_REFRESH_INTERVAL_SECS,
-                scan_opts,
-                pace_tx,
-            )) as Arc<dyn CacheMaintenancePort>),
+            Some(
+                Arc::new(maintenance.with_optimistic_refresh(scan_opts, pace_tx))
+                    as Arc<dyn CacheMaintenancePort>,
+            ),
             Some(maintenance_pool_manager),
         ))
     }
@@ -449,15 +458,10 @@ fn resolve_cookie_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrous_dns_domain::{UpstreamPool, UpstreamStrategy};
 
-    /// With no local record at startup, a PTR registered later — what the
-    /// create use case does — must still be answered by the running resolver.
-    #[tokio::test]
-    async fn ptr_registered_at_runtime_is_answered_without_startup_records() {
-        use ferrous_dns_domain::{DnsRequest, RecordType, UpstreamPool, UpstreamStrategy};
-
+    async fn build_services(mut config: Config) -> (tempfile::TempDir, DnsServices) {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
         config.database.path = dir.path().join("ferrous.db").display().to_string();
         config.dns.pools = vec![UpstreamPool {
             name: "unreachable".to_string(),
@@ -466,7 +470,6 @@ mod tests {
             servers: vec!["127.0.0.1:9".to_string()],
             weight: None,
         }];
-        assert!(config.dns.local_records.is_empty());
 
         let database_url = format!("sqlite:{}", config.database.path);
         let (write, query_log, read) =
@@ -477,6 +480,18 @@ mod tests {
             .await
             .unwrap();
         let services = DnsServices::new(&config, &repos).await.unwrap();
+        (dir, services)
+    }
+
+    /// With no local record at startup, a PTR registered later — what the
+    /// create use case does — must still be answered by the running resolver.
+    #[tokio::test]
+    async fn ptr_registered_at_runtime_is_answered_without_startup_records() {
+        use ferrous_dns_domain::{DnsRequest, RecordType};
+
+        let config = Config::default();
+        assert!(config.dns.local_records.is_empty());
+        let (_dir, services) = build_services(config).await;
 
         services
             .ptr_registry
@@ -494,6 +509,48 @@ mod tests {
         assert!(
             resolution.local_dns,
             "PTR was not answered from the local map"
+        );
+    }
+
+    /// Nothing but the maintenance cycle bounds the positive cache, so turning
+    /// optimistic refresh off must not turn eviction off with it.
+    #[tokio::test]
+    async fn cache_is_still_evicted_with_optimistic_refresh_off() {
+        use ferrous_dns_domain::RecordType;
+        use ferrous_dns_infrastructure::dns::CachedData;
+
+        const MAX_ENTRIES: usize = 10;
+        let mut config = Config::default();
+        config.dns.cache_enabled = true;
+        config.dns.cache_optimistic_refresh = false;
+        config.dns.cache_max_entries = MAX_ENTRIES;
+        config.dns.cache_batch_eviction_percentage = 0.5;
+        let (_dir, services) = build_services(config).await;
+
+        for i in 0..MAX_ENTRIES * 2 {
+            services.cache.insert(
+                &format!("host{i}.example.com"),
+                RecordType::CNAME,
+                CachedData::CanonicalName(Arc::from("target.example.com")),
+                3600,
+                None,
+            );
+        }
+        let before = services.cache.len();
+        assert!(before > MAX_ENTRIES);
+
+        let maintenance = services
+            .cache_maintenance
+            .expect("cache maintenance is wired whenever the cache is enabled");
+        maintenance.run_eviction_cycle().await.unwrap();
+
+        assert!(
+            services.cache.len() < before,
+            "eviction cycle removed nothing from an over-capacity cache"
+        );
+        assert!(
+            services.maintenance_pool_manager.is_none(),
+            "refresh resolver started although optimistic refresh is off"
         );
     }
 }

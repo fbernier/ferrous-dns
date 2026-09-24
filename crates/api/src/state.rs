@@ -22,13 +22,13 @@ use ferrous_dns_application::use_cases::{
     GetSafeSearchConfigsUseCase, GetScheduleProfilesUseCase, GetServiceCatalogUseCase,
     GetTimelineUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetUsersUseCase,
     GetWhitelistSourcesUseCase, GetWhitelistUseCase, ImportConfigUseCase, LoginUseCase,
-    LogoutUseCase, ManageTimeSlotsUseCase, RegisterPasskeyUseCase, SetupPasswordUseCase,
-    SetupTotpUseCase, SyncBlocklistSourcesUseCase, TestDomainUseCase, ToggleSafeSearchUseCase,
-    UnblockServiceUseCase, UpdateApiTokenUseCase, UpdateBlocklistSourceUseCase,
-    UpdateClientUseCase, UpdateCustomServiceUseCase, UpdateGroupUseCase, UpdateLocalRecordUseCase,
-    UpdateManagedDomainUseCase, UpdateRegexFilterUseCase, UpdateScheduleProfileUseCase,
-    UpdateWhitelistSourceUseCase, ValidateApiTokenUseCase, ValidateSessionUseCase,
-    VerifyMfaUseCase,
+    LogoutUseCase, ManageTimeSlotsUseCase, RegisterPasskeyUseCase, ReloadConfigUseCase,
+    SetupPasswordUseCase, SetupTotpUseCase, SyncBlocklistSourcesUseCase, TestDomainUseCase,
+    ToggleSafeSearchUseCase, UnblockServiceUseCase, UpdateApiTokenUseCase,
+    UpdateBlocklistSourceUseCase, UpdateClientUseCase, UpdateCustomServiceUseCase,
+    UpdateGroupUseCase, UpdateLocalRecordUseCase, UpdateManagedDomainUseCase,
+    UpdateRegexFilterUseCase, UpdateScheduleProfileUseCase, UpdateWhitelistSourceUseCase,
+    ValidateApiTokenUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
 };
 use ferrous_dns_domain::Config;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,6 +186,8 @@ pub struct AppState {
     pub config_writer: Arc<Mutex<()>>,
     pub config_file_persistence: Arc<dyn ConfigFilePersistence>,
     pub config_path: Option<Arc<str>>,
+    /// Absent when the server runs without a config file.
+    pub reload_config: Option<Arc<ReloadConfigUseCase>>,
     pub tls_cert: Arc<dyn TlsCertificatePort>,
     /// Whether the web server is actually serving HTTPS. Drives the session
     /// cookie's `Secure` attribute, so it must not be taken from the

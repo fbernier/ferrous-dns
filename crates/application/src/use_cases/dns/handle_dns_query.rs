@@ -552,7 +552,7 @@ impl HandleDnsQueryUseCase {
 
         let group_id = self.block_filter.resolve_group(request.client_ip);
 
-        match self.rate_limiter.check(request.client_ip, false) {
+        match self.rate_limiter.check(request.client_ip) {
             RateLimitDecision::Allow => {}
             RateLimitDecision::DryRunWouldRefuse => {
                 tracing::debug!(client = %request.client_ip, "[dry-run] would rate-limit");
@@ -695,6 +695,7 @@ impl HandleDnsQueryUseCase {
                     return Ok(cached);
                 }
             } else if cached.cache_hit {
+                self.rate_limiter.charge_nxdomain(request.client_ip);
                 self.log(&QueryLog {
                     cache_hit: true,
                     response_status: Some("NXDOMAIN"),
@@ -732,6 +733,7 @@ impl HandleDnsQueryUseCase {
                 {
                     match self.nxdomain_hijack_guard.action() {
                         NxdomainHijackAction::Block => {
+                            self.rate_limiter.charge_nxdomain(request.client_ip);
                             self.log(&QueryLog {
                                 blocked: true,
                                 response_status: Some("NXDOMAIN_HIJACK"),
@@ -806,6 +808,7 @@ impl HandleDnsQueryUseCase {
                 Ok(resolution)
             }
             Err(DomainError::LocalNxDomain) => {
+                self.rate_limiter.charge_nxdomain(request.client_ip);
                 self.log(&QueryLog {
                     response_status: Some("LOCAL_DNS"),
                     ..Self::base_query_log(request, elapsed_us(), group_id)
@@ -815,6 +818,7 @@ impl HandleDnsQueryUseCase {
             Err(e) => {
                 let response_status = match &e {
                     DomainError::NxDomain => {
+                        self.rate_limiter.charge_nxdomain(request.client_ip);
                         if !explicitly_allowed {
                             self.emit_tunneling_event(request, true);
                             self.emit_dga_event(request);

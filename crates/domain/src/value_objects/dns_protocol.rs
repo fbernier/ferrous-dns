@@ -1,3 +1,4 @@
+use crate::DomainError;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
@@ -261,32 +262,32 @@ fn parse_upstream_addr(addr_str: &str) -> Result<UpstreamAddr, String> {
 }
 
 impl FromStr for DnsProtocol {
-    type Err = String;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some(addr_str) = s.strip_prefix("udp://") {
             let addr = parse_upstream_addr(addr_str)
-                .map_err(|_| format!("Invalid UDP address '{}'", addr_str))?;
+                .map_err(|_| DomainError::ConfigError(format!("Invalid UDP address '{s}'")))?;
             return Ok(DnsProtocol::Udp { addr });
         }
         if let Some(addr_str) = s.strip_prefix("tcp://") {
             let addr = parse_upstream_addr(addr_str)
-                .map_err(|_| format!("Invalid TCP address '{}'", addr_str))?;
+                .map_err(|_| DomainError::ConfigError(format!("Invalid TCP address '{s}'")))?;
             return Ok(DnsProtocol::Tcp { addr });
         }
         if let Some(rest) = s.strip_prefix("tls://") {
             let (addr, hostname) = parse_named_addr(rest)
-                .map_err(|e| format!("Invalid TLS address '{s}': {e}. Expected 'tls://IP:PORT' or 'tls://HOSTNAME:PORT'"))?;
+                .map_err(|e| DomainError::ConfigError(format!("Invalid TLS address '{s}': {e}. Expected 'tls://IP:PORT' or 'tls://HOSTNAME:PORT'")))?;
             return Ok(DnsProtocol::Tls { addr, hostname });
         }
         if let Some(rest) = s.strip_prefix("doq://") {
             let (addr, hostname) = parse_named_addr(rest)
-                .map_err(|e| format!("Invalid QUIC address '{s}': {e}. Expected 'doq://IP:PORT' or 'doq://HOSTNAME:PORT'"))?;
+                .map_err(|e| DomainError::ConfigError(format!("Invalid QUIC address '{s}': {e}. Expected 'doq://IP:PORT' or 'doq://HOSTNAME:PORT'")))?;
             return Ok(DnsProtocol::Quic { addr, hostname });
         }
         if let Some(rest) = s.strip_prefix("h3://") {
-            let (hostname, port) =
-                parse_url_authority(rest).map_err(|e| format!("Invalid H3 URL '{s}': {e}"))?;
+            let (hostname, port) = parse_url_authority(rest)
+                .map_err(|e| DomainError::ConfigError(format!("Invalid H3 URL '{s}': {e}")))?;
             return Ok(DnsProtocol::H3 {
                 url: s.into(),
                 hostname,
@@ -295,8 +296,8 @@ impl FromStr for DnsProtocol {
             });
         }
         if let Some(rest) = s.strip_prefix("https://") {
-            let (hostname, port) =
-                parse_url_authority(rest).map_err(|e| format!("Invalid HTTPS URL '{s}': {e}"))?;
+            let (hostname, port) = parse_url_authority(rest)
+                .map_err(|e| DomainError::ConfigError(format!("Invalid HTTPS URL '{s}': {e}")))?;
             return Ok(DnsProtocol::Https {
                 url: s.into(),
                 hostname,
@@ -309,7 +310,7 @@ impl FromStr for DnsProtocol {
                 addr: UpstreamAddr::Resolved(addr),
             });
         }
-        Err(format!("Invalid DNS endpoint format: '{}'. Expected: udp://IP:PORT, tcp://IP:PORT, tls://HOST:PORT, https://URL, h3://URL, doq://HOST:PORT, or IP:PORT", s))
+        Err(DomainError::ConfigError(format!("Invalid DNS endpoint format: '{s}'. Expected: udp://IP:PORT, tcp://IP:PORT, tls://HOST:PORT, https://URL, h3://URL, doq://HOST:PORT, or IP:PORT")))
     }
 }
 

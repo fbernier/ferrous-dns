@@ -5,7 +5,7 @@ use ferrous_dns_application::ports::{
     GroupRepository, LocalRecordCreator,
 };
 use ferrous_dns_application::use_cases::{
-    CreateBlocklistSourceUseCase, CreateGroupUseCase, CreateLocalRecordUseCase,
+    ConfigDestination, CreateBlocklistSourceUseCase, CreateGroupUseCase, CreateLocalRecordUseCase,
     ExportConfigUseCase, ImportConfigUseCase,
 };
 use ferrous_dns_domain::{BlocklistSource, Client, Config, DomainError, Group};
@@ -92,7 +92,10 @@ impl BlocklistSourceRepository for NullBlocklistSourceRepository {
     }
 }
 
-pub fn build_test_backup_use_cases(config: Arc<RwLock<Config>>) -> BackupUseCases {
+pub fn build_test_backup_use_cases(
+    config: Arc<RwLock<Config>>,
+    config_writer: Arc<tokio::sync::Mutex<()>>,
+) -> BackupUseCases {
     let group_repo: Arc<dyn GroupRepository> = Arc::new(NullGroupRepository);
     let blocklist_source_repo: Arc<dyn BlocklistSourceRepository> =
         Arc::new(NullBlocklistSourceRepository);
@@ -117,9 +120,12 @@ pub fn build_test_backup_use_cases(config: Arc<RwLock<Config>>) -> BackupUseCase
             blocklist_source_repo,
         )),
         import: Arc::new(ImportConfigUseCase::new(
-            config,
-            Arc::new(NullConfigFilePersistence),
-            None,
+            ConfigDestination {
+                config,
+                writer: config_writer,
+                persistence: Arc::new(NullConfigFilePersistence),
+                path: None,
+            },
             group_creator,
             blocklist_source_creator,
             local_record_creator,

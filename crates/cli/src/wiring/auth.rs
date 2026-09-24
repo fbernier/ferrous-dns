@@ -89,6 +89,7 @@ pub async fn build_auth_services(
         change_password: Arc::new(ChangePasswordUseCase::new(
             user_provider.clone(),
             password_hasher.clone(),
+            repos.session.clone(),
         )),
         get_auth_status: Arc::new(GetAuthStatusUseCase::new(config)),
         get_active_sessions: Arc::new(GetActiveSessionsUseCase::new(repos.session.clone())),

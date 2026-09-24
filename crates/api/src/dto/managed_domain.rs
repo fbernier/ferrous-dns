@@ -75,6 +75,8 @@ pub struct UpdateManagedDomainRequest {
     pub domain: Option<String>,
     pub action: Option<String>,
     pub group_id: Option<i64>,
-    pub comment: Option<String>,
+    /// Absent keeps the comment; `null` clears it.
+    #[serde(default, deserialize_with = "crate::dto::source_common::double_option")]
+    pub comment: Option<Option<String>>,
     pub enabled: Option<bool>,
 }

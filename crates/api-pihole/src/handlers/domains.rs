@@ -275,7 +275,7 @@ pub async fn update_domain(
                         domain: Some(body.domain),
                         action,
                         group_id,
-                        comment: body.comment,
+                        comment: body.comment.map(Some),
                         enabled: body.enabled,
                         ..Default::default()
                     },
@@ -299,7 +299,7 @@ pub async fn update_domain(
                         pattern: Some(body.domain),
                         action,
                         group_id,
-                        comment: body.comment,
+                        comment: body.comment.map(Some),
                         enabled: body.enabled,
                         ..Default::default()
                     },

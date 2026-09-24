@@ -1526,6 +1526,47 @@ async fn cursor_pages_do_not_skip_rows_written_after_a_clock_step() {
     assert_eq!(seen, expected);
 }
 
+/// Retention can delete the row a client's cursor points at; the next page
+/// must continue below that id instead of coming back empty.
+#[tokio::test]
+async fn a_cursor_whose_row_was_deleted_continues_below_its_id() {
+    let pool = migrated_pool().await;
+    for (domain, minutes) in [("old.com", 30), ("cursor.com", 20), ("new.com", 10)] {
+        insert(
+            &pool,
+            Row {
+                domain,
+                created_at: Some(&minutes_ago(minutes)),
+                ..Row::default()
+            },
+        )
+        .await;
+    }
+    let repo = repo(&pool);
+    let first = repo
+        .get_recent_paged(2, PageAt::Offset(0), 24.0, &no_filter())
+        .await
+        .unwrap();
+    let cursor = first.next_cursor.unwrap();
+    assert_eq!(
+        domains(&first.queries),
+        BTreeSet::from(["new.com", "cursor.com"])
+    );
+
+    sqlx::query("DELETE FROM query_log WHERE id = ?")
+        .bind(cursor)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next = repo
+        .get_recent_paged(2, PageAt::Cursor(cursor), 24.0, &no_filter())
+        .await
+        .unwrap();
+
+    assert_eq!(domains(&next.queries), BTreeSet::from(["old.com"]));
+    assert_eq!(next.next_cursor, None);
+}
+
 /// A window shorter than an hour is not rounded down to nothing.
 #[tokio::test]
 async fn timeline_honours_a_sub_hour_period() {

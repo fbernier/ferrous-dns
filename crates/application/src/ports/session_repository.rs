@@ -18,6 +18,14 @@ pub trait SessionRepository: Send + Sync {
     /// Returns the number of sessions removed.
     async fn delete_expired(&self) -> Result<u64, DomainError>;
 
+    /// Delete every session of `username` except `keep_id`.
+    /// Returns the number of sessions removed.
+    async fn delete_other_sessions(
+        &self,
+        username: &str,
+        keep_id: &str,
+    ) -> Result<u64, DomainError>;
+
     /// List all non-expired sessions (for the Active Sessions UI).
     async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError>;
 }

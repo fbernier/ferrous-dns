@@ -31,29 +31,37 @@ impl TokenBucket {
         self.last_refill_ns.load(Ordering::Relaxed)
     }
 
-    /// Returns `true` if there is at least one general token available (read-only peek).
+    /// Read-only peek: `true` if a query would currently be admitted.
     #[inline]
-    pub(crate) fn has_tokens(&self) -> bool {
-        self.tokens_milli.load(Ordering::Relaxed) >= MILLI
+    pub(crate) fn has_tokens(&self, nx_qps: u32) -> bool {
+        self.tokens_milli.load(Ordering::Relaxed) >= MILLI && !self.nxdomain_exhausted(nx_qps)
     }
 
-    /// Refills tokens based on elapsed time, then tries to consume one token.
-    /// Returns `true` if the token was consumed (query allowed).
+    /// Refills tokens based on elapsed time, then tries to consume one general
+    /// token. Returns `true` if the query is allowed; a subnet whose NXDOMAIN
+    /// budget is spent is refused without consuming.
     #[inline]
-    pub(crate) fn try_consume(
-        &self,
-        now_ns: u64,
-        qps: u32,
-        burst: u32,
-        is_nxdomain: bool,
-        nx_qps: u32,
-    ) -> bool {
+    pub(crate) fn try_consume(&self, now_ns: u64, qps: u32, burst: u32, nx_qps: u32) -> bool {
         self.refill(now_ns, qps, burst, nx_qps);
 
-        if is_nxdomain {
-            return try_decrement(&self.nxdomain_tokens_milli);
+        if self.nxdomain_exhausted(nx_qps) {
+            return false;
         }
         try_decrement(&self.tokens_milli)
+    }
+
+    /// Charges one NXDOMAIN answer against the NXDOMAIN budget. An already
+    /// empty budget stays empty; the next [`Self::try_consume`] refuses.
+    #[inline]
+    pub(crate) fn charge_nxdomain(&self, now_ns: u64, qps: u32, burst: u32, nx_qps: u32) {
+        self.refill(now_ns, qps, burst, nx_qps);
+        try_decrement(&self.nxdomain_tokens_milli);
+    }
+
+    /// `nx_qps == 0` means no NXDOMAIN budget, not a budget of zero.
+    #[inline]
+    fn nxdomain_exhausted(&self, nx_qps: u32) -> bool {
+        nx_qps > 0 && self.nxdomain_tokens_milli.load(Ordering::Relaxed) < MILLI
     }
 
     #[inline]
@@ -139,7 +147,7 @@ mod tests {
     fn consumes_within_burst() {
         let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         for _ in 0..BURST {
-            assert!(bucket.try_consume(0, QPS, BURST, false, NX_QPS));
+            assert!(bucket.try_consume(0, QPS, BURST, NX_QPS));
         }
     }
 
@@ -147,9 +155,9 @@ mod tests {
     fn refuses_after_burst_exhausted() {
         let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         for _ in 0..BURST {
-            bucket.try_consume(0, QPS, BURST, false, NX_QPS);
+            bucket.try_consume(0, QPS, BURST, NX_QPS);
         }
-        assert!(!bucket.try_consume(0, QPS, BURST, false, NX_QPS));
+        assert!(!bucket.try_consume(0, QPS, BURST, NX_QPS));
     }
 
     #[test]
@@ -157,49 +165,70 @@ mod tests {
         let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         // Drain all tokens
         for _ in 0..BURST {
-            bucket.try_consume(0, QPS, BURST, false, NX_QPS);
+            bucket.try_consume(0, QPS, BURST, NX_QPS);
         }
-        assert!(!bucket.try_consume(0, QPS, BURST, false, NX_QPS));
+        assert!(!bucket.try_consume(0, QPS, BURST, NX_QPS));
 
         // Advance 1 second — should refill QPS tokens (10), but capped at BURST (5)
-        assert!(bucket.try_consume(ONE_SEC_NS, QPS, BURST, false, NX_QPS));
+        assert!(bucket.try_consume(ONE_SEC_NS, QPS, BURST, NX_QPS));
     }
 
     #[test]
-    fn nxdomain_uses_separate_budget() {
+    fn spent_nxdomain_budget_refuses_until_it_refills() {
         let bucket = TokenBucket::new(BURST, NX_QPS, 0);
 
-        // Drain NX budget (NX_QPS * 2 = 6 tokens)
-        for _ in 0..(NX_QPS * 2) {
-            assert!(bucket.try_consume(0, QPS, BURST, true, NX_QPS));
+        // NX capacity is NX_QPS * 2 = 6 answers.
+        for _ in 0..(NX_QPS * 2 - 1) {
+            bucket.charge_nxdomain(0, QPS, BURST, NX_QPS);
         }
-        // NX exhausted
-        assert!(!bucket.try_consume(0, QPS, BURST, true, NX_QPS));
+        assert!(bucket.try_consume(0, QPS, BURST, NX_QPS));
+        assert!(bucket.has_tokens(NX_QPS));
 
-        // General budget still has tokens
-        assert!(bucket.try_consume(0, QPS, BURST, false, NX_QPS));
+        bucket.charge_nxdomain(0, QPS, BURST, NX_QPS);
+        assert!(!bucket.try_consume(0, QPS, BURST, NX_QPS));
+        assert!(!bucket.has_tokens(NX_QPS));
+
+        assert!(bucket.try_consume(ONE_SEC_NS, QPS, BURST, NX_QPS));
+    }
+
+    #[test]
+    fn refused_query_does_not_spend_a_general_token() {
+        let bucket = TokenBucket::new(1, 1, 0);
+        for _ in 0..2 {
+            bucket.charge_nxdomain(0, QPS, 1, 1);
+        }
+        assert!(!bucket.try_consume(0, QPS, 1, 1));
+        assert!(bucket.tokens_milli.load(Ordering::Relaxed) >= MILLI);
+    }
+
+    #[test]
+    fn zero_nx_qps_disables_the_nxdomain_budget() {
+        let bucket = TokenBucket::new(BURST, 0, 0);
+        bucket.charge_nxdomain(0, QPS, BURST, 0);
+        assert!(bucket.try_consume(0, QPS, BURST, 0));
+        assert!(bucket.has_tokens(0));
     }
 
     #[test]
     fn partial_refill_fraction_of_second() {
         let bucket = TokenBucket::new(1, NX_QPS, 0);
         // Drain the single token
-        assert!(bucket.try_consume(0, QPS, 1, false, NX_QPS));
-        assert!(!bucket.try_consume(0, QPS, 1, false, NX_QPS));
+        assert!(bucket.try_consume(0, QPS, 1, NX_QPS));
+        assert!(!bucket.try_consume(0, QPS, 1, NX_QPS));
 
         // Advance 100ms — refills 10 QPS * 0.1s = 1 token
-        assert!(bucket.try_consume(ONE_SEC_NS / 10, QPS, 1, false, NX_QPS));
+        assert!(bucket.try_consume(ONE_SEC_NS / 10, QPS, 1, NX_QPS));
     }
 
     #[test]
     fn refill_does_not_exceed_cap() {
         let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         // Consume 1, then advance a long time
-        bucket.try_consume(0, QPS, BURST, false, NX_QPS);
+        bucket.try_consume(0, QPS, BURST, NX_QPS);
         // Advance 10 seconds — would add 100 tokens, but cap is BURST (5)
         let mut allowed = 0;
         for _ in 0..20 {
-            if bucket.try_consume(10 * ONE_SEC_NS, QPS, BURST, false, NX_QPS) {
+            if bucket.try_consume(10 * ONE_SEC_NS, QPS, BURST, NX_QPS) {
                 allowed += 1;
             }
         }
@@ -211,7 +240,7 @@ mod tests {
     fn last_refill_ns_tracks_time() {
         let bucket = TokenBucket::new(BURST, NX_QPS, 42);
         assert_eq!(bucket.last_refill_ns(), 42);
-        bucket.try_consume(1000, QPS, BURST, false, NX_QPS);
+        bucket.try_consume(1000, QPS, BURST, NX_QPS);
         assert_eq!(bucket.last_refill_ns(), 1000);
     }
 }

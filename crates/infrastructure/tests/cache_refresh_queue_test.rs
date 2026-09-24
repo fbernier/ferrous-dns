@@ -104,7 +104,8 @@ fn maintenance_with_pace(
 ) -> (DnsCacheMaintenance, watch::Receiver<RefreshPace>) {
     let (pace_tx, pace_rx) = watch::channel(None);
     (
-        DnsCacheMaintenance::new(Arc::clone(cache), interval_secs, opts, pace_tx),
+        DnsCacheMaintenance::new(Arc::clone(cache), interval_secs)
+            .with_optimistic_refresh(opts, pace_tx),
         pace_rx,
     )
 }
@@ -383,7 +384,8 @@ async fn test_backlog_drains_within_the_interval() {
     );
     drop(stale_tx);
 
-    let maintenance = DnsCacheMaintenance::new(Arc::clone(&cache), 1, permissive_opts(), pace_tx);
+    let maintenance = DnsCacheMaintenance::new(Arc::clone(&cache), 1)
+        .with_optimistic_refresh(permissive_opts(), pace_tx);
     let outcome = maintenance
         .run_refresh_cycle()
         .await

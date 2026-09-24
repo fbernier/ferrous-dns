@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use ferrous_dns_domain::{DomainAction, DomainError, RegexFilter};
 
-/// Fields to change on a regex filter; `None` keeps the stored value.
+/// Fields to change on a regex filter; `None` keeps the stored value, and
+/// `comment: Some(None)` clears it.
 #[derive(Debug, Clone, Default)]
 pub struct RegexFilterUpdate {
     pub name: Option<String>,
     pub pattern: Option<String>,
     pub action: Option<DomainAction>,
     pub group_id: Option<i64>,
-    pub comment: Option<String>,
+    pub comment: Option<Option<String>>,
     pub enabled: Option<bool>,
 }
 

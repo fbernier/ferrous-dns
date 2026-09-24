@@ -2,21 +2,27 @@ use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::value_objects::validators::{validate_comment, validate_url};
 use ferrous_dns_domain::{DomainError, WhitelistSource};
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 
-use crate::ports::{GroupRepository, WhitelistSourceRepository};
+use crate::ports::{BlockFilterEnginePort, GroupRepository, WhitelistSourceRepository};
 
 pub struct UpdateWhitelistSourceUseCase {
     repo: Arc<dyn WhitelistSourceRepository>,
     group_repo: Arc<dyn GroupRepository>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl UpdateWhitelistSourceUseCase {
     pub fn new(
         repo: Arc<dyn WhitelistSourceRepository>,
         group_repo: Arc<dyn GroupRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
-        Self { repo, group_repo }
+        Self {
+            repo,
+            group_repo,
+            block_filter_engine,
+        }
     }
 
     #[instrument(skip(self))]
@@ -61,6 +67,10 @@ impl UpdateWhitelistSourceUseCase {
             enabled = %updated.enabled,
             "Whitelist source updated successfully"
         );
+
+        if let Err(e) = self.block_filter_engine.reload().await {
+            error!(error = %e, "Failed to reload block filter after whitelist source update");
+        }
 
         Ok(updated)
     }

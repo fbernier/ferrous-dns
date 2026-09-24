@@ -49,7 +49,11 @@ impl DgaGuard {
             sld_max_length: config.sld_max_length,
             consonant_ratio_threshold: config.consonant_ratio_threshold,
             digit_ratio_threshold: config.digit_ratio_threshold,
-            whitelist: GuardWhitelist::new(&config.domain_whitelist, &config.client_whitelist),
+            whitelist: GuardWhitelist::new(
+                "dns.dga_detection",
+                &config.domain_whitelist,
+                &config.client_whitelist,
+            ),
         }
     }
 
@@ -349,6 +353,17 @@ mod tests {
         let guard = DgaGuard::from_config(&DgaDetectionConfig {
             enabled: true,
             client_whitelist: vec!["192.168.1.0/24".to_string()],
+            ..Default::default()
+        });
+        let result = guard.check("xjk4f9a2h3b5c7d.com", TEST_IP);
+        assert!(matches!(result, DgaVerdict::Clean));
+    }
+
+    #[test]
+    fn bare_ip_client_whitelist_entry_passes_check() {
+        let guard = DgaGuard::from_config(&DgaDetectionConfig {
+            enabled: true,
+            client_whitelist: vec!["192.168.1.1".to_string()],
             ..Default::default()
         });
         let result = guard.check("xjk4f9a2h3b5c7d.com", TEST_IP);

@@ -66,7 +66,7 @@ impl RegisterPasskeyUseCase {
                 remember_me: false,
                 kind: MfaMethod::Webauthn,
                 state: Some(state_json),
-                expires_at: expires_in(chrono::Duration::seconds(self.challenge_ttl_secs)),
+                expires_at: expires_in(self.challenge_ttl_secs)?,
             })
             .await?;
 

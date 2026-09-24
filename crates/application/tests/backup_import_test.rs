@@ -17,7 +17,9 @@ use ferrous_dns_application::ports::{
     LocalRecordCreator,
 };
 use ferrous_dns_application::use_cases::backup::snapshot::BackupSnapshot;
-use ferrous_dns_application::use_cases::{CreateBlocklistSourceUseCase, ImportConfigUseCase};
+use ferrous_dns_application::use_cases::{
+    ConfigDestination, CreateBlocklistSourceUseCase, ImportConfigUseCase,
+};
 use ferrous_dns_domain::{Config, DomainError, Group, LocalDnsRecord};
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -153,9 +155,12 @@ fn build_import(
     ));
 
     let import = ImportConfigUseCase::new(
-        Arc::new(RwLock::new(Config::default())),
-        Arc::new(NullConfigFilePersistence),
-        Some("/tmp/ferrous-dns-backup-import-test.toml".to_string()),
+        ConfigDestination {
+            config: Arc::new(RwLock::new(Config::default())),
+            writer: Arc::default(),
+            persistence: Arc::new(NullConfigFilePersistence),
+            path: Some("/tmp/ferrous-dns-backup-import-test.toml".to_string()),
+        },
         Arc::new(StubGroupCreator),
         creator,
         Arc::new(StubLocalRecordCreator),
@@ -236,4 +241,115 @@ async fn test_import_reloads_once_when_some_sources_are_duplicates() {
         2,
         "one rebuild per import call"
     );
+}
+
+/// Holds the import mid-save until the test releases it.
+struct GatedSave {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<std::sync::Barrier>,
+}
+
+impl ConfigFilePersistence for GatedSave {
+    fn load_config_from_file(&self, _path: &str) -> Result<Config, DomainError> {
+        Ok(Config::default())
+    }
+
+    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), DomainError> {
+        self.started.notify_one();
+        self.release.wait();
+        Ok(())
+    }
+}
+
+fn import_with(
+    config: Arc<RwLock<Config>>,
+    config_writer: Arc<tokio::sync::Mutex<()>>,
+    persistence: Arc<dyn ConfigFilePersistence>,
+) -> ImportConfigUseCase {
+    let engine: Arc<dyn BlockFilterEnginePort> = Arc::new(MockBlockFilterEngine::new());
+    ImportConfigUseCase::new(
+        ConfigDestination {
+            config,
+            writer: config_writer,
+            persistence,
+            path: Some("/tmp/ferrous-dns-backup-import-test.toml".to_string()),
+        },
+        Arc::new(StubGroupCreator),
+        Arc::new(CreateBlocklistSourceUseCase::new(
+            Arc::new(MockBlocklistSourceRepository::new()),
+            Arc::new(MockGroupRepository::new()),
+            engine.clone(),
+        )),
+        Arc::new(StubLocalRecordCreator),
+        engine,
+    )
+}
+
+/// Mirrors the API config-update test: a writer that does not take the config
+/// writer lock (a local-record or password change) lands while the import is
+/// saving, and must survive it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_import_does_not_overwrite_a_concurrent_config_write() {
+    let config = Arc::new(RwLock::new(Config::default()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let import = import_with(
+        config.clone(),
+        Arc::default(),
+        Arc::new(GatedSave {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+
+    let save = tokio::spawn(async move { import.execute(snapshot_with_sources(&[])).await });
+    started.notified().await;
+
+    let writer_config = config.clone();
+    let mut writer = tokio::spawn(async move {
+        writer_config.write().await.dns.query_timeout = 7;
+    });
+    let writer_done = tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer)
+        .await
+        .is_ok();
+    release.wait();
+
+    let summary = save.await.unwrap().unwrap();
+    assert!(summary.config_updated, "{:?}", summary.errors);
+    if !writer_done {
+        writer.await.unwrap();
+    }
+
+    let config = config.read().await;
+    assert_eq!(config.dns.query_timeout, 7, "the concurrent write was lost");
+    assert_eq!(
+        config.dns.cache_max_entries, 1000,
+        "the import was not applied"
+    );
+}
+
+#[tokio::test]
+async fn test_import_waits_for_the_config_writer() {
+    let config = Arc::new(RwLock::new(Config::default()));
+    let config_writer: Arc<tokio::sync::Mutex<()>> = Arc::default();
+    let import = import_with(
+        config.clone(),
+        config_writer.clone(),
+        Arc::new(NullConfigFilePersistence),
+    );
+
+    let save_in_flight = config_writer.lock().await;
+    let mut run = tokio::spawn(async move { import.execute(snapshot_with_sources(&[])).await });
+    let finished_early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut run)
+        .await
+        .is_ok();
+    assert!(
+        !finished_early,
+        "an import must not interleave with a config save"
+    );
+    assert_ne!(config.read().await.dns.cache_max_entries, 1000);
+    drop(save_in_flight);
+
+    assert!(run.await.unwrap().unwrap().config_updated);
+    assert_eq!(config.read().await.dns.cache_max_entries, 1000);
 }

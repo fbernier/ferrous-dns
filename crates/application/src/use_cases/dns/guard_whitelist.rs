@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use tracing::warn;
 
 /// Longest presentation-format domain name (RFC 1035 §2.3.4).
 const MAX_DOMAIN_LEN: usize = 253;
@@ -15,11 +16,15 @@ struct CidrRange {
 }
 
 impl CidrRange {
-    fn parse(cidr: &str) -> Option<Self> {
-        let (addr_str, prefix_str) = cidr.split_once('/')?;
-        let prefix: u32 = prefix_str.parse().ok()?;
+    /// A CIDR, or a bare address as its /32 or /128 — as `rate_limit.whitelist` accepts.
+    fn parse(entry: &str) -> Option<Self> {
+        let (addr_str, prefix) = match entry.split_once('/') {
+            Some((addr_str, prefix_str)) => (addr_str, Some(prefix_str.parse::<u32>().ok()?)),
+            None => (entry, None),
+        };
 
         if let Ok(v4) = addr_str.parse::<Ipv4Addr>() {
+            let prefix = prefix.unwrap_or(32);
             if prefix > 32 {
                 return None;
             }
@@ -30,6 +35,7 @@ impl CidrRange {
                 mask,
             })
         } else if let Ok(v6) = addr_str.parse::<Ipv6Addr>() {
+            let prefix = prefix.unwrap_or(128);
             if prefix > 128 {
                 return None;
             }
@@ -59,14 +65,28 @@ pub(super) struct GuardWhitelist {
 }
 
 impl GuardWhitelist {
-    /// Unparseable CIDRs are skipped; domains are stored lowercased for [`Self::contains_domain`].
-    pub(super) fn new(domains: &[String], clients: &[String]) -> Self {
+    /// Invalid client entries are skipped with a warning naming `section`;
+    /// domains are stored lowercased for [`Self::contains_domain`].
+    pub(super) fn new(section: &str, domains: &[String], clients: &[String]) -> Self {
         Self {
             domains: domains
                 .iter()
                 .map(|s| s.to_lowercase().into_boxed_str())
                 .collect(),
-            clients: clients.iter().filter_map(|s| CidrRange::parse(s)).collect(),
+            clients: clients
+                .iter()
+                .filter_map(|entry| {
+                    let range = CidrRange::parse(entry);
+                    if range.is_none() {
+                        warn!(
+                            section,
+                            entry = %entry,
+                            "Ignoring client_whitelist entry: not an IP address or CIDR"
+                        );
+                    }
+                    range
+                })
+                .collect(),
         }
     }
 
@@ -90,5 +110,43 @@ impl GuardWhitelist {
         // ASCII bytes; multi-byte sequences are untouched, so it is still valid UTF-8.
         let lower = unsafe { std::str::from_utf8_unchecked(lower) };
         self.domains.contains(lower)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clients(entries: &[&str]) -> GuardWhitelist {
+        let entries: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        GuardWhitelist::new("test", &[], &entries)
+    }
+
+    #[test]
+    fn bare_ipv4_is_a_single_host() {
+        let whitelist = clients(&["10.0.0.50"]);
+        assert!(whitelist.contains_client("10.0.0.50".parse().unwrap()));
+        assert!(whitelist.contains_client("::ffff:10.0.0.50".parse().unwrap()));
+        assert!(!whitelist.contains_client("10.0.0.51".parse().unwrap()));
+    }
+
+    #[test]
+    fn bare_ipv6_is_a_single_host() {
+        let whitelist = clients(&["2001:db8::1"]);
+        assert!(whitelist.contains_client("2001:db8::1".parse().unwrap()));
+        assert!(!whitelist.contains_client("2001:db8::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn invalid_entries_are_skipped_without_dropping_valid_ones() {
+        let whitelist = clients(&[
+            "not-an-ip",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/x",
+            "192.168.1.0/24",
+        ]);
+        assert_eq!(whitelist.clients.len(), 1);
+        assert!(whitelist.contains_client("192.168.1.7".parse().unwrap()));
     }
 }

@@ -4,18 +4,18 @@ use ferrous_dns_api::{
 };
 use ferrous_dns_application::ports::{
     BlocklistSourceCreator, ConfigFilePersistence, ConfigRepository, DnsCachePort, GroupCreator,
-    LocalRecordCreator,
+    LocalRecordCreator, UpstreamReloadPort,
 };
 use ferrous_dns_application::use_cases::{
-    CreateLocalRecordUseCase, DeleteLocalRecordUseCase, ExportConfigUseCase, ImportConfigUseCase,
-    UpdateLocalRecordUseCase,
+    ConfigDestination, ConfigOverrides, CreateLocalRecordUseCase, DeleteLocalRecordUseCase,
+    ExportConfigUseCase, ImportConfigUseCase, ReloadConfigUseCase, UpdateLocalRecordUseCase,
 };
 use ferrous_dns_domain::Config;
 use ferrous_dns_infrastructure::dns::{UpstreamHealthAdapter, UpstreamReloadAdapter};
 use ferrous_dns_infrastructure::repositories::{TomlConfigFilePersistence, TomlConfigRepository};
 use ferrous_dns_infrastructure::tls::TlsCertificateService;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::{DnsServices, Repositories, UseCases};
 
@@ -23,6 +23,50 @@ use super::{DnsServices, Repositories, UseCases};
 /// `ferrous-dns.toml` in the working dir.
 pub(super) fn resolve_config_file(config_path: Option<&str>) -> String {
     config_path.unwrap_or("ferrous-dns.toml").to_string()
+}
+
+/// The live config and its writers, shared by both web APIs, so a save,
+/// import or reload from either serializes with the others and hot-reloads
+/// the same pools.
+pub struct ConfigServices {
+    pub config: Arc<RwLock<Config>>,
+    pub path: Option<Arc<str>>,
+    pub writer: Arc<Mutex<()>>,
+    pub reload_upstream: Arc<dyn UpstreamReloadPort>,
+    /// Absent when the server runs without a config file.
+    pub reload: Option<Arc<ReloadConfigUseCase>>,
+}
+
+pub fn build_config_services(
+    dns_services: &DnsServices,
+    config: Arc<RwLock<Config>>,
+    path: Option<Arc<str>>,
+    overrides: ConfigOverrides,
+) -> ConfigServices {
+    let writer: Arc<Mutex<()>> = Arc::default();
+    let reload_upstream: Arc<dyn UpstreamReloadPort> = Arc::new(UpstreamReloadAdapter::new(
+        std::iter::once(dns_services.pool_manager.clone())
+            .chain(dns_services.dnssec_pool_manager.clone())
+            .chain(dns_services.maintenance_pool_manager.clone())
+            .collect(),
+    ));
+    let reload = path.clone().map(|path| {
+        Arc::new(ReloadConfigUseCase::new(
+            config.clone(),
+            writer.clone(),
+            Arc::new(TomlConfigFilePersistence),
+            path,
+            reload_upstream.clone(),
+            overrides,
+        ))
+    });
+    ConfigServices {
+        config,
+        path,
+        writer,
+        reload_upstream,
+        reload,
+    }
 }
 
 /// Builds the shared API state.
@@ -35,10 +79,11 @@ pub async fn build_app_state(
     auth: AuthUseCases,
     repos: &Repositories,
     dns_services: &DnsServices,
-    config: Arc<RwLock<Config>>,
-    config_path: Option<Arc<str>>,
+    config_services: &ConfigServices,
     https_active: bool,
 ) -> AppState {
+    let config = config_services.config.clone();
+    let config_path = config_services.path.clone();
     let config_repo: Arc<dyn ConfigRepository> = Arc::new(TomlConfigRepository::new(
         resolve_config_file(config_path.as_deref()),
     ));
@@ -67,9 +112,12 @@ pub async fn build_app_state(
                 repos.blocklist_source.clone(),
             )),
             import: Arc::new(ImportConfigUseCase::new(
-                config.clone(),
-                config_persistence.clone(),
-                config_path.as_deref().map(String::from),
+                ConfigDestination {
+                    config: config.clone(),
+                    writer: config_services.writer.clone(),
+                    persistence: config_persistence.clone(),
+                    path: config_path.as_deref().map(String::from),
+                },
                 group_creator,
                 blocklist_source_creator,
                 local_record_creator,
@@ -108,12 +156,7 @@ pub async fn build_app_state(
                 Some(dns_services.health_checker.clone()),
             )),
             dnssec_stats: dns_services.dnssec_stats.clone(),
-            reload_upstream: Arc::new(UpstreamReloadAdapter::new(
-                std::iter::once(dns_services.pool_manager.clone())
-                    .chain(dns_services.dnssec_pool_manager.clone())
-                    .chain(dns_services.maintenance_pool_manager.clone())
-                    .collect(),
-            )),
+            reload_upstream: config_services.reload_upstream.clone(),
         },
         groups: GroupUseCases {
             get_groups: use_cases.get_groups,
@@ -183,9 +226,10 @@ pub async fn build_app_state(
         tls_enabled: https_active,
         restart_pending: Default::default(),
         config,
-        config_writer: Default::default(),
+        config_writer: config_services.writer.clone(),
         config_file_persistence: config_persistence,
         config_path,
+        reload_config: config_services.reload.clone(),
         tls_cert: Arc::new(TlsCertificateService),
         webauthn_configured,
     }

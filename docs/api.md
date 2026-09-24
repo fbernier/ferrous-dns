@@ -83,7 +83,7 @@ Errors return an appropriate HTTP status code with:
 }
 ```
 
-Validation failures (a malformed name, URL, comment, CIDR, regex, action, etc.) return `400 Bad Request`. Creating or renaming something to a name that is already taken returns `409 Conflict`, as does deleting a group that rules or regex filters still reference. Length limits count characters, not bytes.
+Validation failures (a malformed name, URL, comment, CIDR, regex, action, etc.) return `400 Bad Request`. Creating or renaming something to a name that is already taken returns `409 Conflict`, as does deleting a group that regex filters or Safe Search settings still reference. Length limits count characters, not bytes.
 
 ---
 
@@ -235,7 +235,7 @@ Partial update — only include the sections you want to change:
 }
 ```
 
-The merged configuration is validated before anything is applied. An invalid value — an unknown `block_mode` or `dnssec_mode`, an unparseable server or sinkhole address, a `local_dns_server` that is not `IP:port`, or a zero interval, timeout or capacity such as `cache_compaction_interval: 0` — returns **400** with `{ "success": false, "error": "…" }` naming the key, and neither the live server nor the file changes. A request that is valid but cannot be carried out (no writable config file, a failed pool hot-reload or file write) returns 200 with `success: false`.
+The merged configuration is validated before anything is applied. An invalid value — an unknown `block_mode` or `dnssec_mode`, an unparseable server or sinkhole address, a `local_dns_server` that is not `IP:port`, a zero interval, timeout or capacity such as `cache_compaction_interval: 0`, or a session lifetime whose expiry is past the latest representable date such as `session_ttl_hours: 4294967295` — returns **400** with `{ "success": false, "error": "…" }` naming the key, and neither the live server nor the file changes. A request that is valid but cannot be carried out (no writable config file, a failed pool hot-reload or file write) returns 200 with `success: false`.
 
 The file is rewritten atomically (a synced temp file renamed over it), so a crash mid-save leaves the old or the new file, never a truncated one. When the file cannot be replaced — a Docker single-file bind mount, or a directory the server cannot write — it is rewritten in place instead.
 
@@ -246,6 +246,8 @@ POST /api/config/reload
 ```
 
 Reloads the configuration from the TOML file without restarting the server. DNS, blocking, and cache settings take effect immediately. Server-level settings (ports, pihole_compat) require a full restart. A file that fails to parse or validate is reported with `success: false` and the running configuration is kept.
+
+The file is loaded the way startup loads it: command-line overrides the server was started with (`--dns-port`, `--web-port`, `--bind`, `--database`, `--log-level`) still win over the file. Changed upstream pools are rebuilt and swapped in live, as with `POST /api/config`; if that fails, nothing changes. A reload waits for any config save or backup import in progress, so it never interleaves with one. The Pi-hole `POST /api/action/restartdns` runs the same reload.
 
 ### Get Settings
 
@@ -415,10 +417,12 @@ Invalidates the current session. **Public** — no auth required (clears session
 ### Change Password
 
 ```http
-POST /api/auth/change-password
+POST /api/auth/password
 ```
 
-Changes the admin password. **Protected** — requires valid session or API token.
+Changes the password of the signed-in user and returns `204`. **Protected** — the session cookie names the user, so an API token alone is refused with `401`. A wrong `current_password` returns `401` and changes nothing.
+
+Every other session of that user is revoked, so a device signed in with the old password has to log in again. The session that made the change stays signed in.
 
 ```json
 {
@@ -756,7 +760,7 @@ PUT /api/groups/{id}
 DELETE /api/groups/{id}
 ```
 
-Returns `409` if the group still has assigned clients, or if managed domains or regex filters still reference it. Blocklist and allowlist memberships, blocked services and schedule assignments are removed with the group; query-log entries keep their data but lose the group attribution.
+Returns `409` if the group still has assigned clients, or if regex filters or Safe Search settings still reference it. Managed domains (including the rules generated for a blocked service), blocklist and allowlist memberships, blocked services and schedule assignments are removed with the group; query-log entries keep their data but lose the group attribution.
 
 ### Get Group Clients
 
@@ -859,6 +863,8 @@ PUT    /api/whitelist-sources/{id}
 DELETE /api/whitelist-sources/{id}
 ```
 
+Creating, updating or deleting a whitelist source rebuilds the block filter, as blocklist source changes do, so the change applies without waiting for the daily sync. The rebuild re-downloads every enabled list.
+
 ---
 
 ## Managed Domains
@@ -893,6 +899,8 @@ PUT    /api/managed-domains/{id}
 DELETE /api/managed-domains/{id}
 ```
 
+`PUT` is a partial update: an absent field keeps its value. Send `"comment": null` to clear the comment.
+
 ---
 
 ## Regex Filters
@@ -924,6 +932,8 @@ GET    /api/regex-filters/{id}
 PUT    /api/regex-filters/{id}
 DELETE /api/regex-filters/{id}
 ```
+
+`PUT` is a partial update: an absent field keeps its value. Send `"comment": null` to clear the comment.
 
 ---
 

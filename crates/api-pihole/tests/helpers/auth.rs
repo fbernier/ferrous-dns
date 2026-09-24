@@ -144,6 +144,19 @@ impl SessionRepository for InMemorySessionRepository {
     async fn delete_expired(&self) -> Result<u64, DomainError> {
         Ok(0)
     }
+    async fn delete_other_sessions(
+        &self,
+        username: &str,
+        keep_id: &str,
+    ) -> Result<u64, DomainError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = sessions.len();
+        sessions.retain(|s| s.username.as_ref() != username || s.id.as_ref() == keep_id);
+        Ok((before - sessions.len()) as u64)
+    }
     async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError> {
         Ok(self.sessions.lock().unwrap().clone())
     }

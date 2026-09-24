@@ -175,6 +175,16 @@ impl SessionRepository for InMemorySessionRepository {
     async fn delete_expired(&self) -> Result<u64, DomainError> {
         Ok(0)
     }
+    async fn delete_other_sessions(
+        &self,
+        username: &str,
+        keep_id: &str,
+    ) -> Result<u64, DomainError> {
+        let mut sessions = self.sessions.lock().await;
+        let before = sessions.len();
+        sessions.retain(|s| s.username.as_ref() != username || s.id.as_ref() == keep_id);
+        Ok((before - sessions.len()) as u64)
+    }
     async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError> {
         Ok(self.sessions.lock().await.clone())
     }
@@ -337,6 +347,39 @@ async fn login_with_correct_password_creates_session() {
     let stored = session_repo.get_all_active().await.unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].id, session.id);
+}
+
+/// A session TTL chrono cannot add to now refuses the login; it used to panic
+/// the server (release builds abort on panic).
+#[tokio::test]
+async fn login_with_an_unrepresentable_session_ttl_fails_without_panicking() {
+    let session_repo: Arc<dyn SessionRepository> = Arc::new(InMemorySessionRepository::new());
+    let login_uc = LoginUseCase::new(
+        Arc::new(TestUserProvider {
+            admin: make_admin_user("$hashed$"),
+        }),
+        session_repo.clone(),
+        Arc::new(TestPasswordHasher),
+        no_mfa(),
+        Arc::new(AuthConfig {
+            session_ttl_hours: u32::MAX,
+            ..AuthConfig::default()
+        }),
+    );
+
+    let result = login_uc
+        .execute(
+            "admin",
+            "correct-password",
+            false,
+            PEER,
+            "127.0.0.1",
+            "agent",
+        )
+        .await;
+
+    assert!(matches!(result, Err(DomainError::ConfigError(_))));
+    assert!(session_repo.get_all_active().await.unwrap().is_empty());
 }
 
 /// Login with wrong password returns InvalidCredentials.

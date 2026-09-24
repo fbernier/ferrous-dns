@@ -70,10 +70,10 @@ Like every other protected endpoint, these are not restricted by role or owner: 
 
 ### Password Change
 
-Change the admin password from **Settings > Security** or via:
+Change the signed-in user's password from **Settings > Security** or via:
 
 ```http
-POST /api/auth/change-password
+POST /api/auth/password
 Content-Type: application/json
 
 {
@@ -81,6 +81,8 @@ Content-Type: application/json
   "new_password": "new-password"
 }
 ```
+
+The change signs out every other session of that user, so any device still holding a session from before the change must log in again. The session that made the change stays signed in; other users' sessions are untouched.
 
 ### Background Cleanup
 
@@ -328,7 +330,7 @@ stale_entry_ttl_secs       = 300      # evict idle subnet buckets after 5 min
 | `ipv4_prefix_len` | `24` | IPv4 subnet grouping prefix length |
 | `ipv6_prefix_len` | `48` | IPv6 subnet grouping prefix length |
 | `whitelist` | `[]` | CIDRs that bypass rate limiting entirely |
-| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN responses |
+| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN answers. 0 = no NXDOMAIN budget |
 | `slip_ratio` | `0` | Every Nth rate-limited response sends TC=1 instead of REFUSED. 0 = disabled |
 | `dry_run` | `false` | Log rate-limit events without refusing queries |
 | `stale_entry_ttl_secs` | `300` | Seconds before an idle subnet bucket is evicted |
@@ -343,7 +345,7 @@ When `slip_ratio` is set (e.g. `2`), every Nth rate-limited UDP response is sent
 
 ### NXDOMAIN Budget
 
-The `nxdomain_per_second` setting provides a separate, stricter budget for NXDOMAIN responses. This catches malware and IoT devices that probe many random subdomains while leaving the general query budget unaffected.
+The `nxdomain_per_second` setting provides a separate, stricter budget charged for every NXDOMAIN answer a subnet receives. This catches malware and IoT devices that probe many random subdomains while leaving the general query budget unaffected. Once a subnet has spent it, its next queries are rate-limited (REFUSED or TC=1, or only logged under `dry_run`) until it refills. See [Rate Limiting](../configuration/rate-limiting.md#nxdomain-budget).
 
 ### Dry-Run Mode
 

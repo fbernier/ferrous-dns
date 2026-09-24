@@ -1,4 +1,5 @@
 use ferrous_dns_application::ports::ConfigFilePersistence;
+use ferrous_dns_application::use_cases::ConfigOverrides;
 use ferrous_dns_domain::Config;
 use ferrous_dns_infrastructure::repositories::TomlConfigFilePersistence;
 use std::path::Path;
@@ -20,29 +21,29 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The command-line settings that win over the config file, at startup and
+/// on every reload.
+pub fn config_overrides(cli: &Cli) -> ConfigOverrides {
+    ConfigOverrides {
+        dns_port: cli.dns_port,
+        web_port: cli.web_port,
+        bind_address: cli.bind,
+        database_path: cli.database.clone(),
+        log_level: cli.log_level.clone(),
+    }
+}
+
 /// Loads `config_path` (the built-in defaults when there is none), applies
 /// the command-line overrides and validates the result.
-pub fn load_config(config_path: Option<&str>, cli: &Cli) -> anyhow::Result<Config> {
+pub fn load_config(
+    config_path: Option<&str>,
+    overrides: &ConfigOverrides,
+) -> anyhow::Result<Config> {
     let mut config = match config_path {
         Some(path) => TomlConfigFilePersistence.load_config_from_file(path)?,
         None => Config::builtin(),
     };
-
-    if let Some(port) = cli.dns_port {
-        config.server.dns_port = port;
-    }
-    if let Some(port) = cli.web_port {
-        config.server.web_port = port;
-    }
-    if let Some(bind) = cli.bind {
-        config.server.bind_address = bind;
-    }
-    if let Some(db) = &cli.database {
-        config.database.path = db.clone();
-    }
-    if let Some(level) = &cli.log_level {
-        config.logging.level = level.clone();
-    }
+    overrides.apply(&mut config);
 
     config.validate()?;
 

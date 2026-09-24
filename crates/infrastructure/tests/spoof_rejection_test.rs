@@ -25,12 +25,16 @@ enum Mode {
     /// Echo the correct ID but flip the case of one QNAME byte — an off-path forger
     /// guessing the 0x20-randomized case wrong.
     FlipQnameCase,
+    /// A faithful echo sent from another port on the server's IP: a forger
+    /// sharing the host, or an off-path spoof guessing only the address.
+    WrongPort,
 }
 
 /// Spawns a UDP DNS responder on an ephemeral port and returns its address.
 async fn spawn_responder(mode: Mode) -> SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
+    let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; 1500];
@@ -74,7 +78,11 @@ async fn spawn_responder(mode: Mode) -> SocketAddr {
                 resp.set_edns(edns);
             }
 
-            let _ = socket.send_to(&resp.to_bytes().unwrap(), peer).await;
+            let sender = match mode {
+                Mode::WrongPort => &other_port,
+                _ => &socket,
+            };
+            let _ = sender.send_to(&resp.to_bytes().unwrap(), peer).await;
         }
     });
 
@@ -137,6 +145,15 @@ async fn spoofed_transaction_id_is_rejected() {
     assert!(
         result.is_err(),
         "a response with the wrong transaction ID must be rejected, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn response_from_wrong_port_is_rejected() {
+    let result = resolve(Mode::WrongPort).await;
+    assert!(
+        result.is_err(),
+        "a response from the server's IP but another port must be rejected, got {result:?}"
     );
 }
 
@@ -283,4 +300,18 @@ async fn validator_runs_on_post_truncation_tcp_retry() {
         bad.is_err(),
         "a wrong-txid TCP retry must be rejected, got {bad:?}"
     );
+}
+
+/// The answer after a TC retry comes from the configured server, so the display
+/// must stay its configured name rather than the synthesized `tcp://` endpoint.
+#[tokio::test]
+async fn tcp_retry_keeps_configured_server_display() {
+    let addr = spawn_truncating_pair(Mode::Faithful).await;
+    let pm = manager(addr).await;
+    let domain: Arc<str> = Arc::from("example.com");
+    let result = pm
+        .query(&domain, &RecordType::A, 2000, false)
+        .await
+        .unwrap();
+    assert_eq!(&*result.server_display, format!("udp://{addr} (tcp retry)"));
 }

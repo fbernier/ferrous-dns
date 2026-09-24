@@ -46,7 +46,8 @@ impl UpdateRegexFilterUseCase {
             RegexFilter::validate_pattern(p).map_err(DomainError::InvalidRegexFilter)?;
         }
 
-        validate_comment(update.comment.as_deref()).map_err(DomainError::InvalidRegexFilter)?;
+        validate_comment(update.comment.as_ref().and_then(Option::as_deref))
+            .map_err(DomainError::InvalidRegexFilter)?;
 
         if let Some(gid) = update.group_id {
             require_group(self.group_repo.as_ref(), gid).await?;

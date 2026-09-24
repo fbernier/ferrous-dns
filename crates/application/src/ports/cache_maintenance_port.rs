@@ -34,10 +34,15 @@ pub struct CacheCompactionOutcome {
     pub cache_size: usize,
 }
 
-/// Port for DNS cache maintenance operations (refresh + compaction).
+/// Port for DNS cache maintenance operations (eviction, refresh, compaction).
 #[async_trait]
 pub trait CacheMaintenancePort: Send + Sync {
+    /// Evict past `cache_max_entries` and rotate the bloom filter. Runs whether
+    /// or not optimistic refresh is enabled: nothing else bounds the cache.
+    async fn run_eviction_cycle(&self) -> Result<(), DomainError>;
+
     /// Refresh popular cache entries before they expire (optimistic refresh).
+    /// An empty outcome when optimistic refresh is off.
     async fn run_refresh_cycle(&self) -> Result<CacheRefreshOutcome, DomainError>;
 
     /// Remove expired and low-value entries to reclaim memory.

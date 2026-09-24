@@ -57,7 +57,7 @@ pub async fn get_timeline(
     Ok(Json(TimelineResponse {
         total_buckets: buckets_dto.len(),
         period: params.period,
-        granularity: params.granularity,
+        granularity: granularity.as_str().to_string(),
         buckets: buckets_dto,
     }))
 }

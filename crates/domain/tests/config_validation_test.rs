@@ -200,6 +200,45 @@ fn zero_where_zero_has_a_meaning_is_accepted() {
     config.validate().unwrap();
 }
 
+/// These used to panic at login or at startup (and release builds abort on panic).
+#[test]
+fn values_whose_derived_duration_overflows_are_rejected_naming_the_key() {
+    let cases: [(&str, BreakConfig); 4] = [
+        ("auth.session_ttl_hours", |c| {
+            c.auth.session_ttl_hours = u32::MAX
+        }),
+        ("auth.remember_me_days", |c| {
+            c.auth.remember_me_days = u32::MAX
+        }),
+        ("auth.mfa_challenge_ttl_secs", |c| {
+            c.auth.mfa_challenge_ttl_secs = i64::MAX
+        }),
+        ("dns.query_timeout", |c| {
+            c.dns.query_timeout = u64::MAX / 1000 + 1
+        }),
+    ];
+    for (field, break_it) in cases {
+        let mut config = valid_config();
+        break_it(&mut config);
+        let message = validation_message(&config);
+        assert!(
+            message.contains(field),
+            "{field}: the message should name the key: {message}"
+        );
+    }
+}
+
+#[test]
+fn long_but_representable_durations_are_accepted() {
+    let mut config = valid_config();
+    // About 114 and 2,700 years: absurd, but chrono can add them to now.
+    config.auth.session_ttl_hours = 1_000_000;
+    config.auth.remember_me_days = 1_000_000;
+    config.auth.mfa_challenge_ttl_secs = 86_400 * 365 * 1_000;
+    config.dns.query_timeout = u64::MAX / 1000;
+    config.validate().unwrap();
+}
+
 #[test]
 fn a_local_dns_server_must_be_an_ip_and_port() {
     let mut config = valid_config();

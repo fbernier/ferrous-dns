@@ -196,13 +196,16 @@ impl UseCases {
             create_whitelist_source: Arc::new(CreateWhitelistSourceUseCase::new(
                 repos.whitelist_source.clone(),
                 repos.group.clone(),
+                repos.block_filter_engine.clone(),
             )),
             update_whitelist_source: Arc::new(UpdateWhitelistSourceUseCase::new(
                 repos.whitelist_source.clone(),
                 repos.group.clone(),
+                repos.block_filter_engine.clone(),
             )),
             delete_whitelist_source: Arc::new(DeleteWhitelistSourceUseCase::new(
                 repos.whitelist_source.clone(),
+                repos.block_filter_engine.clone(),
             )),
             get_managed_domains: Arc::new(GetManagedDomainsUseCase::new(
                 repos.managed_domain.clone(),

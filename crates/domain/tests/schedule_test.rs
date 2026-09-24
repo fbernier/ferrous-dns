@@ -1,6 +1,5 @@
 use chrono::NaiveTime;
 use ferrous_dns_domain::{ScheduleProfile, TimeSlot};
-use std::sync::Arc;
 
 #[test]
 fn test_schedule_profile_validate_name_empty_returns_error() {
@@ -47,19 +46,6 @@ fn test_schedule_profile_parse_timezone_unknown_name_returns_error() {
             "{tz:?} accepted"
         );
     }
-}
-
-#[test]
-fn test_schedule_profile_validate_comment_none_is_ok() {
-    let result = ScheduleProfile::validate_comment(&None);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_schedule_profile_validate_comment_too_long_returns_error() {
-    let long: Arc<str> = Arc::from("x".repeat(501).as_str());
-    let result = ScheduleProfile::validate_comment(&Some(long));
-    assert!(result.is_err());
 }
 
 #[test]

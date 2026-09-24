@@ -1,4 +1,4 @@
-use ferrous_dns_application::ports::{BlockFilterEnginePort, ConfigFilePersistence};
+use ferrous_dns_application::ports::BlockFilterEnginePort;
 use ferrous_dns_application::use_cases::{
     AppPasswordLoginUseCase, GetTopAllowedDomainsUseCase, LoginUseCase, LogoutUseCase,
     ValidateSessionUseCase, VerifyMfaUseCase,
@@ -11,8 +11,8 @@ use ferrous_dns_application::use_cases::{
     DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientsUseCase, GetGroupsUseCase,
     GetManagedDomainsUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase,
     GetRegexFiltersUseCase, GetTimelineUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase,
-    GetWhitelistSourcesUseCase, UpdateBlocklistSourceUseCase, UpdateClientUseCase,
-    UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
+    GetWhitelistSourcesUseCase, ReloadConfigUseCase, UpdateBlocklistSourceUseCase,
+    UpdateClientUseCase, UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
     UpdateWhitelistSourceUseCase,
 };
 use ferrous_dns_domain::Config;
@@ -118,7 +118,7 @@ pub struct PiholeClientState {
 pub struct PiholeSystemState {
     pub cleanup_query_logs: Arc<CleanupOldQueryLogsUseCase>,
     pub config: Arc<RwLock<Config>>,
-    pub config_file_persistence: Arc<dyn ConfigFilePersistence>,
-    pub config_path: Option<Arc<str>>,
+    /// Absent when the server runs without a config file.
+    pub reload_config: Option<Arc<ReloadConfigUseCase>>,
     pub process_start: std::time::Instant,
 }

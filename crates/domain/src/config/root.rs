@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use super::auth::AuthConfig;
+use super::auth::{expiry_from_now, AuthConfig};
 use super::blocking::BlockingConfig;
 use super::database::DatabaseConfig;
 use super::dns::DnsConfig;
@@ -65,6 +65,7 @@ impl Config {
         }
 
         self.validate_non_zero()?;
+        self.validate_derived_durations()?;
 
         if let Some(server) = &self.dns.local_dns_server {
             if server.parse::<SocketAddr>().is_err() {
@@ -227,6 +228,33 @@ impl Config {
             return Err(DomainError::ConfigError(format!(
                 "dns.cache_min_ttl ({}) must not exceed dns.cache_max_ttl ({})",
                 dns.cache_min_ttl, dns.cache_max_ttl
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Rejects values whose derived duration overflows where it is used:
+    /// session and MFA-challenge expiries are `now + ttl`, and the upstream
+    /// timeout is taken in milliseconds.
+    fn validate_derived_durations(&self) -> Result<(), DomainError> {
+        let auth = &self.auth;
+        for (field, ttl_secs) in [
+            ("auth.session_ttl_hours", auth.session_ttl_secs(false)),
+            ("auth.remember_me_days", auth.session_ttl_secs(true)),
+            ("auth.mfa_challenge_ttl_secs", auth.mfa_challenge_ttl_secs),
+        ] {
+            if expiry_from_now(ttl_secs).is_none() {
+                return Err(DomainError::ConfigError(format!(
+                    "{field} is too large: an expiry {ttl_secs}s from now is not a representable date"
+                )));
+            }
+        }
+
+        if self.dns.query_timeout.checked_mul(1000).is_none() {
+            return Err(DomainError::ConfigError(format!(
+                "dns.query_timeout is too large: {} seconds overflow when converted to milliseconds",
+                self.dns.query_timeout
             )));
         }
 

@@ -67,13 +67,18 @@ async fn paced_recv(
 /// Infrastructure adapter implementing `CacheMaintenancePort`.
 pub struct DnsCacheMaintenance {
     cache: Arc<DnsCache>,
-    /// Counts refresh cycles to throttle bloom rotation.
+    /// Counts maintenance cycles to throttle bloom rotation.
     bloom_cycle_counter: AtomicU64,
-    /// Number of refresh cycles between bloom rotations.
+    /// Number of maintenance cycles between bloom rotations.
     bloom_rotation_cycles: u64,
     /// How often a cycle runs. Load-bearing: it is the window a cycle's backlog
     /// is spread across, so it must match what actually drives the job.
     refresh_interval_secs: u64,
+    /// Absent when `cache_optimistic_refresh` is off.
+    refresh: Option<OptimisticRefresh>,
+}
+
+struct OptimisticRefresh {
     /// Eligibility and priority knobs handed to each scan.
     scan_opts: RefreshScanOptions,
     /// Publishes the drain period the worker should honour.
@@ -81,12 +86,9 @@ pub struct DnsCacheMaintenance {
 }
 
 impl DnsCacheMaintenance {
-    pub fn new(
-        cache: Arc<DnsCache>,
-        refresh_interval_secs: u64,
-        scan_opts: RefreshScanOptions,
-        pace_tx: watch::Sender<RefreshPace>,
-    ) -> Self {
+    /// Eviction, bloom rotation and compaction only; add refresh with
+    /// [`Self::with_optimistic_refresh`].
+    pub fn new(cache: Arc<DnsCache>, refresh_interval_secs: u64) -> Self {
         // Rotation only bounds how long bits left behind by removed keys
         // linger: `rotate_bloom` re-seeds every live entry into the new slot,
         // so an entry's visibility does not depend on this cadence.
@@ -98,7 +100,7 @@ impl DnsCacheMaintenance {
             bloom_rotation_cycles,
             min_ttl,
             refresh_interval_secs,
-            "Bloom rotation throttled to every {} refresh cycles (~{} seconds)",
+            "Bloom rotation throttled to every {} maintenance cycles (~{} seconds)",
             bloom_rotation_cycles,
             bloom_rotation_cycles * interval,
         );
@@ -108,9 +110,19 @@ impl DnsCacheMaintenance {
             bloom_cycle_counter: AtomicU64::new(0),
             bloom_rotation_cycles,
             refresh_interval_secs: interval,
-            scan_opts,
-            pace_tx,
+            refresh: None,
         }
+    }
+
+    /// Enables the optimistic refresh scan; its worker is started separately
+    /// with [`Self::start_refresh_worker`].
+    pub fn with_optimistic_refresh(
+        mut self,
+        scan_opts: RefreshScanOptions,
+        pace_tx: watch::Sender<RefreshPace>,
+    ) -> Self {
+        self.refresh = Some(OptimisticRefresh { scan_opts, pace_tx });
+        self
     }
 
     async fn refresh_entry(
@@ -331,7 +343,7 @@ impl DnsCacheMaintenance {
 
 #[async_trait]
 impl CacheMaintenancePort for DnsCacheMaintenance {
-    async fn run_refresh_cycle(&self) -> Result<CacheRefreshOutcome, DomainError> {
+    async fn run_eviction_cycle(&self) -> Result<(), DomainError> {
         coarse_clock::tick();
 
         if self.cache.is_over_capacity() {
@@ -356,15 +368,26 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
             }
         }
 
+        Ok(())
+    }
+
+    async fn run_refresh_cycle(&self) -> Result<CacheRefreshOutcome, DomainError> {
+        let Some(refresh) = &self.refresh else {
+            return Ok(CacheRefreshOutcome {
+                cache_size: self.cache.len(),
+                ..Default::default()
+            });
+        };
+
         let cache_for_scan = Arc::clone(&self.cache);
-        let scan_opts = self.scan_opts;
+        let scan_opts = refresh.scan_opts;
         let mut candidates =
             tokio::task::spawn_blocking(move || cache_for_scan.get_refresh_candidates(&scan_opts))
                 .await
                 .unwrap_or_default();
 
         if candidates.is_empty() {
-            self.pace_tx.send_replace(None);
+            refresh.pace_tx.send_replace(None);
             return Ok(CacheRefreshOutcome {
                 cache_size: self.cache.len(),
                 ..Default::default()
@@ -382,7 +405,7 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
             for (domain, record_type) in &candidates {
                 self.cache.reset_refresh_queued(domain, record_type);
             }
-            self.pace_tx.send_replace(None);
+            refresh.pace_tx.send_replace(None);
             return Ok(CacheRefreshOutcome {
                 candidates_found: candidate_count,
                 cache_size: self.cache.len(),
@@ -426,7 +449,7 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
         // interval before this cycle runs again.
         let backlog = tx.max_capacity().saturating_sub(tx.capacity());
         let pace = self.pace_for(backlog);
-        self.pace_tx.send_replace(pace);
+        refresh.pace_tx.send_replace(pace);
 
         debug!(
             candidate_count,

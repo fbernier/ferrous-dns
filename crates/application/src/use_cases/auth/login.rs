@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use super::login_rate_limiter::LoginRateLimiter;
-use super::session_factory::{build_session, expires_in, random_hex_256, session_max_age};
+use super::session_factory::{build_session, expires_in, random_hex_256};
 use crate::ports::{MfaRepository, PasswordHasher, SessionRepository, UserProvider};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, MfaChallenge, MfaMethod};
 
@@ -109,9 +109,7 @@ impl LoginUseCase {
 
         if totp_enabled || has_passkeys {
             let challenge_token = random_hex_256()?;
-            let expires_at = expires_in(chrono::Duration::seconds(
-                self.auth_config.mfa_challenge_ttl_secs,
-            ));
+            let expires_at = expires_in(self.auth_config.mfa_challenge_ttl_secs)?;
 
             self.mfa_repo
                 .create_challenge(&MfaChallenge {
@@ -163,6 +161,6 @@ impl LoginUseCase {
 
     /// Returns the `max_age` in seconds for the session cookie.
     pub fn session_max_age(&self, remember_me: bool) -> i64 {
-        session_max_age(remember_me, &self.auth_config)
+        self.auth_config.session_ttl_secs(remember_me)
     }
 }

@@ -8,6 +8,7 @@ pub mod blocklist_sources;
 pub mod cache;
 pub mod client_subnets;
 pub mod clients;
+pub mod config;
 pub mod custom_services;
 pub mod dns;
 pub mod groups;
@@ -33,7 +34,9 @@ pub use auth::{
     RegisterPasskeyUseCase, RegistrationStart, SetupPasswordUseCase, SetupTotpUseCase, TotpSetup,
     ValidateSessionUseCase, VerifyMfaUseCase,
 };
-pub use backup::{BackupSnapshot, ExportConfigUseCase, ImportConfigUseCase, ImportSummary};
+pub use backup::{
+    BackupSnapshot, ConfigDestination, ExportConfigUseCase, ImportConfigUseCase, ImportSummary,
+};
 pub use block_filter::{
     AffectedDomain, BacktestBlocklistsUseCase, BacktestReport, BacktestRequest, CandidateAction,
     GetBlockFilterStatsUseCase, TestDomainUseCase, DEFAULT_BACKTEST_LIMIT,
@@ -54,6 +57,7 @@ pub use clients::{
     CleanupOldClientsUseCase, CreateManualClientUseCase, DeleteClientUseCase, GetClientsUseCase,
     SyncArpCacheUseCase, SyncHostnamesUseCase, UpdateClientUseCase,
 };
+pub use config::{ConfigOverrides, ReloadConfigUseCase};
 pub use custom_services::{
     CreateCustomServiceUseCase, DeleteCustomServiceUseCase, GetCustomServicesUseCase,
     UpdateCustomServiceUseCase,

@@ -103,6 +103,22 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(result.rows_affected())
     }
 
+    #[instrument(skip(self, keep_id))]
+    async fn delete_other_sessions(
+        &self,
+        username: &str,
+        keep_id: &str,
+    ) -> Result<u64, DomainError> {
+        let result = sqlx::query("DELETE FROM auth_sessions WHERE username = ? AND id <> ?")
+            .bind(username)
+            .bind(keep_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err("Failed to delete other sessions"))?;
+
+        Ok(result.rows_affected())
+    }
+
     #[instrument(skip(self))]
     async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError> {
         let rows: Vec<SessionRow> = sqlx::query_as(
