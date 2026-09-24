@@ -784,8 +784,8 @@ impl<'a> Rewriter<'a> {
     }
 
     /// Copies the name at `pos` and returns the source offset past it. A
-    /// pointer is aimed at its target's new offset; one into dropped bytes
-    /// is replaced by the labels it named.
+    /// pointer is aimed at its target's new offset; one whose labels did not
+    /// all stay as they were, dropped or moved apart, is replaced by them.
     fn name(&mut self, mut pos: usize) -> Option<usize> {
         // Source offset past the name where it is written, once a pointer ends it.
         let mut end = None;
@@ -829,17 +829,19 @@ impl<'a> Rewriter<'a> {
         }
     }
 
-    /// Where the source byte at `at` sits in `out`, if it was copied as is
-    /// and a pointer can still reach it.
+    /// Where the source byte at `at` sits in `out`, if a pointer can still
+    /// reach it: the labels it names, up to the root or the next pointer,
+    /// were all copied as is and in one piece.
     fn moved(&self, at: usize) -> Option<u16> {
+        let run_end = skip_name(self.src, at)?;
         let moved = match self.cut {
-            Some(cut) if at >= cut => {
+            Some(cut) if run_end > cut => {
                 let i = self
                     .spans
                     .partition_point(|&(start, _, _)| start <= at)
                     .checked_sub(1)?;
                 let (start, end, out) = self.spans[i];
-                if at >= end {
+                if run_end > end {
                     return None;
                 }
                 out + (at - start)

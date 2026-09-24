@@ -389,3 +389,31 @@ fn relay_reads_a_sig_type_covered_field_inside_its_rdata() {
     let twice = wire_response::relay_with_edns(&once, 1, true, false, Some(&ours));
     assert_eq!(twice.as_deref(), Some(&once[..]));
 }
+
+/// `crash-aa9f0262` from the `upstream_relay` target: a glue owner whose
+/// pointer names labels at the tail of the answer's RDATA, and those run on
+/// into the root owner of the OPT that follows. The pointer's target sits
+/// before the dropped OPT, so it was kept as is, and the name picked up
+/// whatever moved into the OPT's place — the glue record itself, a loop.
+#[test]
+fn relay_keeps_a_name_whose_labels_run_into_the_dropped_opt() {
+    let upstream = b"\x11\x11\x81\x80\x00\x01\x00\x01\x00\x00\x00\x02\x07example\x03com\x00\
+                     \x00\x10\x00\x01\
+                     \xc0\x0c\x00\x10\x00\x01\x00\x00\x00\x3c\x00\x04\x03bar\
+                     \x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x00\
+                     \x03foo\xc0\x29\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x01";
+    let source = Message::from_vec(upstream).unwrap();
+    assert_eq!(source.additionals[0].name.to_ascii(), "foo.bar.");
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: None,
+        ede: None,
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours)).unwrap();
+    let cached = wire_response::cache_form(upstream, 60, 0..=u32::MAX).unwrap();
+    let served = wire_response::relay_cached(&cached, 1, true, Some(&ours), 60).unwrap();
+    for reply in [relayed, served] {
+        let msg = Message::from_vec(&reply).expect("relayed message decodes");
+        assert_eq!(msg.additionals, source.additionals);
+    }
+}
