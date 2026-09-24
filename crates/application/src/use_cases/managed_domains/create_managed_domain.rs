@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -38,10 +39,7 @@ impl CreateManagedDomainUseCase {
         ManagedDomain::validate_comment(&comment.as_deref().map(Arc::from))
             .map_err(DomainError::InvalidManagedDomain)?;
 
-        self.group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        require_group(self.group_repo.as_ref(), group_id).await?;
 
         let managed_domain = self
             .repo

@@ -16,24 +16,8 @@ pub struct DnssecResolver {
 }
 
 impl DnssecResolver {
+    /// `cache` is caller-owned so the wiring can read its counters.
     pub fn new(
-        inner: Arc<dyn DnsResolver>,
-        pool_manager: Arc<PoolManager>,
-        query_timeout_ms: u64,
-        trust_store: TrustAnchorStore,
-    ) -> Self {
-        Self::with_shared_cache(
-            inner,
-            pool_manager,
-            query_timeout_ms,
-            trust_store,
-            Arc::new(DnssecCache::new()),
-        )
-    }
-
-    /// Like [`new`](Self::new), but over a caller-owned validator cache so the
-    /// wiring can read its counters.
-    pub fn with_shared_cache(
         inner: Arc<dyn DnsResolver>,
         pool_manager: Arc<PoolManager>,
         query_timeout_ms: u64,
@@ -50,7 +34,7 @@ impl DnssecResolver {
 
         Self {
             inner,
-            validator: Arc::new(DnssecValidatorPool::with_shared_cache(
+            validator: Arc::new(DnssecValidatorPool::new(
                 pool_manager,
                 query_timeout_ms,
                 pool_size,
@@ -58,10 +42,6 @@ impl DnssecResolver {
                 cache,
             )),
         }
-    }
-
-    pub fn with_pool(inner: Arc<dyn DnsResolver>, validator: Arc<DnssecValidatorPool>) -> Self {
-        Self { inner, validator }
     }
 }
 
@@ -108,14 +88,14 @@ impl DnsResolver for DnssecResolver {
         };
 
         match dnssec_result {
-            Ok(response) => {
+            Ok(status) => {
                 debug!(
                     domain = %query.domain,
-                    status = %response.validation_status.as_str(),
+                    status = %status.as_str(),
                     "DNSSEC validation complete"
                 );
 
-                resolution.dnssec_status = Some(response.validation_status.as_str());
+                resolution.dnssec_status = Some(status.as_str());
                 Ok(resolution)
             }
             Err(e) => {

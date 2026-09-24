@@ -1,8 +1,11 @@
+use crate::repositories::{db_err, is_fk_violation};
 use async_trait::async_trait;
 use ferrous_dns_application::ports::SafeSearchConfigRepository;
 use ferrous_dns_domain::{DomainError, SafeSearchConfig, SafeSearchEngine, YouTubeMode};
 use sqlx::SqlitePool;
 use tracing::warn;
+
+type ConfigRow = (i64, i64, String, bool, String, String, String);
 
 pub struct SqliteSafeSearchConfigRepository {
     pool: SqlitePool,
@@ -13,18 +16,14 @@ impl SqliteSafeSearchConfigRepository {
         Self { pool }
     }
 
-    fn row_to_config(
-        id: i64,
-        group_id: i64,
-        engine_str: String,
-        enabled: i64,
-        youtube_mode_str: String,
-        created_at: String,
-        updated_at: String,
-    ) -> Option<SafeSearchConfig> {
-        let engine = engine_str.parse::<SafeSearchEngine>().map_err(|_| {
-            warn!(engine = %engine_str, "Unrecognised Safe Search engine in database, skipping row");
-        }).ok()?;
+    fn row_to_config(row: ConfigRow) -> Option<SafeSearchConfig> {
+        let (id, group_id, engine_str, enabled, youtube_mode_str, created_at, updated_at) = row;
+        let engine = engine_str
+            .parse::<SafeSearchEngine>()
+            .map_err(|_| {
+                warn!(engine = %engine_str, "Unrecognised Safe Search engine in database, skipping row");
+            })
+            .ok()?;
         let youtube_mode = youtube_mode_str.parse::<YouTubeMode>().unwrap_or_else(|_| {
             warn!(
                 youtube_mode = %youtube_mode_str,
@@ -36,7 +35,7 @@ impl SqliteSafeSearchConfigRepository {
             id: Some(id),
             group_id,
             engine,
-            enabled: enabled != 0,
+            enabled,
             youtube_mode,
             created_at: Some(created_at),
             updated_at: Some(updated_at),
@@ -47,27 +46,20 @@ impl SqliteSafeSearchConfigRepository {
 #[async_trait]
 impl SafeSearchConfigRepository for SqliteSafeSearchConfigRepository {
     async fn get_all(&self) -> Result<Vec<SafeSearchConfig>, DomainError> {
-        let rows = sqlx::query_as::<_, (i64, i64, String, i64, String, String, String)>(
+        let rows = sqlx::query_as::<_, ConfigRow>(
             "SELECT id, group_id, engine, enabled, youtube_mode, created_at, updated_at
              FROM safe_search_configs
              ORDER BY group_id, engine",
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
+        .map_err(db_err("Failed to query all safe search configs"))?;
 
-        Ok(rows
-            .into_iter()
-            .filter_map(
-                |(id, group_id, engine, enabled, yt_mode, created, updated)| {
-                    Self::row_to_config(id, group_id, engine, enabled, yt_mode, created, updated)
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().filter_map(Self::row_to_config).collect())
     }
 
     async fn get_by_group(&self, group_id: i64) -> Result<Vec<SafeSearchConfig>, DomainError> {
-        let rows = sqlx::query_as::<_, (i64, i64, String, i64, String, String, String)>(
+        let rows = sqlx::query_as::<_, ConfigRow>(
             "SELECT id, group_id, engine, enabled, youtube_mode, created_at, updated_at
              FROM safe_search_configs
              WHERE group_id = ?
@@ -76,16 +68,9 @@ impl SafeSearchConfigRepository for SqliteSafeSearchConfigRepository {
         .bind(group_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
+        .map_err(db_err("Failed to query safe search configs by group"))?;
 
-        Ok(rows
-            .into_iter()
-            .filter_map(
-                |(id, group_id, engine, enabled, yt_mode, created, updated)| {
-                    Self::row_to_config(id, group_id, engine, enabled, yt_mode, created, updated)
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().filter_map(Self::row_to_config).collect())
     }
 
     async fn upsert(
@@ -96,11 +81,8 @@ impl SafeSearchConfigRepository for SqliteSafeSearchConfigRepository {
         youtube_mode: YouTubeMode,
     ) -> Result<SafeSearchConfig, DomainError> {
         let now = chrono::Utc::now().to_rfc3339();
-        let engine_str = engine.to_str();
-        let youtube_mode_str = youtube_mode.to_str();
-        let enabled_int = i64::from(enabled);
 
-        let row = sqlx::query_as::<_, (i64, i64, String, i64, String, String, String)>(
+        let row = sqlx::query_as::<_, ConfigRow>(
             "INSERT INTO safe_search_configs (group_id, engine, enabled, youtube_mode, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(group_id, engine) DO UPDATE SET
@@ -110,16 +92,22 @@ impl SafeSearchConfigRepository for SqliteSafeSearchConfigRepository {
              RETURNING id, group_id, engine, enabled, youtube_mode, created_at, updated_at",
         )
         .bind(group_id)
-        .bind(engine_str)
-        .bind(enabled_int)
-        .bind(youtube_mode_str)
+        .bind(engine.to_str())
+        .bind(enabled)
+        .bind(youtube_mode.to_str())
         .bind(&now)
         .bind(&now)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
+        .map_err(|e| {
+            if is_fk_violation(&e) {
+                DomainError::GroupNotFound(group_id)
+            } else {
+                db_err("Failed to upsert safe search config")(e)
+            }
+        })?;
 
-        Self::row_to_config(row.0, row.1, row.2, row.3, row.4, row.5, row.6)
+        Self::row_to_config(row)
             .ok_or_else(|| DomainError::DatabaseError("Invalid safe search config row".into()))
     }
 
@@ -128,7 +116,7 @@ impl SafeSearchConfigRepository for SqliteSafeSearchConfigRepository {
             .bind(group_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
+            .map_err(db_err("Failed to delete safe search configs by group"))?;
         Ok(())
     }
 }

@@ -25,13 +25,6 @@ impl UpstreamAddr {
         }
     }
 
-    pub fn hostname_str(&self) -> Option<&str> {
-        match self {
-            UpstreamAddr::Resolved(_) => None,
-            UpstreamAddr::Unresolved { hostname, .. } => Some(hostname),
-        }
-    }
-
     pub fn is_unresolved(&self) -> bool {
         matches!(self, UpstreamAddr::Unresolved { .. })
     }
@@ -99,25 +92,7 @@ impl DnsProtocol {
             | DnsProtocol::Https { hostname, .. }
             | DnsProtocol::Quic { hostname, .. }
             | DnsProtocol::H3 { hostname, .. } => Some(hostname),
-            _ => None,
-        }
-    }
-
-    pub fn url(&self) -> Option<&str> {
-        match self {
-            DnsProtocol::Https { url, .. } | DnsProtocol::H3 { url, .. } => Some(url),
-            _ => None,
-        }
-    }
-
-    pub fn protocol_name(&self) -> &'static str {
-        match self {
-            DnsProtocol::Udp { .. } => "UDP",
-            DnsProtocol::Tcp { .. } => "TCP",
-            DnsProtocol::Tls { .. } => "TLS",
-            DnsProtocol::Https { .. } => "HTTPS",
-            DnsProtocol::Quic { .. } => "QUIC",
-            DnsProtocol::H3 { .. } => "H3",
+            DnsProtocol::Udp { .. } | DnsProtocol::Tcp { .. } => None,
         }
     }
 
@@ -175,7 +150,10 @@ impl DnsProtocol {
                 hostname: hostname.clone(),
                 resolved_addrs: addrs,
             },
-            _ => self.clone(),
+            DnsProtocol::Udp { .. }
+            | DnsProtocol::Tcp { .. }
+            | DnsProtocol::Tls { .. }
+            | DnsProtocol::Quic { .. } => self.clone(),
         }
     }
 }
@@ -193,6 +171,31 @@ fn parse_host_port(s: &str) -> Option<(&str, u16)> {
         let port = port_str.parse::<u16>().ok()?;
         Some((host, port))
     }
+}
+
+/// The returned name is what the peer certificate is checked against; IPs stay unbracketed.
+fn parse_named_addr(rest: &str) -> Result<(UpstreamAddr, Arc<str>), String> {
+    if let Ok(addr) = rest.parse::<SocketAddr>() {
+        return Ok((UpstreamAddr::Resolved(addr), addr.ip().to_string().into()));
+    }
+    let (host, port_str) = rest.rsplit_once(':').ok_or("missing port")?;
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|e| format!("invalid port: {e}"))?;
+    let hostname: Arc<str> = host.into();
+    Ok((
+        UpstreamAddr::Unresolved {
+            hostname: hostname.clone(),
+            port,
+        },
+        hostname,
+    ))
+}
+
+/// Keeps any `:port` suffix; the pool strips it before resolving.
+fn url_authority(rest: &str) -> &str {
+    rest.split_once('/')
+        .map_or(rest, |(authority, _)| authority)
 }
 
 fn parse_upstream_addr(addr_str: &str) -> Result<UpstreamAddr, String> {
@@ -223,78 +226,26 @@ impl FromStr for DnsProtocol {
             return Ok(DnsProtocol::Tcp { addr });
         }
         if let Some(rest) = s.strip_prefix("tls://") {
-            if let Ok(addr) = rest.parse::<SocketAddr>() {
-                let hostname: Arc<str> = rest.split(':').next().unwrap_or(rest).into();
-                return Ok(DnsProtocol::Tls {
-                    addr: UpstreamAddr::Resolved(addr),
-                    hostname,
-                });
-            }
-            if let Some((host, port_str)) = rest.rsplit_once(':') {
-                let port = port_str
-                    .parse::<u16>()
-                    .map_err(|e| format!("Invalid port in TLS address '{}': {}", rest, e))?;
-                return Ok(DnsProtocol::Tls {
-                    addr: UpstreamAddr::Unresolved {
-                        hostname: host.into(),
-                        port,
-                    },
-                    hostname: host.into(),
-                });
-            }
-            return Err(format!(
-                "Invalid TLS format '{}'. Expected 'tls://IP:PORT' or 'tls://HOSTNAME:PORT'",
-                s
-            ));
+            let (addr, hostname) = parse_named_addr(rest)
+                .map_err(|e| format!("Invalid TLS address '{s}': {e}. Expected 'tls://IP:PORT' or 'tls://HOSTNAME:PORT'"))?;
+            return Ok(DnsProtocol::Tls { addr, hostname });
         }
         if let Some(rest) = s.strip_prefix("doq://") {
-            if let Ok(addr) = rest.parse::<SocketAddr>() {
-                let hostname: Arc<str> = rest.split(':').next().unwrap_or(rest).into();
-                return Ok(DnsProtocol::Quic {
-                    addr: UpstreamAddr::Resolved(addr),
-                    hostname,
-                });
-            }
-            if let Some((host, port_str)) = rest.rsplit_once(':') {
-                let port = port_str
-                    .parse::<u16>()
-                    .map_err(|e| format!("Invalid port in QUIC address '{}': {}", rest, e))?;
-                return Ok(DnsProtocol::Quic {
-                    addr: UpstreamAddr::Unresolved {
-                        hostname: host.into(),
-                        port,
-                    },
-                    hostname: host.into(),
-                });
-            }
-            return Err(format!(
-                "Invalid QUIC format '{}'. Expected 'doq://IP:PORT' or 'doq://HOSTNAME:PORT'",
-                s
-            ));
+            let (addr, hostname) = parse_named_addr(rest)
+                .map_err(|e| format!("Invalid QUIC address '{s}': {e}. Expected 'doq://IP:PORT' or 'doq://HOSTNAME:PORT'"))?;
+            return Ok(DnsProtocol::Quic { addr, hostname });
         }
-        if s.starts_with("h3://") {
-            let url: Arc<str> = s.into();
-            let hostname: Arc<str> = s
-                .strip_prefix("h3://")
-                .and_then(|rest| rest.split('/').next())
-                .ok_or_else(|| format!("Invalid H3 URL: {}", s))?
-                .into();
+        if let Some(rest) = s.strip_prefix("h3://") {
             return Ok(DnsProtocol::H3 {
-                url,
-                hostname,
+                url: s.into(),
+                hostname: url_authority(rest).into(),
                 resolved_addrs: vec![],
             });
         }
-        if s.starts_with("https://") {
-            let url: Arc<str> = s.into();
-            let hostname: Arc<str> = s
-                .strip_prefix("https://")
-                .and_then(|rest| rest.split('/').next())
-                .ok_or_else(|| format!("Invalid HTTPS URL: {}", s))?
-                .into();
+        if let Some(rest) = s.strip_prefix("https://") {
             return Ok(DnsProtocol::Https {
-                url,
-                hostname,
+                url: s.into(),
+                hostname: url_authority(rest).into(),
                 resolved_addrs: vec![],
             });
         }
@@ -313,13 +264,23 @@ impl fmt::Display for DnsProtocol {
             DnsProtocol::Udp { addr } => write!(f, "udp://{}", addr),
             DnsProtocol::Tcp { addr } => write!(f, "tcp://{}", addr),
             DnsProtocol::Tls { addr, hostname } => {
-                write!(f, "tls://{}:{}", hostname, addr.port())
+                write!(f, "tls://")?;
+                write_host_port(f, hostname, addr.port())
             }
             DnsProtocol::Https { url, .. } => write!(f, "{}", url),
             DnsProtocol::H3 { url, .. } => write!(f, "{}", url),
             DnsProtocol::Quic { addr, hostname } => {
-                write!(f, "doq://{}:{}", hostname, addr.port())
+                write!(f, "doq://")?;
+                write_host_port(f, hostname, addr.port())
             }
         }
+    }
+}
+
+fn write_host_port(f: &mut fmt::Formatter<'_>, host: &str, port: u16) -> fmt::Result {
+    if host.contains(':') {
+        write!(f, "[{host}]:{port}")
+    } else {
+        write!(f, "{host}:{port}")
     }
 }

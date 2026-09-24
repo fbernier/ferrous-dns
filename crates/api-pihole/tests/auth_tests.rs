@@ -68,10 +68,6 @@ async fn auth_app(totp_enrolled: bool) -> Router {
     helpers::create_pihole_test_app_with_auth(pool, totp_enrolled).await
 }
 
-// ---------------------------------------------------------------------------
-// GET /auth
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn get_auth_returns_unauthenticated_session_when_no_active_session() {
     let app = auth_app(false).await;
@@ -97,10 +93,6 @@ async fn get_auth_reflects_a_valid_session() {
     assert_eq!(json["session"]["sid"], sid.as_str());
     assert!(json["session"]["validity"].as_i64().unwrap() > 0);
 }
-
-// ---------------------------------------------------------------------------
-// POST /auth — password
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn login_with_correct_password_returns_session() {
@@ -173,7 +165,7 @@ async fn auth_response_schema_contains_all_required_pihole_v6_session_fields() {
 #[tokio::test]
 async fn login_answers_like_a_pihole_without_password_when_auth_is_disabled() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let (status, json) = send(
         &app,
@@ -187,10 +179,6 @@ async fn login_answers_like_a_pihole_without_password_when_auth_is_disabled() {
     assert_eq!(json["session"]["validity"], -1);
     assert_eq!(json["session"]["message"], "no password set");
 }
-
-// ---------------------------------------------------------------------------
-// POST /auth — app password (API token)
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn login_with_api_token_as_app_password_returns_session() {
@@ -222,10 +210,6 @@ async fn app_password_skips_the_second_factor() {
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json["session"]["valid"], true);
 }
-
-// ---------------------------------------------------------------------------
-// POST /auth — second factor
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn login_with_totp_enrolled_requires_the_code() {
@@ -271,10 +255,6 @@ async fn login_with_wrong_totp_code_is_unauthorized() {
     assert_eq!(json["error"]["key"], "unauthorized");
 }
 
-// ---------------------------------------------------------------------------
-// POST /auth — lockout
-// ---------------------------------------------------------------------------
-
 /// A wrong password is tried as an app password too; that second check must
 /// not count again, or the configured five attempts would shrink to three.
 #[tokio::test]
@@ -296,14 +276,10 @@ async fn each_wrong_password_counts_once_toward_the_lockout() {
     assert_eq!(json["error"]["key"], "rate_limiting");
 }
 
-// ---------------------------------------------------------------------------
-// DELETE /auth — logout
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn logout_returns_no_content() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let request = Request::builder()
         .method("DELETE")
@@ -346,10 +322,6 @@ async fn logout_without_a_session_is_unauthorized() {
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
-
-// ---------------------------------------------------------------------------
-// Protected routes — everything except /auth demands a session
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn protected_routes_reject_requests_without_a_session() {
@@ -430,7 +402,7 @@ async fn protected_route_accepts_every_pihole_sid_carrier() {
 #[tokio::test]
 async fn protected_routes_are_open_when_auth_is_disabled() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let (status, _) = send(&app, get("/stats/summary")).await;
 

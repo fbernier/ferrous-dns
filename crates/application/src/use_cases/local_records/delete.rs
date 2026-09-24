@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
-use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord, RecordType};
+use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord};
 use tokio::sync::RwLock;
-use tracing::warn;
 
+use super::{record_not_found, save_failed, LiveRecordSinks};
 use crate::ports::{ConfigRepository, DnsCachePort, PtrRecordRegistry, WildcardRecordRegistry};
 
 pub struct DeleteLocalRecordUseCase {
     config: Arc<RwLock<Config>>,
     config_repo: Arc<dyn ConfigRepository>,
-    ptr_registry: Option<Arc<dyn PtrRecordRegistry>>,
-    dns_cache: Option<Arc<dyn DnsCachePort>>,
-    wildcard_registry: Option<Arc<dyn WildcardRecordRegistry>>,
+    sinks: LiveRecordSinks,
 }
 
 impl DeleteLocalRecordUseCase {
@@ -19,23 +17,21 @@ impl DeleteLocalRecordUseCase {
         Self {
             config,
             config_repo,
-            ptr_registry: None,
-            dns_cache: None,
-            wildcard_registry: None,
+            sinks: LiveRecordSinks::default(),
         }
     }
 
     /// Attaches a live PTR registry so that a successful record deletion immediately
     /// removes the IP → FQDN mapping without requiring a server restart.
     pub fn with_ptr_registry(mut self, registry: Option<Arc<dyn PtrRecordRegistry>>) -> Self {
-        self.ptr_registry = registry;
+        self.sinks.ptr = registry;
         self
     }
 
     /// Attaches a live DNS cache so that a successful record deletion immediately
     /// removes the forward record (A/AAAA) from the cache without requiring a server restart.
     pub fn with_dns_cache(mut self, cache: Option<Arc<dyn DnsCachePort>>) -> Self {
-        self.dns_cache = cache;
+        self.sinks.cache = cache;
         self
     }
 
@@ -45,66 +41,26 @@ impl DeleteLocalRecordUseCase {
         mut self,
         registry: Option<Arc<dyn WildcardRecordRegistry>>,
     ) -> Self {
-        self.wildcard_registry = registry;
+        self.sinks.wildcard = registry;
         self
     }
 
     pub async fn execute(&self, id: i64) -> Result<LocalDnsRecord, DomainError> {
         let mut config = self.config.write().await;
 
-        let idx = id as usize;
-        if idx >= config.dns.local_records.len() {
-            return Err(DomainError::NotFound(format!(
-                "Record with id {} not found",
-                id
-            )));
-        }
+        let idx = usize::try_from(id)
+            .ok()
+            .filter(|&idx| idx < config.dns.local_records.len())
+            .ok_or_else(|| record_not_found(id))?;
 
         let removed_record = config.dns.local_records.remove(idx);
 
         if let Err(e) = self.config_repo.save_local_records(&config).await {
             config.dns.local_records.insert(idx, removed_record.clone());
-            return Err(DomainError::IoError(format!(
-                "Failed to save configuration: {}",
-                e
-            )));
+            return Err(save_failed(e));
         }
 
-        if let Some(suffix) = removed_record.wildcard_suffix(&config.dns.local_domain) {
-            if let Some(ref registry) = self.wildcard_registry {
-                if let Ok(record_type) = removed_record.record_type.parse::<RecordType>() {
-                    registry.unregister(&suffix, record_type);
-                } else {
-                    warn!(
-                        record_type = %removed_record.record_type,
-                        "Wildcard registry: unrecognised record type on removed record, skipping removal"
-                    );
-                }
-            }
-            return Ok(removed_record);
-        }
-
-        if let Some(ref registry) = self.ptr_registry {
-            match removed_record.ip.parse() {
-                Ok(ip) => registry.unregister(ip),
-                Err(_) => {
-                    warn!(ip = %removed_record.ip, "PTR registry: failed to parse IP after delete");
-                }
-            }
-        }
-
-        if let Some(ref cache) = self.dns_cache {
-            let fqdn = removed_record.fqdn(&config.dns.local_domain);
-            if let Ok(record_type) = removed_record.record_type.parse::<RecordType>() {
-                cache.remove_record(&fqdn, &record_type);
-            } else {
-                warn!(
-                    record_type = %removed_record.record_type,
-                    "DNS cache: unrecognised record type on removed record, skipping eviction"
-                );
-            }
-        }
-
+        self.sinks.retire(&removed_record, &config.dns.local_domain);
         Ok(removed_record)
     }
 }

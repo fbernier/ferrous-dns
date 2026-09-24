@@ -53,9 +53,11 @@ impl CoreResolver {
         let Some((suffix, exact)) = &self.local_domain_suffix else {
             return false;
         };
-        domain.eq_ignore_ascii_case(exact.as_ref())
+        // Compare bytes: a `str` slice at this offset may split a multi-byte character.
+        let domain = domain.as_bytes();
+        domain.eq_ignore_ascii_case(exact.as_bytes())
             || (domain.len() > suffix.len()
-                && domain[domain.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_ref()))
+                && domain[domain.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes()))
     }
 
     async fn resolve_local_tld(&self, query: &DnsQuery) -> Result<DnsResolution, DomainError> {
@@ -86,10 +88,8 @@ impl CoreResolver {
                         upstream_pool: None,
                         min_ttl: response.min_ttl,
                         negative_soa_ttl: response.negative_soa_ttl,
-                        // Relay the local server's full answer, exactly as the pool path
-                        // does. Without this, non-address answers (PTR for LAN clients,
-                        // SRV/TXT/MX under the local domain) were parsed into an empty
-                        // `addresses` and reached the client as an empty response.
+                        // Relay the full answer, as the pool path does, so non-address
+                        // records (PTR, SRV, TXT, MX) reach the client.
                         upstream_wire_data: Some(response.raw_bytes),
                     });
                 }

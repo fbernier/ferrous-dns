@@ -208,16 +208,11 @@ fn zero_x20_queries_the_same_name_as_the_plain_path() {
 
 #[test]
 fn hardening_follows_the_opts_for_every_type() {
-    // The flags alone decide now — no record type is silently exempt, and none
+    // The flags alone decide — no record type is silently exempt, and none
     // is silently forced on.
     for rt in [RecordType::A, RecordType::MX, RecordType::DNSKEY] {
-        let (bytes, _) = MessageBuilder::build_query_hardened(
-            "example.com",
-            &rt,
-            false,
-            HardeningOpts::default(),
-        )
-        .unwrap();
+        let (bytes, _) =
+            MessageBuilder::build_query_hardened("example.com", &rt, false, plain()).unwrap();
         let msg = Message::from_vec(&bytes).unwrap();
         assert!(cookie_of(&msg).is_none(), "{rt:?} must honor cookie=false");
         assert!(

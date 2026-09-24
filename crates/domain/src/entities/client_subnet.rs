@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -55,23 +56,12 @@ impl SubnetMatcher {
         Ok(Self { subnets: networks })
     }
 
+    /// Longest prefix wins; among equal prefixes the first subnet wins.
     pub fn find_group_for_ip(&self, ip: IpAddr) -> Option<i64> {
-        let mut best_match: Option<(u8, i64)> = None;
-
-        for (network, group_id) in &self.subnets {
-            if network.contains(ip) {
-                let prefix = network.prefix();
-
-                match best_match {
-                    None => best_match = Some((prefix, *group_id)),
-                    Some((existing_prefix, _)) if prefix > existing_prefix => {
-                        best_match = Some((prefix, *group_id));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        best_match.map(|(_, group_id)| group_id)
+        self.subnets
+            .iter()
+            .filter(|(network, _)| network.contains(ip))
+            .min_by_key(|(network, _)| Reverse(network.prefix()))
+            .map(|(_, group_id)| *group_id)
     }
 }

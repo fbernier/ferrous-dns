@@ -117,7 +117,7 @@ fuzz_target!(|packet: &[u8]| {
         authentic_data: false,
         rcode: Rcode::NoError,
     };
-    let ede = ExtendedDnsError { info_code: 15, extra_text: Some("blocked") };
+    let ede = ExtendedDnsError { info_code: 15, extra_text: "blocked" };
     let reply = EdnsReply { dnssec_ok: query.wants_dnssec, cookie, ede: Some(&ede) };
     let bodies = [
         ResponseBody::Empty,

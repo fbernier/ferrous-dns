@@ -113,8 +113,6 @@ fn save_and_reparse(config: &Config, input: &str) -> toml_edit::DocumentMut {
     output.parse::<toml_edit::DocumentMut>().unwrap()
 }
 
-// ── Chave removida: cache_max_refresh_per_sec ────────────────────────────
-
 /// `default_config_toml()` com a chave já removida do produto ainda presente,
 /// simulando um arquivo escrito por uma versão anterior.
 fn config_toml_with_legacy_refresh_rate() -> String {
@@ -146,8 +144,6 @@ fn test_save_drops_legacy_refresh_rate_key_from_file() {
         "a chave removida deve sair do arquivo no primeiro save"
     );
 }
-
-// ── Pool serialization ───────────────────────────────────────────────────
 
 #[test]
 fn test_save_pools_writes_all_fields() {
@@ -263,8 +259,6 @@ fn test_save_empty_pools_removes_section() {
     assert!(dns.get("pools").is_none());
 }
 
-// ── Pool strategy roundtrip ──────────────────────────────────────────────
-
 #[test]
 fn test_pool_strategy_parallel_roundtrips() {
     let mut config = load_config(default_config_toml());
@@ -349,8 +343,6 @@ fn test_pool_strategy_balanced_roundtrips() {
     assert_eq!(pool.get("strategy").unwrap().as_str().unwrap(), "Balanced");
 }
 
-// ── Adjacent sections preserved ──────────────────────────────────────────
-
 #[test]
 fn test_save_pools_preserves_health_check() {
     let mut config = load_config(default_config_toml());
@@ -404,8 +396,6 @@ fn test_save_pools_preserves_upstream_servers() {
     );
 }
 
-// ── Full config roundtrip ────────────────────────────────────────────────
-
 #[test]
 fn test_full_config_save_and_reload_preserves_pools() {
     let original = load_config(default_config_toml());
@@ -426,8 +416,6 @@ fn test_full_config_save_and_reload_preserves_pools() {
         assert_eq!(orig.servers, saved.servers);
     }
 }
-
-// ── Weight roundtrip ─────────────────────────────────────────────────────
 
 #[test]
 fn test_full_config_save_and_reload_preserves_weight() {
@@ -453,8 +441,6 @@ fn test_full_config_save_and_reload_preserves_weight() {
     assert_eq!(reloaded.dns.pools[0].strategy, UpstreamStrategy::Balanced);
 }
 
-// ── Inline comment preservation ──────────────────────────────────────────
-
 #[test]
 fn test_save_preserves_inline_comments() {
     let input_with_comments =
@@ -473,8 +459,6 @@ fn test_save_preserves_inline_comments() {
         "inline comment should be preserved after save"
     );
 }
-
-// ── Block response mode roundtrip ────────────────────────────────────────
 
 #[test]
 fn test_save_and_reload_preserves_block_mode_and_ttl() {
@@ -560,8 +544,6 @@ fn test_clearing_sinkhole_removes_keys_from_toml() {
     let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
     assert_eq!(reloaded.blocking.sinkhole_ipv4, None);
 }
-
-// ── Error handling ───────────────────────────────────────────────────────
 
 #[test]
 fn test_save_config_to_nonexistent_path_returns_error() {

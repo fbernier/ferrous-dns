@@ -50,7 +50,7 @@ async fn start_test_doq_server_on(bind: &str, conn_limiter: ConnectionLimiter) -
     .unwrap()
     .unwrap();
 
-    let endpoint = bind_doq_endpoint(bind, tls_config).unwrap();
+    let endpoint = bind_doq_endpoint(bind.parse().unwrap(), tls_config).unwrap();
     let addr = common::unmap_addr(endpoint.local_addr().unwrap());
     let handler =
         handler_with_canned_addresses(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))], 300);

@@ -3,7 +3,7 @@ use super::super::dnssec::{DnssecCache, TrustAnchorStore};
 use super::super::load_balancer::PoolManager;
 use super::builder::ResolverBuilder;
 use super::config::ResolverConfig;
-use super::filters::QueryFilters;
+use super::filters::{NonFqdn, QueryFilters};
 use super::local_ptr::PtrMap;
 use super::local_wildcard::WildcardMap;
 use async_trait::async_trait;
@@ -11,8 +11,6 @@ use ferrous_dns_application::ports::{DnsResolution, DnsResolver, QueryLogReposit
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use std::net::Ipv6Addr;
 use std::sync::Arc;
-
-const DEFAULT_CACHE_TTL: u32 = 3600;
 
 pub struct HickoryDnsResolver {
     inner: Arc<dyn DnsResolver>,
@@ -26,7 +24,6 @@ struct BuilderState {
     dnssec_cache: Option<Arc<DnssecCache>>,
     config: ResolverConfig,
     cache: Option<Arc<DnsCache>>,
-    cache_ttl: u32,
     local_domain: Option<String>,
     local_dns_server: Option<String>,
     filters: Option<QueryFilters>,
@@ -55,7 +52,6 @@ impl HickoryDnsResolver {
             dnssec_cache: None,
             config: config.clone(),
             cache: None,
-            cache_ttl: DEFAULT_CACHE_TTL,
             local_domain: None,
             local_dns_server: None,
             filters: None,
@@ -97,7 +93,6 @@ impl HickoryDnsResolver {
 
     pub fn with_cache(mut self, cache: Arc<DnsCache>, cache_ttl: u32) -> Self {
         self.builder_state.cache = Some(cache);
-        self.builder_state.cache_ttl = cache_ttl;
         self.builder_state.config.cache_ttl = cache_ttl;
         self.rebuild();
         self
@@ -115,12 +110,16 @@ impl HickoryDnsResolver {
         local_domain: Option<String>,
         has_local_dns_server: bool,
     ) -> Self {
-        self.builder_state.filters = Some(QueryFilters {
-            block_private_ptr,
-            block_non_fqdn,
-            local_domain: local_domain.clone(),
-            has_local_dns_server,
-        });
+        let non_fqdn = match (block_non_fqdn, &local_domain) {
+            (true, _) => NonFqdn::Block,
+            (false, Some(domain)) => NonFqdn::Qualify(domain.clone()),
+            (false, None) => NonFqdn::Pass,
+        };
+        // A local DNS server answers private PTRs, so they must reach it.
+        self.builder_state.filters = Some(QueryFilters::new(
+            block_private_ptr && !has_local_dns_server,
+            non_fqdn,
+        ));
         self.builder_state.local_domain = local_domain;
         self.rebuild();
         self

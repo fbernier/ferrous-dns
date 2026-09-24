@@ -1,3 +1,4 @@
+use ferrous_dns_domain::DomainError;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,7 +10,7 @@ pub enum EvictionStrategy {
 }
 
 impl FromStr for EvictionStrategy {
-    type Err = String;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
@@ -17,7 +18,9 @@ impl FromStr for EvictionStrategy {
             "hit_rate" | "hitrate" => Ok(Self::HitRate),
             "lfu" => Ok(Self::LFU),
             "lfu-k" | "lfuk" => Ok(Self::LFUK),
-            _ => Err(format!("Invalid eviction strategy: {}", s)),
+            _ => Err(DomainError::ConfigError(format!(
+                "invalid eviction strategy: {s}"
+            ))),
         }
     }
 }

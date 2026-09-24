@@ -1,22 +1,23 @@
 use axum::{
     extract::{ConnectInfo, Path, Request, State},
-    http::{header, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use ferrous_dns_application::use_cases::LoginOutcome;
+use ferrous_dns_domain::{AuthSession, DomainError};
 
 use crate::dto::auth::{
     AuthStatusResponse, ChangePasswordRequest, ConfirmTotpRequest, DisableMfaRequest,
     DiscoverableFinishRequest, DiscoverableStartResponse, LoginRequest, LoginResponse,
     MfaStatusResponse, PasskeyResponse, RecoveryCodesResponse, RegisterPasskeyFinishRequest,
-    RegisterPasskeyStartRequest, SessionResponse, SetupPasswordRequest, SetupTotpResponse,
-    VerifyMfaRequest, WebauthnAuthFinishRequest, WebauthnAuthStartRequest,
-    WebauthnRegisterStartResponse,
+    SessionResponse, SetupPasswordRequest, SetupTotpResponse, VerifyMfaRequest,
+    WebauthnAuthFinishRequest, WebauthnAuthStartRequest, WebauthnRegisterStartResponse,
 };
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -48,7 +49,8 @@ pub fn public_mfa_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(webauthn_discoverable_finish_public))
 }
 
-/// Builds the `Set-Cookie` header value for a freshly issued session.
+/// Builds the `Set-Cookie` header value for a session; an empty id with
+/// `max_age` 0 clears it.
 fn session_cookie(session_id: &str, max_age: i64, tls_enabled: bool) -> String {
     let secure_flag = if tls_enabled { "; Secure" } else { "" };
     format!(
@@ -56,34 +58,41 @@ fn session_cookie(session_id: &str, max_age: i64, tls_enabled: bool) -> String {
     )
 }
 
-/// Resolves the authenticated username from a session id, or 401.
-///
-/// Takes the id by value (not `&Request`) so no non-`Send` borrow is held
-/// across the `await`.
-async fn require_username(state: &AppState, session_id: &str) -> Result<String, ApiError> {
-    let session = state.auth.validate_session.execute(session_id).await?;
-    Ok(session.username.to_string())
+/// 200 response that sets the session cookie for a completed login.
+fn session_established(state: &AppState, session: AuthSession) -> Response {
+    let max_age = state.auth.login.session_max_age(session.remember_me);
+    let cookie = session_cookie(&session.id, max_age, state.tls_enabled);
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(LoginResponse {
+            mfa_required: false,
+            username: Some(session.username.to_string()),
+            role: Some(session.role.as_str()),
+            expires_at: Some(session.expires_at),
+            ..Default::default()
+        }),
+    )
+        .into_response()
 }
 
-/// Extracts the session id from the request cookie, or 401.
-fn require_session_id(request: &Request) -> Result<String, ApiError> {
-    extract_session_cookie(request).ok_or(ApiError(ferrous_dns_domain::DomainError::AuthRequired))
+/// Username of the session named by the request's session cookie, or 401.
+async fn session_username(state: &AppState, headers: &HeaderMap) -> Result<Arc<str>, ApiError> {
+    let session_id = extract_session_cookie(headers).ok_or(ApiError(DomainError::AuthRequired))?;
+    let session = state.auth.validate_session.execute(session_id).await?;
+    Ok(session.username)
 }
 
 /// Reads and JSON-decodes a request body (16 KiB cap), mapping failures to 400.
 async fn read_json<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, ApiError> {
-    let body = axum::body::to_bytes(request.into_body(), 1024 * 16)
-        .await
-        .map_err(|_| {
-            ApiError(ferrous_dns_domain::DomainError::InvalidInput(
-                "Invalid request body".to_string(),
-            ))
-        })?;
-    serde_json::from_slice(&body).map_err(|_| {
-        ApiError(ferrous_dns_domain::DomainError::InvalidInput(
+    fn invalid<E>(_: E) -> ApiError {
+        ApiError(DomainError::InvalidInput(
             "Invalid request body".to_string(),
         ))
-    })
+    }
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 16)
+        .await
+        .map_err(invalid)?;
+    serde_json::from_slice(&body).map_err(invalid)
 }
 
 /// Public: returns auth status (no auth required).
@@ -149,7 +158,7 @@ pub async fn setup_password_public(
 pub async fn login_public(
     State(state): State<AppState>,
     request: Request,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let peer_ip = extract_peer_ip(&request);
     let ip_address = extract_client_ip(&request);
     let user_agent = extract_user_agent(&request);
@@ -171,21 +180,8 @@ pub async fn login_public(
 
     match outcome {
         LoginOutcome::Authenticated(session) => {
-            let max_age = state.auth.login.session_max_age(req.remember_me);
-            let cookie = session_cookie(&session.id, max_age, state.tls_enabled);
             debug!(username = %session.username, "Login successful");
-            Ok((
-                StatusCode::OK,
-                [(header::SET_COOKIE, cookie)],
-                Json(LoginResponse {
-                    mfa_required: false,
-                    username: Some(session.username.to_string()),
-                    role: Some(session.role.as_str().to_string()),
-                    expires_at: Some(session.expires_at.clone()),
-                    ..Default::default()
-                }),
-            )
-                .into_response())
+            Ok(session_established(&state, session))
         }
         LoginOutcome::MfaRequired {
             challenge_token,
@@ -218,7 +214,7 @@ pub async fn login_public(
 pub async fn verify_mfa_public(
     State(state): State<AppState>,
     request: Request,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let peer_ip = extract_peer_ip(&request);
     let ip_address = extract_client_ip(&request);
     let user_agent = extract_user_agent(&request);
@@ -236,21 +232,8 @@ pub async fn verify_mfa_public(
         )
         .await?;
 
-    let max_age = state.auth.login.session_max_age(session.remember_me);
-    let cookie = session_cookie(&session.id, max_age, state.tls_enabled);
     debug!(username = %session.username, "Second factor verified");
-
-    Ok((
-        StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
-        Json(LoginResponse {
-            mfa_required: false,
-            username: Some(session.username.to_string()),
-            role: Some(session.role.as_str().to_string()),
-            expires_at: Some(session.expires_at.clone()),
-            ..Default::default()
-        }),
-    ))
+    Ok(session_established(&state, session))
 }
 
 /// Public: begin a passkey login for a pending MFA challenge.
@@ -294,7 +277,7 @@ pub async fn webauthn_authenticate_start_public(
 pub async fn webauthn_authenticate_finish_public(
     State(state): State<AppState>,
     request: Request,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let ip_address = extract_client_ip(&request);
     let user_agent = extract_user_agent(&request);
     let req: WebauthnAuthFinishRequest = read_json(request).await?;
@@ -305,21 +288,8 @@ pub async fn webauthn_authenticate_finish_public(
         .finish(&req.challenge_token, req.response, &ip_address, &user_agent)
         .await?;
 
-    let max_age = state.auth.login.session_max_age(session.remember_me);
-    let cookie = session_cookie(&session.id, max_age, state.tls_enabled);
     debug!(username = %session.username, "Passkey login verified");
-
-    Ok((
-        StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
-        Json(LoginResponse {
-            mfa_required: false,
-            username: Some(session.username.to_string()),
-            role: Some(session.role.as_str().to_string()),
-            expires_at: Some(session.expires_at.clone()),
-            ..Default::default()
-        }),
-    ))
+    Ok(session_established(&state, session))
 }
 
 /// Public: begin a usernameless (passwordless) passkey login.
@@ -358,7 +328,7 @@ pub async fn webauthn_discoverable_start_public(
 pub async fn webauthn_discoverable_finish_public(
     State(state): State<AppState>,
     request: Request,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let ip_address = extract_client_ip(&request);
     let user_agent = extract_user_agent(&request);
     let req: DiscoverableFinishRequest = read_json(request).await?;
@@ -375,21 +345,8 @@ pub async fn webauthn_discoverable_finish_public(
         )
         .await?;
 
-    let max_age = state.auth.login.session_max_age(session.remember_me);
-    let cookie = session_cookie(&session.id, max_age, state.tls_enabled);
     debug!(username = %session.username, "Passwordless passkey login verified");
-
-    Ok((
-        StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
-        Json(LoginResponse {
-            mfa_required: false,
-            username: Some(session.username.to_string()),
-            role: Some(session.role.as_str().to_string()),
-            expires_at: Some(session.expires_at.clone()),
-            ..Default::default()
-        }),
-    ))
+    Ok(session_established(&state, session))
 }
 
 /// Public: logout and clear session cookie (no auth required).
@@ -403,16 +360,14 @@ pub async fn webauthn_discoverable_finish_public(
     security(),
 )]
 pub async fn logout_public(State(state): State<AppState>, request: Request) -> impl IntoResponse {
-    if let Some(session_id) = extract_session_cookie(&request) {
-        let _ = state.auth.logout.execute(&session_id).await;
+    if let Some(session_id) = extract_session_cookie(request.headers()) {
+        let _ = state.auth.logout.execute(session_id).await;
     }
 
-    let secure_flag = if state.tls_enabled { "; Secure" } else { "" };
-    let clear_cookie = format!(
-        "{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict{secure_flag}; Path=/; Max-Age=0"
-    );
-
-    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, clear_cookie)])
+    (
+        StatusCode::NO_CONTENT,
+        [(header::SET_COOKIE, session_cookie("", 0, state.tls_enabled))],
+    )
 }
 
 #[utoipa::path(
@@ -431,37 +386,16 @@ async fn change_password(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<StatusCode, ApiError> {
-    let session_id = extract_session_cookie(&request)
-        .ok_or(ApiError(ferrous_dns_domain::DomainError::AuthRequired))?;
-
-    let session = state
-        .auth
-        .validate_session
-        .execute(&session_id)
-        .await
-        .map_err(ApiError::from)?;
-
-    let body = axum::body::to_bytes(request.into_body(), 1024 * 16)
-        .await
-        .map_err(|_| {
-            ApiError(ferrous_dns_domain::DomainError::InvalidInput(
-                "Invalid request body".to_string(),
-            ))
-        })?;
-
-    let req: ChangePasswordRequest = serde_json::from_slice(&body).map_err(|_| {
-        ApiError(ferrous_dns_domain::DomainError::InvalidInput(
-            "Invalid request body".to_string(),
-        ))
-    })?;
+    let username = session_username(&state, request.headers()).await?;
+    let req: ChangePasswordRequest = read_json(request).await?;
 
     state
         .auth
         .change_password
-        .execute(&session.username, &req.current_password, &req.new_password)
+        .execute(&username, &req.current_password, &req.new_password)
         .await?;
 
-    debug!(username = %session.username, "Password changed via API");
+    debug!(username = %username, "Password changed via API");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -486,13 +420,13 @@ async fn get_active_sessions(
             .map(|s| SessionResponse {
                 id: s.id.to_string(),
                 username: s.username.to_string(),
-                role: s.role.as_str().to_string(),
+                role: s.role.as_str(),
                 ip_address: s.ip_address.to_string(),
                 user_agent: s.user_agent.to_string(),
                 remember_me: s.remember_me,
-                created_at: s.created_at.clone(),
-                last_seen_at: s.last_seen_at.clone(),
-                expires_at: s.expires_at.clone(),
+                created_at: s.created_at,
+                last_seen_at: s.last_seen_at,
+                expires_at: s.expires_at,
             })
             .collect(),
     ))
@@ -534,8 +468,7 @@ async fn get_mfa_status(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<MfaStatusResponse>, ApiError> {
-    let session_id = require_session_id(&request)?;
-    let username = require_username(&state, &session_id).await?;
+    let username = session_username(&state, request.headers()).await?;
     let status = state.auth.get_mfa_status.execute(&username).await?;
     Ok(Json(MfaStatusResponse {
         totp_enabled: status.totp_enabled,
@@ -570,8 +503,7 @@ async fn setup_totp(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<SetupTotpResponse>, ApiError> {
-    let session_id = require_session_id(&request)?;
-    let username = require_username(&state, &session_id).await?;
+    let username = session_username(&state, request.headers()).await?;
     let setup = state.auth.setup_totp.execute(&username).await?;
     debug!(username = %username, "TOTP setup issued");
     Ok(Json(SetupTotpResponse {
@@ -597,8 +529,7 @@ async fn confirm_totp(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<RecoveryCodesResponse>, ApiError> {
-    let session_id = require_session_id(&request)?;
-    let username = require_username(&state, &session_id).await?;
+    let username = session_username(&state, request.headers()).await?;
     let req: ConfirmTotpRequest = read_json(request).await?;
     let codes = state
         .auth
@@ -627,8 +558,7 @@ async fn disable_mfa(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<StatusCode, ApiError> {
-    let session_id = require_session_id(&request)?;
-    let username = require_username(&state, &session_id).await?;
+    let username = session_username(&state, request.headers()).await?;
     let req: DisableMfaRequest = read_json(request).await?;
     state
         .auth
@@ -644,7 +574,6 @@ async fn disable_mfa(
     post,
     path = "/auth/webauthn/register/start",
     tag = "auth",
-    request_body = RegisterPasskeyStartRequest,
     responses(
         (status = 200, description = "Creation challenge + ceremony token", body = WebauthnRegisterStartResponse),
         (status = 400, description = "WebAuthn not configured"),
@@ -656,9 +585,7 @@ async fn register_passkey_start(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<WebauthnRegisterStartResponse>, ApiError> {
-    let session_id = require_session_id(&request)?;
-    let username = require_username(&state, &session_id).await?;
-    let _req: RegisterPasskeyStartRequest = read_json(request).await?;
+    let username = session_username(&state, request.headers()).await?;
     let start = state
         .auth
         .register_passkey
@@ -686,8 +613,7 @@ async fn register_passkey_finish(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<StatusCode, ApiError> {
-    let session_id = require_session_id(&request)?;
-    let username = require_username(&state, &session_id).await?;
+    let username = session_username(&state, request.headers()).await?;
     let req: RegisterPasskeyFinishRequest = read_json(request).await?;
     state
         .auth
@@ -716,24 +642,26 @@ async fn delete_passkey(
     Path(id): Path<i64>,
     request: Request,
 ) -> Result<StatusCode, ApiError> {
-    let session_id = require_session_id(&request)?;
-    let username = require_username(&state, &session_id).await?;
+    let username = session_username(&state, request.headers()).await?;
     state.auth.delete_passkey.execute(&username, id).await?;
     debug!(username = %username, passkey_id = id, "Passkey removed");
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub fn extract_session_cookie(request: &Request) -> Option<String> {
-    let cookie_header = request.headers().get("cookie")?.to_str().ok()?;
-    for part in cookie_header.split(';') {
-        let trimmed = part.trim();
-        if let Some(value) = trimmed.strip_prefix(SESSION_COOKIE_NAME) {
-            if let Some(value) = value.strip_prefix('=') {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
+/// Session id from the `Cookie` headers; HTTP/2 clients may send one header
+/// per cookie, so every header is searched.
+pub(crate) fn extract_session_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookies| cookies.split(';'))
+        .find_map(|cookie| {
+            cookie
+                .trim()
+                .strip_prefix(SESSION_COOKIE_NAME)?
+                .strip_prefix('=')
+        })
 }
 
 fn extract_client_ip(request: &Request) -> String {
@@ -776,7 +704,20 @@ fn extract_user_agent(request: &Request) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::session_cookie;
+    use super::{extract_session_cookie, session_cookie};
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn session_cookie_is_found_in_any_cookie_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("theme=dark"));
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("ferrous_session_old=x; ferrous_session=abc"),
+        );
+
+        assert_eq!(extract_session_cookie(&headers), Some("abc"));
+    }
 
     #[test]
     fn test_session_cookie_omits_secure_over_plain_http() {

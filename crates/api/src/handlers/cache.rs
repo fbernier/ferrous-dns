@@ -5,7 +5,7 @@ use crate::{
     },
     errors::ApiError,
     state::AppState,
-    utils::{parse_period, validate_period},
+    utils::period_hours,
 };
 use axum::{
     extract::{Query, State},
@@ -37,9 +37,7 @@ pub async fn get_cache_stats(
 ) -> Result<Json<CacheStatsResponse>, ApiError> {
     debug!(period = %params.period, "Fetching cache statistics");
 
-    let period_hours = parse_period(&params.period)
-        .map(validate_period)
-        .unwrap_or(24.0);
+    let period_hours = period_hours(&params.period);
 
     debug!(period_hours = period_hours, "Using period for cache stats");
 
@@ -55,14 +53,7 @@ pub async fn get_cache_stats(
         "Cache statistics retrieved"
     );
 
-    Ok(Json(CacheStatsResponse {
-        total_entries,
-        total_hits: stats.total_hits,
-        total_misses: stats.total_misses,
-        total_refreshes: stats.total_refreshes,
-        hit_rate: stats.hit_rate,
-        refresh_rate: stats.refresh_rate,
-    }))
+    Ok(Json(CacheStatsResponse::new(total_entries, &stats)))
 }
 
 #[utoipa::path(

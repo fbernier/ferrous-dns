@@ -16,28 +16,6 @@ pub struct RegexFilter {
 }
 
 impl RegexFilter {
-    pub fn new(
-        id: Option<i64>,
-        name: Arc<str>,
-        pattern: Arc<str>,
-        action: DomainAction,
-        group_id: i64,
-        comment: Option<Arc<str>>,
-        enabled: bool,
-    ) -> Self {
-        Self {
-            id,
-            name,
-            pattern,
-            action,
-            group_id,
-            comment,
-            enabled,
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
     pub fn validate_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("Regex filter name cannot be empty".to_string());

@@ -1,30 +1,19 @@
-//! Phase 6: regression tests for the negative-cache poisoning bug.
-//!
-//! Before the fix, ANY `Err(_)` returned by the upstream resolver was
-//! cached as a negative response via `insert_negative`. That meant a
-//! single upstream timeout or "no healthy servers" would cause Ferrous
-//! to serve fake NXDOMAIN to clients for the next 300–3600s — turning
-//! transient instability into apparent permanent outage.
-//!
-//! The fix discriminates errors: only `DomainError::NxDomain` /
-//! `DomainError::LocalNxDomain` populate the negative cache. Every other
-//! variant (timeouts, transport failures, no healthy servers, malformed
-//! responses, rate limits, etc.) bypasses the cache entirely so the next
-//! query retries upstream.
+//! Only `DomainError::NxDomain` / `DomainError::LocalNxDomain` populate the
+//! negative cache. Every other error (timeouts, transport failures, no healthy
+//! servers, malformed responses, rate limits, etc.) bypasses it so the next
+//! query retries upstream; caching one would serve fake NXDOMAIN for the whole
+//! negative TTL.
 //!
 //! These tests drive a counting mock resolver that returns a configured
 //! error on the first call and a success on any subsequent call. If the
 //! negative cache was populated on the first failure, the second query
-//! short-circuits and the mock is never called a second time — which is
-//! the bug we are guarding against.
+//! short-circuits and the mock is never called a second time.
 
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
-use ferrous_dns_infrastructure::dns::{
-    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
-};
+use ferrous_dns_infrastructure::dns::{DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,7 +87,6 @@ fn make_resolver(mock: Arc<ScriptedMockResolver>, cache: Arc<DnsCache>) -> Arc<C
         mock as Arc<dyn DnsResolver>,
         cache as Arc<dyn DnsCacheAccess>,
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ))
 }

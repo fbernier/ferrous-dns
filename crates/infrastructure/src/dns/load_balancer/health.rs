@@ -9,14 +9,15 @@ use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ServerStatus {
     Healthy,
     Unhealthy,
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ServerHealth {
     pub status: ServerStatus,
     pub consecutive_failures: u16,
@@ -25,20 +26,8 @@ pub struct ServerHealth {
     pub last_error: Option<String>,
 }
 
-impl Default for ServerHealth {
-    fn default() -> Self {
-        Self {
-            status: ServerStatus::Unknown,
-            consecutive_failures: 0,
-            consecutive_successes: 0,
-            last_check_latency_ms: None,
-            last_error: None,
-        }
-    }
-}
-
 pub struct HealthChecker {
-    health_map: Arc<DashMap<Arc<DnsProtocol>, ServerHealth, FxBuildHasher>>,
+    health_map: DashMap<Arc<DnsProtocol>, ServerHealth, FxBuildHasher>,
     failure_threshold: u8,
     success_threshold: u8,
 }
@@ -46,7 +35,7 @@ pub struct HealthChecker {
 impl HealthChecker {
     pub fn new(failure_threshold: u8, success_threshold: u8) -> Self {
         Self {
-            health_map: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            health_map: DashMap::with_hasher(FxBuildHasher),
             failure_threshold,
             success_threshold,
         }
@@ -99,38 +88,32 @@ impl HealthChecker {
     }
 
     async fn check_all(&self, protocols: &[Arc<DnsProtocol>], timeout_ms: u64) {
-        let query_bytes: Arc<[u8]> =
-            match MessageBuilder::build_query("google.com", &RecordType::A, false) {
-                Ok(b) => Arc::from(b),
-                Err(_) => return,
-            };
+        let Ok(query_bytes) = MessageBuilder::build_query("google.com", &RecordType::A, false)
+        else {
+            return;
+        };
         let futs: Vec<_> = protocols
             .iter()
-            .map(|p| self.check_server(Arc::clone(p), Arc::clone(&query_bytes), timeout_ms))
+            .map(|p| self.check_server(p, &query_bytes, timeout_ms))
             .collect();
         futures::future::join_all(futs).await;
     }
 
-    async fn check_server(
-        &self,
-        protocol: Arc<DnsProtocol>,
-        query_bytes: Arc<[u8]>,
-        timeout_ms: u64,
-    ) {
+    async fn check_server(&self, protocol: &Arc<DnsProtocol>, query_bytes: &[u8], timeout_ms: u64) {
         let start = std::time::Instant::now();
         let timeout_duration = Duration::from_millis(timeout_ms);
 
-        let dns_transport = match transport::get_or_create_transport(&protocol) {
+        let dns_transport = match transport::get_or_create_transport(protocol) {
             Ok(t) => t,
             Err(e) => {
-                self.mark_failed(&protocol, None, Some(e.to_string()));
+                self.mark_failed(protocol, None, e.to_string());
                 return;
             }
         };
 
         let result = tokio::time::timeout(
             timeout_duration,
-            dns_transport.send(&query_bytes, timeout_duration),
+            dns_transport.send(query_bytes, timeout_duration),
         )
         .await;
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -138,30 +121,26 @@ impl HealthChecker {
         match result {
             Err(_) => {
                 warn!(server = %protocol, "Health check: TIMEOUT");
-                self.mark_failed(
-                    &protocol,
-                    None,
-                    Some(format!("Timeout after {}ms", timeout_ms)),
-                );
+                self.mark_failed(protocol, None, format!("Timeout after {}ms", timeout_ms));
             }
             Ok(Err(e)) => {
                 warn!(server = %protocol, error = %e, "Health check: FAILED");
-                self.mark_failed(&protocol, Some(latency_ms), Some(e.to_string()));
+                self.mark_failed(protocol, Some(latency_ms), e.to_string());
             }
-            Ok(Ok(resp)) => match ResponseParser::parse(&resp.bytes) {
+            Ok(Ok(resp)) => match ResponseParser::parse_bytes(resp.bytes) {
                 Ok(dns) if dns.is_server_error() => {
                     self.mark_failed(
-                        &protocol,
+                        protocol,
                         Some(latency_ms),
-                        Some(ResponseParser::rcode_to_status(dns.rcode).to_string()),
+                        ResponseParser::rcode_to_status(dns.rcode).to_string(),
                     );
                 }
                 Ok(_) => {
                     debug!(server = %protocol, latency_ms, "Health check: OK");
-                    self.mark_healthy(&protocol, latency_ms);
+                    self.mark_healthy(protocol, latency_ms);
                 }
                 Err(e) => {
-                    self.mark_failed(&protocol, Some(latency_ms), Some(e.to_string()));
+                    self.mark_failed(protocol, Some(latency_ms), e.to_string());
                 }
             },
         }
@@ -181,17 +160,12 @@ impl HealthChecker {
         }
     }
 
-    fn mark_failed(
-        &self,
-        protocol: &Arc<DnsProtocol>,
-        latency_ms: Option<u64>,
-        error: Option<String>,
-    ) {
+    fn mark_failed(&self, protocol: &Arc<DnsProtocol>, latency_ms: Option<u64>, error: String) {
         let mut entry = self.health_map.entry(Arc::clone(protocol)).or_default();
         entry.consecutive_successes = 0;
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_check_latency_ms = latency_ms;
-        entry.last_error = error;
+        entry.last_error = Some(error);
         if entry.consecutive_failures >= self.failure_threshold as u16 {
             if entry.status != ServerStatus::Unhealthy {
                 warn!(server = %protocol, "Server marked UNHEALTHY");
@@ -207,19 +181,11 @@ impl HealthChecker {
             .unwrap_or(true)
     }
 
-    pub fn get_healthy_protocols(&self, protocols: &[Arc<DnsProtocol>]) -> Vec<Arc<DnsProtocol>> {
-        protocols
-            .iter()
-            .filter(|p| self.is_healthy(p))
-            .cloned()
-            .collect()
-    }
-
     pub fn get_status(&self, protocol: &Arc<DnsProtocol>) -> ServerStatus {
         self.health_map
             .get(protocol)
             .map(|h| h.status)
-            .unwrap_or(ServerStatus::Unknown)
+            .unwrap_or_default()
     }
 
     pub fn get_health_info(&self, protocol: &Arc<DnsProtocol>) -> Option<ServerHealth> {

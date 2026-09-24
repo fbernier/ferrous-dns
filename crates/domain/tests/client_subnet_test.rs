@@ -2,32 +2,6 @@ use ferrous_dns_domain::{ClientSubnet, SubnetMatcher};
 use std::net::IpAddr;
 
 #[test]
-fn test_client_subnet_creation_valid() {
-    let subnet = ClientSubnet::new("192.168.1.0/24".to_string(), 1, None);
-
-    assert_eq!(subnet.group_id, 1);
-    assert_eq!(subnet.subnet_cidr.to_string(), "192.168.1.0/24");
-    assert!(subnet.comment.is_none());
-    assert!(subnet.id.is_none());
-    assert!(subnet.created_at.is_none());
-}
-
-#[test]
-fn test_client_subnet_creation_with_comment() {
-    let subnet = ClientSubnet::new(
-        "10.0.0.0/8".to_string(),
-        2,
-        Some("Office network".to_string()),
-    );
-
-    assert_eq!(subnet.group_id, 2);
-    assert_eq!(
-        subnet.comment.as_ref().map(|s| s.as_ref()),
-        Some("Office network")
-    );
-}
-
-#[test]
 fn test_client_subnet_validate_cidr_missing_mask() {
     let result = ClientSubnet::validate_cidr("192.168.1.0");
 
@@ -47,16 +21,6 @@ fn test_client_subnet_validate_cidr_empty() {
 fn test_client_subnet_validate_cidr_valid() {
     let result = ClientSubnet::validate_cidr("192.168.1.0/24");
     assert!(result.is_ok());
-}
-
-#[test]
-fn test_client_subnet_with_id_and_timestamp() {
-    let mut subnet = ClientSubnet::new("172.16.0.0/12".to_string(), 5, None);
-    subnet.id = Some(123);
-    subnet.created_at = Some("2024-01-01T00:00:00Z".to_string());
-
-    assert_eq!(subnet.id, Some(123));
-    assert_eq!(subnet.created_at, Some("2024-01-01T00:00:00Z".to_string()));
 }
 
 #[test]
@@ -90,4 +54,17 @@ fn test_subnet_matcher_most_specific_wins() {
 
     let ip: IpAddr = "10.1.1.50".parse().unwrap();
     assert_eq!(matcher.find_group_for_ip(ip), Some(5));
+}
+
+#[test]
+fn equal_prefix_overlap_resolves_to_the_first_subnet() {
+    let subnets = vec![
+        ClientSubnet::new("10.0.0.0/8".to_string(), 7, None),
+        ClientSubnet::new("10.0.0.0/8".to_string(), 8, None),
+    ];
+    let matcher = SubnetMatcher::new(subnets).unwrap();
+    assert_eq!(
+        matcher.find_group_for_ip("10.2.3.4".parse().unwrap()),
+        Some(7)
+    );
 }

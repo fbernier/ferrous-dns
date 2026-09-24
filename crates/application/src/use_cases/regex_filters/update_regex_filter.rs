@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{DomainAction, DomainError, RegexFilter};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -54,10 +55,7 @@ impl UpdateRegexFilterUseCase {
         }
 
         if let Some(gid) = group_id {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
         let updated = self

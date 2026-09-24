@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
-use super::session_factory::build_session;
+use super::session_factory::{build_session, is_expired};
 use crate::ports::{MfaRepository, SessionRepository, UserProvider, WebauthnService};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, MfaChallenge, MfaMethod};
 
@@ -138,10 +138,4 @@ impl AuthenticatePasskeyUseCase {
         info!(username = %user.username, "Passkey verified, user logged in");
         Ok(session)
     }
-}
-
-fn is_expired(expires_at: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S")
-        .map(|exp| chrono::Utc::now().naive_utc() > exp)
-        .unwrap_or(true)
 }

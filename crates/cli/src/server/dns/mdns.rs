@@ -24,21 +24,20 @@ fn build_mdns_socket(bind: SocketAddr) -> io::Result<UdpSocket> {
 }
 
 /// Passive mDNS listener: binds UDP 5353, joins the mDNS multicast group, and
-/// logs the datagrams it receives. Parsing announcements into device names and
-/// populating the query log is a follow-up.
+/// logs the datagrams it receives at debug level; it extracts nothing yet.
 ///
 /// Non-fatal by design: if the socket cannot be created (e.g. the port is held
 /// without address reuse) it warns and returns, so the rest of the server keeps
 /// running. Bind to `0.0.0.0` (not the configured `bind_address`) so multicast
 /// reception is robust.
-pub async fn start_mdns_listener() -> anyhow::Result<()> {
+pub async fn start_mdns_listener() {
     let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT));
 
     let socket = match build_mdns_socket(bind) {
         Ok(socket) => socket,
         Err(e) => {
             warn!(error = %e, %bind, "mDNS listener could not bind; mDNS disabled for this run");
-            return Ok(());
+            return;
         }
     };
 

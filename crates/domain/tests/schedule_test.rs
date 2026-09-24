@@ -1,9 +1,5 @@
-use ferrous_dns_domain::schedule::{ScheduleProfile, TimeSlot};
+use ferrous_dns_domain::{ScheduleProfile, TimeSlot};
 use std::sync::Arc;
-
-// ============================================================================
-// ScheduleProfile validation
-// ============================================================================
 
 #[test]
 fn test_schedule_profile_validate_name_empty_returns_error() {
@@ -63,10 +59,6 @@ fn test_schedule_profile_validate_comment_too_long_returns_error() {
     assert!(result.is_err());
 }
 
-// ============================================================================
-// TimeSlot validation
-// ============================================================================
-
 #[test]
 fn test_time_slot_validate_days_zero_returns_error() {
     let result = TimeSlot::validate_days(0);
@@ -98,6 +90,24 @@ fn test_time_slot_validate_time_format_invalid_returns_error() {
     assert!(TimeSlot::validate_time_format("12:60").is_err());
     assert!(TimeSlot::validate_time_format("1200").is_err());
     assert!(TimeSlot::validate_time_format("").is_err());
+}
+
+#[test]
+fn time_format_rejects_forms_that_break_string_ordering() {
+    for time in [
+        "9:00",
+        "+9:05",
+        "09:5",
+        "09:+5",
+        " 9:00",
+        "09:00:00",
+        "٠٩:٠٠",
+    ] {
+        assert!(
+            TimeSlot::validate_time_format(time).is_err(),
+            "{time:?} accepted"
+        );
+    }
 }
 
 #[test]

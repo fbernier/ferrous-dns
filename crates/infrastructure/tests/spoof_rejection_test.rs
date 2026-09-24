@@ -165,9 +165,9 @@ async fn case_forged_qname_is_rejected_with_0x20() {
 
 #[tokio::test]
 async fn case_forged_qname_is_rejected_for_non_address_types() {
-    // These used to be exempt from 0x20 and cookies, so an off-path forger only
-    // had to guess the 16-bit transaction ID — against DS (the trust chain
-    // itself), MX (SPF/DKIM/DMARC) and HTTPS (ipv4hint/ipv6hint, ECH).
+    // Without 0x20 and cookies here an off-path forger only has to guess the
+    // 16-bit transaction ID — against DS (the trust chain itself), MX
+    // (SPF/DKIM/DMARC) and HTTPS (ipv4hint/ipv6hint, ECH).
     let addr = spawn_responder(Mode::FlipQnameCase).await;
     let pm = manager_hardened(addr).await;
     let domain: Arc<str> = Arc::from("example.com");
@@ -197,7 +197,7 @@ async fn forged_cookie_is_rejected_for_non_address_types() {
 /// Spawns a UDP responder that always answers with TC=1 (truncated), paired with
 /// a TCP responder on the same port. The UDP TC=1 forces the truncation retry;
 /// the TCP side replies per `tcp_mode`, letting us assert the validator also runs
-/// on the post-truncation TCP path (`query_server`'s second validate site).
+/// on the post-truncation TCP path.
 async fn spawn_truncating_pair(tcp_mode: Mode) -> SocketAddr {
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = udp.local_addr().unwrap();

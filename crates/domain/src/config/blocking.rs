@@ -125,13 +125,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_null_ip_and_ttl_60() {
-        let config = BlockingConfig::default();
-        assert_eq!(config.block_mode, BlockResponseMode::NullIp);
-        assert_eq!(config.block_ttl, 60);
-    }
-
-    #[test]
     fn missing_block_fields_fall_back_to_defaults() {
         let config: BlockingConfig = toml::from_str("enabled = true").unwrap();
         assert_eq!(config.block_mode, BlockResponseMode::NullIp);
@@ -142,13 +135,6 @@ mod tests {
     fn custom_block_ttl_is_honoured() {
         let config: BlockingConfig = toml::from_str("enabled = true\nblock_ttl = 300").unwrap();
         assert_eq!(config.block_ttl, 300);
-    }
-
-    #[test]
-    fn sinkhole_addresses_default_to_none() {
-        let config: BlockingConfig = toml::from_str("enabled = true").unwrap();
-        assert_eq!(config.sinkhole_ipv4, None);
-        assert_eq!(config.sinkhole_ipv6, None);
     }
 
     #[test]

@@ -1,7 +1,6 @@
 /// Computes Shannon entropy in bits per character.
 ///
 /// Uses a stack-allocated histogram `[u32; 256]` (~1 KB) — zero heap allocation.
-#[inline]
 pub fn shannon_entropy(data: &[u8]) -> f32 {
     if data.is_empty() {
         return 0.0;

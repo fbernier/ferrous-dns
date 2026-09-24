@@ -8,14 +8,10 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// GET /lists
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn list_all_returns_empty_array_on_fresh_database() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -46,7 +42,7 @@ async fn list_all_includes_created_list() {
     let pool = helpers::create_test_db().await;
 
     // Create a blocklist.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
+    let app1 = helpers::create_pihole_test_app(pool.clone()).await;
     let body = serde_json::json!({ "address": "https://block.list/hosts" }).to_string();
     let create_response = app1
         .oneshot(
@@ -62,7 +58,7 @@ async fn list_all_includes_created_list() {
     assert_eq!(create_response.status(), StatusCode::CREATED);
 
     // List all and verify the created one appears.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
+    let app2 = helpers::create_pihole_test_app(pool).await;
     let response = app2
         .oneshot(
             Request::builder()
@@ -92,14 +88,10 @@ async fn list_all_includes_created_list() {
     assert!(found, "https://block.list/hosts must appear in the lists");
 }
 
-// ---------------------------------------------------------------------------
-// POST /lists
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn create_blocklist_returns_created() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let body = serde_json::json!({ "address": "https://block.list/hosts" }).to_string();
     let response = app
@@ -131,7 +123,7 @@ async fn create_blocklist_returns_created() {
 #[tokio::test]
 async fn create_whitelist_returns_created() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let body = serde_json::json!({ "address": "https://white.list/hosts", "type": 1 }).to_string();
     let response = app
@@ -162,7 +154,7 @@ async fn create_whitelist_returns_created() {
 #[tokio::test]
 async fn create_list_with_comment() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let body = serde_json::json!({
         "address": "https://commented.list",
@@ -194,16 +186,12 @@ async fn create_list_with_comment() {
     assert_eq!(json["comment"], "my list");
 }
 
-// ---------------------------------------------------------------------------
-// GET /lists/:id
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn get_list_by_id_returns_matching_list() {
     let pool = helpers::create_test_db().await;
 
     // Create a list and capture its id.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
+    let app1 = helpers::create_pihole_test_app(pool.clone()).await;
     let body = serde_json::json!({ "address": "https://by-id.list/hosts" }).to_string();
     let create_response = app1
         .oneshot(
@@ -230,7 +218,7 @@ async fn get_list_by_id_returns_matching_list() {
         .expect("created list must have an id");
 
     // Fetch by id.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
+    let app2 = helpers::create_pihole_test_app(pool).await;
     let response = app2
         .oneshot(
             Request::builder()
@@ -258,7 +246,7 @@ async fn get_list_by_id_returns_matching_list() {
 #[tokio::test]
 async fn get_nonexistent_list_returns_not_found() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -273,16 +261,12 @@ async fn get_nonexistent_list_returns_not_found() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-// ---------------------------------------------------------------------------
-// PUT /lists/:id
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn update_list_changes_address() {
     let pool = helpers::create_test_db().await;
 
     // Create a list.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
+    let app1 = helpers::create_pihole_test_app(pool.clone()).await;
     let body = serde_json::json!({ "address": "https://original.list" }).to_string();
     let create_response = app1
         .oneshot(
@@ -309,7 +293,7 @@ async fn update_list_changes_address() {
         .expect("created list must have an id");
 
     // Update the list address.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
+    let app2 = helpers::create_pihole_test_app(pool).await;
     let update_body = serde_json::json!({ "address": "https://updated.list" }).to_string();
     let response = app2
         .oneshot(
@@ -336,16 +320,12 @@ async fn update_list_changes_address() {
     assert_eq!(json["address"], "https://updated.list");
 }
 
-// ---------------------------------------------------------------------------
-// DELETE /lists/:id
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn delete_list_returns_no_content() {
     let pool = helpers::create_test_db().await;
 
     // Create a list.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
+    let app1 = helpers::create_pihole_test_app(pool.clone()).await;
     let body = serde_json::json!({ "address": "https://delete-me.list" }).to_string();
     let create_response = app1
         .oneshot(
@@ -372,7 +352,7 @@ async fn delete_list_returns_no_content() {
         .expect("created list must have an id");
 
     // Delete the list.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
+    let app2 = helpers::create_pihole_test_app(pool).await;
     let response = app2
         .oneshot(
             Request::builder()
@@ -390,7 +370,7 @@ async fn delete_list_returns_no_content() {
 #[tokio::test]
 async fn delete_nonexistent_list_returns_not_found() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -406,16 +386,12 @@ async fn delete_nonexistent_list_returns_not_found() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-// ---------------------------------------------------------------------------
-// POST /lists:batchDelete
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn batch_delete_lists_removes_specified() {
     let pool = helpers::create_test_db().await;
 
     // Create first list.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
+    let app1 = helpers::create_pihole_test_app(pool.clone()).await;
     let body = serde_json::json!({ "address": "https://batch1.list" }).to_string();
     let resp1 = app1
         .oneshot(
@@ -439,7 +415,7 @@ async fn batch_delete_lists_removes_specified() {
     let id1 = created1["id"].as_i64().expect("first list must have an id");
 
     // Create second list.
-    let app2 = helpers::create_pihole_test_app(pool.clone(), None).await;
+    let app2 = helpers::create_pihole_test_app(pool.clone()).await;
     let body = serde_json::json!({ "address": "https://batch2.list" }).to_string();
     let resp2 = app2
         .oneshot(
@@ -465,7 +441,7 @@ async fn batch_delete_lists_removes_specified() {
         .expect("second list must have an id");
 
     // Batch delete both (IDs as strings per Pi-hole v6 API).
-    let app3 = helpers::create_pihole_test_app(pool, None).await;
+    let app3 = helpers::create_pihole_test_app(pool).await;
     let delete_body =
         serde_json::json!({ "items": [id1.to_string(), id2.to_string()] }).to_string();
     let response = app3

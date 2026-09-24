@@ -90,27 +90,6 @@ fn test_display_doq() {
 }
 
 #[test]
-fn test_protocol_name() {
-    let udp: DnsProtocol = "udp://8.8.8.8:53".parse().unwrap();
-    assert_eq!(udp.protocol_name(), "UDP");
-
-    let tcp: DnsProtocol = "tcp://8.8.8.8:53".parse().unwrap();
-    assert_eq!(tcp.protocol_name(), "TCP");
-
-    let tls: DnsProtocol = "tls://1.1.1.1:853".parse().unwrap();
-    assert_eq!(tls.protocol_name(), "TLS");
-
-    let https: DnsProtocol = "https://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(https.protocol_name(), "HTTPS");
-
-    let quic: DnsProtocol = "doq://1.1.1.1:853".parse().unwrap();
-    assert_eq!(quic.protocol_name(), "QUIC");
-
-    let h3: DnsProtocol = "h3://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(h3.protocol_name(), "H3");
-}
-
-#[test]
 fn test_socket_addr_extraction() {
     let udp: DnsProtocol = "udp://8.8.8.8:53".parse().unwrap();
     assert!(udp.socket_addr().is_some());
@@ -144,18 +123,6 @@ fn test_hostname_extraction() {
 
     let h3: DnsProtocol = "h3://dns.google/dns-query".parse().unwrap();
     assert_eq!(h3.hostname(), Some("dns.google"));
-}
-
-#[test]
-fn test_url_extraction() {
-    let https: DnsProtocol = "https://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(https.url(), Some("https://1.1.1.1/dns-query"));
-
-    let h3: DnsProtocol = "h3://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(h3.url(), Some("h3://1.1.1.1/dns-query"));
-
-    let udp: DnsProtocol = "udp://8.8.8.8:53".parse().unwrap();
-    assert_eq!(udp.url(), None);
 }
 
 #[test]
@@ -223,14 +190,12 @@ fn test_ipv6_parsing() {
     }
 }
 
-// ── UpstreamAddr + hostname resolution tests ──────────────────────────────────
-
 #[test]
 fn test_parse_udp_hostname() {
     let protocol: DnsProtocol = "udp://dns.google:53".parse().unwrap();
     if let DnsProtocol::Udp { addr } = &protocol {
         assert!(addr.is_unresolved());
-        assert_eq!(addr.hostname_str(), Some("dns.google"));
+        assert_eq!(addr.unresolved_parts(), Some(("dns.google", 53)));
         assert_eq!(addr.port(), 53);
         assert!(addr.socket_addr().is_none());
     } else {
@@ -243,7 +208,7 @@ fn test_parse_tcp_hostname() {
     let protocol: DnsProtocol = "tcp://dns.google:53".parse().unwrap();
     if let DnsProtocol::Tcp { addr } = &protocol {
         assert!(addr.is_unresolved());
-        assert_eq!(addr.hostname_str(), Some("dns.google"));
+        assert_eq!(addr.unresolved_parts(), Some(("dns.google", 53)));
         assert_eq!(addr.port(), 53);
     } else {
         panic!("Expected Tcp variant");
@@ -304,6 +269,22 @@ fn test_parse_doq_ipv6() {
         assert_eq!(sa.port(), 853);
     } else {
         panic!("Expected Quic variant");
+    }
+}
+
+#[test]
+fn ipv6_literal_tls_and_doq_use_the_bare_ip_as_hostname_and_round_trip() {
+    for s in [
+        "doq://[2606:4700:4700::1111]:853",
+        "tls://[2606:4700:4700::1111]:853",
+    ] {
+        let protocol: DnsProtocol = s.parse().unwrap();
+        assert_eq!(protocol.hostname(), Some("2606:4700:4700::1111"));
+        assert_eq!(protocol.to_string(), s);
+        assert_eq!(
+            protocol.to_string().parse::<DnsProtocol>().unwrap(),
+            protocol
+        );
     }
 }
 
@@ -427,8 +408,6 @@ fn test_with_resolved_addr_ipv6() {
     assert!(sa.is_ipv6());
     assert_eq!(format!("{}", resolved), "udp://[2001:4860:4860::8888]:53");
 }
-
-// ── HTTPS/H3 pre-resolved addresses tests ──────────────────────────────────
 
 #[test]
 fn test_parse_https_starts_with_empty_resolved_addrs() {

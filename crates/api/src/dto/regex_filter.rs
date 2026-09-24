@@ -2,12 +2,13 @@ use ferrous_dns_domain::RegexFilter;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RegexFilterResponse {
     pub id: i64,
     pub name: String,
     pub pattern: String,
-    pub action: String,
+    #[schema(value_type = String)]
+    pub action: &'static str,
     pub group_id: i64,
     pub comment: Option<String>,
     pub enabled: bool,
@@ -21,7 +22,7 @@ impl RegexFilterResponse {
             id: f.id.unwrap_or(0),
             name: f.name.to_string(),
             pattern: f.pattern.to_string(),
-            action: f.action.to_str().to_string(),
+            action: f.action.to_str(),
             group_id: f.group_id,
             comment: f.comment.as_ref().map(|s| s.to_string()),
             enabled: f.enabled,

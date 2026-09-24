@@ -16,27 +16,6 @@ pub struct BlocklistSource {
 }
 
 impl BlocklistSource {
-    pub fn new(
-        id: Option<i64>,
-        name: Arc<str>,
-        url: Option<Arc<str>>,
-        group_ids: Vec<i64>,
-        comment: Option<Arc<str>>,
-        enabled: bool,
-    ) -> Self {
-        Self {
-            id,
-            name,
-            url,
-            group_ids,
-            comment,
-            enabled,
-            created_at: None,
-            updated_at: None,
-            last_synced_at: None,
-        }
-    }
-
     pub fn validate_name(name: &str) -> Result<(), String> {
         validators::validate_source_name(name, "Blocklist source")
     }

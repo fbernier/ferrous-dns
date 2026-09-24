@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{BlocklistSource, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -58,10 +59,7 @@ impl UpdateBlocklistSourceUseCase {
 
         if let Some(ref ids) = group_ids {
             for &gid in ids {
-                self.group_repo
-                    .get_by_id(gid)
-                    .await?
-                    .ok_or(DomainError::GroupNotFound(gid))?;
+                require_group(self.group_repo.as_ref(), gid).await?;
             }
         }
 

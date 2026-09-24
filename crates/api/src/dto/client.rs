@@ -1,3 +1,4 @@
+use ferrous_dns_domain::Client;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -11,6 +12,21 @@ pub struct ClientResponse {
     pub last_seen: String,
     pub query_count: u64,
     pub group_id: Option<i64>,
+}
+
+impl From<Client> for ClientResponse {
+    fn from(c: Client) -> Self {
+        Self {
+            id: c.id.unwrap_or(0),
+            ip_address: c.ip_address.to_string(),
+            mac_address: c.mac_address.map(|s| s.to_string()),
+            hostname: c.hostname.map(|s| s.to_string()),
+            first_seen: c.first_seen.unwrap_or_default(),
+            last_seen: c.last_seen.unwrap_or_default(),
+            query_count: c.query_count,
+            group_id: c.group_id,
+        }
+    }
 }
 
 #[derive(Serialize, Debug, ToSchema)]

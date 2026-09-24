@@ -1,18 +1,18 @@
-use super::super::types::{DnskeyRecord, DsRecord};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+/// A cached, already-authenticated RRset with its expiry.
 #[derive(Debug, Clone)]
-pub struct DnskeyEntry {
-    pub(super) keys: Arc<[DnskeyRecord]>,
-    pub(super) expires_at: Instant,
+pub struct CacheEntry<T> {
+    items: Arc<[T]>,
+    expires_at: Instant,
 }
 
-impl DnskeyEntry {
-    pub fn new(keys: Vec<DnskeyRecord>, ttl_secs: u32) -> Self {
+impl<T> CacheEntry<T> {
+    pub fn new(items: Vec<T>, ttl_secs: u32) -> Self {
         Self {
-            keys: Arc::from(keys),
-            expires_at: Instant::now() + std::time::Duration::from_secs(ttl_secs as u64),
+            items: Arc::from(items),
+            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl_secs)),
         }
     }
 
@@ -20,30 +20,7 @@ impl DnskeyEntry {
         Instant::now() >= self.expires_at
     }
 
-    pub fn keys(&self) -> &Arc<[DnskeyRecord]> {
-        &self.keys
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DsEntry {
-    pub(super) records: Arc<[DsRecord]>,
-    pub(super) expires_at: Instant,
-}
-
-impl DsEntry {
-    pub fn new(records: Vec<DsRecord>, ttl_secs: u32) -> Self {
-        Self {
-            records: Arc::from(records),
-            expires_at: Instant::now() + std::time::Duration::from_secs(ttl_secs as u64),
-        }
-    }
-
-    pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.expires_at
-    }
-
-    pub fn records(&self) -> &Arc<[DsRecord]> {
-        &self.records
+    pub fn items(&self) -> &Arc<[T]> {
+        &self.items
     }
 }

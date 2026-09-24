@@ -1,4 +1,5 @@
 use super::rollup::{minute_bucket, MinuteRollup};
+use crate::repositories::sql_ts;
 use chrono::Utc;
 use compact_str::{CompactString, ToCompactString};
 use ferrous_dns_domain::{BlockSource, QueryLog, QuerySource, RecordType};
@@ -101,7 +102,8 @@ pub(super) async fn flush_loop(
     flush_interval_ms: u64,
 ) {
     let mut batch: Vec<QueryLogEntry> = Vec::with_capacity(max_batch_size);
-    let mut flush_interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
+    // `interval` panics on a zero period, which would silently kill this task.
+    let mut flush_interval = tokio::time::interval(Duration::from_millis(flush_interval_ms.max(1)));
 
     loop {
         tokio::select! {
@@ -143,7 +145,7 @@ async fn flush_batch(pool: &SqlitePool, batch: &mut Vec<QueryLogEntry>) {
     // One clock read stamps the raw rows and picks the rollup bucket, so the two
     // can never disagree about which minute a row belongs to.
     let now = Utc::now();
-    let created_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let created_at = sql_ts(now);
     let bucket = minute_bucket(now.timestamp());
 
     let mut tx = match pool.begin().await {

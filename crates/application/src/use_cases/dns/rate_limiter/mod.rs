@@ -2,6 +2,7 @@ mod subnet_key;
 mod token_bucket;
 mod whitelist_set;
 
+use super::coarse_timer::coarse_now_ns;
 use dashmap::DashMap;
 use ferrous_dns_domain::RateLimitConfig;
 use rustc_hash::FxBuildHasher;
@@ -9,12 +10,9 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use subnet_key::SubnetKey;
+use subnet_key::{SubnetGrouping, SubnetKey};
 use token_bucket::TokenBucket;
 use whitelist_set::WhitelistSet;
-
-/// NX burst capacity is this multiple of `nxdomain_per_second`.
-const NX_BURST_MULTIPLIER: u32 = 2;
 
 /// Outcome of a rate-limit check on the DNS hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +37,7 @@ pub struct DnsRateLimiter {
     qps: u32,
     burst: u32,
     nx_qps: u32,
-    v4_prefix: u8,
-    v6_prefix: u8,
+    grouping: SubnetGrouping,
     slip_ratio: u32,
     stale_ttl_ns: u64,
     whitelist: WhitelistSet,
@@ -49,7 +46,6 @@ pub struct DnsRateLimiter {
 }
 
 impl DnsRateLimiter {
-    /// Creates a rate limiter from configuration.
     pub fn new(config: &RateLimitConfig) -> Self {
         Self {
             enabled: config.enabled,
@@ -57,17 +53,15 @@ impl DnsRateLimiter {
             qps: config.queries_per_second,
             burst: config.burst_size,
             nx_qps: config.nxdomain_per_second,
-            v4_prefix: config.ipv4_prefix_len,
-            v6_prefix: config.ipv6_prefix_len,
+            grouping: SubnetGrouping::new(config.ipv4_prefix_len, config.ipv6_prefix_len),
             slip_ratio: config.slip_ratio,
-            stale_ttl_ns: config.stale_entry_ttl_secs * 1_000_000_000,
+            stale_ttl_ns: config.stale_entry_ttl_secs.saturating_mul(1_000_000_000),
             whitelist: WhitelistSet::from_cidrs(&config.whitelist),
             buckets: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             slip_counter: AtomicU64::new(0),
         }
     }
 
-    /// Creates a disabled limiter that always returns `Allow`.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -75,8 +69,7 @@ impl DnsRateLimiter {
             qps: 0,
             burst: 0,
             nx_qps: 0,
-            v4_prefix: 24,
-            v6_prefix: 56,
+            grouping: SubnetGrouping::new(24, 56),
             slip_ratio: 0,
             stale_ttl_ns: 0,
             whitelist: WhitelistSet::from_cidrs(&[]),
@@ -98,12 +91,13 @@ impl DnsRateLimiter {
         }
 
         let now_ns = coarse_now_ns();
-        let key = SubnetKey::from_ip(client_ip, self.v4_prefix, self.v6_prefix);
+        let key = self.grouping.key(client_ip);
 
         let allowed = {
-            let bucket = self.buckets.entry(key).or_insert_with(|| {
-                TokenBucket::new(self.burst, self.nx_qps * NX_BURST_MULTIPLIER, now_ns)
-            });
+            let bucket = self
+                .buckets
+                .entry(key)
+                .or_insert_with(|| TokenBucket::new(self.burst, self.nx_qps, now_ns));
             bucket.try_consume(now_ns, self.qps, self.burst, is_nxdomain, self.nx_qps)
         };
 
@@ -136,7 +130,7 @@ impl DnsRateLimiter {
         if self.whitelist.contains(client_ip) {
             return true;
         }
-        let key = SubnetKey::from_ip(client_ip, self.v4_prefix, self.v6_prefix);
+        let key = self.grouping.key(client_ip);
         match self.buckets.get(&key) {
             Some(bucket) => bucket.has_tokens(),
             None => true,
@@ -162,27 +156,6 @@ impl DnsRateLimiter {
             }
         });
     }
-}
-
-#[cfg(target_os = "linux")]
-#[inline]
-fn coarse_now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: ts is stack-allocated and valid; clock_gettime only writes into the provided pointer.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-#[cfg(not(target_os = "linux"))]
-#[inline]
-fn coarse_now_ns() -> u64 {
-    use std::sync::LazyLock;
-    use std::time::Instant;
-    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    START.elapsed().as_nanos() as u64
 }
 
 #[cfg(test)]

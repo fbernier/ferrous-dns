@@ -17,11 +17,11 @@ pub(crate) struct TokenBucket {
 }
 
 impl TokenBucket {
-    pub(crate) fn new(burst: u32, nx_burst: u32, now_ns: u64) -> Self {
+    pub(crate) fn new(burst: u32, nx_qps: u32, now_ns: u64) -> Self {
         Self {
             tokens_milli: AtomicU64::new(burst as u64 * MILLI),
             last_refill_ns: AtomicU64::new(now_ns),
-            nxdomain_tokens_milli: AtomicU64::new(nx_burst as u64 * MILLI),
+            nxdomain_tokens_milli: AtomicU64::new(nx_burst_milli(nx_qps)),
         }
     }
 
@@ -78,9 +78,17 @@ impl TokenBucket {
         add_capped(&self.tokens_milli, add_milli as u64, cap_milli);
 
         let nx_add = (elapsed_ns as u128 * nx_qps as u128 * MILLI as u128) / 1_000_000_000;
-        let nx_cap = nx_qps as u64 * MILLI * NX_BURST_MULTIPLIER;
-        add_capped(&self.nxdomain_tokens_milli, nx_add as u64, nx_cap);
+        add_capped(
+            &self.nxdomain_tokens_milli,
+            nx_add as u64,
+            nx_burst_milli(nx_qps),
+        );
     }
+}
+
+#[inline]
+fn nx_burst_milli(nx_qps: u32) -> u64 {
+    nx_qps as u64 * MILLI * NX_BURST_MULTIPLIER
 }
 
 #[inline]
@@ -129,7 +137,7 @@ mod tests {
 
     #[test]
     fn consumes_within_burst() {
-        let bucket = TokenBucket::new(BURST, NX_QPS * 2, 0);
+        let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         for _ in 0..BURST {
             assert!(bucket.try_consume(0, QPS, BURST, false, NX_QPS));
         }
@@ -137,7 +145,7 @@ mod tests {
 
     #[test]
     fn refuses_after_burst_exhausted() {
-        let bucket = TokenBucket::new(BURST, NX_QPS * 2, 0);
+        let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         for _ in 0..BURST {
             bucket.try_consume(0, QPS, BURST, false, NX_QPS);
         }
@@ -146,7 +154,7 @@ mod tests {
 
     #[test]
     fn refills_over_time() {
-        let bucket = TokenBucket::new(BURST, NX_QPS * 2, 0);
+        let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         // Drain all tokens
         for _ in 0..BURST {
             bucket.try_consume(0, QPS, BURST, false, NX_QPS);
@@ -159,7 +167,7 @@ mod tests {
 
     #[test]
     fn nxdomain_uses_separate_budget() {
-        let bucket = TokenBucket::new(BURST, NX_QPS * 2, 0);
+        let bucket = TokenBucket::new(BURST, NX_QPS, 0);
 
         // Drain NX budget (NX_QPS * 2 = 6 tokens)
         for _ in 0..(NX_QPS * 2) {
@@ -174,7 +182,7 @@ mod tests {
 
     #[test]
     fn partial_refill_fraction_of_second() {
-        let bucket = TokenBucket::new(1, NX_QPS * 2, 0);
+        let bucket = TokenBucket::new(1, NX_QPS, 0);
         // Drain the single token
         assert!(bucket.try_consume(0, QPS, 1, false, NX_QPS));
         assert!(!bucket.try_consume(0, QPS, 1, false, NX_QPS));
@@ -185,7 +193,7 @@ mod tests {
 
     #[test]
     fn refill_does_not_exceed_cap() {
-        let bucket = TokenBucket::new(BURST, NX_QPS * 2, 0);
+        let bucket = TokenBucket::new(BURST, NX_QPS, 0);
         // Consume 1, then advance a long time
         bucket.try_consume(0, QPS, BURST, false, NX_QPS);
         // Advance 10 seconds — would add 100 tokens, but cap is BURST (5)
@@ -201,7 +209,7 @@ mod tests {
 
     #[test]
     fn last_refill_ns_tracks_time() {
-        let bucket = TokenBucket::new(BURST, NX_QPS * 2, 42);
+        let bucket = TokenBucket::new(BURST, NX_QPS, 42);
         assert_eq!(bucket.last_refill_ns(), 42);
         bucket.try_consume(1000, QPS, BURST, false, NX_QPS);
         assert_eq!(bucket.last_refill_ns(), 1000);

@@ -1,10 +1,7 @@
-use super::balanced::BalancedStrategy;
-use super::failover::FailoverStrategy;
 use super::health::HealthChecker;
-use super::parallel::ParallelStrategy;
 use super::strategy::{QueryContext, ServerDisplays, Strategy, UpstreamResult};
 use crate::dns::forwarding::{HardeningOpts, MessageBuilder, ResponseParser};
-use crate::dns::transport::resolver;
+use crate::dns::transport::{resolver, split_authority};
 use arc_swap::ArcSwap;
 use ferrous_dns_domain::{DnsProtocol, DomainError, RecordType, UpstreamPool, UpstreamStrategy};
 use smallvec::SmallVec;
@@ -12,6 +9,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Resolved addresses kept per family when a hostname upstream is expanded.
+const MAX_ADDRS_PER_FAMILY: usize = 4;
 
 pub struct PoolManager {
     /// Live set of pools, swappable at runtime so upstream changes apply without a restart.
@@ -34,7 +34,7 @@ struct PoolWithStrategy {
     server_protocols: Vec<Arc<DnsProtocol>>,
     server_groups: Vec<ServerGroup>,
     name_arc: Arc<str>,
-    server_displays: Arc<ServerDisplays>,
+    server_displays: ServerDisplays,
 }
 
 /// An opaque, fully-rebuilt pool set produced by [`PoolManager::prepare`] and ready
@@ -51,12 +51,7 @@ impl PoolManager {
         Ok(Self {
             pools: ArcSwap::from_pointee(pools_with_strategy),
             health_checker,
-            // Cookie echo validation is always-on (safe + graceful); 0x20 case
-            // randomization is opt-in via `with_hardening`.
-            hardening: HardeningOpts {
-                cookie: true,
-                qname_0x20: false,
-            },
+            hardening: HardeningOpts::default(),
         })
     }
 
@@ -101,18 +96,14 @@ impl PoolManager {
 
     async fn build_pools(pools: Vec<UpstreamPool>) -> Result<Vec<PoolWithStrategy>, DomainError> {
         if pools.is_empty() {
-            return Err(DomainError::InvalidDomainName(
+            return Err(DomainError::ConfigError(
                 "At least one pool must be configured".into(),
             ));
         }
 
         let mut pools_with_strategy = Vec::new();
         for pool in pools {
-            let strategy = match pool.strategy {
-                UpstreamStrategy::Parallel => Strategy::Parallel(ParallelStrategy::new()),
-                UpstreamStrategy::Balanced => Strategy::Balanced(BalancedStrategy::new()),
-                UpstreamStrategy::Failover => Strategy::Failover(FailoverStrategy::new()),
-            };
+            let strategy = Strategy::new(pool.strategy);
 
             let server_entries: Result<Vec<(Arc<str>, DnsProtocol)>, _> = pool
                 .servers
@@ -121,10 +112,7 @@ impl PoolManager {
                     s.parse::<DnsProtocol>()
                         .map(|proto| (Arc::from(s.as_str()), proto))
                         .map_err(|e| {
-                            DomainError::InvalidDomainName(format!(
-                                "Invalid endpoint '{}': {}",
-                                s, e
-                            ))
+                            DomainError::ConfigError(format!("Invalid endpoint '{}': {}", s, e))
                         })
                 })
                 .collect();
@@ -137,12 +125,10 @@ impl PoolManager {
                 .iter()
                 .flat_map(|g| g.protocols.iter().cloned())
                 .collect();
-            let server_displays: Arc<ServerDisplays> = Arc::new(
-                server_protocols
-                    .iter()
-                    .map(|p| (Arc::clone(p), Arc::from(p.to_string())))
-                    .collect(),
-            );
+            let server_displays: ServerDisplays = server_protocols
+                .iter()
+                .map(|p| (Arc::clone(p), Arc::from(p.to_string())))
+                .collect();
             pools_with_strategy.push(PoolWithStrategy {
                 config: pool,
                 strategy,
@@ -183,7 +169,7 @@ impl PoolManager {
                                     "{} resolved to {} upstream servers (limited to {} per family)",
                                     hostname,
                                     limited.len(),
-                                    4
+                                    MAX_ADDRS_PER_FAMILY
                                 );
                                 let protocols: Vec<Arc<DnsProtocol>> = limited
                                     .iter()
@@ -212,9 +198,7 @@ impl PoolManager {
                         }
                     }
                     DnsProtocol::Https { hostname, .. } | DnsProtocol::H3 { hostname, .. } => {
-                        let host = hostname.to_string();
-                        let port = Self::extract_port_from_hostname(&host, 443);
-                        let clean_host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
+                        let (clean_host, port) = split_authority(hostname, 443);
                         match resolver::resolve_all(clean_host, port, Duration::from_secs(5)).await
                         {
                             Ok(addrs) => {
@@ -255,7 +239,6 @@ impl PoolManager {
     }
 
     fn limit_resolved_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
-        const MAX_ADDRS_PER_FAMILY: usize = 4;
         let mut ipv4_count = 0usize;
         let mut ipv6_count = 0usize;
         addrs
@@ -274,13 +257,6 @@ impl PoolManager {
             .collect()
     }
 
-    fn extract_port_from_hostname(hostname: &str, default: u16) -> u16 {
-        hostname
-            .rsplit_once(':')
-            .and_then(|(_, p)| p.parse::<u16>().ok())
-            .unwrap_or(default)
-    }
-
     pub async fn query(
         &self,
         domain: &Arc<str>,
@@ -296,10 +272,8 @@ impl PoolManager {
             %domain, "Starting load balancer query"
         );
 
-        let (bytes, validator) =
+        let (query_bytes, validator) =
             MessageBuilder::build_query_hardened(domain, record_type, dnssec_ok, self.hardening)?;
-        let query_bytes: Arc<[u8]> = Arc::from(bytes);
-        let validator = Arc::new(validator);
 
         for pool in pools.iter() {
             let healthy_refs: SmallVec<[&Arc<DnsProtocol>; 16]> =
@@ -321,7 +295,7 @@ impl PoolManager {
                 servers: &healthy_refs,
                 domain,
                 timeout_ms,
-                query_bytes: Arc::clone(&query_bytes),
+                query_bytes: &query_bytes,
                 validator: &validator,
                 pool_name: &pool.name_arc,
                 server_displays: &pool.server_displays,
@@ -359,14 +333,6 @@ impl PoolManager {
             .load()
             .iter()
             .flat_map(|p| p.server_protocols.iter().cloned())
-            .collect()
-    }
-
-    pub fn get_all_protocols(&self) -> Vec<DnsProtocol> {
-        self.pools
-            .load()
-            .iter()
-            .flat_map(|p| p.server_protocols.iter().map(|p| (**p).clone()))
             .collect()
     }
 

@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub const TTL_SECS: u64 = 60;
-const L0_CAPACITY: usize = 256;
+const L0_CAPACITY: NonZeroUsize = match NonZeroUsize::new(256) {
+    Some(capacity) => capacity,
+    None => NonZeroUsize::MIN,
+};
 
 /// Monotonic counter bumped when decision caches should be invalidated.
 /// Thread-local L0 entries written under an older epoch are treated as stale.
@@ -78,10 +81,7 @@ type BlockL0Cache = LruCache<u64, (u8, u64, u64), FxBuildHasher>;
 
 thread_local! {
     static BLOCK_L0: RefCell<BlockL0Cache> =
-        RefCell::new(LruCache::with_hasher(
-            NonZeroUsize::new(L0_CAPACITY).unwrap(),
-            FxBuildHasher,
-        ));
+        RefCell::new(LruCache::with_hasher(L0_CAPACITY, FxBuildHasher));
 }
 
 #[inline]
@@ -118,12 +118,9 @@ type L1Shard = Mutex<LruCache<u64, (u8, u64), FxBuildHasher>>;
 
 /// Shared L1 decision cache: `(domain, group)` hash -> `(encoded verdict, expiry)`.
 ///
-/// Sharded LRU, so lookup, insert and eviction are all O(1). The previous
-/// implementation evicted by scanning the whole map for expired entries and
-/// then scanning it again for the single oldest one. Once the cache was full
-/// and nothing had expired yet — the steady state whenever the working set is
-/// larger than the cache — that cost two full passes over 100k entries per
-/// insert, holding shard locks throughout.
+/// Sharded LRU, so lookup, insert and eviction are all O(1): a full cache
+/// whose entries have not expired yet — the steady state once the working set
+/// outgrows it — evicts without scanning.
 pub struct BlockDecisionCache {
     shards: Box<[L1Shard]>,
     shard_mask: u64,
@@ -138,8 +135,8 @@ impl BlockDecisionCache {
     /// effective total is the next multiple of `L1_SHARDS`.
     fn with_capacity(total_capacity: usize) -> Self {
         const _: () = assert!(L1_SHARDS.is_power_of_two());
-        let per_shard = NonZeroUsize::new(total_capacity.div_ceil(L1_SHARDS).max(1))
-            .expect("per-shard capacity is at least 1");
+        let per_shard =
+            NonZeroUsize::new(total_capacity.div_ceil(L1_SHARDS)).unwrap_or(NonZeroUsize::MIN);
         Self {
             shards: (0..L1_SHARDS)
                 .map(|_| Mutex::new(LruCache::with_hasher(per_shard, FxBuildHasher)))
@@ -373,12 +370,10 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
-    /// The regression this whole structure exists to prevent: eviction used to
-    /// scan every entry twice per insert once the cache was full, costing ~2.4ms
-    /// per insert at this capacity. O(1) eviction keeps it in the nanoseconds.
-    /// The bound below is ~1000x looser than the measured cost and still ~48x
-    /// below the scanning implementation, so it discriminates without being
-    /// sensitive to machine load.
+    /// Insert into a full cache must evict in constant time: scanning every
+    /// entry twice per insert costs ~2.4ms at this capacity. The bound below
+    /// is ~1000x looser than the measured cost and still ~48x below a scan,
+    /// so it discriminates without being sensitive to machine load.
     #[test]
     fn insert_cost_stays_flat_when_the_cache_is_full() {
         let cache = BlockDecisionCache::with_capacity(L1_CAPACITY);

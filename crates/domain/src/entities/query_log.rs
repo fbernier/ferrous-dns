@@ -75,10 +75,6 @@ impl QuerySource {
             QuerySource::DnssecValidation => "dnssec_validation",
         }
     }
-
-    pub fn is_internal(&self) -> bool {
-        matches!(self, QuerySource::Internal | QuerySource::DnssecValidation)
-    }
 }
 
 impl std::fmt::Display for QuerySource {
@@ -212,7 +208,7 @@ pub struct QueryLog {
     pub block_source: Option<BlockSource>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryStats {
     pub queries_total: u64,
     pub queries_blocked: u64,
@@ -315,7 +311,7 @@ impl QueryStats {
                 })
                 .collect();
 
-            distribution.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            distribution.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             self.record_type_distribution = distribution;
         } else {
@@ -336,50 +332,4 @@ impl QueryStats {
         types.truncate(n);
         types
     }
-
-    pub fn type_percentage(&self, record_type: RecordType) -> f64 {
-        self.record_type_distribution
-            .iter()
-            .find(|(rt, _)| *rt == record_type)
-            .map(|(_, pct)| *pct)
-            .unwrap_or(0.0)
-    }
-
-    pub fn type_count(&self, record_type: RecordType) -> u64 {
-        *self.queries_by_type.get(&record_type).unwrap_or(&0)
-    }
-}
-
-impl Default for QueryStats {
-    fn default() -> Self {
-        Self {
-            queries_total: 0,
-            queries_blocked: 0,
-            queries_rate_limited: 0,
-            queries_malware_detected: 0,
-            queries_dnssec_bogus: 0,
-            queries_dns64_synthesized: 0,
-            unique_clients: 0,
-            uptime_seconds: 0,
-            cache_hit_rate: 0.0,
-            avg_query_time_ms: 0.0,
-            avg_cache_time_ms: 0.0,
-            avg_upstream_time_ms: 0.0,
-            source_stats: HashMap::new(),
-            queries_by_type: HashMap::new(),
-            most_queried_type: None,
-            record_type_distribution: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CacheStats {
-    pub total_entries: usize,
-    pub total_hits: u64,
-    pub total_misses: u64,
-    pub total_updates: u64,
-    pub total_evictions: u64,
-    pub hit_rate: f64,
-    pub avg_ttl_seconds: u64,
 }

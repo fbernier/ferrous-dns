@@ -1,18 +1,16 @@
-use super::authority as auth_check;
+use super::authority::{self as auth_check, now_secs, to_fqdn};
 use super::denial::prove_denial;
 use crate::dns::dnssec::cache::DnssecCache;
-use crate::dns::dnssec::crypto::SignatureVerifier;
+use crate::dns::dnssec::crypto;
 use crate::dns::dnssec::trust_anchor::TrustAnchorStore;
 use crate::dns::dnssec::types::{DnskeyRecord, DsRecord, RrsigRecord};
-use crate::dns::forwarding::record_type_map::RecordTypeMapper;
 use crate::dns::load_balancer::PoolManager;
 use ferrous_dns_domain::{DnssecStatus, DomainError, RecordType};
 use hickory_proto::dnssec::rdata::DNSSECRData;
 use hickory_proto::dnssec::PublicKey;
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::{Name, RData, Record};
+use hickory_proto::rr::{RData, Record};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -36,55 +34,6 @@ fn is_transient_error(e: &DomainError) -> bool {
 /// can advertise a negative TTL of days; capping it bounds how long a delegation
 /// stays pinned to Insecure after the zone is signed.
 const MAX_NEGATIVE_DS_TTL: u32 = 3600;
-
-/// Builds an FQDN (trailing dot) hickory [`Name`], or `None` on parse error.
-fn to_fqdn(domain: &str) -> Option<Name> {
-    let fqdn = if domain.ends_with('.') {
-        domain.to_owned()
-    } else {
-        format!("{domain}.")
-    };
-    Name::from_str(&fqdn).ok()
-}
-
-/// Current UNIX time in seconds, clamped to `u32` (the RRSIG timestamp domain).
-fn now_secs() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationResult {
-    Secure,
-
-    Insecure,
-
-    Bogus,
-
-    Indeterminate,
-}
-
-impl ValidationResult {
-    /// Canonical status string, sourced from the domain [`DnssecStatus`] enum so
-    /// the validator's output cannot drift from the strings the rest of the
-    /// system compares against and persists.
-    pub fn as_str(&self) -> &'static str {
-        DnssecStatus::from(*self).as_str()
-    }
-}
-
-impl From<ValidationResult> for DnssecStatus {
-    fn from(value: ValidationResult) -> Self {
-        match value {
-            ValidationResult::Secure => DnssecStatus::Secure,
-            ValidationResult::Insecure => DnssecStatus::Insecure,
-            ValidationResult::Bogus => DnssecStatus::Bogus,
-            ValidationResult::Indeterminate => DnssecStatus::Indeterminate,
-        }
-    }
-}
 
 struct DnskeyQueryResult {
     keys: Arc<[DnskeyRecord]>,
@@ -124,14 +73,40 @@ struct DsQueryResult {
     rcode: ResponseCode,
 }
 
+/// True when any of `rrsigs` verifies `raw` (the RRset owned by `owner`)
+/// against any of `keys`.
+fn any_rrsig_verifies(
+    rrsigs: &[RrsigRecord],
+    keys: &[DnskeyRecord],
+    owner: &str,
+    raw: &[Record],
+    now: u32,
+) -> bool {
+    for rrsig in rrsigs {
+        for key in keys {
+            match crypto::verify_rrsig(rrsig, key, owner, raw, now) {
+                Ok(true) => {
+                    debug!(owner = %owner, key_tag = key.calculate_key_tag(), "RRSIG verified");
+                    return true;
+                }
+                Ok(false) => {}
+                Err(e) => warn!(owner = %owner, error = %e, "RRSIG verification error"),
+            }
+        }
+    }
+    false
+}
+
 pub struct ChainVerifier {
     pool_manager: Arc<PoolManager>,
     trust_store: TrustAnchorStore,
-    crypto_verifier: SignatureVerifier,
 
     validated_keys: HashMap<String, Arc<[DnskeyRecord]>>,
 
     dnssec_cache: Arc<DnssecCache>,
+
+    /// Upstream timeout for the DS/DNSKEY lookups of the walk.
+    timeout_ms: u64,
 }
 
 impl ChainVerifier {
@@ -139,34 +114,23 @@ impl ChainVerifier {
         pool_manager: Arc<PoolManager>,
         trust_store: TrustAnchorStore,
         dnssec_cache: Arc<DnssecCache>,
+        timeout_ms: u64,
     ) -> Self {
         Self {
             pool_manager,
             trust_store,
-            crypto_verifier: SignatureVerifier,
             validated_keys: HashMap::new(),
             dnssec_cache,
+            timeout_ms,
         }
     }
 
-    pub fn trust_anchor_count(&self) -> usize {
-        self.trust_store.len()
-    }
-
-    pub async fn verify_chain(
-        &mut self,
-        domain: &str,
-        record_type: RecordType,
-    ) -> Result<ValidationResult, DomainError> {
-        debug!(
-            domain = %domain,
-            record_type = ?record_type,
-            "Starting DNSSEC chain verification"
-        );
+    pub async fn verify_chain(&mut self, domain: &str) -> DnssecStatus {
+        debug!(domain = %domain, "Starting DNSSEC chain verification");
 
         if !self.trust_store.has_anchor_for(".") {
             warn!("No root trust anchor configured");
-            return Ok(ValidationResult::Indeterminate);
+            return DnssecStatus::Indeterminate;
         }
 
         let labels = Self::split_domain(domain);
@@ -183,9 +147,9 @@ impl ChainVerifier {
             Err(e) => {
                 warn!(error = %e, "Root key bootstrap failed");
                 if is_transient_error(&e) {
-                    return Ok(ValidationResult::Indeterminate);
+                    return DnssecStatus::Indeterminate;
                 }
-                return Ok(ValidationResult::Bogus);
+                return DnssecStatus::Bogus;
             }
         }
 
@@ -217,7 +181,7 @@ impl ChainVerifier {
                         child = %child_domain,
                         "Insecure delegation: no DS records, chain is unsigned"
                     );
-                    return Ok(ValidationResult::Insecure);
+                    return DnssecStatus::Insecure;
                 }
                 Err(e) => {
                     warn!(
@@ -231,9 +195,9 @@ impl ChainVerifier {
                     // transient upstream issue doesn't SERVFAIL signed domains in
                     // Strict mode; only genuine crypto/structural failures are Bogus.
                     if is_transient_error(&e) {
-                        return Ok(ValidationResult::Indeterminate);
+                        return DnssecStatus::Indeterminate;
                     }
-                    return Ok(ValidationResult::Bogus);
+                    return DnssecStatus::Bogus;
                 }
             }
 
@@ -245,7 +209,7 @@ impl ChainVerifier {
             "Chain of trust validated successfully"
         );
 
-        Ok(ValidationResult::Secure)
+        DnssecStatus::Secure
     }
 
     async fn validate_delegation(
@@ -254,8 +218,18 @@ impl ChainVerifier {
         child_domain: &str,
     ) -> Result<(), DomainError> {
         let (ds_result, dnskey_result) = tokio::join!(
-            Self::fetch_ds(&self.dnssec_cache, &self.pool_manager, child_domain),
-            Self::fetch_dnskey(&self.dnssec_cache, &self.pool_manager, child_domain),
+            Self::fetch_ds(
+                &self.dnssec_cache,
+                &self.pool_manager,
+                child_domain,
+                self.timeout_ms
+            ),
+            Self::fetch_dnskey(
+                &self.dnssec_cache,
+                &self.pool_manager,
+                child_domain,
+                self.timeout_ms
+            ),
         );
 
         let ds_result = ds_result?;
@@ -296,7 +270,7 @@ impl ChainVerifier {
                 ));
             };
 
-            if ds_result.rrsigs.is_empty() || ds_result.raw_records.is_empty() {
+            if ds_result.rrsigs.is_empty() {
                 warn!(
                     parent = %parent_domain,
                     child = %child_domain,
@@ -307,34 +281,13 @@ impl ChainVerifier {
                 ));
             }
 
-            let now = now_secs();
-            let mut ds_authentic = false;
-            'ds: for rrsig in &ds_result.rrsigs {
-                for key in parent_keys.iter() {
-                    match self.crypto_verifier.verify_rrsig(
-                        rrsig,
-                        key,
-                        child_domain,
-                        &ds_result.raw_records,
-                        now,
-                    ) {
-                        Ok(true) => {
-                            debug!(
-                                parent = %parent_domain,
-                                child = %child_domain,
-                                key_tag = key.calculate_key_tag(),
-                                "DS RRSIG verified against parent key"
-                            );
-                            ds_authentic = true;
-                            break 'ds;
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            warn!(error = %e, "DS RRSIG verification error");
-                        }
-                    }
-                }
-            }
+            let ds_authentic = any_rrsig_verifies(
+                &ds_result.rrsigs,
+                &parent_keys,
+                child_domain,
+                &ds_result.raw_records,
+                now_secs(),
+            );
 
             if !ds_authentic {
                 warn!(
@@ -363,7 +316,7 @@ impl ChainVerifier {
         if !ds_result
             .records
             .iter()
-            .any(|ds| SignatureVerifier::is_supported_algorithm(ds.algorithm))
+            .any(|ds| crypto::is_supported_algorithm(ds.algorithm))
         {
             debug!(
                 domain = %child_domain,
@@ -385,7 +338,7 @@ impl ChainVerifier {
 
         for ds in ds_result.records.iter() {
             for dnskey in dnskey_result.keys.iter() {
-                match self.crypto_verifier.verify_ds(ds, dnskey, child_domain) {
+                match crypto::verify_ds(ds, dnskey, child_domain) {
                     Ok(true) => {
                         debug!(
                             domain = %child_domain,
@@ -441,34 +394,13 @@ impl ChainVerifier {
                 ));
             }
 
-            let now = now_secs();
-
-            let mut rrsig_ok = false;
-            'outer: for rrsig in &dnskey_result.rrsigs {
-                for key in &validated_keys {
-                    match self.crypto_verifier.verify_rrsig(
-                        rrsig,
-                        key,
-                        child_domain,
-                        &dnskey_result.raw_records,
-                        now,
-                    ) {
-                        Ok(true) => {
-                            debug!(
-                                domain = %child_domain,
-                                key_tag = key.calculate_key_tag(),
-                                "DNSKEY RRSIG verified"
-                            );
-                            rrsig_ok = true;
-                            break 'outer;
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            warn!(error = %e, "RRSIG verification error");
-                        }
-                    }
-                }
-            }
+            let rrsig_ok = any_rrsig_verifies(
+                &dnskey_result.rrsigs,
+                &validated_keys,
+                child_domain,
+                &dnskey_result.raw_records,
+                now_secs(),
+            );
 
             if !rrsig_ok {
                 warn!(
@@ -523,12 +455,10 @@ impl ChainVerifier {
             return Ok(());
         }
 
-        let (nsec3s, nsecs) = auth_check::collect_verified_denial(
-            &ds_result.authority,
-            &self.crypto_verifier,
-            now_secs(),
-            &|zone| self.validated_keys.get(zone).cloned(),
-        );
+        let (nsec3s, nsecs) =
+            auth_check::collect_verified_denial(&ds_result.authority, now_secs(), &|zone| {
+                self.validated_keys.get(zone).cloned()
+            });
 
         if nsec3s.is_empty() && nsecs.is_empty() {
             warn!(
@@ -558,7 +488,7 @@ impl ChainVerifier {
         );
 
         match result {
-            ValidationResult::Bogus => {
+            DnssecStatus::Bogus => {
                 warn!(
                     parent = %parent_domain,
                     child = %child_domain,
@@ -573,7 +503,7 @@ impl ChainVerifier {
             // an NSEC3 opt-out with "the records present prove nothing", and the
             // latter is exactly where a partial forgery lands — caching it would
             // turn one won race into a downgrade that outlives the attack.
-            ValidationResult::Secure => {
+            DnssecStatus::Secure => {
                 if let Some(ttl) = ds_result.negative_ttl.filter(|ttl| *ttl > 0) {
                     self.dnssec_cache.cache_ds(
                         child_domain,
@@ -583,7 +513,7 @@ impl ChainVerifier {
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            DnssecStatus::Insecure | DnssecStatus::Indeterminate => Ok(()),
         }
     }
 
@@ -591,6 +521,7 @@ impl ChainVerifier {
         cache: &DnssecCache,
         pool: &PoolManager,
         domain: &str,
+        timeout_ms: u64,
     ) -> Result<DsQueryResult, DomainError> {
         if let Some(records) = cache.get_ds(domain) {
             debug!(
@@ -613,7 +544,9 @@ impl ChainVerifier {
         debug!(domain = %domain, "DS cache miss, querying DNS");
 
         let domain_arc: Arc<str> = Arc::from(domain);
-        let result = pool.query(&domain_arc, &RecordType::DS, 5000, true).await;
+        let result = pool
+            .query(&domain_arc, &RecordType::DS, timeout_ms, true)
+            .await;
 
         match result {
             Ok(upstream_result) => {
@@ -648,27 +581,10 @@ impl ChainVerifier {
                                 digest: ds.digest().to_vec(),
                             });
                         }
-                        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
-                            let input = rrsig.input();
-                            if input.type_covered != hickory_proto::rr::RecordType::DS {
-                                continue;
-                            }
-                            let Some(type_covered) =
-                                RecordTypeMapper::from_hickory(input.type_covered)
-                            else {
-                                continue;
-                            };
-                            rrsigs.push(RrsigRecord {
-                                type_covered,
-                                algorithm: u8::from(input.algorithm),
-                                labels: input.num_labels,
-                                original_ttl: input.original_ttl,
-                                signature_expiration: input.sig_expiration.get(),
-                                signature_inception: input.sig_inception.get(),
-                                key_tag: input.key_tag,
-                                signer_name: input.signer_name.to_string(),
-                                signature: rrsig.sig().to_vec(),
-                            });
+                        RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                            if rrsig.input().type_covered == hickory_proto::rr::RecordType::DS =>
+                        {
+                            rrsigs.extend(RrsigRecord::from_hickory(rrsig));
                         }
                         _ => {}
                     }
@@ -693,7 +609,7 @@ impl ChainVerifier {
                     raw_records,
                     from_cache: false,
                     ttl,
-                    authority: upstream_result.response.message.authorities.to_vec(),
+                    authority: upstream_result.response.message.authorities,
                     negative_ttl: upstream_result.response.negative_soa_ttl,
                     rcode: upstream_result.response.rcode,
                 })
@@ -709,6 +625,7 @@ impl ChainVerifier {
         cache: &DnssecCache,
         pool: &PoolManager,
         domain: &str,
+        timeout_ms: u64,
     ) -> Result<DnskeyQueryResult, DomainError> {
         if let Some(keys) = cache.get_dnskey(domain) {
             debug!(
@@ -729,7 +646,7 @@ impl ChainVerifier {
 
         let domain_arc: Arc<str> = Arc::from(domain);
         let result = pool
-            .query(&domain_arc, &RecordType::DNSKEY, 5000, true)
+            .query(&domain_arc, &RecordType::DNSKEY, timeout_ms, true)
             .await;
 
         match result {
@@ -750,27 +667,11 @@ impl ChainVerifier {
                             });
                             raw_records.push(record.clone());
                         }
-                        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
-                            let input = rrsig.input();
-                            if input.type_covered != hickory_proto::rr::RecordType::DNSKEY {
-                                continue;
-                            }
-                            let Some(type_covered) =
-                                RecordTypeMapper::from_hickory(input.type_covered)
-                            else {
-                                continue;
-                            };
-                            rrsigs.push(RrsigRecord {
-                                type_covered,
-                                algorithm: u8::from(input.algorithm),
-                                labels: input.num_labels,
-                                original_ttl: input.original_ttl,
-                                signature_expiration: input.sig_expiration.get(),
-                                signature_inception: input.sig_inception.get(),
-                                key_tag: input.key_tag,
-                                signer_name: input.signer_name.to_string(),
-                                signature: rrsig.sig().to_vec(),
-                            });
+                        RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                            if rrsig.input().type_covered
+                                == hickory_proto::rr::RecordType::DNSKEY =>
+                        {
+                            rrsigs.extend(RrsigRecord::from_hickory(rrsig));
                         }
                         _ => {}
                     }
@@ -818,13 +719,9 @@ impl ChainVerifier {
     /// rollover the outgoing and incoming keys are published side by side for
     /// months, and only one of them signs the RRset at any given moment.
     async fn bootstrap_root_keys(&mut self) -> Result<(), DomainError> {
-        if !self.trust_store.has_anchor_for(".") {
-            return Err(DomainError::InvalidDnsResponse(
-                "No root trust anchor configured".into(),
-            ));
-        }
-
-        let dnskey_result = Self::fetch_dnskey(&self.dnssec_cache, &self.pool_manager, ".").await?;
+        let dnskey_result =
+            Self::fetch_dnskey(&self.dnssec_cache, &self.pool_manager, ".", self.timeout_ms)
+                .await?;
 
         if dnskey_result.keys.is_empty() {
             return Err(DomainError::InvalidDnsResponse(
@@ -860,28 +757,13 @@ impl ChainVerifier {
             ));
         }
 
-        let now = now_secs();
-        let mut rrsig_ok = false;
-        'anchors: for anchor_key in &anchor_keys {
-            for rrsig in &dnskey_result.rrsigs {
-                match self.crypto_verifier.verify_rrsig(
-                    rrsig,
-                    anchor_key,
-                    ".",
-                    &dnskey_result.raw_records,
-                    now,
-                ) {
-                    Ok(true) => {
-                        rrsig_ok = true;
-                        break 'anchors;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(error = %e, "Root DNSKEY RRSIG verification error");
-                    }
-                }
-            }
-        }
+        let rrsig_ok = any_rrsig_verifies(
+            &dnskey_result.rrsigs,
+            &anchor_keys,
+            ".",
+            &dnskey_result.raw_records,
+            now_secs(),
+        );
 
         if !rrsig_ok {
             return Err(DomainError::InvalidDnsResponse(format!(
@@ -933,7 +815,7 @@ impl ChainVerifier {
     pub fn split_domain(domain: &str) -> Vec<&str> {
         let domain = domain.trim_end_matches('.');
 
-        if domain.is_empty() || domain == "." {
+        if domain.is_empty() {
             return Vec::new();
         }
 

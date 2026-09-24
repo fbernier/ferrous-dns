@@ -2,9 +2,7 @@ use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
-use ferrous_dns_infrastructure::dns::{
-    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
-};
+use ferrous_dns_infrastructure::dns::{DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy};
 use futures::future::join_all;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,7 +67,6 @@ async fn test_inflight_map_empty_after_leader_error() {
         Arc::new(FailingResolver::new()) as Arc<dyn DnsResolver>,
         make_cache(),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 
@@ -97,7 +94,6 @@ async fn test_follower_receives_error_on_leader_failure_without_hanging() {
         Arc::new(FailingResolver::new()) as Arc<dyn DnsResolver>,
         make_cache(),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 
@@ -142,7 +138,6 @@ async fn test_leader_cancellation_cleans_inflight_and_unblocks_next_query() {
         }) as Arc<dyn DnsResolver>,
         make_cache(),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 

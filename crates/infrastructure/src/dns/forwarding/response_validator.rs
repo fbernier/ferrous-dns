@@ -1,12 +1,10 @@
+use super::message_builder::{CLIENT_COOKIE_LEN, COOKIE_OPTION_CODE};
 use super::response_parser::DnsResponse;
 use bytes::Bytes;
 use ferrous_dns_domain::{DnsProtocol, DomainError};
 use hickory_proto::op::Message;
 use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_proto::rr::{Name, RecordType as HickoryRecordType};
-
-const CLIENT_COOKIE_LEN: usize = 8;
-const COOKIE_OPTION_CODE: u16 = 10;
 
 /// Per-query expectations used to reject spoofed/off-path upstream responses on
 /// the plain-UDP/TCP (Do53) path. Produced by
@@ -201,10 +199,9 @@ impl ResponseValidator {
 /// Walking only the question is not enough, though it is tempting: owner names
 /// elsewhere are *usually* compression pointers back to it. Not always. An
 /// upstream is free to write them literally, and compression pointers are
-/// 14-bit, so any name past offset 16383 of a large answer — DNSKEY, RRSIG, TXT,
-/// exactly the types 0x20 was just extended to — cannot be compressed at all.
-/// Those literal copies carry our randomized case into the cache and back out to
-/// clients.
+/// 14-bit, so any name past offset 16383 of a large answer (DNSKEY, RRSIG, TXT)
+/// cannot be compressed at all. Those literal copies would carry our randomized
+/// case into the cache and back out to clients.
 ///
 /// Rdata is skipped wholesale via its length field rather than parsed. The names
 /// that can echo our randomized QNAME are owner names; names buried in rdata
@@ -287,9 +284,9 @@ fn is_do53(protocol: &DnsProtocol) -> bool {
 
 fn extract_cookie<'a>(
     mut options: impl Iterator<Item = &'a (EdnsCode, EdnsOption)>,
-) -> Option<Vec<u8>> {
+) -> Option<&'a [u8]> {
     options.find_map(|(_, opt)| match opt {
-        EdnsOption::Unknown(COOKIE_OPTION_CODE, data) => Some(data.clone()),
+        EdnsOption::Unknown(COOKIE_OPTION_CODE, data) => Some(data.as_slice()),
         _ => None,
     })
 }

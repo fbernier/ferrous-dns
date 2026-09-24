@@ -1,59 +1,85 @@
-use ferrous_dns_domain::DomainError;
+use bytes::Bytes;
+use ferrous_dns_domain::{DomainError, UpstreamAddr};
 use ferrous_dns_infrastructure::dns::fast_path;
 use ferrous_dns_infrastructure::dns::forwarding::ResponseParser;
-#[cfg(feature = "dns-over-h3")]
-use ferrous_dns_infrastructure::dns::transport::h3::H3Transport;
-#[cfg(feature = "dns-over-quic")]
-use ferrous_dns_infrastructure::dns::transport::quic::QuicTransport;
-use ferrous_dns_infrastructure::dns::transport::DnsTransport;
-use ferrous_dns_infrastructure::dns::transport::{
-    https::HttpsTransport, tcp::TcpTransport, tls::TlsTransport, udp::UdpTransport,
-};
+use ferrous_dns_infrastructure::dns::transport::tcp::TcpTransport;
 use ferrous_dns_infrastructure::dns::wire_response;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
-mod helpers;
-use helpers::DnsServerBuilder;
+const TCP_QUERY: [u8; 12] = [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
 
-#[test]
-fn test_all_protocols_have_unique_names() {
-    let udp = UdpTransport::new(DnsServerBuilder::google_dns());
-    let tcp = TcpTransport::new(DnsServerBuilder::google_dns());
-    let (tls_addr, tls_host) = DnsServerBuilder::cloudflare_tls();
-    let tls = TlsTransport::new(tls_addr, tls_host.into());
-    let https = HttpsTransport::new(
-        DnsServerBuilder::cloudflare_https(),
-        "1.1.1.1".to_string(),
-        vec![],
-    );
-
-    let mut names = vec![
-        udp.protocol_name(),
-        tcp.protocol_name(),
-        tls.protocol_name(),
-        https.protocol_name(),
-    ];
-
-    #[cfg(feature = "dns-over-h3")]
-    {
-        let h3 = H3Transport::new(DnsServerBuilder::cloudflare_h3(), vec![]);
-        names.push(h3.protocol_name());
-    }
-
-    #[cfg(feature = "dns-over-quic")]
-    {
-        let (quic_addr, quic_host) = DnsServerBuilder::cloudflare_doq();
-        let quic = QuicTransport::new(quic_addr, quic_host.into());
-        names.push(quic.protocol_name());
-    }
-
-    let mut unique = names.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(unique.len(), names.len(), "Protocol names should be unique");
+async fn echo_one_message(stream: &mut TcpStream) {
+    let len = stream.read_u16().await.unwrap();
+    let mut message = vec![0; usize::from(len)];
+    stream.read_exact(&mut message).await.unwrap();
+    stream.write_u16(len).await.unwrap();
+    stream.write_all(&message).await.unwrap();
 }
 
-// ── RFC 6891: OPT record in fast-path responses ───────────────────────────────
+/// Echoes one length-prefixed message per connection, then closes it, the way
+/// servers retire idle connections (RFC 7766 §6.2.3).
+async fn spawn_one_answer_per_connection_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            echo_one_message(&mut stream).await;
+        }
+    });
+    addr
+}
+
+/// Answers only the very first message, then keeps every connection open and silent.
+async fn spawn_server_that_stalls_after_one_answer() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            if held.is_empty() {
+                echo_one_message(&mut stream).await;
+            }
+            held.push(stream);
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn tcp_transport_reconnects_when_the_server_closed_the_pooled_connection() {
+    let addr = spawn_one_answer_per_connection_server().await;
+    let transport = TcpTransport::new(UpstreamAddr::Resolved(addr));
+
+    for attempt in 0..2 {
+        let answer = transport
+            .send(&TCP_QUERY, Duration::from_secs(2))
+            .await
+            .unwrap_or_else(|e| panic!("attempt {attempt}: {e}"));
+        assert_eq!(answer.as_ref(), &TCP_QUERY);
+    }
+}
+
+#[tokio::test]
+async fn tcp_transport_reconnect_stays_within_the_query_timeout() {
+    let addr = spawn_server_that_stalls_after_one_answer().await;
+    let transport = TcpTransport::new(UpstreamAddr::Resolved(addr));
+    transport
+        .send(&TCP_QUERY, Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    let timeout = Duration::from_millis(400);
+    let started = Instant::now();
+    assert!(transport.send(&TCP_QUERY, timeout).await.is_err());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < timeout + timeout / 2,
+        "a stalled pooled connection plus the reconnect took {elapsed:?}"
+    );
+}
 
 fn build_edns_query() -> Vec<u8> {
     vec![
@@ -153,6 +179,15 @@ fn test_fast_path_response_includes_opt_when_client_sent_edns() {
         u16::from_be_bytes([wire[opt_start + 1], wire[opt_start + 2]]),
         41,
         "OPT TYPE must be 41"
+    );
+}
+
+#[test]
+fn unparsable_upstream_answer_is_an_invalid_response() {
+    let error = ResponseParser::parse_bytes(Bytes::from_static(&[0xde, 0xad])).unwrap_err();
+    assert!(
+        matches!(error, DomainError::InvalidDnsResponse(_)),
+        "{error:?}"
     );
 }
 

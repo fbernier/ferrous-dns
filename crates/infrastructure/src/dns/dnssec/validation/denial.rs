@@ -4,7 +4,7 @@
 //! already proven authentic by their RRSIGs — these routines decide whether the
 //! denial (NXDOMAIN / NODATA) is actually proven for the queried name and type.
 //!
-//! Mapping to [`ValidationResult`]:
+//! Mapping to [`DnssecStatus`]:
 //! * `Secure` — the denial is fully proven.
 //! * `Insecure` — the denial points at an unsigned (opt-out) delegation, or the
 //!   NSEC3 iteration count is above the hardening cap; serve without AD.
@@ -13,8 +13,8 @@
 //! The matching logic follows the structure of unbound / hickory's validator but
 //! is implemented here against the project's own chain-of-trust machinery.
 
-use super::chain::ValidationResult;
 use data_encoding::BASE32_DNSSEC;
+use ferrous_dns_domain::DnssecStatus;
 use hickory_proto::dnssec::rdata::{NSEC, NSEC3};
 use hickory_proto::dnssec::Nsec3HashAlgorithm;
 use hickory_proto::op::ResponseCode;
@@ -38,7 +38,6 @@ pub struct VerifiedNsec3<'a> {
 }
 
 /// Entry point: prove a negative response using the verified NSEC/NSEC3 records.
-///
 pub fn prove_denial(
     qname: &Name,
     qtype: RecordType,
@@ -46,18 +45,16 @@ pub fn prove_denial(
     soa_name: &Name,
     nsec3s: &[VerifiedNsec3<'_>],
     nsecs: &[VerifiedNsec<'_>],
-) -> ValidationResult {
+) -> DnssecStatus {
     if !nsec3s.is_empty() {
         verify_nsec3(qname, qtype, rcode, soa_name, nsec3s)
     } else if !nsecs.is_empty() {
         verify_nsec1(qname, qtype, rcode, soa_name, nsecs)
     } else {
         // Signed zone, negative answer, but no denial records at all: stripped.
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     }
 }
-
-// ============================ NSEC3 (RFC 5155) =============================
 
 fn verify_nsec3(
     qname: &Name,
@@ -65,7 +62,7 @@ fn verify_nsec3(
     rcode: ResponseCode,
     soa_name: &Name,
     nsec3s: &[VerifiedNsec3<'_>],
-) -> ValidationResult {
+) -> DnssecStatus {
     // RFC 5155 §8.2 — all NSEC3 RRs in the proof share the same parameters.
     let first = &nsec3s[0];
     let salt = first.data.salt();
@@ -75,18 +72,18 @@ fn verify_nsec3(
             || r.data.salt() != salt
             || r.data.iterations() != iterations
     }) {
-        return ValidationResult::Bogus;
+        return DnssecStatus::Bogus;
     }
 
     // RFC 9276 §3.2 hardening: refuse to spend CPU on high iteration counts.
     if iterations > NSEC3_ITERATION_CAP {
-        return ValidationResult::Insecure;
+        return DnssecStatus::Insecure;
     }
 
     match rcode {
         ResponseCode::NXDomain => nsec3_nxdomain(qname, soa_name, salt, iterations, nsec3s),
         ResponseCode::NoError => nsec3_nodata(qname, qtype, soa_name, salt, iterations, nsec3s),
-        _ => ValidationResult::Bogus,
+        _ => DnssecStatus::Bogus,
     }
 }
 
@@ -157,11 +154,11 @@ fn nsec3_nxdomain(
     salt: &[u8],
     iterations: u16,
     nsec3s: &[VerifiedNsec3<'_>],
-) -> ValidationResult {
+) -> DnssecStatus {
     // NXDOMAIN must not carry a matching NSEC3 for the query name itself.
     if let Some((_, qlabel)) = nsec3_hash(qname, salt, iterations) {
         if nsec3_find_matching(nsec3s, &qlabel).is_some() {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         }
     }
 
@@ -177,35 +174,35 @@ fn nsec3_nxdomain(
         }
         // idx == 0 would mean qname itself matches → contradicts NXDOMAIN.
         if idx == 0 {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         }
         // Next closer = the candidate one label longer than the closest encloser.
         let next_closer = &candidates[idx - 1];
         let Some((nc_raw, nc_label)) = nsec3_hash(next_closer, salt, iterations) else {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         };
         let Some(nc_record) = nsec3_find_covering(nsec3s, &nc_raw, &nc_label) else {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         };
         // Opt-out over the next closer → the (insecure) name may exist unsigned.
         if nc_record.data.opt_out() {
-            return ValidationResult::Insecure;
+            return DnssecStatus::Insecure;
         }
         // Wildcard at the closest encloser must be covered (proven absent).
         let Some(wildcard) = make_wildcard(ce) else {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         };
         let Some((wc_raw, wc_label)) = nsec3_hash(&wildcard, salt, iterations) else {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         };
         return match nsec3_find_covering(nsec3s, &wc_raw, &wc_label) {
-            Some(_) => ValidationResult::Secure,
-            None => ValidationResult::Bogus,
+            Some(_) => DnssecStatus::Secure,
+            None => DnssecStatus::Bogus,
         };
     }
 
     // No matching closest encloser found.
-    ValidationResult::Bogus
+    DnssecStatus::Bogus
 }
 
 /// RFC 5155 §8.5–8.7 — NODATA proofs.
@@ -216,9 +213,9 @@ fn nsec3_nodata(
     salt: &[u8],
     iterations: u16,
     nsec3s: &[VerifiedNsec3<'_>],
-) -> ValidationResult {
+) -> DnssecStatus {
     let Some((q_raw, q_label)) = nsec3_hash(qname, salt, iterations) else {
-        return ValidationResult::Bogus;
+        return DnssecStatus::Bogus;
     };
 
     // §8.5 / §8.6 — an NSEC3 matching QNAME with QTYPE and CNAME absent.
@@ -234,9 +231,9 @@ fn nsec3_nodata(
             let has_type = record.data.type_bit_maps().any(|t| t == qtype);
             let has_cname = record.data.type_bit_maps().any(|t| t == RecordType::CNAME);
             if has_type || has_cname {
-                return ValidationResult::Bogus;
+                return DnssecStatus::Bogus;
             }
-            return ValidationResult::Secure;
+            return DnssecStatus::Secure;
         }
     }
 
@@ -244,19 +241,19 @@ fn nsec3_nodata(
     if qtype == RecordType::DS {
         if let Some(record) = nsec3_find_covering(nsec3s, &q_raw, &q_label) {
             if record.data.opt_out() {
-                return ValidationResult::Insecure;
+                return DnssecStatus::Insecure;
             }
         }
     }
 
     // §8.7 — wildcard NODATA: closest-encloser proof for a servicing wildcard.
     if wildcard_based_encloser(qname, soa_name, salt, iterations, nsec3s) {
-        return ValidationResult::Secure;
+        return DnssecStatus::Secure;
     }
 
     // Signed NSEC3 records are present but none conclusively prove this NODATA.
     // Fail open (served without AD) rather than SERVFAIL a possibly valid name.
-    ValidationResult::Insecure
+    DnssecStatus::Insecure
 }
 
 /// Wildcard closest-encloser proof (RFC 5155 §8.7): a *matching* wildcard NSEC3
@@ -297,19 +294,17 @@ fn make_wildcard(name: &Name) -> Option<Name> {
     Name::new().append_label("*").ok()?.append_name(name).ok()
 }
 
-// ============================ NSEC (RFC 4034/4035) =========================
-
 fn verify_nsec1(
     qname: &Name,
     qtype: RecordType,
     rcode: ResponseCode,
     soa_name: &Name,
     nsecs: &[VerifiedNsec<'_>],
-) -> ValidationResult {
+) -> DnssecStatus {
     match rcode {
         ResponseCode::NoError => nsec1_nodata(qname, qtype, nsecs),
         ResponseCode::NXDomain => nsec1_nxdomain(qname, soa_name, nsecs),
-        _ => ValidationResult::Bogus,
+        _ => DnssecStatus::Bogus,
     }
 }
 
@@ -336,7 +331,7 @@ fn wrong_side_of_delegation(mut type_bit_maps: impl Iterator<Item = RecordType>)
     type_bit_maps.any(|t| t == RecordType::SOA)
 }
 
-fn nsec1_nodata(qname: &Name, qtype: RecordType, nsecs: &[VerifiedNsec<'_>]) -> ValidationResult {
+fn nsec1_nodata(qname: &Name, qtype: RecordType, nsecs: &[VerifiedNsec<'_>]) -> DnssecStatus {
     // Direct match: an NSEC owned by QNAME with QTYPE and CNAME absent.
     for n in nsecs {
         if n.owner != qname {
@@ -351,21 +346,21 @@ fn nsec1_nodata(qname: &Name, qtype: RecordType, nsecs: &[VerifiedNsec<'_>]) -> 
         let has_type = n.data.type_bit_maps().any(|t| t == qtype);
         let has_cname = n.data.type_bit_maps().any(|t| t == RecordType::CNAME);
         if has_type || has_cname {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         }
-        return ValidationResult::Secure;
+        return DnssecStatus::Secure;
     }
     // No NSEC matched the name — cannot prove this NODATA. Fail open.
-    ValidationResult::Insecure
+    DnssecStatus::Insecure
 }
 
-fn nsec1_nxdomain(qname: &Name, soa_name: &Name, nsecs: &[VerifiedNsec<'_>]) -> ValidationResult {
+fn nsec1_nxdomain(qname: &Name, soa_name: &Name, nsecs: &[VerifiedNsec<'_>]) -> DnssecStatus {
     // An NSEC must cover QNAME (proving the exact name does not exist).
     let covering = nsecs
         .iter()
         .find(|n| nsec1_covers(n.owner, n.data.next_domain_name(), qname));
     let Some(covering) = covering else {
-        return ValidationResult::Bogus;
+        return DnssecStatus::Bogus;
     };
 
     // Closest encloser = longest common ancestor of QNAME with the covering
@@ -378,20 +373,20 @@ fn nsec1_nxdomain(qname: &Name, soa_name: &Name, nsecs: &[VerifiedNsec<'_>]) -> 
         ce_next
     };
     if closest.num_labels() < soa_name.num_labels() {
-        return ValidationResult::Bogus;
+        return DnssecStatus::Bogus;
     }
 
     // The wildcard at the closest encloser must be covered (proven absent).
     let Some(wildcard) = make_wildcard(&closest) else {
-        return ValidationResult::Bogus;
+        return DnssecStatus::Bogus;
     };
     let wildcard_covered = nsecs.iter().any(|n| {
         n.owner == &wildcard || nsec1_covers(n.owner, n.data.next_domain_name(), &wildcard)
     });
     if wildcard_covered {
-        ValidationResult::Secure
+        DnssecStatus::Secure
     } else {
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     }
 }
 
@@ -415,8 +410,6 @@ fn common_suffix(a: &Name, b: &Name) -> Name {
     Name::from_labels(shared).unwrap_or_else(|_| Name::root())
 }
 
-// ===================== Wildcard expansion (RFC 4035 §5.3.4) ================
-
 /// Prove that a wildcard-expanded *positive* answer is legitimate: the exact
 /// `qname` must be shown not to exist (otherwise the wildcard must not have been
 /// applied). `wildcard_labels` is the RRSIG `num_labels` of the answer.
@@ -425,38 +418,38 @@ pub fn prove_wildcard_expansion(
     wildcard_labels: u8,
     nsec3s: &[VerifiedNsec3<'_>],
     nsecs: &[VerifiedNsec<'_>],
-) -> ValidationResult {
+) -> DnssecStatus {
     if !nsec3s.is_empty() {
         let salt = nsec3s[0].data.salt();
         let iterations = nsec3s[0].data.iterations();
         if iterations > NSEC3_ITERATION_CAP {
-            return ValidationResult::Insecure;
+            return DnssecStatus::Insecure;
         }
         if qname.num_labels() <= wildcard_labels {
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         }
         // Next closer: ancestor of qname one label longer than the wildcard's
         // closest encloser; an NSEC3 must *cover* it.
         let next_closer = ancestor_with_labels(qname, wildcard_labels + 1);
         match nsec3_hash(&next_closer, salt, iterations) {
             Some((nc_raw, nc_label)) => match nsec3_find_covering(nsec3s, &nc_raw, &nc_label) {
-                Some(_) => ValidationResult::Secure,
-                None => ValidationResult::Bogus,
+                Some(_) => DnssecStatus::Secure,
+                None => DnssecStatus::Bogus,
             },
-            None => ValidationResult::Insecure,
+            None => DnssecStatus::Insecure,
         }
     } else if !nsecs.is_empty() {
         if nsecs
             .iter()
             .any(|n| nsec1_covers(n.owner, n.data.next_domain_name(), qname))
         {
-            ValidationResult::Secure
+            DnssecStatus::Secure
         } else {
-            ValidationResult::Bogus
+            DnssecStatus::Bogus
         }
     } else {
         // Wildcard expansion claimed but no NSEC/NSEC3 records to justify it.
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     }
 }
 

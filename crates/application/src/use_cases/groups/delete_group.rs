@@ -1,3 +1,4 @@
+use super::require_group;
 use ferrous_dns_domain::DomainError;
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -15,11 +16,7 @@ impl DeleteGroupUseCase {
 
     #[instrument(skip(self))]
     pub async fn execute(&self, id: i64) -> Result<(), DomainError> {
-        let group = self
-            .group_repo
-            .get_by_id(id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(id))?;
+        let group = require_group(self.group_repo.as_ref(), id).await?;
 
         if group.is_default {
             return Err(DomainError::ProtectedGroupCannotBeDeleted);

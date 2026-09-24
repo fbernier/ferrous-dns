@@ -1,4 +1,4 @@
-use ferrous_dns_domain::BlockSource;
+use ferrous_dns_domain::{BlockSource, QueryLog};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -50,10 +50,8 @@ pub struct PiholeQueryEntry {
     pub reply: PiholeReply,
     pub upstream: String,
     /// Not yet tracked by Ferrous DNS.
-    // TODO: populate from CNAME chain data when available
     pub cname: Option<String>,
     /// Not yet tracked by Ferrous DNS.
-    // TODO: populate with blocklist ID when domain-to-list mapping is implemented
     pub list_id: Option<i64>,
     pub ede: PiholeEde,
 }
@@ -73,22 +71,25 @@ pub struct SuggestionsResponse {
     pub dnssec: Vec<String>,
 }
 
-/// Maps Ferrous query log fields to Pi-hole v6 status strings.
-pub(crate) fn map_query_status(
-    blocked: bool,
-    cache_hit: bool,
-    block_source: Option<&BlockSource>,
-) -> &'static str {
-    if blocked {
-        match block_source {
-            Some(BlockSource::RegexFilter) => "REGEX",
-            Some(BlockSource::ManagedDomain) => "DENYLIST",
-            Some(BlockSource::CnameCloaking) => "GRAVITY_CNAME",
-            _ => "GRAVITY",
-        }
-    } else if cache_hit {
-        "CACHE"
-    } else {
-        "FORWARDED"
+/// Maps a Ferrous query log entry to its Pi-hole v6 status string.
+pub(crate) fn map_query_status(q: &QueryLog) -> &'static str {
+    if !q.blocked {
+        return if q.cache_hit { "CACHE" } else { "FORWARDED" };
+    }
+    match q.block_source {
+        Some(BlockSource::RegexFilter) => "REGEX",
+        Some(BlockSource::ManagedDomain) => "DENYLIST",
+        Some(BlockSource::CnameCloaking) => "GRAVITY_CNAME",
+        Some(
+            BlockSource::Blocklist
+            | BlockSource::Schedule
+            | BlockSource::DnsRebinding
+            | BlockSource::RateLimit
+            | BlockSource::DnsTunneling
+            | BlockSource::NxdomainHijack
+            | BlockSource::ResponseIpFilter
+            | BlockSource::DgaDetection,
+        )
+        | None => "GRAVITY",
     }
 }

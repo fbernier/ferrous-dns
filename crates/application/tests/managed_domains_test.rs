@@ -9,8 +9,6 @@ use std::sync::Arc;
 mod helpers;
 use helpers::{MockBlockFilterEngine, MockGroupRepository, MockManagedDomainRepository};
 
-// ── GetManagedDomainsUseCase ──────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_get_all_empty() {
     let repo = Arc::new(MockManagedDomainRepository::new());
@@ -88,8 +86,6 @@ async fn test_get_by_id_not_found() {
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
 }
-
-// ── CreateManagedDomainUseCase ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_create_deny_success() {
@@ -256,8 +252,6 @@ async fn test_create_duplicate_name() {
     }
 }
 
-// ── UpdateManagedDomainUseCase ────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_update_toggle_enabled() {
     let repo = Arc::new(MockManagedDomainRepository::new());
@@ -382,8 +376,6 @@ async fn test_update_invalid_group() {
         other => panic!("Expected GroupNotFound, got {:?}", other),
     }
 }
-
-// ── DeleteManagedDomainUseCase ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_delete_success() {

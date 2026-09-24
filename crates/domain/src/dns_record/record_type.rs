@@ -1,4 +1,3 @@
-use super::RecordCategory;
 use std::fmt;
 use std::str::FromStr;
 
@@ -115,87 +114,7 @@ impl_record_type_conversions! {
     (SVCB,       "SVCB",       64),
     (HTTPS,      "HTTPS",      65),
     (CAA,        "CAA",        257),
-    (ANAME,      "ANAME",      32769),
-}
-
-impl RecordType {
-    pub fn category(&self) -> RecordCategory {
-        match self {
-            RecordType::A
-            | RecordType::AAAA
-            | RecordType::CNAME
-            | RecordType::MX
-            | RecordType::TXT
-            | RecordType::PTR => RecordCategory::Basic,
-
-            RecordType::SRV
-            | RecordType::SOA
-            | RecordType::NS
-            | RecordType::NAPTR
-            | RecordType::SVCB
-            | RecordType::HTTPS
-            | RecordType::DNAME
-            | RecordType::ANAME => RecordCategory::Advanced,
-
-            RecordType::DS
-            | RecordType::DNSKEY
-            | RecordType::RRSIG
-            | RecordType::NSEC
-            | RecordType::NSEC3
-            | RecordType::NSEC3PARAM
-            | RecordType::CDS
-            | RecordType::CDNSKEY => RecordCategory::Dnssec,
-
-            RecordType::CAA
-            | RecordType::TLSA
-            | RecordType::SSHFP
-            | RecordType::IPSECKEY
-            | RecordType::OPENPGPKEY => RecordCategory::Security,
-
-            RecordType::NULL | RecordType::HINFO | RecordType::WKS => RecordCategory::Legacy,
-
-            RecordType::OPT => RecordCategory::Protocol,
-
-            RecordType::ZONEMD => RecordCategory::Integrity,
-        }
-    }
-
-    pub fn is_dnssec(&self) -> bool {
-        matches!(self.category(), RecordCategory::Dnssec)
-    }
-
-    pub fn is_basic(&self) -> bool {
-        matches!(self.category(), RecordCategory::Basic)
-    }
-
-    pub fn is_security_related(&self) -> bool {
-        matches!(
-            self.category(),
-            RecordCategory::Security | RecordCategory::Dnssec
-        )
-    }
-
-    pub fn is_modern(&self) -> bool {
-        matches!(
-            self,
-            RecordType::SVCB | RecordType::HTTPS | RecordType::ZONEMD
-        )
-    }
-
-    pub fn by_category(category: RecordCategory) -> Vec<RecordType> {
-        use RecordType::*;
-        match category {
-            RecordCategory::Basic => vec![A, AAAA, CNAME, MX, TXT, PTR],
-            RecordCategory::Advanced => vec![SRV, SOA, NS, NAPTR, SVCB, HTTPS, DNAME, ANAME],
-            RecordCategory::Dnssec => {
-                vec![DS, DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM, CDS, CDNSKEY]
-            }
-            RecordCategory::Security => vec![CAA, TLSA, SSHFP, IPSECKEY, OPENPGPKEY],
-            RecordCategory::Legacy => vec![NULL, HINFO, WKS],
-            RecordCategory::Protocol => vec![OPT],
-            RecordCategory::Integrity => vec![ZONEMD],
-        }
-    }
+    (ANAME,      "ANAME",      65305),
 }
 
 impl fmt::Display for RecordType {

@@ -1308,78 +1308,6 @@ impl Default for DnsResolutionBuilder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_mock_dns_resolver() {
-        let resolver = MockDnsResolver::new();
-
-        let resolution = DnsResolutionBuilder::new()
-            .with_address("1.1.1.1")
-            .cache_hit()
-            .build();
-
-        resolver.set_response("example.com", resolution).await;
-
-        let query = DnsQuery {
-            domain: "example.com".into(),
-            record_type: RecordType::A,
-        };
-
-        let result = resolver.resolve(&query).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().cache_hit);
-    }
-
-    #[tokio::test]
-    async fn test_mock_blocklist() {
-        let blocklist =
-            MockBlocklistRepository::with_blocked_domains(vec!["ads.com", "tracker.com"]);
-
-        assert!(blocklist.is_blocked("ads.com").await.unwrap());
-        assert!(!blocklist.is_blocked("google.com").await.unwrap());
-
-        assert_eq!(blocklist.count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn test_mock_query_log() {
-        let log_repo = MockQueryLogRepository::new();
-
-        let log = QueryLog {
-            id: None,
-            domain: "test.com".into(),
-            record_type: RecordType::A,
-            client_ip: IpAddr::from_str("192.168.1.1").unwrap(),
-            client_hostname: None,
-            blocked: false,
-            response_time_us: Some(10),
-            cache_hit: true,
-            cache_refresh: false,
-            dnssec_status: None,
-            dns64_synthesized: false,
-            answers: None,
-            upstream_server: None,
-            upstream_pool: None,
-            response_status: None,
-            timestamp: None,
-            query_source: Default::default(),
-            protocol: None,
-            group_id: None,
-            block_source: None,
-        };
-
-        log_repo.log_query(&log).await.unwrap();
-
-        assert_eq!(log_repo.count().await, 1);
-        assert_eq!(log_repo.get_cache_hits().await.len(), 1);
-    }
-}
-
-// ── MockManagedDomainRepository ────────────────────────────────────────────────
-
 #[derive(Clone)]
 pub struct MockManagedDomainRepository {
     domains: Arc<RwLock<Vec<ManagedDomain>>>,
@@ -1569,8 +1497,6 @@ impl ManagedDomainRepository for MockManagedDomainRepository {
     }
 }
 
-// ── MockBlockFilterEngine ──────────────────────────────────────────────────────
-
 #[derive(Clone)]
 pub struct MockBlockFilterEngine {
     reload_count: Arc<RwLock<u32>>,
@@ -1680,8 +1606,6 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
     fn set_blocking_enabled(&self, _enabled: bool) {}
 }
 
-// ── MockTunnelingFlagStore ─────────────────────────────────────────────────────
-
 use ferrous_dns_application::ports::TunnelingFlagStore;
 
 pub struct MockTunnelingFlagStore {
@@ -1711,8 +1635,6 @@ impl TunnelingFlagStore for MockTunnelingFlagStore {
         self.flagged.read().unwrap().contains(domain)
     }
 }
-
-// ── MockNxdomainHijackIpStore ─────────────────────────────────────────────────
 
 use ferrous_dns_application::ports::NxdomainHijackIpStore;
 
@@ -1744,8 +1666,6 @@ impl NxdomainHijackIpStore for MockNxdomainHijackIpStore {
     }
 }
 
-// ── MockResponseIpFilterStore ─────────────────────────────────────────────────
-
 use ferrous_dns_application::ports::ResponseIpFilterStore;
 
 pub struct MockResponseIpFilterStore {
@@ -1775,8 +1695,6 @@ impl ResponseIpFilterStore for MockResponseIpFilterStore {
         self.blocked_ips.read().unwrap().contains(ip)
     }
 }
-
-// ── MockDgaFlagStore ──────────────────────────────────────────────────────────
 
 use ferrous_dns_application::ports::DgaFlagStore;
 

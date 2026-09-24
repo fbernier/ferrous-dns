@@ -19,8 +19,12 @@ pub struct UserResponse {
     pub id: Option<i64>,
     pub username: String,
     pub display_name: Option<String>,
-    pub role: String,
-    pub source: String,
+    /// `admin` or `viewer`.
+    #[schema(value_type = String)]
+    pub role: &'static str,
+    /// `toml` or `database`.
+    #[schema(value_type = String)]
+    pub source: &'static str,
     pub enabled: bool,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,

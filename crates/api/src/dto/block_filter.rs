@@ -10,8 +10,6 @@ pub struct BlockFilterStatsResponse {
     pub total_blocked_domains: usize,
 }
 
-// --- Single-domain test ---------------------------------------------------
-
 /// Request to evaluate one domain against the static filter index.
 #[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct FilterTestRequest {
@@ -27,11 +25,13 @@ pub struct FilterTestRequest {
 #[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct FilterMatchDto {
     /// blocklist | manual | managed_domain | regex | allowlist
-    pub kind: String,
+    #[schema(value_type = String)]
+    pub kind: &'static str,
     pub source_id: Option<i64>,
     pub name: String,
     /// exact | wildcard | pattern | regex
-    pub match_type: String,
+    #[schema(value_type = String)]
+    pub match_type: &'static str,
 }
 
 #[derive(Serialize, Debug, Clone, ToSchema)]
@@ -73,10 +73,10 @@ fn match_type_str(match_type: MatchType) -> &'static str {
 impl From<&BlockMatch> for FilterMatchDto {
     fn from(m: &BlockMatch) -> Self {
         Self {
-            kind: block_kind_str(m.kind).to_string(),
+            kind: block_kind_str(m.kind),
             source_id: m.source_id,
             name: m.name.clone(),
-            match_type: match_type_str(m.match_type).to_string(),
+            match_type: match_type_str(m.match_type),
         }
     }
 }
@@ -84,10 +84,10 @@ impl From<&BlockMatch> for FilterMatchDto {
 impl From<&AllowMatch> for FilterMatchDto {
     fn from(m: &AllowMatch) -> Self {
         Self {
-            kind: allow_kind_str(m.kind).to_string(),
+            kind: allow_kind_str(m.kind),
             source_id: m.source_id,
             name: m.name.clone(),
-            match_type: match_type_str(m.match_type).to_string(),
+            match_type: match_type_str(m.match_type),
         }
     }
 }
@@ -103,8 +103,6 @@ impl From<FilterExplanation> for FilterTestResponse {
         }
     }
 }
-
-// --- Backtest (what-if simulator) -----------------------------------------
 
 /// Request to simulate a candidate allow/deny ruleset (not yet applied) over the
 /// domains seen in recent traffic.
@@ -141,7 +139,8 @@ pub struct AffectedDomainDto {
 #[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct BacktestResponse {
     /// "deny" or "allow".
-    pub action: String,
+    #[schema(value_type = String)]
+    pub action: &'static str,
     pub group_id: i64,
     pub window_hours: f32,
     /// Distinct domains evaluated.
@@ -186,7 +185,7 @@ impl From<AffectedDomain> for AffectedDomainDto {
 impl From<BacktestReport> for BacktestResponse {
     fn from(r: BacktestReport) -> Self {
         Self {
-            action: candidate_action_str(r.action).to_string(),
+            action: candidate_action_str(r.action),
             group_id: r.group_id,
             window_hours: r.window_hours,
             corpus_size: r.corpus_size,

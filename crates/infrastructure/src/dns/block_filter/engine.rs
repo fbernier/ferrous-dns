@@ -4,7 +4,9 @@ use super::decision_cache::{
     decision_key, decision_l0_clear, decision_l0_get_by_key, decision_l0_set_by_key,
     BlockDecisionCache,
 };
+use super::suffix_trie::SuffixTrie;
 use crate::dns::cache::coarse_clock::coarse_now_secs;
+use aho_corasick::AhoCorasick;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -28,7 +30,10 @@ use tracing::{error, info, warn};
 /// Cached entry: (group_id, expiry_secs, epoch_at_insert).
 type GroupL0Cache = LruCache<IpAddr, (i64, u64, u64), FxBuildHasher>;
 
-const GROUP_L0_CAPACITY: usize = 256;
+const GROUP_L0_CAPACITY: NonZeroUsize = match NonZeroUsize::new(256) {
+    Some(capacity) => capacity,
+    None => NonZeroUsize::MIN,
+};
 
 /// Monotonic counter bumped when client-to-group mappings change.
 /// Entries written under an older epoch are treated as stale.
@@ -36,10 +41,7 @@ static GROUP_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static GROUP_L0: RefCell<GroupL0Cache> =
-        RefCell::new(LruCache::with_hasher(
-            NonZeroUsize::new(GROUP_L0_CAPACITY).unwrap(),
-            FxBuildHasher,
-        ));
+        RefCell::new(LruCache::with_hasher(GROUP_L0_CAPACITY, FxBuildHasher));
 }
 
 pub struct BlockFilterEngine {
@@ -227,7 +229,6 @@ impl BlockFilterEngine {
 
 #[async_trait]
 impl BlockFilterEnginePort for BlockFilterEngine {
-    #[inline]
     fn resolve_group(&self, ip: IpAddr) -> i64 {
         let current_epoch = GROUP_EPOCH.load(Ordering::Acquire);
 
@@ -252,7 +253,6 @@ impl BlockFilterEnginePort for BlockFilterEngine {
         gid
     }
 
-    #[inline]
     fn check(&self, domain: &str, group_id: i64) -> FilterDecision {
         // Schedule changes must not be memoized with per-domain decisions.
         let schedule_override = self.schedule_state.get(group_id);
@@ -291,13 +291,16 @@ impl BlockFilterEnginePort for BlockFilterEngine {
             Some(GroupOverride::TimedBlockUntil(t)) if coarse_now_secs() < t => {
                 return FilterDecision::Block(BlockSource::Schedule);
             }
-            _ => {} // expired or no override — fall through to the compiled rules
+            Some(GroupOverride::TimedBypassUntil(_) | GroupOverride::TimedBlockUntil(_)) | None => {
+            } // expired or no override — fall through to the compiled rules
         }
 
-        // Tier 4 — downloaded blocklists.
+        // Tier 4 — downloaded blocklists. Manual verdicts returned in tier 1.
         match verdict {
             Verdict::Block(source) => FilterDecision::Block(source),
-            _ => FilterDecision::Allow,
+            Verdict::NoMatch | Verdict::ManualAllow | Verdict::ManualDeny(_) => {
+                FilterDecision::Allow
+            }
         }
     }
 
@@ -316,44 +319,39 @@ impl BlockFilterEnginePort for BlockFilterEngine {
         list_lines: &[String],
         regexes: &[String],
     ) -> Result<Vec<bool>, DomainError> {
-        // Parse the candidate list with the same parser used for real blocklists,
-        // so a pasted hosts/adblock/wildcard list behaves exactly as it would if
-        // it were added to ferrous.
+        // Compiled the way `compile_block_index` compiles a real list, so a
+        // candidate matches exactly what it would enforce once added.
         let mut exact: HashSet<String> = HashSet::new();
-        let mut wildcards: Vec<(String, String)> = Vec::new();
+        let mut suffixes = SuffixTrie::default();
         let mut patterns: Vec<String> = Vec::new();
         for entry in parse_list_text(&list_lines.join("\n")) {
             match entry {
-                ParsedEntry::Exact(d) => {
-                    exact.insert(d);
+                ParsedEntry::Exact(domain) => {
+                    exact.insert(domain);
                 }
-                ParsedEntry::Wildcard(w) => {
-                    let base = w.strip_prefix("*.").unwrap_or(&w).to_string();
-                    if !base.is_empty() {
-                        let dotted = format!(".{base}");
-                        wildcards.push((base, dotted));
-                    }
+                ParsedEntry::Wildcard(pattern) => suffixes.insert_wildcard(&pattern, 1),
+                ParsedEntry::DomainAndSubdomains(domain) => {
+                    suffixes.insert_wildcard(&domain, 1);
+                    exact.insert(domain);
                 }
-                ParsedEntry::DomainAndSubdomains(d) => {
-                    if !d.is_empty() {
-                        let dotted = format!(".{d}");
-                        wildcards.push((d.clone(), dotted));
-                        exact.insert(d);
-                    }
-                }
-                ParsedEntry::Pattern(p) => {
-                    if !p.is_empty() {
-                        patterns.push(p);
-                    }
-                }
+                ParsedEntry::Pattern(pattern) => patterns.push(pattern),
             }
         }
+        let substrings = if patterns.is_empty() {
+            None
+        } else {
+            AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build(&patterns)
+                .inspect_err(|e| warn!(error = %e, "Failed to compile candidate patterns"))
+                .ok()
+        };
 
         let compiled: Vec<Regex> = regexes
             .iter()
             .map(|p| {
-                Regex::new(p).map_err(|e| {
-                    DomainError::InvalidDomainName(format!("invalid regex '{p}': {e}"))
+                Regex::new(&format!("(?i){p}")).map_err(|e| {
+                    DomainError::InvalidRegexFilter(format!("invalid regex '{p}': {e}"))
                 })
             })
             .collect::<Result<_, _>>()?;
@@ -363,10 +361,8 @@ impl BlockFilterEnginePort for BlockFilterEngine {
             .map(|d| {
                 let domain = d.to_ascii_lowercase();
                 exact.contains(&domain)
-                    || wildcards
-                        .iter()
-                        .any(|(base, dotted)| domain == *base || domain.ends_with(dotted.as_str()))
-                    || patterns.iter().any(|p| domain.contains(p.as_str()))
+                    || suffixes.lookup(&domain) != 0
+                    || substrings.as_ref().is_some_and(|ac| ac.is_match(&domain))
                     || compiled
                         .iter()
                         .any(|re| re.is_match(&domain).unwrap_or(false))
@@ -376,7 +372,6 @@ impl BlockFilterEnginePort for BlockFilterEngine {
         Ok(result)
     }
 
-    #[inline]
     fn store_cname_decision(&self, domain: &str, group_id: i64, ttl_secs: u64) {
         let key = decision_key(domain, group_id);
         // Not a manual rule: a CNAME-derived block still yields to the blocking

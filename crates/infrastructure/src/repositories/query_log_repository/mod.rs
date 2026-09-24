@@ -12,6 +12,7 @@ use ferrous_dns_application::ports::{
 };
 use ferrous_dns_domain::query_log::{DnssecStats, QueryLogFilter};
 use ferrous_dns_domain::{config::DatabaseConfig, DomainError, QueryLog, QueryStats};
+use reader::DomainVerdict;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -153,7 +154,7 @@ impl QueryLogRepository for SqliteQueryLogRepository {
         limit: u32,
         period_hours: f32,
     ) -> Result<Vec<(String, u64)>, DomainError> {
-        reader::get_top_blocked_domains(&self.read_pool, limit, period_hours).await
+        reader::get_top_domains(&self.read_pool, DomainVerdict::Blocked, limit, period_hours).await
     }
 
     async fn get_top_allowed_domains(
@@ -161,7 +162,7 @@ impl QueryLogRepository for SqliteQueryLogRepository {
         limit: u32,
         period_hours: f32,
     ) -> Result<Vec<(String, u64)>, DomainError> {
-        reader::get_top_allowed_domains(&self.read_pool, limit, period_hours).await
+        reader::get_top_domains(&self.read_pool, DomainVerdict::Allowed, limit, period_hours).await
     }
 
     async fn get_distinct_recent_domains(
@@ -169,7 +170,7 @@ impl QueryLogRepository for SqliteQueryLogRepository {
         limit: u32,
         period_hours: f32,
     ) -> Result<Vec<(String, u64)>, DomainError> {
-        reader::get_distinct_recent_domains(&self.read_pool, limit, period_hours).await
+        reader::get_top_domains(&self.read_pool, DomainVerdict::Any, limit, period_hours).await
     }
 
     async fn get_top_clients(

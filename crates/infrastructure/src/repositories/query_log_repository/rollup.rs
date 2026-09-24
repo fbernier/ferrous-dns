@@ -151,19 +151,19 @@ fn bump<K: PartialEq>(counts: &mut Vec<(K, i64)>, key: K) {
 
 impl MinuteRollup {
     pub fn add(&mut self, e: &QueryLogEntry) {
-        let counters = match self
+        let i = match self
             .by_source
-            .iter_mut()
-            .find(|(s, _)| *s == e.query_source)
+            .iter()
+            .position(|(s, _)| *s == e.query_source)
         {
-            Some((_, c)) => c,
+            Some(i) => i,
             None => {
                 self.by_source
                     .push((e.query_source, MinuteCounters::default()));
-                &mut self.by_source.last_mut().expect("just pushed").1
+                self.by_source.len() - 1
             }
         };
-        counters.add(e);
+        self.by_source[i].1.add(e);
 
         if e.query_source != QuerySource::Client {
             return;

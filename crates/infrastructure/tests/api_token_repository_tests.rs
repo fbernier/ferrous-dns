@@ -1,53 +1,17 @@
 use ferrous_dns_application::ports::ApiTokenRepository;
 use ferrous_dns_infrastructure::repositories::SqliteApiTokenRepository;
-use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 
-async fn create_test_db() -> sqlx::SqlitePool {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .expect("Failed to create in-memory SQLite pool");
-
-    sqlx::query(
-        "CREATE TABLE api_tokens (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            name         TEXT    NOT NULL UNIQUE,
-            key_prefix   TEXT    NOT NULL,
-            key_hash     TEXT    NOT NULL,
-            key_raw      TEXT,
-            created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
-            last_used_at TEXT
-        )",
-    )
-    .execute(&pool)
-    .await
-    .expect("Failed to create api_tokens table");
-
-    sqlx::query("CREATE INDEX idx_api_tokens_name ON api_tokens(name)")
-        .execute(&pool)
-        .await
-        .expect("Failed to create name index");
-
-    sqlx::query("CREATE INDEX idx_api_tokens_key_hash ON api_tokens(key_hash)")
-        .execute(&pool)
-        .await
-        .expect("Failed to create key_hash index");
-
-    pool
-}
+#[path = "support/db.rs"]
+mod db;
 
 fn make_repo(pool: sqlx::SqlitePool) -> SqliteApiTokenRepository {
     SqliteApiTokenRepository::new(Arc::new(pool))
 }
 
-// ---------------------------------------------------------------------------
-// create
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn create_returns_token_with_all_fields() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let token = repo
@@ -66,7 +30,7 @@ async fn create_returns_token_with_all_fields() {
 
 #[tokio::test]
 async fn create_duplicate_name_returns_error() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     repo.create("dup", "pre", "hash1", "raw1").await.unwrap();
@@ -80,13 +44,9 @@ async fn create_duplicate_name_returns_error() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// get_all
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn get_all_empty() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let tokens = repo.get_all().await.unwrap();
@@ -95,7 +55,7 @@ async fn get_all_empty() {
 
 #[tokio::test]
 async fn get_all_returns_multiple() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     repo.create("first", "pre1", "hash1", "raw1").await.unwrap();
@@ -107,13 +67,9 @@ async fn get_all_returns_multiple() {
     assert_eq!(tokens.len(), 2);
 }
 
-// ---------------------------------------------------------------------------
-// get_by_id / get_by_name
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn get_by_id_found() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let created = repo.create("find-me", "pre", "hash", "raw").await.unwrap();
@@ -126,7 +82,7 @@ async fn get_by_id_found() {
 
 #[tokio::test]
 async fn get_by_id_not_found() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     assert!(repo.get_by_id(999).await.unwrap().is_none());
@@ -134,7 +90,7 @@ async fn get_by_id_not_found() {
 
 #[tokio::test]
 async fn get_by_name_found() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     repo.create("named", "pre", "hash", "raw").await.unwrap();
@@ -145,19 +101,15 @@ async fn get_by_name_found() {
 
 #[tokio::test]
 async fn get_by_name_not_found() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     assert!(repo.get_by_name("nope").await.unwrap().is_none());
 }
 
-// ---------------------------------------------------------------------------
-// update
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn update_name_only() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let created = repo.create("old-name", "pre", "hash", "raw").await.unwrap();
@@ -170,7 +122,7 @@ async fn update_name_only() {
 
 #[tokio::test]
 async fn update_name_and_key() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let created = repo.create("token", "pre", "hash", "raw").await.unwrap();
@@ -188,7 +140,7 @@ async fn update_name_and_key() {
 
 #[tokio::test]
 async fn update_nonexistent_returns_not_found() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let err = repo
@@ -203,7 +155,7 @@ async fn update_nonexistent_returns_not_found() {
 
 #[tokio::test]
 async fn update_duplicate_name_returns_error() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     repo.create("taken", "pre1", "hash1", "raw1").await.unwrap();
@@ -220,13 +172,9 @@ async fn update_duplicate_name_returns_error() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// delete
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn delete_existing() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let created = repo.create("del", "pre", "hash", "raw").await.unwrap();
@@ -238,7 +186,7 @@ async fn delete_existing() {
 
 #[tokio::test]
 async fn delete_nonexistent_returns_error() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let err = repo.delete(999).await.unwrap_err();
@@ -248,13 +196,9 @@ async fn delete_nonexistent_returns_error() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// update_last_used
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn update_last_used_sets_timestamp() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let created = repo.create("used", "pre", "hash", "raw").await.unwrap();
@@ -267,13 +211,9 @@ async fn update_last_used_sets_timestamp() {
     assert!(token.last_used_at.is_some());
 }
 
-// ---------------------------------------------------------------------------
-// get_all_hashes / get_id_by_hash
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn get_all_hashes_returns_pairs() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     repo.create("a", "pre1", "hash_a", "raw1").await.unwrap();
@@ -289,7 +229,7 @@ async fn get_all_hashes_returns_pairs() {
 
 #[tokio::test]
 async fn get_id_by_hash_found() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let created = repo
@@ -304,7 +244,7 @@ async fn get_id_by_hash_found() {
 
 #[tokio::test]
 async fn get_id_by_hash_not_found() {
-    let pool = create_test_db().await;
+    let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
     let result = repo.get_id_by_hash("nonexistent").await.unwrap();

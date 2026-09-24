@@ -47,7 +47,6 @@ impl SafeSearchEngine {
         }
     }
 
-    /// Returns a slice of all supported engines in a stable order.
     pub fn all() -> &'static [SafeSearchEngine] {
         &[
             SafeSearchEngine::Google,
@@ -116,11 +115,8 @@ impl std::str::FromStr for YouTubeMode {
 pub struct SafeSearchConfig {
     /// Database row identifier. `None` before first persist.
     pub id: Option<i64>,
-    /// The group this configuration applies to.
     pub group_id: i64,
-    /// The search engine this configuration controls.
     pub engine: SafeSearchEngine,
-    /// Whether Safe Search is active for this engine and group.
     pub enabled: bool,
     /// YouTube restriction level. Only relevant when `engine == YouTube`.
     pub youtube_mode: YouTubeMode,

@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use async_trait::async_trait;
 use ferrous_dns_domain::{BlocklistSource, DomainError};
 use std::sync::Arc;
@@ -67,10 +68,7 @@ impl CreateBlocklistSourceUseCase {
             .map_err(DomainError::InvalidBlocklistSource)?;
 
         for &gid in &group_ids {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
         let source = self

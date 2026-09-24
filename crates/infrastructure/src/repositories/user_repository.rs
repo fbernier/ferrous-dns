@@ -7,6 +7,8 @@ use tracing::{error, info, instrument};
 use ferrous_dns_application::ports::UserRepository;
 use ferrous_dns_domain::{DomainError, User, UserRole, UserSource};
 
+use crate::repositories::{db_err, is_unique_violation, sql_now};
+
 pub struct SqliteUserRepository {
     pool: Arc<SqlitePool>,
 }
@@ -38,7 +40,7 @@ impl UserRepository for SqliteUserRepository {
         password_hash: &str,
         role: &str,
     ) -> Result<User, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
         let row: UserRow = sqlx::query_as(
             "INSERT INTO users (username, display_name, password_hash, role, enabled, created_at, updated_at)
@@ -53,13 +55,11 @@ impl UserRepository for SqliteUserRepository {
         .bind(&now)
         .fetch_one(self.pool.as_ref())
         .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+        .map_err(|e| {
+            if is_unique_violation(&e) {
                 DomainError::DuplicateUsername(username.to_string())
-            }
-            _ => {
-                error!("Failed to create user: {e}");
-                DomainError::DatabaseError(e.to_string())
+            } else {
+                db_err("Failed to create user")(e)
             }
         })?;
 
@@ -76,10 +76,7 @@ impl UserRepository for SqliteUserRepository {
         .bind(username)
         .fetch_optional(self.pool.as_ref())
         .await
-        .map_err(|e| {
-            error!("Failed to get user by username: {e}");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to get user by username"))?;
 
         Ok(row.map(row_to_user))
     }
@@ -93,10 +90,7 @@ impl UserRepository for SqliteUserRepository {
         .bind(id)
         .fetch_optional(self.pool.as_ref())
         .await
-        .map_err(|e| {
-            error!("Failed to get user by id: {e}");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to get user by id"))?;
 
         Ok(row.map(row_to_user))
     }
@@ -109,42 +103,20 @@ impl UserRepository for SqliteUserRepository {
         )
         .fetch_all(self.pool.as_ref())
         .await
-        .map_err(|e| {
-            error!("Failed to get all users: {e}");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to get all users"))?;
 
         Ok(rows.into_iter().map(row_to_user).collect())
     }
 
     #[instrument(skip(self, password_hash))]
     async fn update_password(&self, id: i64, password_hash: &str) -> Result<(), DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+        let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
             .bind(password_hash)
-            .bind(&now)
+            .bind(sql_now())
             .bind(id)
             .execute(self.pool.as_ref())
             .await
-            .map_err(|e| {
-                error!("Failed to update user password: {e}");
-                DomainError::DatabaseError(e.to_string())
-            })?;
-
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    async fn delete(&self, id: i64) -> Result<(), DomainError> {
-        let result = sqlx::query("DELETE FROM users WHERE id = ?")
-            .bind(id)
-            .execute(self.pool.as_ref())
-            .await
-            .map_err(|e| {
-                error!("Failed to delete user: {e}");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to update user password"))?;
 
         if result.rows_affected() == 0 {
             return Err(DomainError::UserNotFound(id.to_string()));
@@ -152,25 +124,65 @@ impl UserRepository for SqliteUserRepository {
 
         Ok(())
     }
+
+    /// Username-keyed auth state has no FK: purge it so sessions die and a reused name inherits no factors.
+    #[instrument(skip(self))]
+    async fn delete(&self, id: i64) -> Result<(), DomainError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(db_err("Failed to begin user delete"))?;
+
+        let deleted: Option<(String,)> =
+            sqlx::query_as("DELETE FROM users WHERE id = ? RETURNING username")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err("Failed to delete user"))?;
+
+        let Some((username,)) = deleted else {
+            return Err(DomainError::UserNotFound(id.to_string()));
+        };
+
+        for stmt in [
+            "DELETE FROM auth_sessions WHERE username = ?",
+            "DELETE FROM user_mfa WHERE username = ?",
+            "DELETE FROM mfa_recovery_codes WHERE username = ?",
+            "DELETE FROM webauthn_credentials WHERE username = ?",
+            "DELETE FROM mfa_challenges WHERE username = ?",
+        ] {
+            sqlx::query(stmt)
+                .bind(&username)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("Failed to delete user auth state"))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(db_err("Failed to commit user delete"))?;
+
+        Ok(())
+    }
 }
 
-fn row_to_user(row: UserRow) -> User {
-    let role = UserRole::parse(&row.4).unwrap_or_else(|_| {
-        tracing::error!(
-            role = row.4,
-            "Invalid user role in database, defaulting to Viewer"
-        );
+fn row_to_user(
+    (id, username, display_name, password_hash, role, enabled, created_at, updated_at): UserRow,
+) -> User {
+    let role = UserRole::parse(&role).unwrap_or_else(|_| {
+        error!(role, "Invalid user role in database, defaulting to Viewer");
         UserRole::Viewer
     });
     User {
-        id: Some(row.0),
-        username: Arc::from(row.1.as_str()),
-        display_name: row.2.map(|s| Arc::from(s.as_str())),
-        password_hash: Arc::from(row.3.as_str()),
+        id: Some(id),
+        username: Arc::from(username.as_str()),
+        display_name: display_name.map(|s| Arc::from(s.as_str())),
+        password_hash: Arc::from(password_hash.as_str()),
         role,
         source: UserSource::Database,
-        enabled: row.5,
-        created_at: Some(row.6),
-        updated_at: Some(row.7),
+        enabled,
+        created_at: Some(created_at),
+        updated_at: Some(updated_at),
     }
 }

@@ -12,12 +12,12 @@ pub mod local_wildcard;
 
 pub use builder::ResolverBuilder;
 pub use cache_layer::CachedResolver;
-pub use config::{QueryFiltersConfig, ResolverConfig};
+pub use config::ResolverConfig;
 pub use core::CoreResolver;
 pub use dns64_layer::Dns64Resolver;
 pub use dnssec_layer::DnssecResolver;
 pub use filtered_resolver::FilteredResolver;
-pub use filters::QueryFilters;
+pub use filters::{NonFqdn, QueryFilters};
 pub use legacy::HickoryDnsResolver;
 pub use local_ptr::LocalPtrResolver;
 pub use local_wildcard::{LocalWildcardResolver, WildcardAnswer, WildcardMap, WildcardRegistry};

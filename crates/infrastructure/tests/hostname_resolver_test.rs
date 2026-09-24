@@ -19,6 +19,8 @@ fn test_ip_to_reverse_domain_ipv4_zeros() {
 fn test_ip_to_reverse_domain_ipv6() {
     let ip: IpAddr = "2001:db8::1".parse().unwrap();
     let reverse = PtrHostnameResolver::ip_to_reverse_domain(&ip);
-    assert!(reverse.ends_with(".ip6.arpa"));
-    assert!(reverse.contains("8.b.d.0.1.0.0.2"));
+    assert_eq!(
+        reverse,
+        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"
+    );
 }

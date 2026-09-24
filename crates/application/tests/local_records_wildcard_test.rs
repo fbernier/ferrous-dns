@@ -12,8 +12,6 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
-// ── Mock ConfigRepository ────────────────────────────────────────────────────
-
 struct MockConfigRepository {
     should_fail: bool,
 }
@@ -38,8 +36,6 @@ impl ConfigRepository for MockConfigRepository {
         }
     }
 }
-
-// ── Mock registries ──────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct MockWildcardRegistry {
@@ -94,8 +90,6 @@ impl PtrRecordRegistry for MockPtrRegistry {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 fn default_config() -> Arc<RwLock<Config>> {
     Arc::new(RwLock::new(Config::default()))
 }
@@ -125,8 +119,6 @@ fn exact_record() -> LocalDnsRecord {
         ttl: Some(300),
     }
 }
-
-// ── Create ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_create_wildcard_registers_in_the_wildcard_index() {
@@ -286,8 +278,6 @@ async fn test_create_wildcard_does_not_register_on_save_failure() {
     assert!(wildcards.registered.lock().unwrap().is_empty());
 }
 
-// ── Delete ───────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_delete_wildcard_unregisters_it() {
     let wildcards = MockWildcardRegistry::new_arc();
@@ -318,8 +308,6 @@ async fn test_delete_exact_record_leaves_the_wildcard_index_alone() {
     assert!(result.is_ok());
     assert!(wildcards.unregistered.lock().unwrap().is_empty());
 }
-
-// ── Update ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_update_from_exact_to_wildcard_moves_the_record() {

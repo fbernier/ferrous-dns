@@ -1,4 +1,4 @@
-use ferrous_dns_domain::dns_record::{RecordCategory, RecordType};
+use ferrous_dns_domain::dns_record::RecordType;
 use hickory_proto::rr::RecordType as HickoryRecordType;
 pub struct RecordTypeMapper;
 
@@ -24,7 +24,7 @@ impl RecordTypeMapper {
             RecordType::CAA => HickoryRecordType::CAA,
             RecordType::TLSA => HickoryRecordType::TLSA,
             RecordType::SSHFP => HickoryRecordType::SSHFP,
-            RecordType::DNAME => HickoryRecordType::ANAME,
+            RecordType::DNAME => HickoryRecordType::DNAME,
 
             RecordType::RRSIG => HickoryRecordType::RRSIG,
             RecordType::NSEC => HickoryRecordType::NSEC,
@@ -71,6 +71,7 @@ impl RecordTypeMapper {
             HickoryRecordType::CAA => Some(RecordType::CAA),
             HickoryRecordType::TLSA => Some(RecordType::TLSA),
             HickoryRecordType::SSHFP => Some(RecordType::SSHFP),
+            HickoryRecordType::DNAME => Some(RecordType::DNAME),
 
             HickoryRecordType::RRSIG => Some(RecordType::RRSIG),
             HickoryRecordType::NSEC => Some(RecordType::NSEC),
@@ -96,33 +97,23 @@ impl RecordTypeMapper {
             _ => None,
         }
     }
+}
 
-    pub fn is_supported(hickory_type: HickoryRecordType) -> bool {
-        Self::from_hickory(hickory_type).is_some()
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn hickory_types_for_category(category: RecordCategory) -> Vec<HickoryRecordType> {
-        RecordType::by_category(category)
-            .into_iter()
-            .map(|rt| Self::to_hickory(&rt))
-            .collect()
-    }
-
-    pub fn is_dnssec(hickory_type: HickoryRecordType) -> bool {
-        Self::from_hickory(hickory_type)
-            .map(|rt| rt.is_dnssec())
-            .unwrap_or(false)
-    }
-
-    pub fn is_security_related(hickory_type: HickoryRecordType) -> bool {
-        Self::from_hickory(hickory_type)
-            .map(|rt| rt.is_security_related())
-            .unwrap_or(false)
-    }
-
-    pub fn is_modern(hickory_type: HickoryRecordType) -> bool {
-        Self::from_hickory(hickory_type)
-            .map(|rt| rt.is_modern())
-            .unwrap_or(false)
+    #[test]
+    fn hickory_mapping_agrees_with_wire_codes() {
+        for code in 0..=u16::MAX {
+            assert_eq!(
+                RecordTypeMapper::from_hickory(HickoryRecordType::from(code)),
+                RecordType::from_u16(code),
+                "type code {code}"
+            );
+            if let Some(rt) = RecordType::from_u16(code) {
+                assert_eq!(u16::from(RecordTypeMapper::to_hickory(&rt)), code, "{rt}");
+            }
+        }
     }
 }

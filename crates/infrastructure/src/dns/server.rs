@@ -1,7 +1,10 @@
+use crate::dns::cache::key::normalize_domain;
 use crate::dns::ede::{self, ExtendedDnsError};
 use crate::dns::fast_path;
 use crate::dns::forwarding::RecordTypeMapper;
-use crate::dns::wire_response::{self, EdnsReply, Rcode, ResponseBody, ResponseHead};
+use crate::dns::wire_response::{
+    self, EdnsReply, Rcode, ResponseBody, ResponseHead, COOKIE_OPTION_CODE,
+};
 use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
 use ferrous_dns_domain::{
     BlockResponseMode, ClientProtocol, DnsRequest, DnssecStatus, DomainError, EdnsCookie,
@@ -17,9 +20,9 @@ const DEFAULT_TTL: u32 = 60;
 
 /// How domain-verdict blocks (blocklist, DGA, tunneling, C2 filter) are answered.
 ///
-/// Snapshotted from `[blocking]` config at boot; applied to the wire response so
-/// blocked answers become cacheable (default `NullIp`) instead of the legacy,
-/// non-cacheable `REFUSED` that caused clients to retry aggressively.
+/// Snapshotted from `[blocking]` config at boot. The default `NullIp` makes a
+/// blocked answer cacheable, so clients do not retry it the way they retry
+/// `REFUSED`.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockPolicy {
     pub mode: BlockResponseMode,
@@ -41,20 +44,6 @@ impl DnsServerHandler {
         Self {
             use_case,
             block_policy,
-        }
-    }
-
-    /// Normalizes a domain received from Hickory for downstream use: strips the
-    /// trailing root dot and lowercases ASCII bytes (RFC 1035 §2.3.3 — DNS is
-    /// case-insensitive). Returns `Cow::Borrowed` when the trimmed slice is
-    /// already lowercase (zero-alloc fast path); otherwise owns a lowercased
-    /// copy.
-    fn normalize_domain(domain: &str) -> Cow<'_, str> {
-        let trimmed = domain.trim_end_matches('.');
-        if trimmed.bytes().all(|b| !b.is_ascii_uppercase()) {
-            Cow::Borrowed(trimmed)
-        } else {
-            Cow::Owned(trimmed.to_ascii_lowercase())
         }
     }
 
@@ -345,7 +334,7 @@ fn parse_client_query_hickory(
     let first = msg.queries.first()?;
     let record_type = RecordTypeMapper::from_hickory(first.query_type())?;
     let domain_name = first.name().to_utf8();
-    let domain = DnsServerHandler::normalize_domain(&domain_name);
+    let domain = normalize_domain(domain_name.trim_end_matches('.'));
 
     let mut request = DnsRequest::new(domain.as_ref(), record_type, client_ip)
         .with_checking_disabled(msg.checking_disabled)
@@ -355,7 +344,7 @@ fn parse_client_query_hickory(
             .as_ref()
             .iter()
             .find_map(|(_, opt)| match opt {
-                EdnsOption::Unknown(10, data) => Some(data.as_slice()),
+                EdnsOption::Unknown(COOKIE_OPTION_CODE, data) => Some(data.as_slice()),
                 _ => None,
             })
     });
@@ -389,8 +378,8 @@ fn parse_client_query_hickory(
 /// [`BlockPolicy`]. `NullIp` synthesizes a cacheable `0.0.0.0`/`::` answer
 /// (NODATA for non-A/AAAA queries); other modes set the matching response
 /// code with an empty answer section. Negative answers (NXDOMAIN / NODATA)
-/// carry a synthetic SOA so they can be negatively cached. `Refused` keeps
-/// the legacy error response.
+/// carry a synthetic SOA so they can be negatively cached; `Refused` carries
+/// none.
 pub fn build_blocked_wire(
     query: &ClientQuery<'_>,
     record_type: RecordType,

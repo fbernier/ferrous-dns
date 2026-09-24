@@ -1,7 +1,7 @@
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use ferrous_dns_application::ports::{ResponseIpFilterEvictionTarget, ResponseIpFilterStore};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
-use ferrous_dns_domain::ResponseIpFilterConfig;
+use ferrous_dns_domain::{DomainError, ResponseIpFilterConfig};
 use rustc_hash::FxBuildHasher;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -11,24 +11,20 @@ const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// Downloads C2 IP threat feeds and provides O(1) hot-path lookup.
 ///
-/// Maintains a `DashSet` of known C2 IPs for lock-free hot-path checks, and a
-/// `DashMap` with TTL metadata for background eviction. The fetch loop runs as
-/// an async task, downloading feeds at the configured interval.
+/// Known C2 IPs are looked up on the hot path and aged out in the background.
+/// The fetch loop runs as an async task, downloading feeds at the configured
+/// interval.
 pub struct ResponseIpFilterDetector {
     config: ResponseIpFilterConfig,
-    /// O(1) hot-path lookup set.
-    pub blocked_ips: DashSet<IpAddr, FxBuildHasher>,
-    /// Last confirmation timestamp (ns) per IP, for TTL-based eviction.
-    pub blocked_ip_confirmed_at: DashMap<IpAddr, u64, FxBuildHasher>,
+    /// C2 IP → last time a feed listed it (coarse ns), for TTL eviction.
+    pub blocked_ips: DashMap<IpAddr, u64, FxBuildHasher>,
 }
 
 impl ResponseIpFilterDetector {
-    /// Creates a new detector with empty state.
     pub fn new(config: &ResponseIpFilterConfig) -> Self {
         Self {
             config: config.clone(),
-            blocked_ips: DashSet::with_hasher(FxBuildHasher),
-            blocked_ip_confirmed_at: DashMap::with_hasher(FxBuildHasher),
+            blocked_ips: DashMap::with_hasher(FxBuildHasher),
         }
     }
 
@@ -60,8 +56,7 @@ impl ResponseIpFilterDetector {
             match fetch_ip_list(url, http_client).await {
                 Ok(ips) => {
                     for ip in ips {
-                        self.blocked_ip_confirmed_at.insert(ip, now_ns);
-                        if self.blocked_ips.insert(ip) {
+                        if self.blocked_ips.insert(ip, now_ns).is_none() {
                             total_new += 1;
                         }
                     }
@@ -88,26 +83,22 @@ impl ResponseIpFilterDetector {
 
 impl ResponseIpFilterStore for ResponseIpFilterDetector {
     fn is_blocked_ip(&self, ip: &IpAddr) -> bool {
-        self.blocked_ips.contains(ip)
+        self.blocked_ips.contains_key(ip)
     }
 }
 
 impl ResponseIpFilterEvictionTarget for ResponseIpFilterDetector {
     fn evict_stale_ips(&self) {
         let now_ns = coarse_now_ns();
-        let ttl_ns = self.config.ip_ttl_secs * NS_PER_SEC;
+        let ttl_ns = self.config.ip_ttl_secs.saturating_mul(NS_PER_SEC);
 
-        self.blocked_ip_confirmed_at
-            .retain(|ip, &mut confirmed_ns| {
-                let age_ns = now_ns.saturating_sub(confirmed_ns);
-                if age_ns > ttl_ns {
-                    self.blocked_ips.remove(ip);
-                    debug!(ip = %ip, "Evicted stale C2 IP");
-                    false
-                } else {
-                    true
-                }
-            });
+        self.blocked_ips.retain(|ip, confirmed_ns| {
+            let keep = now_ns.saturating_sub(*confirmed_ns) <= ttl_ns;
+            if !keep {
+                debug!(ip = %ip, "Evicted stale C2 IP");
+            }
+            keep
+        });
     }
 
     fn blocked_ip_count(&self) -> usize {
@@ -115,22 +106,25 @@ impl ResponseIpFilterEvictionTarget for ResponseIpFilterDetector {
     }
 }
 
-async fn fetch_ip_list(url: &str, client: &reqwest::Client) -> Result<Vec<IpAddr>, String> {
+async fn fetch_ip_list(url: &str, client: &reqwest::Client) -> Result<Vec<IpAddr>, DomainError> {
     let response = client
         .get(url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("fetch error for {url}: {e}"))?;
+        .map_err(|e| DomainError::IoError(format!("fetch error for {url}: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(format!("HTTP {} for {url}", response.status().as_u16()));
+        return Err(DomainError::IoError(format!(
+            "HTTP {} for {url}",
+            response.status().as_u16()
+        )));
     }
 
     let text = response
         .text()
         .await
-        .map_err(|e| format!("read error for {url}: {e}"))?;
+        .map_err(|e| DomainError::IoError(format!("read error for {url}: {e}")))?;
 
     Ok(parse_ip_list(&text))
 }

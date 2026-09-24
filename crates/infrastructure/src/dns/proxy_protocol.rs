@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const PROXY_V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
@@ -10,7 +10,6 @@ const MAX_ADDITIONAL_LEN: usize = 536;
 const COMMAND_LOCAL: u8 = 0x00;
 const COMMAND_PROXY: u8 = 0x01;
 
-const FAMILY_UNSPEC: u8 = 0x00;
 const FAMILY_TCP4: u8 = 0x11;
 const FAMILY_TCP6: u8 = 0x21;
 
@@ -77,51 +76,33 @@ pub async fn read_proxy_v2_client_ip<R: AsyncRead + Unpin>(
 
     match command {
         COMMAND_LOCAL => Ok(peer_addr),
-        COMMAND_PROXY => extract_source_ip(family, &additional[..additional_len], peer_addr),
+        COMMAND_PROXY => Ok(extract_source_ip(
+            family,
+            &additional[..additional_len],
+            peer_addr,
+        )),
         _ => Err(ProxyProtocolError::UnknownCommand),
     }
 }
 
-fn extract_source_ip(
-    family: u8,
-    additional: &[u8],
-    peer_addr: IpAddr,
-) -> Result<IpAddr, ProxyProtocolError> {
+/// The client address a `PROXY` header carries. Any other family (`UNSPEC`,
+/// datagram or UNIX) or a truncated address block keeps the peer address.
+fn extract_source_ip(family: u8, additional: &[u8], peer_addr: IpAddr) -> IpAddr {
     match family {
-        FAMILY_TCP4 if additional.len() >= 4 => {
-            let octets = [additional[0], additional[1], additional[2], additional[3]];
-            Ok(IpAddr::V4(Ipv4Addr::from(octets)))
-        }
-        FAMILY_TCP6 if additional.len() >= 16 => {
-            let octets = [
-                additional[0],
-                additional[1],
-                additional[2],
-                additional[3],
-                additional[4],
-                additional[5],
-                additional[6],
-                additional[7],
-                additional[8],
-                additional[9],
-                additional[10],
-                additional[11],
-                additional[12],
-                additional[13],
-                additional[14],
-                additional[15],
-            ];
+        FAMILY_TCP4 => additional
+            .first_chunk::<4>()
+            .map_or(peer_addr, |octets| IpAddr::from(*octets)),
+        FAMILY_TCP6 => additional.first_chunk::<16>().map_or(peer_addr, |octets| {
             // A dual-stack frontend encodes an IPv4 client as TCP6 with a
             // v4-mapped address. Normalise it, so a client keyed as
             // `10.0.0.1` on the direct path is not keyed as
             // `::ffff:10.0.0.1` behind the proxy.
-            let v6 = Ipv6Addr::from(octets);
-            Ok(match v6.to_ipv4_mapped() {
+            let v6 = Ipv6Addr::from(*octets);
+            match v6.to_ipv4_mapped() {
                 Some(v4) => IpAddr::V4(v4),
                 None => IpAddr::V6(v6),
-            })
-        }
-        FAMILY_UNSPEC => Ok(peer_addr),
-        _ => Ok(peer_addr),
+            }
+        }),
+        _ => peer_addr,
     }
 }

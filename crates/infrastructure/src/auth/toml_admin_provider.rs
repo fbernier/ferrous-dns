@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use ferrous_dns_domain::{AdminConfig, User, UserRole, UserSource};
 
-/// Reads the admin user from TOML config (`[auth.admin]`).
-///
-/// This is the "escape hatch" — if a user loses access to the database,
-/// they can always edit the TOML file and restart to regain admin access.
+/// `[auth.admin]` user: the escape hatch that regains access by editing TOML when the DB is lost.
 pub struct TomlAdminProvider {
     admin_config: AdminConfig,
 }
@@ -35,7 +32,7 @@ impl TomlAdminProvider {
         })
     }
 
-    /// Returns the admin username regardless of password state.
+    /// Unlike `get_admin`, returned even when no password is set, so the name stays reserved.
     pub fn admin_username(&self) -> &str {
         &self.admin_config.username
     }

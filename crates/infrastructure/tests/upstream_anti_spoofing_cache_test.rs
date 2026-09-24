@@ -8,9 +8,7 @@ use ferrous_dns_domain::{DnsQuery, RecordType, UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::forwarding::HardeningOpts;
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 use ferrous_dns_infrastructure::dns::resolver::{CachedResolver, CoreResolver};
-use ferrous_dns_infrastructure::dns::{
-    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
-};
+use ferrous_dns_infrastructure::dns::{DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy};
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, Record};
@@ -213,7 +211,6 @@ async fn assert_cache_hit_miss(echo_cookie: bool) {
         core as Arc<dyn DnsResolver>,
         make_cache(),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 

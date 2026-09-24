@@ -64,7 +64,8 @@ pub struct TimeSlotResponse {
     pub days: u8,
     pub start_time: String,
     pub end_time: String,
-    pub action: String,
+    #[schema(value_type = String)]
+    pub action: &'static str,
     pub created_at: Option<String>,
 }
 
@@ -76,7 +77,7 @@ impl TimeSlotResponse {
             days: s.days,
             start_time: s.start_time.to_string(),
             end_time: s.end_time.to_string(),
-            action: s.action.to_str().to_string(),
+            action: s.action.to_str(),
             created_at: s.created_at.as_deref().map(String::from),
         }
     }

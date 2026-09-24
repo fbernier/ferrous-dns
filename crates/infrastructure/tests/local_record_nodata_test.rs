@@ -4,7 +4,7 @@ use ferrous_dns_domain::RecordType::{A, AAAA, CNAME, TXT};
 use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::{CachedResolver, LocalWildcardResolver};
 use ferrous_dns_infrastructure::dns::{
-    CachedAddresses, CachedData, DnsCache, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
+    CachedAddresses, CachedData, DnsCache, DnsCacheConfig, EvictionStrategy,
 };
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,13 +53,7 @@ fn setup() -> (Arc<DnsCache>, Arc<CachedResolver>, Arc<Upstream>) {
         max_ttl: 86_400,
     }));
     let upstream = Arc::new(Upstream::default());
-    let resolver = Arc::new(CachedResolver::new(
-        upstream.clone(),
-        cache.clone(),
-        300,
-        Arc::new(NegativeQueryTracker::new()),
-        4,
-    ));
+    let resolver = Arc::new(CachedResolver::new(upstream.clone(), cache.clone(), 300, 4));
     (cache, resolver, upstream)
 }
 
@@ -327,7 +321,6 @@ async fn test_coalesced_followers_keep_local_nodata() {
             release: Mutex::new(release_rx),
         }),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
     let leader_resolver = resolver.clone();

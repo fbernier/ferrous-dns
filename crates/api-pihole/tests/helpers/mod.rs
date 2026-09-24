@@ -8,26 +8,22 @@ use ferrous_dns_api_pihole::state::{
     PiholeBlockingState, PiholeClientState, PiholeGroupState, PiholeListsState, PiholeQueryState,
     PiholeSystemState,
 };
-use ferrous_dns_api_pihole::{create_pihole_routes, PiholeAppState};
-use ferrous_dns_application::ports::{
-    BlockFilterEnginePort, FilterDecision, UpstreamGroupHealth, UpstreamHealthPort, UpstreamStatus,
-};
+use ferrous_dns_api_pihole::{create_pihole_router_with_openapi, PiholeAppState};
+use ferrous_dns_application::ports::{BlockFilterEnginePort, FilterDecision};
 use ferrous_dns_application::use_cases::{
-    AssignClientGroupUseCase, CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase,
-    CreateGroupUseCase, CreateManagedDomainUseCase, CreateManualClientUseCase,
-    CreateRegexFilterUseCase, CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase,
-    DeleteClientUseCase, DeleteGroupUseCase, DeleteManagedDomainUseCase, DeleteRegexFilterUseCase,
-    DeleteWhitelistSourceUseCase, GetBlockFilterStatsUseCase, GetBlocklistSourcesUseCase,
-    GetCacheStatsUseCase, GetClientsUseCase, GetGroupsUseCase, GetManagedDomainsUseCase,
-    GetQueryStatsUseCase, GetRecentQueriesUseCase, GetRegexFiltersUseCase, GetTimelineUseCase,
-    GetTopAllowedDomainsUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase,
-    GetWhitelistSourcesUseCase, UpdateBlocklistSourceUseCase, UpdateClientUseCase,
-    UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
-    UpdateWhitelistSourceUseCase,
+    CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateGroupUseCase,
+    CreateManagedDomainUseCase, CreateManualClientUseCase, CreateRegexFilterUseCase,
+    CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase, DeleteClientUseCase,
+    DeleteGroupUseCase, DeleteManagedDomainUseCase, DeleteRegexFilterUseCase,
+    DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientsUseCase, GetGroupsUseCase,
+    GetManagedDomainsUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase,
+    GetRegexFiltersUseCase, GetTimelineUseCase, GetTopAllowedDomainsUseCase,
+    GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetWhitelistSourcesUseCase,
+    UpdateBlocklistSourceUseCase, UpdateClientUseCase, UpdateGroupUseCase,
+    UpdateManagedDomainUseCase, UpdateRegexFilterUseCase, UpdateWhitelistSourceUseCase,
 };
 use ferrous_dns_domain::config::DatabaseConfig;
-use ferrous_dns_domain::Config;
-use ferrous_dns_domain::DomainError;
+use ferrous_dns_domain::{BlockSource, Config, DomainError};
 use ferrous_dns_infrastructure::repositories::{
     blocklist_source_repository::SqliteBlocklistSourceRepository,
     client_repository::SqliteClientRepository, group_repository::SqliteGroupRepository,
@@ -37,24 +33,46 @@ use ferrous_dns_infrastructure::repositories::{
     whitelist_source_repository::SqliteWhitelistSourceRepository,
 };
 use sqlx::sqlite::SqlitePoolOptions;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-// ---------------------------------------------------------------------------
-// Mock: BlockFilterEnginePort
-// ---------------------------------------------------------------------------
+/// Client IP the mock engine resolves to [`MOCK_CLIENT_GROUP`]; every other
+/// client resolves to the default group 1.
+pub const MOCK_GROUPED_CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+pub const MOCK_CLIENT_GROUP: i64 = 2;
 
-struct MockBlockFilterEngine;
+/// Domain decisions of the mock engine:
+/// - `regex.blocked.test` → blocked by a regex filter
+/// - `list.blocked.test` → blocked by a blocklist
+/// - `allowlisted.test` → explicitly allowed
+/// - `group.blocked.test` → blocked by a blocklist in [`MOCK_CLIENT_GROUP`] only
+/// - anything else → allowed
+struct MockBlockFilterEngine {
+    blocking_enabled: AtomicBool,
+}
 
 #[async_trait]
 impl BlockFilterEnginePort for MockBlockFilterEngine {
-    fn resolve_group(&self, _ip: IpAddr) -> i64 {
-        1
+    fn resolve_group(&self, ip: IpAddr) -> i64 {
+        if ip == MOCK_GROUPED_CLIENT {
+            MOCK_CLIENT_GROUP
+        } else {
+            1
+        }
     }
 
-    fn check(&self, _domain: &str, _group_id: i64) -> FilterDecision {
-        FilterDecision::Allow
+    fn check(&self, domain: &str, group_id: i64) -> FilterDecision {
+        match domain {
+            "regex.blocked.test" => FilterDecision::Block(BlockSource::RegexFilter),
+            "list.blocked.test" => FilterDecision::Block(BlockSource::Blocklist),
+            "allowlisted.test" => FilterDecision::ExplicitAllow,
+            "group.blocked.test" if group_id == MOCK_CLIENT_GROUP => {
+                FilterDecision::Block(BlockSource::Blocklist)
+            }
+            _ => FilterDecision::Allow,
+        }
     }
 
     fn store_cname_decision(&self, _domain: &str, _group_id: i64, _ttl_secs: u64) {}
@@ -72,31 +90,13 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
     }
 
     fn is_blocking_enabled(&self) -> bool {
-        true
+        self.blocking_enabled.load(Ordering::Relaxed)
     }
 
-    fn set_blocking_enabled(&self, _enabled: bool) {}
-}
-
-// ---------------------------------------------------------------------------
-// Mock: UpstreamHealthPort
-// ---------------------------------------------------------------------------
-
-struct MockUpstreamHealth;
-
-impl UpstreamHealthPort for MockUpstreamHealth {
-    fn get_all_upstream_status(&self) -> Vec<(String, UpstreamStatus)> {
-        Vec::new()
-    }
-
-    fn get_grouped_upstream_health(&self) -> Vec<UpstreamGroupHealth> {
-        Vec::new()
+    fn set_blocking_enabled(&self, enabled: bool) {
+        self.blocking_enabled.store(enabled, Ordering::Relaxed);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Test DB + App builder
-// ---------------------------------------------------------------------------
 
 pub async fn create_test_db() -> sqlx::SqlitePool {
     let pool = SqlitePoolOptions::new()
@@ -281,7 +281,7 @@ pub async fn create_pihole_test_app_with_auth(
     pool: sqlx::SqlitePool,
     totp_enrolled: bool,
 ) -> Router {
-    create_pihole_routes(build_pihole_state(pool, true, totp_enrolled).await)
+    create_pihole_router_with_openapi(build_pihole_state(pool, true, totp_enrolled).await).0
 }
 
 async fn build_pihole_state(
@@ -303,7 +303,9 @@ async fn build_pihole_state(
     let blocklist_source_repo = Arc::new(SqliteBlocklistSourceRepository::new(pool.clone()));
     let whitelist_source_repo = Arc::new(SqliteWhitelistSourceRepository::new(pool.clone()));
 
-    let block_filter_engine: Arc<dyn BlockFilterEnginePort> = Arc::new(MockBlockFilterEngine);
+    let block_filter_engine: Arc<dyn BlockFilterEnginePort> = Arc::new(MockBlockFilterEngine {
+        blocking_enabled: AtomicBool::new(true),
+    });
 
     let mut config = Config::default();
     config.auth.enabled = auth_enabled;
@@ -324,11 +326,6 @@ async fn build_pihole_state(
             )),
             get_top_clients: Arc::new(GetTopClientsUseCase::new(query_log_repo.clone())),
             get_recent_queries: Arc::new(GetRecentQueriesUseCase::new(query_log_repo.clone())),
-            upstream_health: Arc::new(MockUpstreamHealth),
-            get_block_filter_stats: Arc::new(GetBlockFilterStatsUseCase::new(
-                block_filter_engine.clone(),
-            )),
-            get_cache_stats: Arc::new(GetCacheStatsUseCase::new(query_log_repo.clone())),
         },
         blocking: PiholeBlockingState {
             block_filter_engine: block_filter_engine.clone(),
@@ -409,12 +406,7 @@ async fn build_pihole_state(
                 group_repo.clone(),
             )),
             update_client: Arc::new(UpdateClientUseCase::new(client_repo.clone())),
-            delete_client: Arc::new(DeleteClientUseCase::new(client_repo.clone())),
-            assign_client_group: Arc::new(AssignClientGroupUseCase::new(
-                client_repo,
-                group_repo,
-                block_filter_engine,
-            )),
+            delete_client: Arc::new(DeleteClientUseCase::new(client_repo)),
         },
         system: PiholeSystemState {
             cleanup_query_logs: Arc::new(CleanupOldQueryLogsUseCase::new(query_log_repo)),
@@ -428,8 +420,13 @@ async fn build_pihole_state(
 
 /// App with `[auth]` disabled, so every route is open — the routes' own tests
 /// don't have to log in first.
-pub async fn create_pihole_test_app(pool: sqlx::SqlitePool, _unused: Option<&str>) -> Router {
-    create_pihole_routes(build_pihole_state(pool, false, false).await)
+pub async fn create_pihole_test_app(pool: sqlx::SqlitePool) -> Router {
+    create_pihole_router_with_openapi(build_pihole_state(pool, false, false).await).0
+}
+
+/// The OpenAPI document served next to [`create_pihole_test_app`].
+pub async fn create_pihole_test_openapi(pool: sqlx::SqlitePool) -> utoipa::openapi::OpenApi {
+    create_pihole_router_with_openapi(build_pihole_state(pool, false, false).await).1
 }
 
 pub async fn insert_query(
@@ -453,7 +450,32 @@ pub async fn insert_query(
     .await
     .expect("Failed to insert query log entry");
 
-    // Stats read the minute rollups; rebuild them with the production backfill.
+    rebuild_rollups(pool).await;
+}
+
+/// Inserts an allowed query answered by `upstream_server` in `upstream_pool`.
+pub async fn insert_upstream_query(
+    pool: &sqlx::SqlitePool,
+    domain: &str,
+    upstream_pool: &str,
+    upstream_server: &str,
+) {
+    sqlx::query(
+        "INSERT INTO query_log (domain, record_type, client_ip, blocked, response_time_ms, cache_hit, query_source, upstream_pool, upstream_server)
+         VALUES (?, 'A', '10.0.0.1', 0, 100, 0, 'client', ?, ?)",
+    )
+    .bind(domain)
+    .bind(upstream_pool)
+    .bind(upstream_server)
+    .execute(pool)
+    .await
+    .expect("Failed to insert query log entry");
+
+    rebuild_rollups(pool).await;
+}
+
+/// Stats read the minute rollups; rebuild them with the production backfill.
+async fn rebuild_rollups(pool: &sqlx::SqlitePool) {
     sqlx::raw_sql(concat!(
         "DELETE FROM query_log_minute; DELETE FROM query_log_minute_record_type;",
         "DELETE FROM query_log_minute_block_source; DELETE FROM query_log_minute_upstream;",

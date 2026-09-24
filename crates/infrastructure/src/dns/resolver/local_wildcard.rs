@@ -63,7 +63,7 @@ impl WildcardAnswer {
 pub struct LocalWildcardResolver {
     inner: Arc<dyn DnsResolver>,
     /// Live index of covered suffix → answers.
-    pub map: Arc<WildcardMap>,
+    map: Arc<WildcardMap>,
 }
 
 impl LocalWildcardResolver {

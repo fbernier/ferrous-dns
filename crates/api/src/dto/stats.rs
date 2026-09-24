@@ -1,20 +1,19 @@
+use ferrous_dns_domain::QueryStats;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
+const TOP_TYPES_LIMIT: usize = 10;
+
 #[derive(Deserialize, Debug, IntoParams)]
 pub struct StatsQuery {
-    #[serde(default = "default_period")]
+    #[serde(default = "crate::utils::default_period")]
     pub period: String,
-}
-
-fn default_period() -> String {
-    "24h".to_string()
 }
 
 pub type QuerySourceStats = HashMap<String, u64>;
 
-#[derive(Serialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, Default, ToSchema)]
 pub struct StatsResponse {
     pub queries_total: u64,
     pub queries_blocked: u64,
@@ -35,6 +34,49 @@ pub struct StatsResponse {
     pub source_stats: QuerySourceStats,
 }
 
+impl From<QueryStats> for StatsResponse {
+    fn from(stats: QueryStats) -> Self {
+        let top_10_types = stats
+            .top_types(TOP_TYPES_LIMIT)
+            .into_iter()
+            .map(|(rt, count)| TopType {
+                record_type: rt.as_str().to_string(),
+                count,
+            })
+            .collect();
+
+        Self {
+            queries_total: stats.queries_total,
+            queries_blocked: stats.queries_blocked,
+            queries_rate_limited: stats.queries_rate_limited,
+            queries_malware_detected: stats.queries_malware_detected,
+            queries_dnssec_bogus: stats.queries_dnssec_bogus,
+            clients: stats.unique_clients,
+            uptime: stats.uptime_seconds,
+            cache_hit_rate: stats.cache_hit_rate,
+            avg_query_time_ms: stats.avg_query_time_ms,
+            avg_cache_time_ms: stats.avg_cache_time_ms,
+            avg_upstream_time_ms: stats.avg_upstream_time_ms,
+            queries_by_type: stats
+                .queries_by_type
+                .iter()
+                .map(|(rt, count)| (rt.as_str().to_string(), *count))
+                .collect(),
+            most_queried_type: stats.most_queried_type.map(|rt| rt.as_str().to_string()),
+            record_type_distribution: stats
+                .record_type_distribution
+                .iter()
+                .map(|(rt, pct)| TypeDistribution {
+                    record_type: rt.as_str().to_string(),
+                    percentage: *pct,
+                })
+                .collect(),
+            top_10_types,
+            source_stats: stats.source_stats,
+        }
+    }
+}
+
 #[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct TypeDistribution {
     pub record_type: String,
@@ -45,27 +87,4 @@ pub struct TypeDistribution {
 pub struct TopType {
     pub record_type: String,
     pub count: u64,
-}
-
-impl Default for StatsResponse {
-    fn default() -> Self {
-        Self {
-            queries_total: 0,
-            queries_blocked: 0,
-            queries_rate_limited: 0,
-            queries_malware_detected: 0,
-            queries_dnssec_bogus: 0,
-            clients: 0,
-            uptime: 0,
-            cache_hit_rate: 0.0,
-            avg_query_time_ms: 0.0,
-            avg_cache_time_ms: 0.0,
-            avg_upstream_time_ms: 0.0,
-            queries_by_type: HashMap::new(),
-            most_queried_type: None,
-            record_type_distribution: Vec::new(),
-            top_10_types: Vec::new(),
-            source_stats: HashMap::new(),
-        }
-    }
 }

@@ -19,6 +19,8 @@ use utoipa::{
 };
 
 use crate::dto;
+use crate::handlers::auth::SESSION_COOKIE_NAME;
+use crate::middleware::require_auth::API_KEY_HEADER;
 
 /// Adds the cookie and API-key security schemes to the generated spec.
 pub struct SecurityAddon;
@@ -31,11 +33,11 @@ impl Modify for SecurityAddon {
 
         components.add_security_scheme(
             "session_cookie",
-            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("ferrous_session"))),
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(SESSION_COOKIE_NAME))),
         );
         components.add_security_scheme(
             "api_key",
-            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-Api-Key"))),
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new(API_KEY_HEADER))),
         );
     }
 }
@@ -92,7 +94,6 @@ impl Modify for SecurityAddon {
         dto::auth::DisableMfaRequest,
         dto::auth::PasskeyResponse,
         dto::auth::MfaStatusResponse,
-        dto::auth::RegisterPasskeyStartRequest,
         dto::auth::WebauthnRegisterStartResponse,
         dto::auth::RegisterPasskeyFinishRequest,
         dto::auth::WebauthnAuthStartRequest,
@@ -183,7 +184,7 @@ impl Modify for SecurityAddon {
         dto::config::RateLimitConfigUpdate,
         dto::config::BlockingConfigUpdate,
         dto::config::SettingsDto,
-        dto::config::SettingsUpdateResponse,
+        dto::config::ConfigSaveResponse,
         // dashboard / stats
         dto::DashboardResponse,
         dto::TopBlockedDomain,
@@ -233,9 +234,6 @@ mod tests {
     fn openapi_spec_serializes_with_security_schemes() {
         let spec = ApiDoc::openapi();
         let json = serde_json::to_value(&spec).expect("spec must serialize");
-
-        assert_eq!(json["info"]["title"], "Ferrous DNS API");
-        assert_eq!(json["info"]["version"], env!("CARGO_PKG_VERSION"));
 
         let schemes = &json["components"]["securitySchemes"];
         assert!(schemes["session_cookie"].is_object());

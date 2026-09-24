@@ -1,6 +1,6 @@
 use axum::extract::State;
 use axum::Json;
-use ferrous_dns_domain::Config;
+use ferrous_dns_domain::{Config, DomainError};
 use tracing::info;
 
 use crate::{dto::action::ActionResponse, errors::PiholeApiError, state::PiholeAppState};
@@ -45,7 +45,7 @@ pub async fn restartdns(
 ) -> Result<Json<ActionResponse>, PiholeApiError> {
     if let Some(ref path) = state.system.config_path {
         let new_config = Config::load(Some(path.as_ref()), Default::default())
-            .map_err(|e| PiholeApiError(ferrous_dns_domain::DomainError::IoError(e.to_string())))?;
+            .map_err(|e| DomainError::ConfigError(e.to_string()))?;
         let mut config_guard = state.system.config.write().await;
         *config_guard = new_config;
         info!("Configuration reloaded from {path}");

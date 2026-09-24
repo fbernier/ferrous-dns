@@ -31,10 +31,7 @@ pub trait DnsCacheAccess: Send + Sync {
         dnssec_status: Option<CachedDnssecStatus>,
     );
 
-    /// Phase 6: records a transient upstream error that was explicitly NOT
-    /// cached as a negative response (timeout, connection refused/reset,
-    /// no healthy servers, etc.). Default is a no-op so test doubles don't
-    /// have to implement metrics.
-    #[inline]
+    /// Counts an upstream failure that was deliberately not cached as a
+    /// negative answer. A no-op by default so test doubles skip metrics.
     fn record_transient_upstream_error(&self) {}
 }

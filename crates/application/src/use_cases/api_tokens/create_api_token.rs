@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::ports::ApiTokenRepository;
+use crate::use_cases::auth::session_factory::random_hex_256;
 use ferrous_dns_domain::{ApiToken, DomainError};
 
 /// Response returned when a new API token is created.
@@ -35,15 +36,9 @@ impl CreateApiTokenUseCase {
 
         let raw_token = match custom_token {
             Some(t) if !t.is_empty() => t.to_string(),
-            _ => super::generate_token()?,
+            _ => random_hex_256()?,
         };
-
-        let key_prefix = if raw_token.len() >= 8 {
-            &raw_token[..8]
-        } else {
-            &raw_token
-        };
-        let key_hash = super::hash_token(&raw_token);
+        let (key_prefix, key_hash) = super::key_material(&raw_token);
 
         let token = self
             .repo

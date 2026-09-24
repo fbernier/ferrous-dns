@@ -2,53 +2,6 @@ use ferrous_dns_domain::BlocklistSource;
 use std::sync::Arc;
 
 #[test]
-fn test_blocklist_source_creation() {
-    let source = BlocklistSource::new(
-        Some(1),
-        Arc::from("Test List"),
-        Some(Arc::from("https://example.com/list.txt")),
-        vec![1],
-        Some(Arc::from("Test comment")),
-        true,
-    );
-
-    assert_eq!(source.id, Some(1));
-    assert_eq!(source.name.as_ref(), "Test List");
-    assert_eq!(source.url.as_deref(), Some("https://example.com/list.txt"));
-    assert_eq!(source.group_ids, vec![1]);
-    assert_eq!(source.comment.as_deref(), Some("Test comment"));
-    assert!(source.enabled);
-    assert!(source.created_at.is_none());
-    assert!(source.updated_at.is_none());
-}
-
-#[test]
-fn test_blocklist_source_multiple_groups() {
-    let source = BlocklistSource::new(
-        Some(2),
-        Arc::from("Multi-Group List"),
-        None,
-        vec![1, 2, 3],
-        None,
-        true,
-    );
-
-    assert_eq!(source.group_ids, vec![1, 2, 3]);
-    assert_eq!(source.group_ids.len(), 3);
-}
-
-#[test]
-fn test_blocklist_source_no_url_no_comment() {
-    let source = BlocklistSource::new(None, Arc::from("Manual List"), None, vec![1], None, false);
-
-    assert!(source.id.is_none());
-    assert_eq!(source.name.as_ref(), "Manual List");
-    assert!(source.url.is_none());
-    assert!(source.comment.is_none());
-    assert!(!source.enabled);
-}
-
-#[test]
 fn test_validate_name_valid() {
     assert!(BlocklistSource::validate_name("Valid Name").is_ok());
     assert!(BlocklistSource::validate_name("A").is_ok());

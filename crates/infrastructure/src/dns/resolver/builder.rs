@@ -1,4 +1,4 @@
-use super::super::cache::{DnsCache, NegativeQueryTracker};
+use super::super::cache::DnsCache;
 use super::super::dnssec::{DnssecCache, TrustAnchorStore};
 use super::super::load_balancer::PoolManager;
 use super::cache_layer::CachedResolver;
@@ -77,11 +77,6 @@ impl ResolverBuilder {
         self
     }
 
-    pub fn with_dnssec(mut self) -> Self {
-        self.config.dnssec_enabled = true;
-        self
-    }
-
     pub fn with_local_domain(mut self, domain: Option<String>) -> Self {
         self.local_domain = domain;
         self
@@ -146,21 +141,16 @@ impl ResolverBuilder {
                 .clone()
                 .unwrap_or_else(|| self.pool_manager.clone());
             let trust_anchors = self.trust_anchors.unwrap_or_default();
-            resolver = Arc::new(match self.dnssec_cache {
-                Some(cache) => DnssecResolver::with_shared_cache(
-                    resolver,
-                    dnssec_pm,
-                    self.config.query_timeout_ms,
-                    trust_anchors,
-                    cache,
-                ),
-                None => DnssecResolver::new(
-                    resolver,
-                    dnssec_pm,
-                    self.config.query_timeout_ms,
-                    trust_anchors,
-                ),
-            });
+            let dnssec_cache = self
+                .dnssec_cache
+                .unwrap_or_else(|| Arc::new(DnssecCache::new()));
+            resolver = Arc::new(DnssecResolver::new(
+                resolver,
+                dnssec_pm,
+                self.config.query_timeout_ms,
+                trust_anchors,
+                dnssec_cache,
+            ));
         }
 
         // DNS64 sits below the cache: synthesized AAAA answers are stored as
@@ -171,17 +161,12 @@ impl ResolverBuilder {
         }
 
         if let Some(cache) = self.cache {
-            let tracker = Arc::new(NegativeQueryTracker::new());
-            tracker.start_cleanup_task();
-            let cached = CachedResolver::new(
+            resolver = Arc::new(CachedResolver::new(
                 resolver,
                 cache,
                 self.config.cache_ttl,
-                tracker,
                 self.config.inflight_shards,
-            );
-
-            resolver = Arc::new(cached);
+            ));
         }
 
         // Wildcard local records answer above the cache. A cache key is matched

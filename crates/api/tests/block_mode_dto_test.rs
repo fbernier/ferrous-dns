@@ -1,4 +1,4 @@
-use ferrous_dns_api::dto::config::{block_mode_from_str, block_mode_to_string};
+use ferrous_dns_api::dto::config::block_mode_from_str;
 use ferrous_dns_domain::BlockResponseMode;
 
 #[test]
@@ -9,7 +9,7 @@ fn block_mode_string_round_trips() {
         BlockResponseMode::NoData,
         BlockResponseMode::Refused,
     ] {
-        assert_eq!(block_mode_from_str(&block_mode_to_string(mode)), mode);
+        assert_eq!(block_mode_from_str(mode.as_str()), mode);
     }
 }
 

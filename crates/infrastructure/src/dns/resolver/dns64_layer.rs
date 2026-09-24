@@ -1,15 +1,12 @@
+use super::local_ptr::ptr_resolution;
 use async_trait::async_trait;
-use bytes::Bytes;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver, EMPTY_CNAME_CHAIN};
 use ferrous_dns_domain::{
     DnsQuery, DnssecStatus, DomainError, Nat64Prefix, PrivateIpFilter, RecordType,
 };
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::PTR;
-use hickory_proto::rr::{Name, RData, Record};
-use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::rr::{Name, RData};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -38,7 +35,6 @@ impl Dns64Resolver {
     async fn resolve_aaaa(&self, query: &DnsQuery) -> Result<DnsResolution, DomainError> {
         let res = self.inner.resolve(query).await?;
 
-        // Only an empty answer is a synthesis candidate.
         if !res.addresses.is_empty() {
             return Ok(res);
         }
@@ -55,7 +51,7 @@ impl Dns64Resolver {
             return Ok(res);
         }
 
-        // Re-query A for the same name (down the inner stack: dnssec -> core).
+        // Through the inner stack, so the A answer is DNSSEC-validated too.
         let a_query = DnsQuery::new(Arc::clone(&query.domain), RecordType::A);
         let Ok(a_res) = self.inner.resolve(&a_query).await else {
             return Ok(res); // no A either — keep the original NODATA
@@ -66,7 +62,6 @@ impl Dns64Resolver {
             return Ok(res);
         }
 
-        // Embed each non-private IPv4 into the NAT64 prefix.
         let synth: Vec<IpAddr> = a_res
             .addresses
             .iter()
@@ -114,7 +109,6 @@ impl Dns64Resolver {
             return self.inner.resolve(query).await;
         };
 
-        // Look up the IPv4's reverse name through the inner stack.
         let v4_arpa = ipv4_to_arpa(v4);
         let v4_query = DnsQuery::new(Arc::from(v4_arpa.as_str()), RecordType::PTR);
         let Ok(v4_res) = self.inner.resolve(&v4_query).await else {
@@ -134,7 +128,8 @@ impl Dns64Resolver {
             "DNS64: reverse PTR synthesized from in-addr.arpa"
         );
 
-        match build_ptr_response(&query.domain, &targets, v4_res.min_ttl.unwrap_or(0)) {
+        // The answer's owner stays the original ip6.arpa name.
+        match ptr_resolution(&query.domain, &targets, v4_res.min_ttl.unwrap_or(0), false) {
             Some(resolution) => Ok(resolution),
             None => self.inner.resolve(query).await,
         }
@@ -173,38 +168,4 @@ fn ptr_targets_from_wire(wire: Option<&[u8]>) -> Vec<Name> {
             _ => None,
         })
         .collect()
-}
-
-/// Builds a PTR response wire whose answer **owner is `owner_name`** (the
-/// original `ip6.arpa` query name) carrying the resolved `targets`.
-fn build_ptr_response(owner_name: &str, targets: &[Name], ttl: u32) -> Option<DnsResolution> {
-    let owner = Name::from_str(owner_name).ok()?;
-
-    let mut message = Message::new(0, MessageType::Response, OpCode::Query);
-    message.metadata.response_code = ResponseCode::NoError;
-    message.metadata.authoritative = true;
-    for target in targets {
-        message.add_answer(Record::from_rdata(
-            owner.clone(),
-            ttl,
-            RData::PTR(PTR(target.clone())),
-        ));
-    }
-
-    let mut buf = Vec::with_capacity(128);
-    let mut encoder = BinEncoder::new(&mut buf);
-    message.emit(&mut encoder).ok()?;
-
-    Some(DnsResolution {
-        addresses: Arc::new(Vec::new()),
-        cache_hit: false,
-        local_dns: false,
-        dnssec_status: None,
-        cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
-        upstream_server: None,
-        upstream_pool: None,
-        min_ttl: Some(ttl),
-        negative_soa_ttl: None,
-        upstream_wire_data: Some(Bytes::from(buf)),
-    })
 }

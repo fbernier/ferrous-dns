@@ -33,14 +33,10 @@ pub struct TimelineResponse {
 
 #[derive(Deserialize, Debug, IntoParams)]
 pub struct TimelineQuery {
-    #[serde(default = "default_period")]
+    #[serde(default = "crate::utils::default_period")]
     pub period: String,
     #[serde(default = "default_granularity")]
     pub granularity: String,
-}
-
-fn default_period() -> String {
-    "24h".to_string()
 }
 
 fn default_granularity() -> String {

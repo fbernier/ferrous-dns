@@ -29,12 +29,6 @@ pub struct DnsResponse {
 }
 
 impl DnsResponse {
-    pub fn is_nodata(&self) -> bool {
-        self.rcode == ResponseCode::NoError
-            && self.addresses.is_empty()
-            && self.cname_chain.is_empty()
-    }
-
     pub fn is_nxdomain(&self) -> bool {
         self.rcode == ResponseCode::NXDomain
     }
@@ -53,7 +47,7 @@ impl ResponseParser {
     /// Parses DNS response from owned bytes (zero-copy for raw_bytes).
     pub fn parse_bytes(response_bytes: Bytes) -> Result<DnsResponse, DomainError> {
         let message = Message::from_vec(&response_bytes).map_err(|e| {
-            DomainError::InvalidDomainName(format!("Failed to parse DNS response: {}", e))
+            DomainError::InvalidDnsResponse(format!("Failed to parse DNS response: {}", e))
         })?;
 
         let rcode = message.response_code;
@@ -113,10 +107,6 @@ impl ResponseParser {
             message,
             raw_bytes: response_bytes,
         })
-    }
-
-    pub fn parse(response_bytes: &[u8]) -> Result<DnsResponse, DomainError> {
-        Self::parse_bytes(Bytes::copy_from_slice(response_bytes))
     }
 
     pub fn is_transport_error(error: &DomainError) -> bool {

@@ -319,3 +319,26 @@ async fn test_protection_disabled_does_not_block() {
 
     assert!(result.is_ok());
 }
+
+#[tokio::test]
+async fn test_cached_private_answer_for_public_domain_is_blocked() {
+    let private = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+    let resolver = MockDnsResolver::new();
+    resolver.set_cached_response("evil.com", DnsResolution::new(vec![private], true));
+    resolver
+        .set_response("evil.com", DnsResolution::new(vec![private], true))
+        .await;
+
+    let use_case = make_use_case(resolver, None, &[]);
+
+    assert!(use_case
+        .try_cache_direct(
+            "evil.com",
+            RecordType::A,
+            "127.0.0.1".parse().unwrap(),
+            ferrous_dns_domain::ClientProtocol::Udp,
+        )
+        .is_none());
+    let result = use_case.execute(&dns_request("evil.com")).await;
+    assert!(matches!(result, Err(DomainError::Blocked)));
+}

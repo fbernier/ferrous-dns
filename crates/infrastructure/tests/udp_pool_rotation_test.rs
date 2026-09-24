@@ -1,15 +1,15 @@
 //! Source-port rotation and bounded admission in the upstream UDP socket pool.
 //!
-//! A pooled socket used to keep its ephemeral port for the life of the process,
-//! so the few ports an upstream ever saw were fixed and an attacker who learned
-//! one could reuse it indefinitely — leaving off-path forgery to guess the
-//! 16-bit transaction ID alone. Sockets now retire after a bounded number of
-//! queries so a discovered port goes stale.
+//! A pooled socket that kept its ephemeral port forever would leave the few
+//! ports an upstream ever sees fixed, so an attacker who learned one could reuse
+//! it indefinitely and off-path forgery would only have to guess the 16-bit
+//! transaction ID. Sockets retire after a bounded number of queries so a
+//! discovered port goes stale.
 
 use ferrous_dns_domain::{DomainError, UpstreamAddr};
 use ferrous_dns_infrastructure::dns::forwarding::ResponseParser;
+use ferrous_dns_infrastructure::dns::transport::udp::UdpTransport;
 use ferrous_dns_infrastructure::dns::transport::udp_pool::UdpSocketPool;
-use ferrous_dns_infrastructure::dns::transport::{udp::UdpTransport, DnsTransport};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -71,6 +71,28 @@ async fn source_port_rotates_once_the_budget_is_spent() {
         ports.len() >= 2,
         "rotation must actually change the source port, saw {} distinct",
         ports.len()
+    );
+}
+
+#[tokio::test]
+async fn sockets_held_at_once_never_share_a_source_port() {
+    // Enough sockets that the kernel reusing a held ephemeral port would all but
+    // certainly show up (birthday bound over ~28k ports).
+    const HELD: usize = 1000;
+    let pool = UdpSocketPool::new(HELD, HELD);
+
+    let mut held = Vec::with_capacity(HELD);
+    let mut ports = HashSet::new();
+    for _ in 0..HELD {
+        let socket = pool.acquire(upstream()).await.unwrap();
+        ports.insert(socket.socket().local_addr().unwrap().port());
+        held.push(socket);
+    }
+
+    assert_eq!(
+        ports.len(),
+        HELD,
+        "two live sockets got the same port; one of them would never see its answers"
     );
 }
 

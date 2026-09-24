@@ -15,45 +15,64 @@ fn base_options(database_url: &str) -> Result<SqliteConnectOptions, sqlx::Error>
     })
 }
 
+/// Applied on every connection: these pragmas are per-connection state, and each pool
+/// commits through its own connections (auto-checkpoints fire on the committing connection).
 async fn apply_per_connection_pragmas(
     conn: &mut SqliteConnection,
     cache_size_kb: u32,
     mmap_size_mb: u32,
+    wal_autocheckpoint: u32,
 ) -> Result<(), sqlx::Error> {
     let cache_pragma = format!("PRAGMA cache_size = -{}", cache_size_kb);
     let mmap_pragma = format!("PRAGMA mmap_size = {}", mmap_size_mb as u64 * 1024 * 1024);
+    let checkpoint_pragma = format!("PRAGMA wal_autocheckpoint = {}", wal_autocheckpoint);
     sqlx::query(&cache_pragma).execute(&mut *conn).await?;
     sqlx::query(&mmap_pragma).execute(&mut *conn).await?;
+    sqlx::query(&checkpoint_pragma).execute(&mut *conn).await?;
     sqlx::query("PRAGMA temp_store = MEMORY")
         .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
+async fn build_pool(
+    database_url: &str,
+    cfg: &DatabaseConfig,
+    max_connections: u32,
+    min_connections: u32,
+    busy_timeout: Duration,
+    acquire_timeout: Duration,
+) -> Result<SqlitePool, sqlx::Error> {
+    let options = base_options(database_url)?.busy_timeout(busy_timeout);
+    let cache_kb = cfg.sqlite_cache_size_kb;
+    let mmap_mb = cfg.sqlite_mmap_size_mb;
+    let autocheckpoint = cfg.wal_autocheckpoint;
+    SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        .acquire_timeout(acquire_timeout)
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                apply_per_connection_pragmas(conn, cache_kb, mmap_mb, autocheckpoint).await
+            })
+        })
+        .connect_with(options)
+        .await
+}
+
 pub async fn create_write_pool(
     database_url: &str,
     cfg: &DatabaseConfig,
 ) -> Result<SqlitePool, sqlx::Error> {
-    let options =
-        base_options(database_url)?.busy_timeout(Duration::from_secs(cfg.write_busy_timeout_secs));
-
-    let cache_kb = cfg.sqlite_cache_size_kb;
-    let mmap_mb = cfg.sqlite_mmap_size_mb;
-    let pool = SqlitePoolOptions::new()
-        .max_connections(cfg.write_pool_max_connections)
-        .min_connections(1)
-        .acquire_timeout(Duration::from_secs(cfg.write_busy_timeout_secs))
-        .after_connect(move |conn, _| {
-            Box::pin(async move { apply_per_connection_pragmas(conn, cache_kb, mmap_mb).await })
-        })
-        .connect_with(options)
-        .await?;
-
-    sqlx::query(&format!(
-        "PRAGMA wal_autocheckpoint = {}",
-        cfg.wal_autocheckpoint
-    ))
-    .execute(&pool)
+    let busy = Duration::from_secs(cfg.write_busy_timeout_secs);
+    let pool = build_pool(
+        database_url,
+        cfg,
+        cfg.write_pool_max_connections,
+        1,
+        busy,
+        busy,
+    )
     .await?;
 
     sqlx::migrate!("../../migrations").run(&pool).await?;
@@ -67,47 +86,29 @@ pub async fn create_query_log_pool(
     database_url: &str,
     cfg: &DatabaseConfig,
 ) -> Result<SqlitePool, sqlx::Error> {
-    let options =
-        base_options(database_url)?.busy_timeout(Duration::from_secs(cfg.write_busy_timeout_secs));
-
-    let cache_kb = cfg.sqlite_cache_size_kb;
-    let mmap_mb = cfg.sqlite_mmap_size_mb;
-    let pool = SqlitePoolOptions::new()
-        .max_connections(cfg.query_log_pool_max_connections)
-        .min_connections(1)
-        .acquire_timeout(Duration::from_secs(cfg.write_busy_timeout_secs))
-        .after_connect(move |conn, _| {
-            Box::pin(async move { apply_per_connection_pragmas(conn, cache_kb, mmap_mb).await })
-        })
-        .connect_with(options)
-        .await?;
-
-    Ok(pool)
+    let busy = Duration::from_secs(cfg.write_busy_timeout_secs);
+    build_pool(
+        database_url,
+        cfg,
+        cfg.query_log_pool_max_connections,
+        1,
+        busy,
+        busy,
+    )
+    .await
 }
 
 pub async fn create_read_pool(
     database_url: &str,
     cfg: &DatabaseConfig,
 ) -> Result<SqlitePool, sqlx::Error> {
-    let options =
-        base_options(database_url)?.busy_timeout(Duration::from_secs(cfg.read_busy_timeout_secs));
-
-    let cache_kb = cfg.sqlite_cache_size_kb;
-    let mmap_mb = cfg.sqlite_mmap_size_mb;
-    let pool = SqlitePoolOptions::new()
-        .max_connections(cfg.read_pool_max_connections)
-        .min_connections(2)
-        .acquire_timeout(Duration::from_secs(cfg.read_acquire_timeout_secs))
-        .after_connect(move |conn, _| {
-            Box::pin(async move { apply_per_connection_pragmas(conn, cache_kb, mmap_mb).await })
-        })
-        .connect_with(options)
-        .await?;
-
-    Ok(pool)
-}
-
-pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let cfg = DatabaseConfig::default();
-    create_write_pool(database_url, &cfg).await
+    build_pool(
+        database_url,
+        cfg,
+        cfg.read_pool_max_connections,
+        2,
+        Duration::from_secs(cfg.read_busy_timeout_secs),
+        Duration::from_secs(cfg.read_acquire_timeout_secs),
+    )
+    .await
 }

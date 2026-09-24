@@ -2,23 +2,19 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use ferrous_dns_domain::{BlocklistSource, DomainError, WhitelistSource};
 
 use crate::{
     dto::domains::BatchDeleteRequest,
     dto::lists::{CreateListRequest, ListsResponse, PiholeListEntry},
     errors::PiholeApiError,
+    handlers::require_id,
     state::PiholeAppState,
 };
 
-fn blocklist_to_entry(
-    s: &ferrous_dns_domain::BlocklistSource,
-) -> Result<PiholeListEntry, PiholeApiError> {
+fn blocklist_to_entry(s: &BlocklistSource) -> Result<PiholeListEntry, DomainError> {
     Ok(PiholeListEntry {
-        id: s.id.ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                "blocklist source missing id".into(),
-            ))
-        })?,
+        id: require_id(s.id, "blocklist source")?,
         address: s.url.as_ref().map(|u| u.to_string()).unwrap_or_default(),
         enabled: s.enabled,
         comment: s.comment.as_ref().map(|c| c.to_string()),
@@ -31,15 +27,9 @@ fn blocklist_to_entry(
     })
 }
 
-fn whitelist_to_entry(
-    s: &ferrous_dns_domain::WhitelistSource,
-) -> Result<PiholeListEntry, PiholeApiError> {
+fn whitelist_to_entry(s: &WhitelistSource) -> Result<PiholeListEntry, DomainError> {
     Ok(PiholeListEntry {
-        id: s.id.ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                "whitelist source missing id".into(),
-            ))
-        })?,
+        id: require_id(s.id, "whitelist source")?,
         address: s.url.as_ref().map(|u| u.to_string()).unwrap_or_default(),
         enabled: s.enabled,
         comment: s.comment.as_ref().map(|c| c.to_string()),
@@ -153,9 +143,7 @@ pub async fn get_by_id(
     if let Some(s) = state.lists.get_whitelist_sources.get_by_id(id).await? {
         return Ok(Json(whitelist_to_entry(&s)?));
     }
-    Err(PiholeApiError(ferrous_dns_domain::DomainError::NotFound(
-        format!("List {id} not found"),
-    )))
+    Err(DomainError::NotFound(format!("List {id} not found")).into())
 }
 
 /// Pi-hole v6 PUT /api/lists/:id — update adlist.
@@ -180,7 +168,6 @@ pub async fn update_list(
 ) -> Result<Json<PiholeListEntry>, PiholeApiError> {
     let group_ids = body.groups;
 
-    // Try blocklist first, then whitelist.
     if let Some(_existing) = state.lists.get_blocklist_sources.get_by_id(id).await? {
         let result = state
             .lists
@@ -213,9 +200,7 @@ pub async fn update_list(
         return Ok(Json(whitelist_to_entry(&result)?));
     }
 
-    Err(PiholeApiError(ferrous_dns_domain::DomainError::NotFound(
-        format!("List {id} not found"),
-    )))
+    Err(DomainError::NotFound(format!("List {id} not found")).into())
 }
 
 /// Pi-hole v6 DELETE /api/lists/:id — delete adlist.
@@ -256,9 +241,7 @@ pub async fn delete_list(
         state.lists.delete_whitelist_source.execute(id).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    Err(PiholeApiError(ferrous_dns_domain::DomainError::NotFound(
-        format!("List {id} not found"),
-    )))
+    Err(DomainError::NotFound(format!("List {id} not found")).into())
 }
 
 /// Pi-hole v6 POST /api/lists:batchDelete — batch delete.

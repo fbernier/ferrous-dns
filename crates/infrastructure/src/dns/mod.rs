@@ -21,18 +21,17 @@ pub mod wire_response;
 
 pub use block_filter::BlockFilterEngine;
 pub use cache::{
-    CacheKey, CacheMetrics, CachedAddresses, CachedData, CachedDnssecStatus, CachedRecord,
-    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, LocalRecordStatus,
-    NegativeQueryTracker, RefreshRequest, RefreshScanOptions, RefreshSenders,
+    CachedAddresses, CachedData, CachedDnssecStatus, CachedRecord, DnsCache, DnsCacheAccess,
+    DnsCacheConfig, EvictionStrategy, LocalRecordStatus, RefreshRequest, RefreshScanOptions,
+    RefreshSenders,
 };
 pub use cache_maintenance::{DnsCacheMaintenance, RefreshPace};
 pub use dga_detection::DgaDetector;
 pub use load_balancer::{
-    BalancedStrategy, FailoverStrategy, HealthChecker, ParallelStrategy, PoolManager, ServerHealth,
-    ServerStatus, UpstreamHealthAdapter, UpstreamReloadAdapter,
+    HealthChecker, PoolManager, ServerHealth, ServerStatus, UpstreamHealthAdapter,
+    UpstreamReloadAdapter,
 };
 pub use nxdomain_hijack::NxdomainHijackDetector;
-pub use proxy_protocol::read_proxy_v2_client_ip;
 pub use resolver::HickoryDnsResolver;
 pub use response_ip_filter::ResponseIpFilterDetector;
 pub use safe_search::SafeSearchEnforcer;

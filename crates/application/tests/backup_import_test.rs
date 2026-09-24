@@ -25,8 +25,6 @@ use tokio::sync::RwLock;
 mod helpers;
 use helpers::{MockBlockFilterEngine, MockBlocklistSourceRepository, MockGroupRepository};
 
-// ── Stubs for the ports this test does not exercise ──────────────────────────
-
 struct StubGroupCreator;
 
 #[async_trait::async_trait]
@@ -64,8 +62,6 @@ impl ConfigFilePersistence for NullConfigFilePersistence {
         Ok(())
     }
 }
-
-// ── Fixtures ─────────────────────────────────────────────────────────────────
 
 /// Builds a version-1 snapshot carrying one blocklist source per name.
 ///
@@ -173,8 +169,6 @@ fn build_import(
 
     (import, source_repo)
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_import_reloads_block_filter_once_for_the_whole_batch() {

@@ -14,7 +14,7 @@ use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::{
     CachedAddresses, CachedData, CachedDnssecStatus, DnsCache, DnsCacheAccess, DnsCacheConfig,
-    EvictionStrategy, LocalRecordStatus, NegativeQueryTracker,
+    EvictionStrategy, LocalRecordStatus,
 };
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,7 +105,6 @@ async fn leader_answers_from_a_cache_filled_after_the_callers_probe() {
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
         cache,
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 
@@ -238,7 +237,6 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
         Arc::clone(&deferred) as Arc<dyn DnsCacheAccess>,
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 

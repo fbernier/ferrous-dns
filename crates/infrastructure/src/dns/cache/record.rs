@@ -134,12 +134,15 @@ impl CachedRecord {
         self.flags.load(AtomicOrdering::Relaxed) & FLAG_PERMANENT != 0
     }
 
+    /// Seconds a client may hold the answer. A permanent entry never expires,
+    /// so it reports its configured TTL rather than the distance to `u64::MAX`.
     #[inline(always)]
-    pub fn is_expired(&self) -> bool {
+    pub fn remaining_ttl_at_secs(&self, now_secs: u64) -> u32 {
         if self.is_permanent() {
-            return false;
+            self.ttl
+        } else {
+            self.expires_at_secs.saturating_sub(now_secs) as u32
         }
-        coarse_now_secs() >= self.expires_at_secs
     }
 
     #[inline(always)]

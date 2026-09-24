@@ -64,6 +64,24 @@ fn test_permanent_entry_reports_its_configured_ttl() {
 }
 
 #[test]
+fn test_permanent_entry_remaining_ttl_is_its_configured_ttl() {
+    let cache = make_cache();
+    cache.insert_permanent(
+        "nas.home.lan",
+        RecordType::A,
+        make_ip_data("10.0.0.5"),
+        300,
+        None,
+    );
+
+    assert_eq!(
+        cache.get_remaining_ttl("nas.home.lan", &RecordType::A),
+        Some(300),
+        "a never-expiring entry must not report the distance to its sentinel expiry"
+    );
+}
+
+#[test]
 fn test_permanent_entry_ttl_survives_a_second_read_from_l1() {
     let cache = make_cache();
     cache.insert_permanent(

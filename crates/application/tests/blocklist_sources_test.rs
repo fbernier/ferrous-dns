@@ -406,8 +406,6 @@ async fn test_delete_not_found() {
     }
 }
 
-// ── Block filter reload ───────────────────────────────────────────────────────
-
 /// Polls until the spawned reload has run at least `expected` times. The sync
 /// use case reloads in a background task, so the count is not visible until
 /// this task yields to the scheduler.
@@ -538,8 +536,6 @@ async fn test_batch_creator_does_not_reload_block_filter() {
     assert!(result.is_ok());
     assert_eq!(engine.reload_count().await, 0);
 }
-
-// ── Manual sync ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_sync_starts_a_reload() {

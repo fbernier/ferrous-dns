@@ -1,9 +1,10 @@
+use crate::repositories::{db_err, is_fk_violation, is_unique_violation, parse_db_action, sql_now};
 use async_trait::async_trait;
 use ferrous_dns_application::ports::ManagedDomainRepository;
 use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain};
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tracing::{error, instrument};
+use tracing::instrument;
 
 type ManagedDomainRow = (
     i64,
@@ -12,7 +13,7 @@ type ManagedDomainRow = (
     String,
     i64,
     Option<String>,
-    i64,
+    bool,
     Option<String>,
     String,
     String,
@@ -44,13 +45,10 @@ impl SqliteManagedDomainRepository {
             id: Some(id),
             name: Arc::from(name.as_str()),
             domain: Arc::from(domain.as_str()),
-            action: action.parse::<DomainAction>().unwrap_or_else(|_| {
-                tracing::warn!(action = %action, "Invalid domain action in DB, defaulting to Deny");
-                DomainAction::Deny
-            }),
+            action: parse_db_action(&action),
             group_id,
             comment: comment.map(|s| Arc::from(s.as_str())),
-            enabled: enabled != 0,
+            enabled,
             service_id: service_id.map(|s| Arc::from(s.as_str())),
             created_at: Some(created_at),
             updated_at: Some(updated_at),
@@ -70,7 +68,7 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         comment: Option<String>,
         enabled: bool,
     ) -> Result<ManagedDomain, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
         let row = sqlx::query_as::<_, ManagedDomainRow>(
             "INSERT INTO managed_domains (name, domain, action, group_id, comment, enabled, created_at, updated_at)
@@ -82,20 +80,20 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         .bind(action.to_str())
         .bind(group_id)
         .bind(&comment)
-        .bind(if enabled { 1i64 } else { 0i64 })
+        .bind(enabled)
         .bind(&now)
         .bind(&now)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint failed") {
+            if is_unique_violation(&e) {
                 DomainError::InvalidManagedDomain(format!(
-                    "Managed domain '{}' already exists",
-                    name
+                    "Managed domain '{name}' already exists"
                 ))
+            } else if is_fk_violation(&e) {
+                DomainError::GroupNotFound(group_id)
             } else {
-                error!(error = %e, "Failed to create managed domain");
-                DomainError::DatabaseError(e.to_string())
+                db_err("Failed to create managed domain")(e)
             }
         })?;
 
@@ -111,10 +109,7 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query managed domain by id");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query managed domain by id"))?;
 
         Ok(row.map(Self::row_to_domain))
     }
@@ -127,10 +122,7 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query all managed domains");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query all managed domains"))?;
 
         Ok(rows.into_iter().map(Self::row_to_domain).collect())
     }
@@ -144,24 +136,18 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         let count_row = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM managed_domains")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to count managed domains");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to count managed domains"))?;
         let total = count_row.0 as u64;
 
         let rows = sqlx::query_as::<_, ManagedDomainRow>(
             "SELECT id, name, domain, action, group_id, comment, enabled, service_id, created_at, updated_at
              FROM managed_domains ORDER BY name ASC LIMIT ? OFFSET ?",
         )
-        .bind(limit as i64)
-        .bind(offset as i64)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query managed domains paged");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query managed domains paged"))?;
 
         Ok((rows.into_iter().map(Self::row_to_domain).collect(), total))
     }
@@ -177,46 +163,38 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         comment: Option<String>,
         enabled: Option<bool>,
     ) -> Result<ManagedDomain, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        let current = self
-            .get_by_id(id)
-            .await?
-            .ok_or(DomainError::ManagedDomainNotFound(id))?;
-
-        let final_name = name.unwrap_or_else(|| current.name.to_string());
-        let final_domain = domain.unwrap_or_else(|| current.domain.to_string());
-        let final_action = action.unwrap_or(current.action);
-        let final_group_id = group_id.unwrap_or(current.group_id);
-        let final_comment: Option<String> =
-            comment.or_else(|| current.comment.as_ref().map(|s| s.to_string()));
-        let final_enabled = enabled.unwrap_or(current.enabled);
-
         let row = sqlx::query_as::<_, ManagedDomainRow>(
             "UPDATE managed_domains
-             SET name = ?, domain = ?, action = ?, group_id = ?, comment = ?, enabled = ?, updated_at = ?
+             SET name = COALESCE(?, name),
+                 domain = COALESCE(?, domain),
+                 action = COALESCE(?, action),
+                 group_id = COALESCE(?, group_id),
+                 comment = COALESCE(?, comment),
+                 enabled = COALESCE(?, enabled),
+                 updated_at = ?
              WHERE id = ?
              RETURNING id, name, domain, action, group_id, comment, enabled, service_id, created_at, updated_at",
         )
-        .bind(&final_name)
-        .bind(&final_domain)
-        .bind(final_action.to_str())
-        .bind(final_group_id)
-        .bind(&final_comment)
-        .bind(if final_enabled { 1i64 } else { 0i64 })
-        .bind(&now)
+        .bind(&name)
+        .bind(&domain)
+        .bind(action.map(|a| a.to_str()))
+        .bind(group_id)
+        .bind(&comment)
+        .bind(enabled)
+        .bind(sql_now())
         .bind(id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint failed") {
+            if is_unique_violation(&e) {
                 DomainError::InvalidManagedDomain(format!(
                     "Managed domain '{}' already exists",
-                    final_name
+                    name.as_deref().unwrap_or_default()
                 ))
+            } else if let Some(gid) = group_id.filter(|_| is_fk_violation(&e)) {
+                DomainError::GroupNotFound(gid)
             } else {
-                error!(error = %e, "Failed to update managed domain");
-                DomainError::DatabaseError(e.to_string())
+                db_err("Failed to update managed domain")(e)
             }
         })?;
 
@@ -230,10 +208,7 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to delete managed domain");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to delete managed domain"))?;
 
         if result.rows_affected() == 0 {
             return Err(DomainError::ManagedDomainNotFound(id));
@@ -249,13 +224,14 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
         group_id: i64,
         domains: Vec<(String, String)>,
     ) -> Result<usize, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
         let mut count = 0usize;
 
-        let mut tx = self.pool.begin().await.map_err(|e| {
-            error!(error = %e, "Failed to begin transaction for bulk create");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(db_err("Failed to begin transaction for bulk create"))?;
 
         for (name, domain) in &domains {
             let result = sqlx::query(
@@ -271,20 +247,16 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
             .bind(&now)
             .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to bulk create managed domain");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to bulk create managed domain"))?;
 
             if result.rows_affected() > 0 {
                 count += 1;
             }
         }
 
-        tx.commit().await.map_err(|e| {
-            error!(error = %e, "Failed to commit bulk create transaction");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        tx.commit()
+            .await
+            .map_err(db_err("Failed to commit bulk create transaction"))?;
 
         Ok(count)
     }
@@ -297,10 +269,7 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
                 .bind(group_id)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| {
-                    error!(error = %e, "Failed to delete managed domains by service");
-                    DomainError::DatabaseError(e.to_string())
-                })?;
+                .map_err(db_err("Failed to delete managed domains by service"))?;
 
         Ok(result.rows_affected())
     }
@@ -311,10 +280,7 @@ impl ManagedDomainRepository for SqliteManagedDomainRepository {
             .bind(service_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to delete all managed domains by service");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to delete all managed domains by service"))?;
 
         Ok(result.rows_affected())
     }

@@ -4,13 +4,3 @@ pub struct WhitelistedDomain {
     pub domain: String,
     pub added_at: Option<String>,
 }
-
-impl WhitelistedDomain {
-    pub fn new(domain: String) -> Self {
-        Self {
-            id: None,
-            domain,
-            added_at: None,
-        }
-    }
-}

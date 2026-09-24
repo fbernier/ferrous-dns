@@ -1,9 +1,8 @@
-#![allow(dead_code)]
-
+use super::stubs::{NullConfigFilePersistence, NullConfigRepository};
 use ferrous_dns_api::BackupUseCases;
 use ferrous_dns_application::ports::{
-    BlocklistSourceCreator, BlocklistSourceRepository, ConfigFilePersistence, ConfigRepository,
-    GroupCreator, GroupRepository, LocalRecordCreator,
+    BlocklistSourceCreator, BlocklistSourceRepository, GroupCreator, GroupRepository,
+    LocalRecordCreator,
 };
 use ferrous_dns_application::use_cases::{
     CreateBlocklistSourceUseCase, CreateGroupUseCase, CreateLocalRecordUseCase,
@@ -84,23 +83,6 @@ impl BlocklistSourceRepository for NullBlocklistSourceRepository {
         Err(DomainError::IoError("test stub".to_string()))
     }
     async fn delete(&self, _id: i64) -> Result<(), DomainError> {
-        Ok(())
-    }
-}
-
-struct NullConfigFilePersistence;
-
-impl ConfigFilePersistence for NullConfigFilePersistence {
-    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-struct NullConfigRepository;
-
-#[async_trait::async_trait]
-impl ConfigRepository for NullConfigRepository {
-    async fn save_local_records(&self, _config: &Config) -> Result<(), DomainError> {
         Ok(())
     }
 }

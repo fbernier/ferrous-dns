@@ -11,8 +11,8 @@ use tracing::{error, info};
 struct SafeSearchIndex {
     /// Maps each monitored search engine domain to its engine type.
     domain_to_engine: FxHashMap<Box<str>, Engine>,
-    /// Maps (group_id, engine) → (enabled, youtube_strict).
-    group_configs: FxHashMap<(i64, Engine), (bool, bool)>,
+    /// (group_id, engine) → YouTube mode, for enabled configs only.
+    group_configs: FxHashMap<(i64, Engine), YouTubeMode>,
 }
 
 impl SafeSearchIndex {
@@ -26,7 +26,7 @@ impl SafeSearchIndex {
     /// Compiles an index from persisted configurations.
     fn from_configs(configs: &[SafeSearchConfig]) -> Self {
         let mut domain_to_engine: FxHashMap<Box<str>, Engine> = FxHashMap::default();
-        let mut group_configs: FxHashMap<(i64, Engine), (bool, bool)> = FxHashMap::default();
+        let mut group_configs: FxHashMap<(i64, Engine), YouTubeMode> = FxHashMap::default();
 
         for engine in Engine::all() {
             for domain in domains_for(*engine) {
@@ -34,9 +34,8 @@ impl SafeSearchIndex {
             }
         }
 
-        for cfg in configs {
-            let youtube_strict = matches!(cfg.youtube_mode, YouTubeMode::Strict);
-            group_configs.insert((cfg.group_id, cfg.engine), (cfg.enabled, youtube_strict));
+        for cfg in configs.iter().filter(|cfg| cfg.enabled) {
+            group_configs.insert((cfg.group_id, cfg.engine), cfg.youtube_mode);
         }
 
         Self {
@@ -45,7 +44,6 @@ impl SafeSearchIndex {
         }
     }
 
-    #[inline]
     fn cname_for(&self, domain: &str, group_id: i64) -> Option<&'static str> {
         let normalised = domain.trim_end_matches('.');
         let lower;
@@ -57,13 +55,9 @@ impl SafeSearchIndex {
         };
 
         let engine = self.domain_to_engine.get(lookup)?;
-        let &(enabled, youtube_strict) = self.group_configs.get(&(group_id, *engine))?;
+        let &youtube = self.group_configs.get(&(group_id, *engine))?;
 
-        if !enabled {
-            return None;
-        }
-
-        Some(cname_target(*engine, youtube_strict))
+        Some(cname_target(*engine, youtube))
     }
 }
 
@@ -101,7 +95,6 @@ impl SafeSearchEnforcer {
 
 #[async_trait]
 impl SafeSearchEnginePort for SafeSearchEnforcer {
-    #[inline]
     fn cname_for(&self, domain: &str, group_id: i64) -> Option<&'static str> {
         self.index.load().cname_for(domain, group_id)
     }

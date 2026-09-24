@@ -5,7 +5,7 @@ use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::VarInt;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -25,31 +25,28 @@ const DOQ_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 const DOQ_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Builds and binds a QUIC server endpoint for DoQ (DNS-over-QUIC, RFC 9250)
-/// on `bind_addr`, advertising whatever ALPN the supplied `tls_config` carries
+/// on `bind`, advertising whatever ALPN the supplied `tls_config` carries
 /// (the caller sets `doq`). Binding is synchronous, so the returned endpoint is
 /// ready to accept connections immediately.
 ///
 /// Like the Do53 and DoT listeners, the socket is always AF_INET6 with
-/// `only_v6` off: an IPv4 `bind_addr` is bound in v4-mapped form and keeps its
+/// `only_v6` off: an IPv4 `bind` is bound in v4-mapped form and keeps its
 /// v4-only behaviour, while `[::]` serves both families on one socket.
 pub fn bind_doq_endpoint(
-    bind_addr: &str,
+    bind: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> anyhow::Result<quinn::Endpoint> {
-    let addr = pktinfo::v6_mapped_bind_addr(bind_addr.parse()?);
     let quic_crypto = QuicServerConfig::try_from(tls_config)?;
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .keep_alive_interval(Some(DOQ_KEEP_ALIVE_INTERVAL))
+        .max_concurrent_bidi_streams(VarInt::from_u32(DOQ_MAX_CONCURRENT_BIDI_STREAMS));
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    // A freshly built ServerConfig uniquely owns its transport config, so this
-    // never no-ops; expect() surfaces the invariant instead of silently
-    // skipping the transport tuning below.
-    let transport_config = Arc::get_mut(&mut server_config.transport)
-        .expect("fresh quinn ServerConfig has a uniquely-owned transport config");
-    transport_config.keep_alive_interval(Some(DOQ_KEEP_ALIVE_INTERVAL));
-    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(DOQ_MAX_CONCURRENT_BIDI_STREAMS));
+    server_config.transport_config(Arc::new(transport));
 
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(false)?;
-    socket.bind(&addr.into())?;
+    socket.bind(&pktinfo::v6_mapped_bind_addr(bind).into())?;
     socket.set_nonblocking(true)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no async runtime available for the DoQ endpoint"))?;
@@ -62,12 +59,12 @@ pub fn bind_doq_endpoint(
 }
 
 pub async fn start_doq_server(
-    bind_addr: String,
+    bind: SocketAddr,
     handler: Arc<DnsServerHandler>,
     tls_config: Arc<rustls::ServerConfig>,
     doq_conn_limiter: ConnectionLimiter,
 ) -> anyhow::Result<()> {
-    let endpoint = bind_doq_endpoint(&bind_addr, tls_config)?;
+    let endpoint = bind_doq_endpoint(bind, tls_config)?;
     // `local_addr` reports the v4-mapped form of an IPv4 bind; report the
     // address the operator configured.
     let local_addr = pktinfo::unmap_socket_addr(endpoint.local_addr()?);
@@ -162,11 +159,10 @@ async fn handle_doq_stream(
         .handle_raw_udp_fallback(&dns_buf, client_ip, ClientProtocol::Doq)
         .await
     {
-        let resp_len = (resp.len() as u16).to_be_bytes();
-        if send_stream.write_all(&resp_len).await.is_err() {
-            return;
-        }
-        if send_stream.write_all(&resp).await.is_err() {
+        if super::tcp::write_framed(&mut send_stream, &resp)
+            .await
+            .is_err()
+        {
             return;
         }
     }

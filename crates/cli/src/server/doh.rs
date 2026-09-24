@@ -7,7 +7,7 @@ use ferrous_dns_domain::ClientProtocol;
 use ferrous_dns_infrastructure::dns::forwarding::EDNS_MAX_PAYLOAD;
 use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query as DnsQuery};
-use hickory_proto::rr::{DNSClass, Name, RData, RecordType as HickoryRecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType as HickoryRecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use serde_json::{json, Value};
 use std::net::IpAddr;
@@ -46,8 +46,7 @@ pub async fn dns_query_handler(
             Ok(b) => b.to_vec(),
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         }
-    } else if json_response && params.name.is_some() {
-        let name = params.name.as_deref().unwrap_or("");
+    } else if let (true, Some(name)) = (json_response, params.name.as_deref()) {
         let qtype = params.record_type.as_deref().unwrap_or("A");
         match build_wire_query(name, qtype) {
             Ok(w) => w,
@@ -152,34 +151,6 @@ fn wire_to_dns_json(wire: &[u8]) -> anyhow::Result<String> {
         .map(|q| json!({ "name": q.name().to_string(), "type": u16::from(q.query_type()) }))
         .collect();
 
-    let answers: Vec<Value> = msg
-        .answers
-        .iter()
-        .filter(|r| r.record_type() != HickoryRecordType::OPT)
-        .map(|r| {
-            json!({
-                "name": r.name.to_string(),
-                "type": u16::from(r.record_type()),
-                "TTL": r.ttl,
-                "data": format_rdata(&r.data),
-            })
-        })
-        .collect();
-
-    let authority: Vec<Value> = msg
-        .authorities
-        .iter()
-        .filter(|r| r.record_type() != HickoryRecordType::OPT)
-        .map(|r| {
-            json!({
-                "name": r.name.to_string(),
-                "type": u16::from(r.record_type()),
-                "TTL": r.ttl,
-                "data": format_rdata(&r.data),
-            })
-        })
-        .collect();
-
     Ok(serde_json::to_string(&json!({
         "Status": u16::from(msg.response_code),
         "TC": msg.truncation,
@@ -188,9 +159,24 @@ fn wire_to_dns_json(wire: &[u8]) -> anyhow::Result<String> {
         "AD": msg.authentic_data,
         "CD": msg.checking_disabled,
         "Question": questions,
-        "Answer": answers,
-        "Authority": authority,
+        "Answer": records_json(&msg.answers),
+        "Authority": records_json(&msg.authorities),
     }))?)
+}
+
+fn records_json(records: &[Record]) -> Vec<Value> {
+    records
+        .iter()
+        .filter(|r| r.record_type() != HickoryRecordType::OPT)
+        .map(|r| {
+            json!({
+                "name": r.name.to_string(),
+                "type": u16::from(r.record_type()),
+                "TTL": r.ttl,
+                "data": format_rdata(&r.data),
+            })
+        })
+        .collect()
 }
 
 fn format_rdata(data: &RData) -> String {

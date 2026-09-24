@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{ApiTokenRepository, SessionRepository, UserProvider};
 use ferrous_dns_application::use_cases::{
-    AppPasswordLoginUseCase, CreateApiTokenUseCase, DeleteApiTokenUseCase, GetApiTokensUseCase,
-    LoginRateLimiter, UpdateApiTokenUseCase, ValidateApiTokenUseCase,
+    AppPasswordLoginUseCase, CreateApiTokenUseCase, LoginRateLimiter, UpdateApiTokenUseCase,
+    ValidateApiTokenUseCase,
 };
 use ferrous_dns_domain::{
     ApiToken, AuthConfig, AuthSession, DomainError, User, UserRole, UserSource,
@@ -11,10 +11,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-
-// ---------------------------------------------------------------------------
-// In-memory mock
-// ---------------------------------------------------------------------------
 
 struct MockApiTokenRepo {
     tokens: RwLock<Vec<ApiToken>>,
@@ -155,10 +151,6 @@ impl ApiTokenRepository for MockApiTokenRepo {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CreateApiTokenUseCase
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn create_token_generates_random_key() {
     let repo = Arc::new(MockApiTokenRepo::new());
@@ -195,7 +187,7 @@ async fn create_token_rejects_empty_name() {
     let uc = CreateApiTokenUseCase::new(repo);
 
     let result = uc.execute("", None).await;
-    assert!(matches!(result, Err(DomainError::ConfigError(_))));
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
@@ -204,7 +196,7 @@ async fn create_token_rejects_invalid_name() {
     let uc = CreateApiTokenUseCase::new(repo);
 
     let result = uc.execute("bad!name", None).await;
-    assert!(matches!(result, Err(DomainError::ConfigError(_))));
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
@@ -226,61 +218,15 @@ async fn create_token_prefix_from_short_key() {
     assert_eq!(created.token.key_prefix.as_ref(), "abc");
 }
 
-// ---------------------------------------------------------------------------
-// GetApiTokensUseCase
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn get_tokens_empty_list() {
+async fn create_token_prefix_stops_at_char_boundary() {
     let repo = Arc::new(MockApiTokenRepo::new());
-    let uc = GetApiTokensUseCase::new(repo);
+    let uc = CreateApiTokenUseCase::new(repo);
 
-    let tokens = uc.execute().await.unwrap();
-    assert!(tokens.is_empty());
+    // Byte 8 falls inside the fourth 'é'.
+    let created = uc.execute("utf8", Some("aééééé")).await.unwrap();
+    assert_eq!(created.token.key_prefix.as_ref(), "aééé");
 }
-
-#[tokio::test]
-async fn get_tokens_returns_all() {
-    let repo = Arc::new(MockApiTokenRepo::new());
-    let create = CreateApiTokenUseCase::new(repo.clone());
-    create.execute("first", None).await.unwrap();
-    create.execute("second", None).await.unwrap();
-
-    let get = GetApiTokensUseCase::new(repo);
-    let tokens = get.execute().await.unwrap();
-    assert_eq!(tokens.len(), 2);
-}
-
-// ---------------------------------------------------------------------------
-// DeleteApiTokenUseCase
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn delete_existing_token() {
-    let repo = Arc::new(MockApiTokenRepo::new());
-    let create = CreateApiTokenUseCase::new(repo.clone());
-    let created = create.execute("to-delete", None).await.unwrap();
-    let id = created.token.id.unwrap();
-
-    let delete = DeleteApiTokenUseCase::new(repo.clone());
-    assert!(delete.execute(id).await.is_ok());
-
-    let all = repo.get_all().await.unwrap();
-    assert!(all.is_empty());
-}
-
-#[tokio::test]
-async fn delete_nonexistent_token_returns_error() {
-    let repo = Arc::new(MockApiTokenRepo::new());
-    let delete = DeleteApiTokenUseCase::new(repo);
-
-    let err = delete.execute(999).await.unwrap_err();
-    assert!(matches!(err, DomainError::ApiTokenNotFound(999)));
-}
-
-// ---------------------------------------------------------------------------
-// UpdateApiTokenUseCase
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn update_token_name_only() {
@@ -358,12 +304,28 @@ async fn update_rejects_invalid_name() {
 
     let update = UpdateApiTokenUseCase::new(repo);
     let err = update.execute(id, "", None).await.unwrap_err();
-    assert!(matches!(err, DomainError::ConfigError(_)));
+    assert!(matches!(err, DomainError::InvalidInput(_)));
 }
 
-// ---------------------------------------------------------------------------
-// ValidateApiTokenUseCase
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn update_with_empty_key_keeps_existing_key() {
+    let repo = Arc::new(MockApiTokenRepo::new());
+    let create = CreateApiTokenUseCase::new(repo.clone());
+    let created = create.execute("token", None).await.unwrap();
+    let id = created.token.id.unwrap();
+
+    UpdateApiTokenUseCase::new(repo.clone())
+        .execute(id, "token", Some(""))
+        .await
+        .unwrap();
+
+    let validate = ValidateApiTokenUseCase::new(repo);
+    assert_eq!(validate.execute(&created.raw_token).await.unwrap(), id);
+    assert!(matches!(
+        validate.execute("").await,
+        Err(DomainError::InvalidCredentials)
+    ));
+}
 
 #[tokio::test]
 async fn validate_correct_token_returns_id() {
@@ -433,10 +395,6 @@ async fn validate_empty_repo_returns_invalid_credentials() {
     let err = validate.execute("any-token").await.unwrap_err();
     assert!(matches!(err, DomainError::InvalidCredentials));
 }
-
-// ---------------------------------------------------------------------------
-// AppPasswordLoginUseCase
-// ---------------------------------------------------------------------------
 
 const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
 

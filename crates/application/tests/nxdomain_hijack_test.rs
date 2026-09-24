@@ -45,8 +45,6 @@ async fn resolver_with_ip(domain: &str, ip: &str) -> MockDnsResolver {
     resolver
 }
 
-// ── Block action ──────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn hijacked_response_is_blocked() {
     let resolver = resolver_with_ip("example.com", HIJACK_IP).await;
@@ -82,8 +80,6 @@ async fn clean_response_passes_with_block_action() {
     assert!(result.is_ok());
 }
 
-// ── Alert action ──────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn hijacked_response_allowed_in_alert_mode() {
     let resolver = resolver_with_ip("example.com", HIJACK_IP).await;
@@ -98,8 +94,6 @@ async fn hijacked_response_allowed_in_alert_mode() {
 
     assert!(result.is_ok(), "alert mode should allow hijacked response");
 }
-
-// ── Disabled detection ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn disabled_detection_allows_hijacked_response() {
@@ -116,8 +110,6 @@ async fn disabled_detection_allows_hijacked_response() {
 
     assert!(result.is_ok());
 }
-
-// ── Cache direct path ─────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn cache_hit_with_hijack_ip_falls_through() {
@@ -142,8 +134,6 @@ async fn cache_hit_with_hijack_ip_falls_through() {
     assert!(logs[0].blocked);
     assert_eq!(logs[0].block_source, Some(BlockSource::NxdomainHijack));
 }
-
-// ── Empty store never blocks ──────────────────────────────────────────────────
 
 #[tokio::test]
 async fn empty_store_never_blocks() {

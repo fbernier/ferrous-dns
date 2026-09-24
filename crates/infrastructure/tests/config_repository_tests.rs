@@ -91,8 +91,6 @@ fn config_with_records(records: Vec<LocalDnsRecord>) -> Config {
     config
 }
 
-// ── TomlConfigRepository: save_local_records ────────────────────────────────
-
 #[tokio::test]
 async fn test_save_local_records_writes_to_correct_path() {
     let dir = tempfile::tempdir().unwrap();

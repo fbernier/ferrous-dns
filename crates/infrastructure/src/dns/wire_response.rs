@@ -12,33 +12,20 @@ const OPT_RECORD: [u8; 11] = [
 /// exceed it is rejected (`None`) and handled by the slow path instead.
 pub const RESPONSE_BUF_LEN: usize = 523;
 
-/// Clones the cached wire bytes and overwrites the query ID (bytes 0–1) with
-/// `new_id` so the response matches the client's original query.
-///
-/// Returns `None` if `wire` is shorter than 2 bytes.
-pub fn patch_wire_id(wire: &[u8], new_id: u16) -> Option<Vec<u8>> {
-    if wire.len() < 2 {
-        return None;
-    }
-    let mut buf = wire.to_vec();
-    buf[0] = (new_id >> 8) as u8;
-    buf[1] = new_id as u8;
-    Some(buf)
-}
-
-/// Patches the query ID like [`patch_wire_id`] and additionally clears the
-/// Authenticated Data (AD) bit in the response flags.
+/// Clones the cached wire bytes under the client's query ID and with the
+/// Authenticated Data (AD) bit cleared; `None` if `wire` cannot hold an ID.
 ///
 /// The cached-wire fast path is only taken for clients that did **not** set the
 /// EDNS DO bit, so per RFC 6840 §5.8 we must never assert AD to them — yet the
 /// cached upstream bytes may carry AD=1 from the validating resolver. Clearing
 /// it here keeps the fast path compliant without re-parsing the message.
 pub fn patch_wire_id_clear_ad(wire: &[u8], new_id: u16) -> Option<Vec<u8>> {
-    let mut buf = patch_wire_id(wire, new_id)?;
-    // Byte 3 holds RA/Z/AD/CD/RCODE; 0x20 is the AD bit.
-    if buf.len() > 3 {
-        buf[3] &= !0x20;
+    if wire.len() < 2 {
+        return None;
     }
+    let mut buf = wire.to_vec();
+    buf[..2].copy_from_slice(&new_id.to_be_bytes());
+    set_ad_bit(&mut buf, false);
     Some(buf)
 }
 
@@ -151,7 +138,8 @@ fn write_address_rr(out: &mut [u8], addr: &IpAddr, ttl: u32) -> usize {
 const CLASS_IN: u16 = 1;
 const TYPE_SOA: u16 = 6;
 const TYPE_OPT: u16 = 41;
-const OPTION_COOKIE: u16 = 10;
+/// EDNS option code of the DNS Cookie (RFC 7873 §4).
+pub(crate) const COOKIE_OPTION_CODE: u16 = 10;
 /// UDP payload size advertised in every OPT this server writes.
 const EDNS_UDP_PAYLOAD: u16 = 4096;
 /// `hostmaster.ferrous-dns.invalid.` — the synthetic SOA RNAME.
@@ -202,7 +190,7 @@ pub struct EdnsReply<'a> {
 impl EdnsReply<'_> {
     fn write(&self, out: &mut Vec<u8>) {
         let cookie_len = self.cookie.map_or(0, |c| 4 + c.len());
-        let ede_len = self.ede.map_or(0, |e| 6 + e.extra_text.map_or(0, str::len));
+        let ede_len = self.ede.map_or(0, |e| 6 + e.extra_text.len());
         let rdlen = (cookie_len + ede_len) as u16;
         out.push(0);
         out.extend_from_slice(&TYPE_OPT.to_be_bytes());
@@ -211,12 +199,12 @@ impl EdnsReply<'_> {
         out.extend_from_slice(&[0, 0, u8::from(self.dnssec_ok) << 7, 0]);
         out.extend_from_slice(&rdlen.to_be_bytes());
         if let Some(cookie) = self.cookie {
-            out.extend_from_slice(&OPTION_COOKIE.to_be_bytes());
+            out.extend_from_slice(&COOKIE_OPTION_CODE.to_be_bytes());
             out.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
             out.extend_from_slice(cookie);
         }
         if let Some(ede) = self.ede {
-            let text = ede.extra_text.unwrap_or_default().as_bytes();
+            let text = ede.extra_text.as_bytes();
             out.extend_from_slice(&ede::OPTION_CODE.to_be_bytes());
             out.extend_from_slice(&((2 + text.len()) as u16).to_be_bytes());
             out.extend_from_slice(&ede.info_code.to_be_bytes());

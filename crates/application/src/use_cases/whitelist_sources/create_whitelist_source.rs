@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{DomainError, WhitelistSource};
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -35,10 +36,7 @@ impl CreateWhitelistSourceUseCase {
             .map_err(DomainError::InvalidWhitelistSource)?;
 
         for &gid in &group_ids {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
         let source = self

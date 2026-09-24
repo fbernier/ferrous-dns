@@ -1097,14 +1097,3 @@ async fn discoverable_passkey_login_rejected_when_webauthn_not_configured() {
         Ok(_) => panic!("discoverable login must not start when WebAuthn is unconfigured"),
     }
 }
-
-/// Constant-time comparison works correctly (uses subtle crate directly).
-#[test]
-fn timing_safe_eq_basic_correctness() {
-    use subtle::ConstantTimeEq;
-    let eq = |a: &[u8], b: &[u8]| -> bool { a.ct_eq(b).into() };
-    assert!(eq(b"token123", b"token123"));
-    assert!(!eq(b"token123", b"token456"));
-    assert!(!eq(b"short", b"longer-value"));
-    assert!(eq(b"", b""));
-}

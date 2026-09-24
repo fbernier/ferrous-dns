@@ -1,5 +1,5 @@
 use super::super::types::{DnskeyRecord, DsRecord};
-use super::entries::{DnskeyEntry, DsEntry};
+use super::entries::CacheEntry;
 use super::stats::{CacheStats, CacheStatsSnapshot};
 use crate::counted_map::CountedDashMap;
 use std::sync::Arc;
@@ -16,11 +16,11 @@ const MAX_ENTRIES: usize = 50_000;
 const EVICTION_BATCH_SIZE: usize = 32;
 
 pub struct DnssecCache {
-    dnskeys: CountedDashMap<Arc<str>, DnskeyEntry>,
+    dnskeys: CountedDashMap<Arc<str>, CacheEntry<DnskeyRecord>>,
 
-    ds_records: CountedDashMap<Arc<str>, DsEntry>,
+    ds_records: CountedDashMap<Arc<str>, CacheEntry<DsRecord>>,
 
-    stats: Arc<CacheStats>,
+    stats: CacheStats,
 }
 
 impl DnssecCache {
@@ -28,88 +28,38 @@ impl DnssecCache {
         Self {
             dnskeys: CountedDashMap::new(),
             ds_records: CountedDashMap::new(),
-            stats: Arc::new(CacheStats::default()),
+            stats: CacheStats::default(),
         }
     }
 
     pub fn cache_dnskey(&self, domain: &str, keys: Vec<DnskeyRecord>, ttl_seconds: u32) {
-        let key = Arc::from(domain);
-        let entry = DnskeyEntry::new(keys, ttl_seconds);
-
-        evict_if_full(&self.dnskeys, DnskeyEntry::is_expired);
-        self.dnskeys.insert(key, entry);
-
-        trace!(
-            domain = %domain,
-            ttl = ttl_seconds,
-            "Cached DNSKEY records"
-        );
+        insert(&self.dnskeys, domain, keys, ttl_seconds);
+        trace!(domain = %domain, ttl = ttl_seconds, "Cached DNSKEY records");
     }
 
     pub fn get_dnskey(&self, domain: &str) -> Option<Arc<[DnskeyRecord]>> {
-        if let Some(entry) = self.dnskeys.get(domain) {
-            if !entry.is_expired() {
-                self.stats.record_dnskey_hit(domain);
-
-                trace!(
-                    domain = %domain,
-                    "DNSKEY cache hit"
-                );
-
-                return Some(Arc::clone(entry.keys()));
-            } else {
-                drop(entry);
-                self.dnskeys.remove(domain);
-
-                debug!(
-                    domain = %domain,
-                    "DNSKEY cache expired"
-                );
-            }
+        let hit = lookup(&self.dnskeys, domain);
+        if hit.is_some() {
+            self.stats.record_dnskey_hit();
+        } else {
+            self.stats.record_dnskey_miss();
         }
-
-        self.stats.record_dnskey_miss(domain);
-        None
+        hit
     }
 
     pub fn cache_ds(&self, domain: &str, records: Vec<DsRecord>, ttl_seconds: u32) {
-        let key = Arc::from(domain);
-        let entry = DsEntry::new(records, ttl_seconds);
-
-        evict_if_full(&self.ds_records, DsEntry::is_expired);
-        self.ds_records.insert(key, entry);
-
-        trace!(
-            domain = %domain,
-            ttl = ttl_seconds,
-            "Cached DS records"
-        );
+        insert(&self.ds_records, domain, records, ttl_seconds);
+        trace!(domain = %domain, ttl = ttl_seconds, "Cached DS records");
     }
 
     pub fn get_ds(&self, domain: &str) -> Option<Arc<[DsRecord]>> {
-        if let Some(entry) = self.ds_records.get(domain) {
-            if !entry.is_expired() {
-                self.stats.record_ds_hit(domain);
-
-                trace!(
-                    domain = %domain,
-                    "DS cache hit"
-                );
-
-                return Some(Arc::clone(entry.records()));
-            } else {
-                drop(entry);
-                self.ds_records.remove(domain);
-
-                debug!(
-                    domain = %domain,
-                    "DS cache expired"
-                );
-            }
+        let hit = lookup(&self.ds_records, domain);
+        if hit.is_some() {
+            self.stats.record_ds_hit();
+        } else {
+            self.stats.record_ds_miss();
         }
-
-        self.stats.record_ds_miss(domain);
-        None
+        hit
     }
 
     pub fn stats(&self) -> CacheStatsSnapshot {
@@ -128,12 +78,28 @@ impl DnssecCache {
     pub fn record_ds_denial_fail_open(&self) {
         self.stats.record_ds_denial_fail_open();
     }
+}
 
-    pub fn clear(&self) {
-        self.dnskeys.clear();
-        self.ds_records.clear();
-        debug!("DNSSEC cache cleared");
+fn insert<T>(
+    map: &CountedDashMap<Arc<str>, CacheEntry<T>>,
+    domain: &str,
+    items: Vec<T>,
+    ttl_seconds: u32,
+) {
+    evict_if_full(map, CacheEntry::is_expired);
+    map.insert(Arc::from(domain), CacheEntry::new(items, ttl_seconds));
+}
+
+fn lookup<T>(map: &CountedDashMap<Arc<str>, CacheEntry<T>>, domain: &str) -> Option<Arc<[T]>> {
+    let entry = map.get(domain)?;
+    if !entry.is_expired() {
+        return Some(Arc::clone(entry.items()));
     }
+    drop(entry);
+    // Conditional: a concurrent validator may have re-cached a fresh set since the read.
+    map.remove_if(domain, |_, entry| entry.is_expired());
+    debug!(domain = %domain, "DNSSEC cache entry expired");
+    None
 }
 
 impl Default for DnssecCache {

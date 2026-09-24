@@ -65,7 +65,7 @@ impl DnsCache {
         CacheEntryPage {
             entries,
             total,
-            records_total: self.size(),
+            records_total: self.len(),
         }
     }
 }

@@ -188,7 +188,7 @@ fn edns_request_gets_edns_response_with_ede() {
         .expect("EDNS OPT (carrying the EDE) should be present");
     let ede = ede.unwrap();
     let mut expected = ede.info_code.to_be_bytes().to_vec();
-    expected.extend_from_slice(ede.extra_text.unwrap().as_bytes());
+    expected.extend_from_slice(ede.extra_text.as_bytes());
     assert!(
         edns.options().as_ref().iter().any(|(_, opt)| matches!(
             opt,

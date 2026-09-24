@@ -44,29 +44,6 @@ pub struct ManagedDomain {
 }
 
 impl ManagedDomain {
-    pub fn new(
-        id: Option<i64>,
-        name: Arc<str>,
-        domain: Arc<str>,
-        action: DomainAction,
-        group_id: i64,
-        comment: Option<Arc<str>>,
-        enabled: bool,
-    ) -> Self {
-        Self {
-            id,
-            name,
-            domain,
-            action,
-            group_id,
-            comment,
-            enabled,
-            service_id: None,
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
     pub fn validate_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("Managed domain name cannot be empty".to_string());
@@ -89,11 +66,10 @@ impl ManagedDomain {
             return Err("Wildcard must be a prefix: use '*.example.com' format".to_string());
         }
 
-        let check = if let Some(rest) = domain.strip_prefix("*.") {
-            rest
-        } else {
-            domain
-        };
+        let check = domain.strip_prefix("*.").unwrap_or(domain);
+        if check.is_empty() || check.starts_with('.') || check.contains("..") {
+            return Err("Domain cannot contain an empty label".to_string());
+        }
 
         let valid = check
             .chars()

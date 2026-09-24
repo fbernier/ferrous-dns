@@ -32,14 +32,9 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: Option<&str>, cli_overrides: CliOverrides) -> Result<Self, ConfigError> {
-        let mut config = if let Some(path) = path {
-            Self::from_file(path)?
-        } else if std::path::Path::new("ferrous-dns.toml").exists() {
-            Self::from_file("ferrous-dns.toml")?
-        } else if std::path::Path::new("/etc/ferrous-dns/config.toml").exists() {
-            Self::from_file("/etc/ferrous-dns/config.toml")?
-        } else {
-            Self::default()
+        let mut config = match path.or_else(find_config_path) {
+            Some(path) => Self::from_file(path)?,
+            None => Self::default(),
         };
 
         config.apply_cli_overrides(cli_overrides);
@@ -88,12 +83,8 @@ impl Config {
             return Err(ConfigError::Validation("DNS port cannot be 0".to_string()));
         }
 
-        // Every listener parses its address only when it binds, and the
-        // encrypted ones bind inside a spawned task — so without this an
-        // unparseable address takes a listener down with a single log line
-        // while the process stays up. Check them all up front instead. A
-        // listener that falls back to `bind_address` is already covered by
-        // the first check, so only an explicit override is named separately.
+        // Listeners parse addresses only at bind time, some inside spawned tasks, so a bad one
+        // would otherwise just log and leave the process up without that listener.
         check_listen_address("server.bind_address", &self.server.dns_listen_address())?;
         let encrypted = &self.server.encrypted_dns;
         if encrypted.dot_enabled && encrypted.dot_bind_address.is_some() {
@@ -133,14 +124,16 @@ impl Config {
     }
 
     pub fn get_config_path() -> Option<String> {
-        if std::path::Path::new("ferrous-dns.toml").exists() {
-            Some("ferrous-dns.toml".to_string())
-        } else if std::path::Path::new("/etc/ferrous-dns/config.toml").exists() {
-            Some("/etc/ferrous-dns/config.toml".to_string())
-        } else {
-            None
-        }
+        find_config_path().map(str::to_string)
     }
+}
+
+const CANDIDATE_PATHS: [&str; 2] = ["ferrous-dns.toml", "/etc/ferrous-dns/config.toml"];
+
+fn find_config_path<'a>() -> Option<&'a str> {
+    CANDIDATE_PATHS
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
 }
 
 #[derive(Debug, Default)]

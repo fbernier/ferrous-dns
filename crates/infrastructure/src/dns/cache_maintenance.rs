@@ -1,5 +1,6 @@
 use super::cache::{
-    coarse_clock, CachedAddresses, CachedData, DnsCache, RefreshRequest, RefreshScanOptions,
+    coarse_clock, CachedAddresses, CachedData, CachedDnssecStatus, DnsCache, RefreshRequest,
+    RefreshScanOptions,
 };
 
 use async_trait::async_trait;
@@ -7,7 +8,7 @@ use ferrous_dns_application::ports::{
     CacheCompactionOutcome, CacheMaintenancePort, CacheRefreshOutcome, DnsResolver,
     QueryLogRepository,
 };
-use ferrous_dns_domain::{DnsQuery, DomainError, QueryLog, QuerySource};
+use ferrous_dns_domain::{DnsQuery, DomainError, QueryLog, QuerySource, RecordType};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -86,9 +87,9 @@ impl DnsCacheMaintenance {
         scan_opts: RefreshScanOptions,
         pace_tx: watch::Sender<RefreshPace>,
     ) -> Self {
-        // Rotation only governs how quickly bits left behind by removed keys
-        // are purged: `rotate_bloom` re-seeds every live entry into the new
-        // slot, so an entry's visibility no longer depends on this cadence.
+        // Rotation only bounds how long bits left behind by removed keys
+        // linger: `rotate_bloom` re-seeds every live entry into the new slot,
+        // so an entry's visibility does not depend on this cadence.
         let min_ttl = cache.min_ttl() as u64;
         let interval = refresh_interval_secs.max(1);
         let bloom_rotation_cycles = (min_ttl / interval).max(MIN_BLOOM_ROTATION_CYCLES);
@@ -113,11 +114,11 @@ impl DnsCacheMaintenance {
     }
 
     async fn refresh_entry(
-        cache: &Arc<DnsCache>,
-        resolver: &Arc<dyn DnsResolver>,
-        query_log: &Option<Arc<dyn QueryLogRepository>>,
+        cache: &DnsCache,
+        resolver: &dyn DnsResolver,
+        query_log: Option<&dyn QueryLogRepository>,
         domain: &str,
-        record_type: &ferrous_dns_domain::RecordType,
+        record_type: &RecordType,
     ) -> Result<bool, DomainError> {
         let start = Instant::now();
 
@@ -128,81 +129,70 @@ impl DnsCacheMaintenance {
         );
 
         let query = DnsQuery::new(domain, *record_type);
+        let resolution = resolver.resolve(&query).await?;
+        let response_time = start.elapsed().as_micros() as u64;
 
-        match resolver.resolve(&query).await {
-            Ok(resolution)
-                if !resolution.addresses.is_empty() || resolution.upstream_wire_data.is_some() =>
-            {
-                let response_time = start.elapsed().as_micros() as u64;
+        let new_data = if !resolution.addresses.is_empty() {
+            CachedData::IpAddresses(CachedAddresses {
+                addresses: Arc::clone(&resolution.addresses),
+            })
+        } else if let Some(wire_bytes) = &resolution.upstream_wire_data {
+            CachedData::WireData(wire_bytes.clone())
+        } else {
+            return Ok(false);
+        };
+        let dnssec_status: Option<CachedDnssecStatus> =
+            resolution.dnssec_status.and_then(|s| s.parse().ok());
 
-                let dnssec_status: Option<super::cache::CachedDnssecStatus> =
-                    resolution.dnssec_status.and_then(|s| s.parse().ok());
-
-                let new_data = if !resolution.addresses.is_empty() {
-                    CachedData::IpAddresses(CachedAddresses {
-                        addresses: Arc::clone(&resolution.addresses),
-                    })
-                } else if let Some(ref wire_bytes) = resolution.upstream_wire_data {
-                    CachedData::WireData(wire_bytes.clone())
-                } else {
-                    return Ok(false);
-                };
-
-                let refreshed = cache.refresh_record(
-                    domain,
-                    record_type,
-                    resolution.min_ttl,
-                    new_data,
-                    dnssec_status,
-                );
-
-                if !refreshed {
-                    return Ok(false);
-                }
-
-                if let Some(log) = query_log {
-                    let log_entry = QueryLog {
-                        id: None,
-                        domain: Arc::from(domain),
-                        record_type: *record_type,
-                        client_ip: IpAddr::from([127, 0, 0, 1]),
-                        client_hostname: None,
-                        blocked: false,
-                        response_time_us: Some(response_time),
-                        cache_hit: false,
-                        cache_refresh: true,
-                        dnssec_status: resolution.dnssec_status,
-                        dns64_synthesized: false,
-                        answers: Some(Arc::clone(&resolution.addresses)),
-                        upstream_server: resolution.upstream_server.clone(),
-                        upstream_pool: resolution.upstream_pool.clone(),
-                        response_status: Some("NOERROR"),
-                        timestamp: None,
-                        query_source: QuerySource::Internal,
-                        protocol: None,
-                        group_id: None,
-                        block_source: None,
-                    };
-
-                    if let Err(e) = log.log_query(&log_entry).await {
-                        debug!(error = %e, "Failed to log refresh query (non-critical)");
-                    }
-                }
-
-                debug!(
-                    domain = %domain,
-                    record_type = %record_type,
-                    cache_hit = resolution.cache_hit,
-                    dnssec_status = ?resolution.dnssec_status,
-                    response_time_us = response_time,
-                    "Cache entry refreshed with new DNSSEC validation"
-                );
-
-                Ok(true)
-            }
-            Ok(_) => Ok(false),
-            Err(e) => Err(e),
+        if !cache.refresh_record(
+            domain,
+            record_type,
+            resolution.min_ttl,
+            new_data,
+            dnssec_status,
+        ) {
+            return Ok(false);
         }
+
+        if let Some(log) = query_log {
+            let log_entry = QueryLog {
+                id: None,
+                domain: Arc::from(domain),
+                record_type: *record_type,
+                client_ip: IpAddr::from([127, 0, 0, 1]),
+                client_hostname: None,
+                blocked: false,
+                response_time_us: Some(response_time),
+                cache_hit: false,
+                cache_refresh: true,
+                dnssec_status: resolution.dnssec_status,
+                dns64_synthesized: false,
+                answers: Some(Arc::clone(&resolution.addresses)),
+                upstream_server: resolution.upstream_server.clone(),
+                upstream_pool: resolution.upstream_pool.clone(),
+                response_status: Some("NOERROR"),
+                timestamp: None,
+                query_source: QuerySource::Internal,
+                protocol: None,
+                group_id: None,
+                block_source: None,
+            };
+
+            if let Err(e) = log.log_query(&log_entry).await {
+                debug!(error = %e, "Failed to log refresh query (non-critical)");
+            }
+        }
+
+        debug!(
+            domain = %domain,
+            record_type = %record_type,
+            cache_hit = resolution.cache_hit,
+            dnssec_status = ?resolution.dnssec_status,
+            response_time_us = response_time,
+            "Cache entry refreshed with new DNSSEC validation"
+        );
+
+        Ok(true)
     }
 
     /// Spawns the background worker that drains both refresh queues.
@@ -272,13 +262,18 @@ impl DnsCacheMaintenance {
                 let resolver = Arc::clone(&resolver);
                 let query_log = query_log.clone();
                 tokio::spawn(async move {
-                    match Self::refresh_entry(&cache, &resolver, &query_log, &domain, &record_type)
-                        .await
+                    match Self::refresh_entry(
+                        &cache,
+                        resolver.as_ref(),
+                        query_log.as_deref(),
+                        &domain,
+                        &record_type,
+                    )
+                    .await
                     {
                         Ok(true) => {
-                            // Keeps `cache_optimistic_refreshes` meaning what
-                            // it always did: background prefetches, not
-                            // serve-stale repairs.
+                            // `cache_optimistic_refreshes` counts background
+                            // prefetches, not serve-stale repairs.
                             if origin == RefreshOrigin::Optimistic {
                                 cache
                                     .metrics()
@@ -365,16 +360,16 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
         if candidates.is_empty() {
             self.pace_tx.send_replace(None);
             return Ok(CacheRefreshOutcome {
-                cache_size: self.cache.size(),
+                cache_size: self.cache.len(),
                 ..Default::default()
             });
         }
 
         let candidate_count = candidates.len();
 
-        // The cycle only scans and enqueues; the queue worker performs the
-        // refreshes at its configured pace. Doing them inline here is what
-        // made a cycle's cost scale with the eligible working set.
+        // The cycle only scans and enqueues; the worker refreshes at the pace
+        // this cycle publishes below, so a cycle's cost does not grow with the
+        // number of eligible entries.
         let Some(tx) = self.cache.optimistic_refresh_sender() else {
             // No worker wired up, so nothing would ever drain the queue —
             // release the flags rather than stranding the entries.
@@ -384,7 +379,7 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
             self.pace_tx.send_replace(None);
             return Ok(CacheRefreshOutcome {
                 candidates_found: candidate_count,
-                cache_size: self.cache.size(),
+                cache_size: self.cache.len(),
                 ..Default::default()
             });
         };
@@ -443,7 +438,7 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
             dropped,
             shed,
             paced_period_ms: pace.map(|p| p.as_millis() as u64),
-            cache_size: self.cache.size(),
+            cache_size: self.cache.len(),
         })
     }
 
@@ -459,7 +454,7 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
 
         Ok(CacheCompactionOutcome {
             entries_removed: removed,
-            cache_size: self.cache.size(),
+            cache_size: self.cache.len(),
         })
     }
 }

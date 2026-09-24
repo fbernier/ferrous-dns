@@ -3,8 +3,12 @@ use super::response_parser::{DnsResponse, ResponseParser};
 use super::response_validator::ResponseValidator;
 use crate::dns::transport;
 use ferrous_dns_domain::{DnsProtocol, DomainError, RecordType, UpstreamAddr};
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+/// Budget for the TCP retry when the UDP attempt already spent the whole timeout.
+const TC_RETRY_FLOOR: Duration = Duration::from_millis(500);
 
 /// Queries `local_dns_server` — the LAN router — for local names and private
 /// PTRs. Its answers are relayed to clients as raw wire bytes, so it gets the
@@ -22,13 +26,9 @@ impl Default for DnsForwarder {
 }
 
 impl DnsForwarder {
-    /// DNS Cookies on, 0x20 off — the upstream pools' default.
     pub fn new() -> Self {
         Self {
-            hardening: HardeningOpts {
-                cookie: true,
-                qname_0x20: false,
-            },
+            hardening: HardeningOpts::default(),
         }
     }
 
@@ -51,29 +51,48 @@ impl DnsForwarder {
             .map_err(|e| DomainError::IoError(format!("Invalid server address: {}", e)))?;
         let (query_bytes, validator) =
             MessageBuilder::build_query_hardened(domain, record_type, false, self.hardening)?;
-        let timeout = Duration::from_millis(timeout_ms);
-        let start = Instant::now();
-
         let udp = DnsProtocol::Udp {
             addr: UpstreamAddr::Resolved(server_addr),
         };
-        let response = exchange(&udp, &query_bytes, &validator, timeout).await?;
-        if !response.truncated {
-            return Ok(response);
-        }
-
-        let tcp = DnsProtocol::Tcp {
-            addr: UpstreamAddr::Resolved(server_addr),
-        };
-        let remaining = timeout
-            .checked_sub(start.elapsed())
-            .unwrap_or(Duration::from_millis(500));
-        exchange(&tcp, &query_bytes, &validator, remaining).await
+        let (response, _) = exchange_with_tc_retry(
+            &udp,
+            &query_bytes,
+            &validator,
+            Duration::from_millis(timeout_ms),
+        )
+        .await?;
+        Ok(response)
     }
 }
 
-/// One validated round trip over `protocol`, with our 0x20 case stripped from
-/// the answer before anything downstream sees it.
+/// One validated round trip over `protocol`, retried over TCP when a UDP answer
+/// comes back truncated. Also returns the protocol that produced the answer.
+pub(crate) async fn exchange_with_tc_retry<'p>(
+    protocol: &'p DnsProtocol,
+    query_bytes: &[u8],
+    validator: &ResponseValidator,
+    timeout: Duration,
+) -> Result<(DnsResponse, Cow<'p, DnsProtocol>), DomainError> {
+    let start = Instant::now();
+    let response = exchange(protocol, query_bytes, validator, timeout).await?;
+    let DnsProtocol::Udp { addr } = protocol else {
+        return Ok((response, Cow::Borrowed(protocol)));
+    };
+    if !response.truncated {
+        return Ok((response, Cow::Borrowed(protocol)));
+    }
+
+    let tcp = DnsProtocol::Tcp { addr: addr.clone() };
+    let remaining = timeout
+        .checked_sub(start.elapsed())
+        .unwrap_or(TC_RETRY_FLOOR);
+    let response = exchange(&tcp, query_bytes, validator, remaining).await?;
+    Ok((response, Cow::Owned(tcp)))
+}
+
+/// One round trip over `protocol`. Validation runs before anything reads the
+/// answer — so a forged TC=1 cannot waste a TCP retry — and our 0x20 case is
+/// stripped right after, so nothing downstream ever holds a randomized QNAME.
 async fn exchange(
     protocol: &DnsProtocol,
     query_bytes: &[u8],

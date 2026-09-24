@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use super::login_rate_limiter::LoginRateLimiter;
-use super::session_factory::build_session;
+use super::session_factory::{build_session, is_expired};
 use crate::ports::{MfaRepository, PasswordHasher, SessionRepository, TotpService, UserProvider};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError};
 
@@ -132,11 +132,4 @@ impl VerifyMfaUseCase {
         }
         Ok(false)
     }
-}
-
-/// Checks if a timestamp has passed; fail-closed on parse error.
-fn is_expired(expires_at: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S")
-        .map(|exp| chrono::Utc::now().naive_utc() > exp)
-        .unwrap_or(true)
 }

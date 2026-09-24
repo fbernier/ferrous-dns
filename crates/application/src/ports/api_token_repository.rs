@@ -19,7 +19,6 @@ pub trait ApiTokenRepository: Send + Sync {
     /// List all tokens (without raw keys — only prefix and metadata).
     async fn get_all(&self) -> Result<Vec<ApiToken>, DomainError>;
 
-    /// Find a token by database ID.
     async fn get_by_id(&self, id: i64) -> Result<Option<ApiToken>, DomainError>;
 
     /// Find a token by name (for duplicate detection).

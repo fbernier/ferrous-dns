@@ -4,10 +4,8 @@ use ferrous_dns_domain::{AuthSession, DomainError};
 /// Port for managing browser authentication sessions in persistent storage.
 #[async_trait]
 pub trait SessionRepository: Send + Sync {
-    /// Persist a new session.
     async fn create(&self, session: &AuthSession) -> Result<(), DomainError>;
 
-    /// Retrieve a session by its ID. Returns `None` if not found.
     async fn get_by_id(&self, id: &str) -> Result<Option<AuthSession>, DomainError>;
 
     /// Update the `last_seen_at` timestamp for keep-alive tracking.

@@ -24,13 +24,6 @@ impl DnsCache {
             );
         }
 
-        self.compaction_counter
-            .fetch_add(1, AtomicOrdering::Relaxed);
-
         removed
-    }
-
-    pub fn compaction_count(&self) -> usize {
-        self.compaction_counter.load(AtomicOrdering::Relaxed)
     }
 }

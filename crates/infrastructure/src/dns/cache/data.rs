@@ -37,10 +37,6 @@ impl CachedDnssecStatus {
             Self::Indeterminate => "Indeterminate",
         }
     }
-
-    pub fn from_option_string(opt: Option<String>) -> Self {
-        opt.and_then(|s| s.parse().ok()).unwrap_or(Self::Unknown)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,15 +57,6 @@ pub enum CachedData {
 }
 
 impl CachedData {
-    pub fn is_empty(&self) -> bool {
-        match self {
-            CachedData::IpAddresses(entry) => entry.addresses.is_empty(),
-            CachedData::CanonicalName(name) => name.is_empty(),
-            CachedData::WireData(bytes) => bytes.is_empty(),
-            CachedData::NegativeResponse => false,
-        }
-    }
-
     pub fn is_negative(&self) -> bool {
         matches!(self, CachedData::NegativeResponse)
     }
@@ -77,21 +64,18 @@ impl CachedData {
     pub fn as_ip_addresses(&self) -> Option<&Arc<Vec<IpAddr>>> {
         match self {
             CachedData::IpAddresses(entry) => Some(&entry.addresses),
-            _ => None,
+            CachedData::CanonicalName(_)
+            | CachedData::WireData(_)
+            | CachedData::NegativeResponse => None,
         }
     }
 
     pub fn as_canonical_name(&self) -> Option<&Arc<str>> {
         match self {
             CachedData::CanonicalName(name) => Some(name),
-            _ => None,
-        }
-    }
-
-    pub fn as_wire_data(&self) -> Option<&Bytes> {
-        match self {
-            CachedData::WireData(bytes) => Some(bytes),
-            _ => None,
+            CachedData::IpAddresses(_) | CachedData::WireData(_) | CachedData::NegativeResponse => {
+                None
+            }
         }
     }
 }

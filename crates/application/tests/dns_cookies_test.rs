@@ -56,8 +56,6 @@ fn valid_cookie_for(client_ip: IpAddr) -> Vec<u8> {
     data
 }
 
-// ── Cookie disabled ──────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn should_pass_through_when_disabled() {
     let resolver = resolver_ok().await;
@@ -69,8 +67,6 @@ async fn should_pass_through_when_disabled() {
     let result = use_case.execute(&request).await;
     assert!(result.is_ok());
 }
-
-// ── require_valid_cookie = false ─────────────────────────────────────────────
 
 #[tokio::test]
 async fn should_allow_query_without_cookie_when_require_valid_cookie_false() {
@@ -104,8 +100,6 @@ async fn should_allow_query_with_only_client_cookie_when_require_valid_cookie_fa
         "bootstrapping client cookie must be allowed when require_valid_cookie is false"
     );
 }
-
-// ── require_valid_cookie = true ──────────────────────────────────────────────
 
 #[tokio::test]
 async fn should_allow_query_with_valid_server_cookie() {

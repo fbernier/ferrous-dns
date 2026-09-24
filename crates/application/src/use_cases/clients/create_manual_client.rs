@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{Client, DomainError};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -37,10 +38,7 @@ impl CreateManualClientUseCase {
         mac_address: Option<String>,
     ) -> Result<Client, DomainError> {
         if let Some(gid) = group_id {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
         let initial = self.client_repo.get_or_create(ip_address).await?;

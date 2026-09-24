@@ -1,55 +1,11 @@
 use std::sync::Arc;
 
 use ferrous_dns_application::ports::MfaRepository;
-use ferrous_dns_domain::{MfaChallenge, MfaMethod, WebauthnCredential};
+use ferrous_dns_domain::{DomainError, MfaChallenge, MfaMethod, WebauthnCredential};
 use ferrous_dns_infrastructure::auth::SqliteMfaRepository;
-use sqlx::sqlite::SqlitePoolOptions;
 
-async fn create_test_db() -> sqlx::SqlitePool {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .expect("in-memory SQLite pool");
-
-    for ddl in [
-        "CREATE TABLE user_mfa (
-            username TEXT PRIMARY KEY,
-            totp_secret TEXT NOT NULL,
-            totp_enabled INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
-            confirmed_at TEXT
-        )",
-        "CREATE TABLE mfa_recovery_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            code_hash TEXT NOT NULL,
-            used_at TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
-        )",
-        "CREATE TABLE mfa_challenges (
-            token TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            remember_me INTEGER NOT NULL DEFAULT 0,
-            kind TEXT NOT NULL,
-            state TEXT,
-            expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
-        )",
-        "CREATE TABLE webauthn_credentials (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            credential_id TEXT NOT NULL UNIQUE,
-            label TEXT,
-            passkey TEXT NOT NULL,
-            sign_count INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
-            last_used_at TEXT
-        )",
-    ] {
-        sqlx::query(ddl).execute(&pool).await.expect("create table");
-    }
-    pool
-}
+#[path = "support/db.rs"]
+mod db;
 
 fn repo(pool: sqlx::SqlitePool) -> SqliteMfaRepository {
     SqliteMfaRepository::new(Arc::new(pool))
@@ -61,9 +17,22 @@ fn future_ts(secs: i64) -> String {
         .to_string()
 }
 
+fn credential(credential_id: &str, sign_count: i64) -> WebauthnCredential {
+    WebauthnCredential {
+        id: None,
+        username: Arc::from("admin"),
+        credential_id: Arc::from(credential_id),
+        label: None,
+        passkey: "{}".into(),
+        sign_count,
+        created_at: None,
+        last_used_at: None,
+    }
+}
+
 #[tokio::test]
 async fn totp_secret_upsert_enable_roundtrip() {
-    let repo = repo(create_test_db().await);
+    let repo = repo(db::migrated_pool().await);
 
     assert!(repo.get("admin").await.unwrap().is_none());
 
@@ -84,7 +53,7 @@ async fn totp_secret_upsert_enable_roundtrip() {
 
 #[tokio::test]
 async fn recovery_codes_replace_and_consume() {
-    let repo = repo(create_test_db().await);
+    let repo = repo(db::migrated_pool().await);
 
     repo.replace_recovery_codes("admin", &["h1".into(), "h2".into(), "h3".into()])
         .await
@@ -116,7 +85,7 @@ async fn recovery_codes_replace_and_consume() {
 
 #[tokio::test]
 async fn challenge_lifecycle_and_expiry_cleanup() {
-    let repo = repo(create_test_db().await);
+    let repo = repo(db::migrated_pool().await);
 
     let ch = MfaChallenge {
         token: Arc::from("tok1"),
@@ -154,7 +123,7 @@ async fn challenge_lifecycle_and_expiry_cleanup() {
 
 #[tokio::test]
 async fn webauthn_credentials_crud() {
-    let repo = repo(create_test_db().await);
+    let repo = repo(db::migrated_pool().await);
 
     assert!(!repo.has_credentials("admin").await.unwrap());
 
@@ -189,7 +158,7 @@ async fn webauthn_credentials_crud() {
 
 #[tokio::test]
 async fn find_credential_by_id_resolves_owner() {
-    let repo = repo(create_test_db().await);
+    let repo = repo(db::migrated_pool().await);
 
     // Unknown id → None.
     assert!(repo.find_credential_by_id("nope").await.unwrap().is_none());
@@ -220,7 +189,7 @@ async fn find_credential_by_id_resolves_owner() {
 
 #[tokio::test]
 async fn delete_all_wipes_every_factor() {
-    let repo = repo(create_test_db().await);
+    let repo = repo(db::migrated_pool().await);
 
     repo.upsert_secret("admin", "S").await.unwrap();
     repo.enable("admin").await.unwrap();
@@ -249,4 +218,90 @@ async fn delete_all_wipes_every_factor() {
         .unwrap()
         .is_empty());
     assert!(!repo.has_credentials("admin").await.unwrap());
+}
+
+#[tokio::test]
+async fn recovery_code_cannot_be_spent_twice() {
+    let repo = repo(db::migrated_pool().await);
+    repo.replace_recovery_codes("admin", &["h1".into()])
+        .await
+        .unwrap();
+    let id = repo.list_unused_recovery_codes("admin").await.unwrap()[0].id;
+
+    repo.mark_recovery_code_used(id).await.unwrap();
+    assert!(matches!(
+        repo.mark_recovery_code_used(id).await,
+        Err(DomainError::InvalidMfaCode)
+    ));
+}
+
+#[tokio::test]
+async fn challenge_can_be_consumed_only_once() {
+    let repo = repo(db::migrated_pool().await);
+    repo.create_challenge(&MfaChallenge {
+        token: Arc::from("tok"),
+        username: Arc::from("admin"),
+        remember_me: false,
+        kind: MfaMethod::Totp,
+        state: None,
+        expires_at: future_ts(300),
+    })
+    .await
+    .unwrap();
+
+    repo.delete_challenge("tok").await.unwrap();
+    assert!(matches!(
+        repo.delete_challenge("tok").await,
+        Err(DomainError::MfaChallengeExpired)
+    ));
+}
+
+#[tokio::test]
+async fn challenge_with_unknown_kind_is_not_usable() {
+    let pool = db::migrated_pool().await;
+    sqlx::query(
+        "INSERT INTO mfa_challenges (token, username, remember_me, kind, expires_at)
+         VALUES ('tok', 'admin', 0, 'sms', ?)",
+    )
+    .bind(future_ts(300))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(repo(pool).get_challenge("tok").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn credential_counter_must_increase_unless_authenticator_has_none() {
+    let repo = repo(db::migrated_pool().await);
+    repo.add_credential(&credential("counted", 0))
+        .await
+        .unwrap();
+    repo.add_credential(&credential("counterless", 0))
+        .await
+        .unwrap();
+
+    repo.update_credential_counter("counted", 7).await.unwrap();
+    for replayed in [7, 3, 0] {
+        assert!(
+            matches!(
+                repo.update_credential_counter("counted", replayed).await,
+                Err(DomainError::WebauthnError(_))
+            ),
+            "counter {replayed} after 7 must be rejected"
+        );
+    }
+    let stored = repo
+        .find_credential_by_id("counted")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.sign_count, 7);
+
+    repo.update_credential_counter("counterless", 0)
+        .await
+        .unwrap();
+    repo.update_credential_counter("counterless", 0)
+        .await
+        .unwrap();
 }

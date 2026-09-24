@@ -1,3 +1,4 @@
+use super::require_group;
 use ferrous_dns_domain::{DomainError, Group};
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -21,11 +22,7 @@ impl UpdateGroupUseCase {
         enabled: Option<bool>,
         comment: Option<String>,
     ) -> Result<Group, DomainError> {
-        let group = self
-            .group_repo
-            .get_by_id(id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(id))?;
+        let group = require_group(self.group_repo.as_ref(), id).await?;
 
         if let Some(ref n) = name {
             Group::validate_name(n).map_err(DomainError::InvalidGroupName)?;

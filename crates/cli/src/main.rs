@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .max_blocking_threads(16)
         .build()
-        .expect("Failed to build tokio runtime");
+        .context("Failed to build tokio runtime")?;
 
     runtime.block_on(async_main())
 }
@@ -64,30 +64,20 @@ async fn async_main() -> anyhow::Result<()> {
         config.blocking.enabled,
     )
     .await?;
-    let mut dns_services = wiring::DnsServices::new(&config, &repos).await?;
+    let dns_services = wiring::DnsServices::new(&config, &repos).await?;
     let use_cases = wiring::UseCases::new(
         &repos,
         dns_services.pool_manager.clone(),
         config.dns.local_dns_server.clone(),
     );
 
-    let tunneling_eviction_job = dns_services.tunneling_eviction_job.take();
-    let nxdomain_hijack_job = dns_services.nxdomain_hijack_eviction_job.take();
-    let response_ip_filter_job = dns_services.response_ip_filter_eviction_job.take();
-    let dga_eviction_job = dns_services.dga_eviction_job.take();
-    let runner = bootstrap::build_job_runner(
+    bootstrap::spawn_jobs(
         &use_cases,
         &repos,
         &config,
         wal_pool,
         dns_services.cache_maintenance.clone(),
-        tunneling_eviction_job,
-        nxdomain_hijack_job,
-        response_ip_filter_job,
-        dga_eviction_job,
     );
-
-    runner.start().await;
 
     info!("Loading subnet matcher cache");
     if let Err(e) = use_cases.subnet_matcher.refresh().await {
@@ -100,24 +90,19 @@ async fn async_main() -> anyhow::Result<()> {
             ferrous_dns_domain::Config::get_config_path().map(|p| Arc::from(p.as_str()))
         });
 
-    let upstream_health: Arc<dyn ferrous_dns_application::ports::UpstreamHealthPort> =
-        Arc::new(ferrous_dns_infrastructure::dns::UpstreamHealthAdapter::new(
-            dns_services.pool_manager.clone(),
-            dns_services.health_checker.clone(),
-        ));
-
     let auth =
         wiring::build_auth_services(&repos, config_arc.clone(), effective_config_path.as_deref())
             .await;
 
-    let pihole_state = wiring::build_pihole_state(
-        &use_cases,
-        &auth,
-        repos.block_filter_engine.clone(),
-        upstream_health,
-        config_arc.clone(),
-        effective_config_path.clone(),
-    );
+    let pihole_state = config.server.pihole_compat.then(|| {
+        wiring::build_pihole_state(
+            &use_cases,
+            &auth,
+            repos.block_filter_engine.clone(),
+            config_arc.clone(),
+            effective_config_path.clone(),
+        )
+    });
 
     // The session cookie's `Secure` flag must follow the transport actually in
     // use, so the web TLS material is loaded before the state is built: with
@@ -145,7 +130,11 @@ async fn async_main() -> anyhow::Result<()> {
     )
     .await;
 
-    let dns_addr = config.server.dns_listen_address();
+    let dns_addr: SocketAddr = config
+        .server
+        .dns_listen_address()
+        .parse()
+        .context("Invalid DNS bind address")?;
     let handler_use_case = dns_services.handler_use_case;
     let tcp_conn_limiter = dns_services.tcp_conn_limiter;
     let dot_conn_limiter = dns_services.dot_conn_limiter;
@@ -175,11 +164,7 @@ async fn async_main() -> anyhow::Result<()> {
     });
 
     if config.dns.mdns_enabled {
-        tokio::spawn(async move {
-            if let Err(e) = server::start_mdns_listener().await {
-                error!(error = %e, "mDNS listener error");
-            }
-        });
+        tokio::spawn(server::start_mdns_listener());
     }
 
     let tls_config =
@@ -196,7 +181,11 @@ async fn async_main() -> anyhow::Result<()> {
 
     if config.server.encrypted_dns.dot_enabled {
         if let Some(tls_cfg) = tls_config.clone() {
-            let dot_addr = config.server.dot_listen_address();
+            let dot_addr: SocketAddr = config
+                .server
+                .dot_listen_address()
+                .parse()
+                .context("Invalid DoT bind address")?;
             let dot_handler = Arc::new(DnsServerHandler::new(
                 handler_use_case.clone(),
                 block_policy,
@@ -226,7 +215,11 @@ async fn async_main() -> anyhow::Result<()> {
             &[b"doq"],
         )?;
         if let Some(tls_cfg) = doq_tls_config {
-            let doq_addr = config.server.doq_listen_address();
+            let doq_addr: SocketAddr = config
+                .server
+                .doq_listen_address()
+                .parse()
+                .context("Invalid DoQ bind address")?;
             let doq_handler = Arc::new(DnsServerHandler::new(
                 handler_use_case.clone(),
                 block_policy,
@@ -269,14 +262,13 @@ async fn async_main() -> anyhow::Result<()> {
         .server
         .web_listen_address()
         .parse()
-        .expect("Invalid address");
+        .context("Invalid web bind address")?;
 
     server::start_web_server(
         web_addr,
         app_state,
         pihole_state,
         &config.server.cors_allowed_origins,
-        config.server.pihole_compat,
         config.server.metrics_enabled,
         doh_handler,
         web_tls_config,

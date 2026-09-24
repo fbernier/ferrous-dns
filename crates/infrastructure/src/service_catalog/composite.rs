@@ -8,16 +8,21 @@ use super::ServiceCatalog;
 /// Composite catalog that merges built-in (static) and custom (dynamic) services.
 pub struct CompositeServiceCatalog {
     static_catalog: ServiceCatalog,
-    custom_services: RwLock<Vec<ServiceDefinition>>,
-    custom_by_id: RwLock<HashMap<Arc<str>, usize>>,
+    custom: RwLock<CustomServices>,
+}
+
+/// List and index share one lock so a reader never pairs an index with a different list.
+#[derive(Default)]
+struct CustomServices {
+    list: Vec<ServiceDefinition>,
+    by_id: HashMap<Arc<str>, usize>,
 }
 
 impl CompositeServiceCatalog {
     pub fn new(static_catalog: ServiceCatalog) -> Self {
         Self {
             static_catalog,
-            custom_services: RwLock::new(Vec::new()),
-            custom_by_id: RwLock::new(HashMap::new()),
+            custom: RwLock::default(),
         }
     }
 }
@@ -28,30 +33,21 @@ impl ServiceCatalogPort for CompositeServiceCatalog {
             return Some(def.clone());
         }
 
-        let by_id = self.custom_by_id.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(&idx) = by_id.get(id) {
-            let customs = self
-                .custom_services
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            return customs.get(idx).cloned();
-        }
-
-        None
+        let custom = self.custom.read().unwrap_or_else(|e| e.into_inner());
+        custom
+            .by_id
+            .get(id)
+            .and_then(|&idx| custom.list.get(idx))
+            .cloned()
     }
 
     fn all(&self) -> Vec<ServiceDefinition> {
         let static_all = self.static_catalog.all();
-        let customs = self
-            .custom_services
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let custom = self.custom.read().unwrap_or_else(|e| e.into_inner());
 
-        let mut result = Vec::with_capacity(static_all.len() + customs.len());
-        for def in static_all {
-            result.push(def.clone());
-        }
-        result.extend(customs.iter().cloned());
+        let mut result = Vec::with_capacity(static_all.len() + custom.list.len());
+        result.extend_from_slice(static_all);
+        result.extend_from_slice(&custom.list);
         result
     }
 
@@ -67,19 +63,16 @@ impl ServiceCatalogPort for CompositeServiceCatalog {
     }
 
     fn reload_custom(&self, custom: Vec<ServiceDefinition>) {
-        let mut by_id = HashMap::with_capacity(custom.len());
-        for (idx, def) in custom.iter().enumerate() {
-            by_id.insert(Arc::clone(&def.id), idx);
-        }
+        let by_id = custom
+            .iter()
+            .enumerate()
+            .map(|(idx, def)| (Arc::clone(&def.id), idx))
+            .collect();
+        let next = CustomServices {
+            list: custom,
+            by_id,
+        };
 
-        let mut lock = self
-            .custom_services
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        *lock = custom;
-        drop(lock);
-
-        let mut id_lock = self.custom_by_id.write().unwrap_or_else(|e| e.into_inner());
-        *id_lock = by_id;
+        *self.custom.write().unwrap_or_else(|e| e.into_inner()) = next;
     }
 }

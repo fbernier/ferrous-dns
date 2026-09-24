@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{Client, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -52,10 +53,7 @@ impl UpdateClientUseCase {
 
         if let Some(gid) = group_id {
             if let Some(ref group_repo) = self.group_repo {
-                group_repo
-                    .get_by_id(gid)
-                    .await?
-                    .ok_or(DomainError::GroupNotFound(gid))?;
+                require_group(group_repo.as_ref(), gid).await?;
             }
             self.client_repo.assign_group(client_id, gid).await?;
         }

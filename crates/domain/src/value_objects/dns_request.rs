@@ -30,19 +30,17 @@ impl EdnsCookie {
         }
     }
 
-    /// Returns the raw cookie bytes.
+    // Tiny accessors read per query from other crates; keep them inlinable there.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
     }
 
-    /// Returns the number of bytes stored.
     #[inline]
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
-    /// Returns `true` when no bytes are stored.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -58,7 +56,6 @@ pub struct DnsRequest {
     /// Contains the client cookie (8 bytes) optionally followed by a server
     /// cookie (8–32 bytes). Absent when the client sends no OPT record or
     /// does not include option code 10.
-    /// Stored inline — zero heap allocation.
     pub edns_cookie: Option<EdnsCookie>,
     /// The client's CD (Checking Disabled) header bit (RFC 4035). When `true`,
     /// the client wants to perform its own DNSSEC validation, so the resolver
@@ -81,19 +78,16 @@ impl DnsRequest {
         }
     }
 
-    /// Attaches raw EDNS cookie option data (option code 10) to this request.
     pub fn with_cookie(mut self, data: &[u8]) -> Self {
         self.edns_cookie = Some(EdnsCookie::from_bytes(data));
         self
     }
 
-    /// Sets the client's CD (Checking Disabled) bit.
     pub fn with_checking_disabled(mut self, cd: bool) -> Self {
         self.checking_disabled = cd;
         self
     }
 
-    /// Records the transport the query arrived on.
     pub fn with_protocol(mut self, protocol: ClientProtocol) -> Self {
         self.protocol = Some(protocol);
         self

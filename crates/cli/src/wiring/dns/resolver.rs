@@ -8,21 +8,21 @@ use tracing::{debug, info, warn};
 use crate::wiring::Repositories;
 
 /// Builds the resolver stack, returning the DNSSEC validator cache alongside it
-/// when validation is on, so the caller can report its counters.
+/// when validation is on, so the caller can report its counters. Validation is
+/// on exactly when a `dnssec_pool_manager` is given.
 pub(super) fn build_resolver(
     pool_manager: Arc<PoolManager>,
-    pool_manager_for_dnssec: Arc<PoolManager>,
+    dnssec_pool_manager: Option<Arc<PoolManager>>,
     config: &Config,
     repos: &Repositories,
     timeout_ms: u64,
 ) -> anyhow::Result<(HickoryDnsResolver, Option<Arc<DnssecCache>>)> {
     let dnssec_mode = config.dns.effective_dnssec_mode();
-    let dnssec_validates = dnssec_mode.validates();
 
     let mut resolver = HickoryDnsResolver::new_with_pools(
         pool_manager,
         timeout_ms,
-        dnssec_validates,
+        dnssec_pool_manager.is_some(),
         Some(repos.query_log.clone()),
     )?
     .with_query_filters(
@@ -33,10 +33,10 @@ pub(super) fn build_resolver(
     )
     .with_local_dns_server(config.dns.local_dns_server.clone());
 
-    let dnssec_cache = if dnssec_validates {
+    let dnssec_cache = if let Some(dnssec_pool_manager) = dnssec_pool_manager {
         let cache = Arc::new(DnssecCache::new());
         resolver = resolver
-            .with_dnssec_pool_manager(pool_manager_for_dnssec)
+            .with_dnssec_pool_manager(dnssec_pool_manager)
             .with_trust_anchors(load_trust_anchors(config)?)
             .with_dnssec_cache(Arc::clone(&cache));
         Some(cache)

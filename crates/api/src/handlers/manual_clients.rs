@@ -40,19 +40,7 @@ pub async fn create_manual_client(
         .execute(ip_address, req.group_id, req.hostname, req.mac_address)
         .await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ClientResponse {
-            id: client.id.unwrap_or(0),
-            ip_address: client.ip_address.to_string(),
-            mac_address: client.mac_address.map(|s| s.to_string()),
-            hostname: client.hostname.map(|s| s.to_string()),
-            first_seen: client.first_seen.unwrap_or_default(),
-            last_seen: client.last_seen.unwrap_or_default(),
-            query_count: client.query_count,
-            group_id: client.group_id,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(ClientResponse::from(client))))
 }
 
 #[utoipa::path(
@@ -79,16 +67,7 @@ pub async fn update_manual_client(
         .execute(id, req.hostname, req.group_id)
         .await?;
 
-    Ok(Json(ClientResponse {
-        id: client.id.unwrap_or(0),
-        ip_address: client.ip_address.to_string(),
-        mac_address: client.mac_address.map(|s| s.to_string()),
-        hostname: client.hostname.map(|s| s.to_string()),
-        first_seen: client.first_seen.unwrap_or_default(),
-        last_seen: client.last_seen.unwrap_or_default(),
-        query_count: client.query_count,
-        group_id: client.group_id,
-    }))
+    Ok(Json(ClientResponse::from(client)))
 }
 
 #[utoipa::path(

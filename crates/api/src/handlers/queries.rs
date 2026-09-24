@@ -2,7 +2,7 @@ use crate::{
     dto::{PaginatedQueries, QueryParams, QueryResponse},
     errors::ApiError,
     state::AppState,
-    utils::{parse_period, validate_period},
+    utils::period_hours,
 };
 use axum::{
     extract::{Query, State},
@@ -42,9 +42,7 @@ pub async fn get_queries(
         "Fetching recent queries"
     );
 
-    let period_hours = parse_period(&params.period)
-        .map(validate_period)
-        .unwrap_or(24.0);
+    let period_hours = period_hours(&params.period);
 
     let input = PagedQueryInput {
         limit: params.limit,

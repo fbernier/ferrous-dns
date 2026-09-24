@@ -7,7 +7,7 @@ use ferrous_dns_application::ports::{
 use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, PrivateIpFilter, RecordType};
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::PTR;
-use hickory_proto::rr::{Name, RData};
+use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use rustc_hash::FxBuildHasher;
 use std::net::IpAddr;
@@ -115,7 +115,9 @@ impl DnsResolver for LocalPtrResolver {
             None => return self.inner.resolve(query).await,
         };
 
-        if let Some(entry) = self.map.get(&ip) {
+        // Built inside the closure so the shard guard is gone before any await:
+        // a register/unregister on that shard would otherwise block its thread.
+        let local = self.map.get(&ip).and_then(|entry| {
             let (fqdn, ttl) = entry.value();
             debug!(
                 domain = %query.domain,
@@ -123,49 +125,62 @@ impl DnsResolver for LocalPtrResolver {
                 ptr = %fqdn,
                 "LocalPtrResolver: PTR answered from local records"
             );
-            return match build_ptr_resolution(query, fqdn, *ttl) {
-                Some(resolution) => Ok(resolution),
-                None => self.inner.resolve(query).await,
-            };
-        }
+            parse_ptr_target(fqdn)
+                .and_then(|target| ptr_resolution(&query.domain, &[target], *ttl, true))
+        });
 
-        self.inner.resolve(query).await
+        match local {
+            Some(resolution) => Ok(resolution),
+            None => self.inner.resolve(query).await,
+        }
     }
 }
 
-fn build_ptr_resolution(query: &DnsQuery, hostname: &str, ttl: u32) -> Option<DnsResolution> {
-    let query_name = Name::from_str(&query.domain)
-        .map_err(|e| {
-            warn!(domain = %query.domain, error = %e, "PTR: failed to parse query name");
-        })
-        .ok()?;
-
-    let ptr_name = Name::from_str(hostname)
+fn parse_ptr_target(hostname: &str) -> Option<Name> {
+    Name::from_str(hostname)
         .map_err(|e| {
             warn!(hostname = %hostname, error = %e, "PTR: failed to parse PTR hostname");
         })
-        .ok()?;
+        .ok()
+}
 
-    let record = hickory_proto::rr::Record::from_rdata(query_name, ttl, RData::PTR(PTR(ptr_name)));
+/// An authoritative NOERROR answering the PTR query `owner` with `targets`.
+pub(super) fn ptr_resolution(
+    owner: &str,
+    targets: &[Name],
+    ttl: u32,
+    local_dns: bool,
+) -> Option<DnsResolution> {
+    let owner_name = Name::from_str(owner)
+        .map_err(|e| {
+            warn!(domain = %owner, error = %e, "PTR: failed to parse query name");
+        })
+        .ok()?;
 
     let mut message = Message::new(0, MessageType::Response, OpCode::Query);
     message.metadata.response_code = ResponseCode::NoError;
     message.metadata.authoritative = true;
-    message.add_answer(record);
+    for target in targets {
+        message.add_answer(Record::from_rdata(
+            owner_name.clone(),
+            ttl,
+            RData::PTR(PTR(target.clone())),
+        ));
+    }
 
     let mut buf = Vec::with_capacity(128);
     let mut encoder = BinEncoder::new(&mut buf);
     message
         .emit(&mut encoder)
         .map_err(|e| {
-            warn!(hostname = %hostname, error = %e, "PTR: failed to serialize response");
+            warn!(domain = %owner, error = %e, "PTR: failed to serialize response");
         })
         .ok()?;
 
     Some(DnsResolution {
         addresses: Arc::new(Vec::new()),
         cache_hit: false,
-        local_dns: true,
+        local_dns,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,

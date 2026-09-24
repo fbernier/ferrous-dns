@@ -1,19 +1,19 @@
-use ferrous_dns_application::ports::{BlockFilterEnginePort, UpstreamHealthPort};
+use ferrous_dns_application::ports::BlockFilterEnginePort;
 use ferrous_dns_application::use_cases::{
-    AppPasswordLoginUseCase, AssignClientGroupUseCase, GetTopAllowedDomainsUseCase, LoginUseCase,
-    LogoutUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
+    AppPasswordLoginUseCase, GetTopAllowedDomainsUseCase, LoginUseCase, LogoutUseCase,
+    ValidateSessionUseCase, VerifyMfaUseCase,
 };
 use ferrous_dns_application::use_cases::{
     CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateGroupUseCase,
     CreateManagedDomainUseCase, CreateManualClientUseCase, CreateRegexFilterUseCase,
     CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase, DeleteClientUseCase,
     DeleteGroupUseCase, DeleteManagedDomainUseCase, DeleteRegexFilterUseCase,
-    DeleteWhitelistSourceUseCase, GetBlockFilterStatsUseCase, GetBlocklistSourcesUseCase,
-    GetCacheStatsUseCase, GetClientsUseCase, GetGroupsUseCase, GetManagedDomainsUseCase,
-    GetQueryStatsUseCase, GetRecentQueriesUseCase, GetRegexFiltersUseCase, GetTimelineUseCase,
-    GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetWhitelistSourcesUseCase,
-    UpdateBlocklistSourceUseCase, UpdateClientUseCase, UpdateGroupUseCase,
-    UpdateManagedDomainUseCase, UpdateRegexFilterUseCase, UpdateWhitelistSourceUseCase,
+    DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientsUseCase, GetGroupsUseCase,
+    GetManagedDomainsUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase,
+    GetRegexFiltersUseCase, GetTimelineUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase,
+    GetWhitelistSourcesUseCase, UpdateBlocklistSourceUseCase, UpdateClientUseCase,
+    UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
+    UpdateWhitelistSourceUseCase,
 };
 use ferrous_dns_domain::Config;
 use std::sync::Arc;
@@ -63,9 +63,6 @@ pub struct PiholeQueryState {
     pub get_top_allowed_domains: Arc<GetTopAllowedDomainsUseCase>,
     pub get_top_clients: Arc<GetTopClientsUseCase>,
     pub get_recent_queries: Arc<GetRecentQueriesUseCase>,
-    pub upstream_health: Arc<dyn UpstreamHealthPort>,
-    pub get_block_filter_stats: Arc<GetBlockFilterStatsUseCase>,
-    pub get_cache_stats: Arc<GetCacheStatsUseCase>,
 }
 
 #[derive(Clone)]
@@ -109,7 +106,6 @@ pub struct PiholeClientState {
     pub create_manual_client: Arc<CreateManualClientUseCase>,
     pub update_client: Arc<UpdateClientUseCase>,
     pub delete_client: Arc<DeleteClientUseCase>,
-    pub assign_client_group: Arc<AssignClientGroupUseCase>,
 }
 
 #[derive(Clone)]

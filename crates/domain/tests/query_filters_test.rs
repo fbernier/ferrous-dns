@@ -93,6 +93,19 @@ fn test_extract_ip_from_ptr_ipv4() {
 }
 
 #[test]
+fn ip6_arpa_requires_32_single_nibble_labels() {
+    let canonical = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa";
+    assert_eq!(
+        PrivateIpFilter::extract_ip_from_ptr(canonical),
+        Some("::1".parse().unwrap())
+    );
+    let packed = "10.00.00.00.00.00.00.00.00.00.00.00.00.00.00.00.ip6.arpa";
+    assert_eq!(PrivateIpFilter::extract_ip_from_ptr(packed), None);
+    let stray = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.x.ip6.arpa";
+    assert_eq!(PrivateIpFilter::extract_ip_from_ptr(stray), None);
+}
+
+#[test]
 fn test_is_private_ptr_query() {
     assert!(PrivateIpFilter::is_private_ptr_query(
         "1.0.168.192.in-addr.arpa"

@@ -56,6 +56,28 @@ async fn test_parse_arp_table_filters_incomplete_entries() {
 }
 
 #[tokio::test]
+async fn test_parse_arp_table_keeps_permanent_entries() {
+    // `arp -s` entries carry ATF_PERM next to ATF_COM: flags 0x6.
+    let content = r#"IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.1      0x1         0x6         aa:bb:cc:dd:ee:ff     *        eth0
+192.168.1.2      0x1         0x4         11:22:33:44:55:66     *        eth0
+"#;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let reader = LinuxArpReader::with_path(temp_file.path().to_str().unwrap().to_string());
+    let arp_table = reader.read_arp_table().await.unwrap();
+
+    assert_eq!(arp_table.len(), 1);
+    assert_eq!(
+        arp_table.get(&"192.168.1.1".parse::<IpAddr>().unwrap()),
+        Some(&"aa:bb:cc:dd:ee:ff".to_string())
+    );
+}
+
+#[tokio::test]
 async fn test_parse_arp_table_filters_invalid_ips() {
     let content = r#"IP address       HW type     Flags       HW address            Mask     Device
 192.168.1.1      0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0

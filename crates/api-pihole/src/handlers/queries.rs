@@ -118,7 +118,7 @@ pub async fn get_queries(
                     .map(|h| h.to_string())
                     .filter(|h| !h.is_empty()),
             },
-            status: map_query_status(q.blocked, q.cache_hit, q.block_source.as_ref()),
+            status: map_query_status(&q),
             dnssec: q
                 .dnssec_status
                 .map(|s| s.to_uppercase())
@@ -156,9 +156,6 @@ pub async fn get_queries(
 /// Pi-hole v6 GET /api/queries/suggestions
 ///
 /// Returns categorised suggestions based on recent queries.
-///
-// TODO: extract aggregation into a dedicated use case (GetQuerySuggestionsUseCase)
-// with DISTINCT SQL queries instead of in-memory dedup
 #[utoipa::path(
     get,
     path = "/queries/suggestions",
@@ -202,8 +199,7 @@ pub async fn get_suggestions(
             upstreams.insert(u.to_string());
         }
         types.insert(q.record_type.to_string());
-        statuses
-            .insert(map_query_status(q.blocked, q.cache_hit, q.block_source.as_ref()).to_string());
+        statuses.insert(map_query_status(q).to_string());
         if let Some(r) = q.response_status {
             replies.insert(r.to_string());
         }

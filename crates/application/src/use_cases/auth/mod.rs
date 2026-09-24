@@ -12,7 +12,7 @@ mod login;
 mod login_rate_limiter;
 mod logout;
 mod register_passkey;
-mod session_factory;
+pub(crate) mod session_factory;
 mod setup_password;
 mod setup_totp;
 mod validate_session;

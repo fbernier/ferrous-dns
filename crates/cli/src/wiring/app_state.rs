@@ -3,7 +3,8 @@ use ferrous_dns_api::{
     GroupUseCases, QueryUseCases, SafeSearchUseCases, ScheduleUseCases, ServiceUseCases,
 };
 use ferrous_dns_application::ports::{
-    BlocklistSourceCreator, ConfigFilePersistence, GroupCreator, LocalRecordCreator,
+    BlocklistSourceCreator, ConfigFilePersistence, ConfigRepository, DnsCachePort, GroupCreator,
+    LocalRecordCreator,
 };
 use ferrous_dns_application::use_cases::{
     CreateLocalRecordUseCase, DeleteLocalRecordUseCase, ExportConfigUseCase, ImportConfigUseCase,
@@ -41,30 +42,27 @@ pub async fn build_app_state(
     config_path: Option<Arc<str>>,
     https_active: bool,
 ) -> AppState {
-    let config_repo: Arc<dyn ferrous_dns_application::ports::ConfigRepository> = Arc::new(
-        TomlConfigRepository::new(resolve_config_file(config_path.as_deref())),
-    );
+    let config_repo: Arc<dyn ConfigRepository> = Arc::new(TomlConfigRepository::new(
+        resolve_config_file(config_path.as_deref()),
+    ));
 
     let webauthn_configured = config.read().await.auth.webauthn.is_configured();
 
     let config_persistence: Arc<dyn ConfigFilePersistence> = Arc::new(TomlConfigFilePersistence);
 
+    let dns_cache: Arc<dyn DnsCachePort> = dns_services.cache.clone();
+    let create_local_record = Arc::new(
+        CreateLocalRecordUseCase::new(config.clone(), config_repo.clone())
+            .with_ptr_registry(dns_services.ptr_registry.clone())
+            .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
+            .with_dns_cache(Some(dns_cache.clone())),
+    );
+
     let backup = {
         let group_creator: Arc<dyn GroupCreator> = use_cases.create_group.clone();
         let blocklist_source_creator: Arc<dyn BlocklistSourceCreator> =
             use_cases.create_blocklist_source.clone();
-        let local_record_creator_for_import = Arc::new(
-            CreateLocalRecordUseCase::new(config.clone(), config_repo.clone())
-                .with_ptr_registry(dns_services.ptr_registry.clone())
-                .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                .with_dns_cache(Some(dns_services.cache.clone()
-                    as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
-        );
-        let local_record_creator: Arc<dyn LocalRecordCreator> = local_record_creator_for_import;
-        let resolved_path = config_path
-            .as_deref()
-            .map(String::from)
-            .or_else(Config::get_config_path);
+        let local_record_creator: Arc<dyn LocalRecordCreator> = create_local_record.clone();
         BackupUseCases {
             export: Arc::new(ExportConfigUseCase::new(
                 config.clone(),
@@ -75,7 +73,7 @@ pub async fn build_app_state(
                 ImportConfigUseCase::new(
                     config.clone(),
                     config_persistence.clone(),
-                    resolved_path,
+                    config_path.as_deref().map(String::from),
                     group_creator,
                     blocklist_source_creator,
                     local_record_creator,
@@ -96,44 +94,31 @@ pub async fn build_app_state(
             get_top_clients: use_cases.get_top_clients,
         },
         dns: DnsUseCases {
-            cache: dns_services.cache.clone()
-                as Arc<dyn ferrous_dns_application::ports::DnsCachePort>,
-            create_local_record: Arc::new(
-                CreateLocalRecordUseCase::new(config.clone(), config_repo.clone())
-                    .with_ptr_registry(dns_services.ptr_registry.clone())
-                    .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_services.cache.clone()
-                        as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
-            ),
+            cache: dns_cache.clone(),
+            create_local_record,
             update_local_record: Arc::new(
                 UpdateLocalRecordUseCase::new(config.clone(), config_repo.clone())
                     .with_ptr_registry(dns_services.ptr_registry.clone())
                     .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_services.cache.clone()
-                        as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
+                    .with_dns_cache(Some(dns_cache.clone())),
             ),
             delete_local_record: Arc::new(
                 DeleteLocalRecordUseCase::new(config.clone(), config_repo)
                     .with_ptr_registry(dns_services.ptr_registry.clone())
                     .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_services.cache.clone()
-                        as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
+                    .with_dns_cache(Some(dns_cache)),
             ),
             upstream_health: Arc::new(UpstreamHealthAdapter::new(
                 dns_services.pool_manager.clone(),
-                dns_services.health_checker.clone(),
+                Some(dns_services.health_checker.clone()),
             )),
             dnssec_stats: dns_services.dnssec_stats.clone(),
-            reload_upstream: Arc::new(UpstreamReloadAdapter::new({
-                let mut managers = vec![
-                    dns_services.pool_manager.clone(),
-                    dns_services.dnssec_pool_manager.clone(),
-                ];
-                if let Some(maintenance) = dns_services.maintenance_pool_manager.clone() {
-                    managers.push(maintenance);
-                }
-                managers
-            })),
+            reload_upstream: Arc::new(UpstreamReloadAdapter::new(
+                std::iter::once(dns_services.pool_manager.clone())
+                    .chain(dns_services.dnssec_pool_manager.clone())
+                    .chain(dns_services.maintenance_pool_manager.clone())
+                    .collect(),
+            )),
         },
         groups: GroupUseCases {
             get_groups: use_cases.get_groups,

@@ -49,25 +49,6 @@ impl DnsResolution {
             || self.upstream_wire_data.is_some()
             || !self.cname_chain.is_empty()
     }
-
-    pub fn with_dnssec(
-        addresses: Vec<IpAddr>,
-        cache_hit: bool,
-        dnssec_status: Option<&'static str>,
-    ) -> Self {
-        Self {
-            addresses: Arc::new(addresses),
-            cache_hit,
-            local_dns: false,
-            dnssec_status,
-            cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
-            upstream_server: None,
-            upstream_pool: None,
-            min_ttl: None,
-            negative_soa_ttl: None,
-            upstream_wire_data: None,
-        }
-    }
 }
 
 #[async_trait]

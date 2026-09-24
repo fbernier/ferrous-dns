@@ -8,8 +8,6 @@ use ferrous_dns_domain::{DomainError, MfaChallenge, RecoveryCode, UserMfa, Webau
 /// database users.
 #[async_trait]
 pub trait MfaRepository: Send + Sync {
-    // --- TOTP enrollment ---
-
     /// Fetch the MFA record for a user, if any.
     async fn get(&self, username: &str) -> Result<Option<UserMfa>, DomainError>;
 
@@ -21,8 +19,6 @@ pub trait MfaRepository: Send + Sync {
 
     /// Remove all MFA state for a user (TOTP, recovery codes, WebAuthn creds).
     async fn delete_all(&self, username: &str) -> Result<(), DomainError>;
-
-    // --- Recovery codes ---
 
     /// Replace the full set of recovery codes with the given hashes.
     async fn replace_recovery_codes(
@@ -40,15 +36,11 @@ pub trait MfaRepository: Send + Sync {
     /// Mark a recovery code consumed.
     async fn mark_recovery_code_used(&self, id: i64) -> Result<(), DomainError>;
 
-    // --- Login challenges ---
-
     async fn create_challenge(&self, challenge: &MfaChallenge) -> Result<(), DomainError>;
     async fn get_challenge(&self, token: &str) -> Result<Option<MfaChallenge>, DomainError>;
     async fn delete_challenge(&self, token: &str) -> Result<(), DomainError>;
     /// Remove challenges past their expiry. Returns the number removed.
     async fn delete_expired_challenges(&self) -> Result<u64, DomainError>;
-
-    // --- WebAuthn credentials ---
 
     async fn add_credential(&self, cred: &WebauthnCredential) -> Result<(), DomainError>;
     async fn list_credentials(

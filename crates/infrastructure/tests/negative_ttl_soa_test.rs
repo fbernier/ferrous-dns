@@ -3,7 +3,7 @@ use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::{
-    CachedData, DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
+    CachedData, DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy,
 };
 use hickory_proto::rr::rdata::SOA;
 use hickory_proto::rr::{Name, RData, Record};
@@ -88,7 +88,6 @@ async fn test_soa_ttl_used_when_present() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -119,7 +118,6 @@ async fn test_soa_ttl_below_min_clamped_to_300() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -148,7 +146,6 @@ async fn test_soa_ttl_above_max_clamped_to_3600() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -178,7 +175,6 @@ async fn test_fallback_to_tracker_when_no_soa() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 

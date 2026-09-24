@@ -34,10 +34,6 @@ impl UserRole {
             other => Err(format!("Invalid role: {other}")),
         }
     }
-
-    pub fn can_write(&self) -> bool {
-        matches!(self, Self::Admin)
-    }
 }
 
 /// A user account that can authenticate with Ferrous DNS.
@@ -55,25 +51,6 @@ pub struct User {
 }
 
 impl User {
-    pub fn new(
-        username: Arc<str>,
-        password_hash: Arc<str>,
-        role: UserRole,
-        source: UserSource,
-    ) -> Self {
-        Self {
-            id: None,
-            username,
-            display_name: None,
-            password_hash,
-            role,
-            source,
-            enabled: true,
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
     /// TOML admin cannot be deleted or disabled via API.
     pub fn is_protected(&self) -> bool {
         self.source == UserSource::Toml

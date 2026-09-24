@@ -61,12 +61,7 @@ async fn get_catalog_entry(
         .services
         .get_service_catalog
         .get_by_id(&id)
-        .ok_or_else(|| {
-            ApiError(DomainError::ServiceNotFoundInCatalog(format!(
-                "Service '{}' not found in catalog",
-                id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::ServiceNotFoundInCatalog(id)))?;
     Ok(Json(ServiceDefinitionResponse::from_definition(&def)))
 }
 

@@ -65,8 +65,6 @@ async fn resolver_with_response(domain: &str) -> MockDnsResolver {
     resolver
 }
 
-// ── Phase 1: hot-path guard (block action) ──────────────────────────────────
-
 #[tokio::test]
 async fn long_fqdn_is_blocked() {
     let long_domain = format!("{}.evil.com", "a".repeat(120));
@@ -121,8 +119,6 @@ async fn normal_domain_passes_tunneling_guard() {
     assert!(result.is_ok());
 }
 
-// ── Phase 1: alert action ───────────────────────────────────────────────────
-
 #[tokio::test]
 async fn alert_action_allows_long_fqdn() {
     let long_domain = format!("{}.evil.com", "a".repeat(120));
@@ -135,8 +131,6 @@ async fn alert_action_allows_long_fqdn() {
 
     assert!(result.is_ok(), "alert mode should allow the query through");
 }
-
-// ── Disabled tunneling ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn disabled_tunneling_allows_everything() {
@@ -153,8 +147,6 @@ async fn disabled_tunneling_allows_everything() {
 
     assert!(result.is_ok());
 }
-
-// ── Whitelisted domains ─────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn whitelisted_domain_bypasses_guard() {
@@ -173,8 +165,6 @@ async fn whitelisted_domain_bypasses_guard() {
 
     assert!(result.is_ok());
 }
-
-// ── Flagged domain store ────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn flagged_domain_is_blocked() {
@@ -222,8 +212,6 @@ async fn flagged_domain_with_alert_action_allows_query() {
 
     assert!(result.is_ok(), "alert mode should allow flagged domain");
 }
-
-// ── Event emission ──────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn tunneling_event_is_emitted_after_resolution() {

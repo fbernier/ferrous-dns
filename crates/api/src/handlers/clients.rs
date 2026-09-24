@@ -44,19 +44,7 @@ pub async fn get_clients(
             .await?
     };
 
-    let response: Vec<ClientResponse> = clients
-        .into_iter()
-        .map(|c| ClientResponse {
-            id: c.id.unwrap_or(0),
-            ip_address: c.ip_address.to_string(),
-            mac_address: c.mac_address.map(|s| s.to_string()),
-            hostname: c.hostname.map(|s| s.to_string()),
-            first_seen: c.first_seen.unwrap_or_default(),
-            last_seen: c.last_seen.unwrap_or_default(),
-            query_count: c.query_count,
-            group_id: c.group_id,
-        })
-        .collect();
+    let response: Vec<ClientResponse> = clients.into_iter().map(ClientResponse::from).collect();
 
     debug!(count = response.len(), "Clients retrieved successfully");
     Ok(Json(response))

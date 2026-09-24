@@ -2,27 +2,36 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use ferrous_dns_domain::{DomainError, Group};
 
 use crate::{
     dto::domains::BatchDeleteRequest,
     dto::groups::{CreateGroupRequest, GroupsResponse, PiholeGroupEntry, UpdateGroupRequest},
     errors::PiholeApiError,
+    handlers::require_id,
     state::PiholeAppState,
 };
 
-fn group_to_entry(g: &ferrous_dns_domain::Group) -> Result<PiholeGroupEntry, PiholeApiError> {
+fn group_to_entry(g: &Group) -> Result<PiholeGroupEntry, DomainError> {
     Ok(PiholeGroupEntry {
-        id: g.id.ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                "group missing id".into(),
-            ))
-        })?,
+        id: require_id(g.id, "group")?,
         name: g.name.to_string(),
         enabled: g.enabled,
         comment: g.comment.as_ref().map(|c| c.to_string()),
         date_added: g.created_at.clone(),
         date_modified: g.updated_at.clone(),
     })
+}
+
+async fn find_group(state: &PiholeAppState, name: &str) -> Result<Group, DomainError> {
+    state
+        .groups
+        .get_groups
+        .get_all()
+        .await?
+        .into_iter()
+        .find(|g| g.name.as_ref() == name)
+        .ok_or_else(|| DomainError::NotFound(format!("Group {name} not found")))
 }
 
 /// Pi-hole v6 GET /api/groups — list all groups.
@@ -87,16 +96,8 @@ pub async fn get_by_name(
     State(state): State<PiholeAppState>,
     Path(name): Path<String>,
 ) -> Result<Json<PiholeGroupEntry>, PiholeApiError> {
-    let groups = state.groups.get_groups.get_all().await?;
-    let group = groups
-        .iter()
-        .find(|g| g.name.as_ref() == name)
-        .ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::NotFound(format!(
-                "Group {name} not found"
-            )))
-        })?;
-    Ok(Json(group_to_entry(group)?))
+    let group = find_group(&state, &name).await?;
+    Ok(Json(group_to_entry(&group)?))
 }
 
 /// Pi-hole v6 PUT /api/groups/:name — update group.
@@ -119,20 +120,7 @@ pub async fn update_group(
     Path(name): Path<String>,
     Json(body): Json<UpdateGroupRequest>,
 ) -> Result<Json<PiholeGroupEntry>, PiholeApiError> {
-    let groups = state.groups.get_groups.get_all().await?;
-    let group = groups
-        .iter()
-        .find(|g| g.name.as_ref() == name)
-        .ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::NotFound(format!(
-                "Group {name} not found"
-            )))
-        })?;
-    let id = group.id.ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-            "record missing id".into(),
-        ))
-    })?;
+    let id = require_id(find_group(&state, &name).await?.id, "group")?;
     let result = state
         .groups
         .update_group
@@ -159,20 +147,7 @@ pub async fn delete_group(
     State(state): State<PiholeAppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, PiholeApiError> {
-    let groups = state.groups.get_groups.get_all().await?;
-    let group = groups
-        .iter()
-        .find(|g| g.name.as_ref() == name)
-        .ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::NotFound(format!(
-                "Group {name} not found"
-            )))
-        })?;
-    let id = group.id.ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-            "record missing id".into(),
-        ))
-    })?;
+    let id = require_id(find_group(&state, &name).await?.id, "group")?;
     state.groups.delete_group.execute(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -195,11 +170,7 @@ pub async fn batch_delete(
     let groups = state.groups.get_groups.get_all().await?;
     for item in &body.items {
         if let Some(g) = groups.iter().find(|g| g.name.as_ref() == item.as_str()) {
-            let id = g.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
+            let id = require_id(g.id, "group")?;
             state.groups.delete_group.execute(id).await?;
         }
     }

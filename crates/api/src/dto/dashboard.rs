@@ -3,13 +3,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::{CacheStatsResponse, QueryRateResponse, StatsResponse, TimelineResponse};
 
-fn default_period() -> String {
-    "24h".to_string()
-}
-
 #[derive(Deserialize, Debug, IntoParams)]
 pub struct DashboardQuery {
-    #[serde(default = "default_period")]
+    #[serde(default = "crate::utils::default_period")]
     pub period: String,
     #[serde(default)]
     pub include_timeline: bool,

@@ -30,34 +30,25 @@ impl UpdateApiTokenUseCase {
             }
         }
 
-        let (key_prefix, key_hash, key_raw) = match custom_token {
-            Some(token) => {
-                let prefix = if token.len() >= 8 { &token[..8] } else { token };
-                let hash = super::hash_token(token);
-                (
-                    Some(prefix.to_string()),
-                    Some(hash),
-                    Some(token.to_string()),
-                )
-            }
-            None => (None, None, None),
-        };
-
+        // An empty key keeps the current one, matching create's "empty means not provided".
+        let new_key = custom_token
+            .filter(|token| !token.is_empty())
+            .map(|token| (token, super::key_material(token)));
         let updated = self
             .repo
             .update(
                 id,
                 name,
-                key_prefix.as_deref(),
-                key_hash.as_deref(),
-                key_raw.as_deref(),
+                new_key.as_ref().map(|(_, (prefix, _))| *prefix),
+                new_key.as_ref().map(|(_, (_, hash))| hash.as_str()),
+                new_key.as_ref().map(|(raw, _)| *raw),
             )
             .await?;
 
         info!(
             id = id,
             name = name,
-            key_changed = custom_token.is_some(),
+            key_changed = new_key.is_some(),
             "API token updated"
         );
         Ok(updated)

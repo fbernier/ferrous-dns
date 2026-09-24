@@ -1,11 +1,10 @@
-use super::balanced::BalancedStrategy;
-use super::failover::FailoverStrategy;
-use super::parallel::ParallelStrategy;
+use super::{balanced, failover, parallel};
 use crate::dns::forwarding::{DnsResponse, ResponseValidator};
-use ferrous_dns_domain::{DnsProtocol, DomainError};
+use ferrous_dns_domain::{DnsProtocol, DomainError, UpstreamStrategy};
 use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// Display name per configured upstream. Keys are config, not client input,
@@ -23,26 +22,39 @@ pub struct UpstreamResult {
 
 pub struct QueryContext<'a> {
     pub servers: &'a [&'a Arc<DnsProtocol>],
-    pub domain: &'a Arc<str>,
+    pub domain: &'a str,
     pub timeout_ms: u64,
-    pub query_bytes: Arc<[u8]>,
-    pub validator: &'a Arc<ResponseValidator>,
+    pub query_bytes: &'a [u8],
+    pub validator: &'a ResponseValidator,
     pub pool_name: &'a Arc<str>,
-    pub server_displays: &'a Arc<ServerDisplays>,
+    pub server_displays: &'a ServerDisplays,
 }
 
 pub enum Strategy {
-    Parallel(ParallelStrategy),
-    Balanced(BalancedStrategy),
-    Failover(FailoverStrategy),
+    Parallel,
+    /// Round-robin; `next` picks the server the next query starts from.
+    Balanced {
+        next: AtomicUsize,
+    },
+    Failover,
 }
 
 impl Strategy {
+    pub fn new(strategy: UpstreamStrategy) -> Self {
+        match strategy {
+            UpstreamStrategy::Parallel => Self::Parallel,
+            UpstreamStrategy::Balanced => Self::Balanced {
+                next: AtomicUsize::new(0),
+            },
+            UpstreamStrategy::Failover => Self::Failover,
+        }
+    }
+
     pub async fn query_refs(&self, ctx: &QueryContext<'_>) -> Result<UpstreamResult, DomainError> {
         match self {
-            Self::Parallel(s) => s.query_refs(ctx).await,
-            Self::Balanced(s) => s.query_refs(ctx).await,
-            Self::Failover(s) => s.query_refs(ctx).await,
+            Self::Parallel => parallel::query(ctx).await,
+            Self::Balanced { next } => balanced::query(ctx, next).await,
+            Self::Failover => failover::query(ctx).await,
         }
     }
 }

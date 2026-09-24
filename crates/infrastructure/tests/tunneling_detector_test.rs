@@ -1,9 +1,8 @@
-use ferrous_dns_application::ports::TunnelingFlagStore;
+use ferrous_dns_application::ports::{TunnelingEvictionTarget, TunnelingFlagStore};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
 use ferrous_dns_application::use_cases::dns::TunnelingAnalysisEvent;
 use ferrous_dns_domain::{RecordType, TunnelingDetectionConfig};
 use ferrous_dns_infrastructure::dns::tunneling::client_stats::{ClientApexStats, TrackingKey};
-use ferrous_dns_infrastructure::dns::tunneling::detector::TunnelingAlert;
 use ferrous_dns_infrastructure::dns::TunnelingDetector;
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -32,21 +31,12 @@ fn make_event(domain: &str, record_type: RecordType, nxdomain: bool) -> Tunnelin
     }
 }
 
-// ── TunnelingFlagStore trait ────────────────────────────────────────────────
-
 #[test]
 fn flagged_domain_is_detected_by_store() {
     let (detector, _tx, _rx) = TunnelingDetector::new(&test_config());
-    let alert = TunnelingAlert {
-        signal: "entropy".to_string(),
-        measured_value: 4.5,
-        threshold: 3.8,
-        confidence: 0.8,
-        timestamp_ns: coarse_now_ns(),
-    };
     detector
         .flagged_domains
-        .insert(Arc::from("evil.com"), alert);
+        .insert(Arc::from("evil.com"), coarse_now_ns());
     assert!(detector.is_flagged("sub.evil.com"));
     assert!(detector.is_flagged("evil.com"));
 }
@@ -60,21 +50,12 @@ fn unflagged_domain_passes() {
 #[test]
 fn flagged_domain_check_extracts_apex() {
     let (detector, _tx, _rx) = TunnelingDetector::new(&test_config());
-    detector.flagged_domains.insert(
-        Arc::from("malware.net"),
-        TunnelingAlert {
-            signal: "query_rate".to_string(),
-            measured_value: 100.0,
-            threshold: 50.0,
-            confidence: 0.9,
-            timestamp_ns: coarse_now_ns(),
-        },
-    );
+    detector
+        .flagged_domains
+        .insert(Arc::from("malware.net"), coarse_now_ns());
     assert!(detector.is_flagged("deep.sub.malware.net"));
     assert!(!detector.is_flagged("malware.org"));
 }
-
-// ── Eviction ────────────────────────────────────────────────────────────────
 
 #[test]
 fn stale_entries_are_evicted() {
@@ -117,16 +98,9 @@ fn fresh_entries_survive_eviction() {
 fn stale_flagged_domains_are_evicted() {
     let (detector, _tx, _rx) = TunnelingDetector::new(&test_config());
     let stale_ns = coarse_now_ns() - 10_000_000_000;
-    detector.flagged_domains.insert(
-        Arc::from("old-evil.com"),
-        TunnelingAlert {
-            signal: "entropy".to_string(),
-            measured_value: 4.0,
-            threshold: 3.8,
-            confidence: 0.8,
-            timestamp_ns: stale_ns,
-        },
-    );
+    detector
+        .flagged_domains
+        .insert(Arc::from("old-evil.com"), stale_ns);
 
     assert_eq!(detector.flagged_count(), 1);
     detector.evict_stale();
@@ -136,22 +110,49 @@ fn stale_flagged_domains_are_evicted() {
 #[test]
 fn fresh_flagged_domains_survive_eviction() {
     let (detector, _tx, _rx) = TunnelingDetector::new(&test_config());
-    detector.flagged_domains.insert(
-        Arc::from("recent-evil.com"),
-        TunnelingAlert {
-            signal: "entropy".to_string(),
-            measured_value: 4.0,
-            threshold: 3.8,
-            confidence: 0.8,
-            timestamp_ns: coarse_now_ns(),
-        },
-    );
+    detector
+        .flagged_domains
+        .insert(Arc::from("recent-evil.com"), coarse_now_ns());
 
     detector.evict_stale();
     assert_eq!(detector.flagged_count(), 1);
 }
 
-// ── Confidence scoring ──────────────────────────────────────────────────────
+#[test]
+fn entries_stamped_after_eviction_read_the_clock_survive() {
+    let (detector, _tx, _rx) = TunnelingDetector::new(&test_config());
+    let later = coarse_now_ns() + 60_000_000_000;
+    let key = TrackingKey {
+        subnet: 0,
+        apex_hash: 4242,
+    };
+    detector.stats.insert(key, ClientApexStats::new(later));
+    detector
+        .flagged_domains
+        .insert(Arc::from("racing.com"), later);
+
+    detector.evict_stale();
+    assert_eq!(detector.tracked_count(), 1);
+    assert_eq!(detector.flagged_count(), 1);
+}
+
+#[test]
+fn unbounded_ttl_never_evicts() {
+    let (detector, _tx, _rx) = TunnelingDetector::new(&TunnelingDetectionConfig {
+        stale_entry_ttl_secs: u64::MAX,
+        ..test_config()
+    });
+    let key = TrackingKey {
+        subnet: 0,
+        apex_hash: 4242,
+    };
+    detector.stats.insert(key, ClientApexStats::new(0));
+    detector.flagged_domains.insert(Arc::from("old.com"), 0);
+
+    detector.evict_stale();
+    assert_eq!(detector.tracked_count(), 1);
+    assert_eq!(detector.flagged_count(), 1);
+}
 
 #[test]
 fn confidence_scoring_combines_signals() {
@@ -247,14 +248,15 @@ fn txt_proportion_contributes_to_confidence() {
     );
 }
 
-// ── process_event ───────────────────────────────────────────────────────────
-
 #[test]
-fn process_event_increments_query_count() {
+fn process_event_counts_queries_per_client_and_apex() {
     let (detector, _tx, _rx) = TunnelingDetector::new(&test_config());
-    detector.process_event(&make_event("sub.example.com", RecordType::A, false));
+    detector.process_event(&make_event("a.example.com", RecordType::A, false));
+    detector.process_event(&make_event("b.example.com", RecordType::A, false));
 
     assert_eq!(detector.tracked_count(), 1);
+    let entry = detector.stats.iter().next().unwrap();
+    assert_eq!(entry.value().query_count.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -288,8 +290,6 @@ fn different_clients_create_separate_entries() {
 
     assert_eq!(detector.tracked_count(), 2);
 }
-
-// ── Analysis loop ───────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn analysis_loop_processes_events_from_channel() {

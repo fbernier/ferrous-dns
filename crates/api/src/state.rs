@@ -152,13 +152,11 @@ pub struct AuthUseCases {
     pub create_user: Arc<CreateUserUseCase>,
     pub get_users: Arc<GetUsersUseCase>,
     pub delete_user: Arc<DeleteUserUseCase>,
-    // MFA (TOTP + recovery codes)
     pub verify_mfa: Arc<VerifyMfaUseCase>,
     pub setup_totp: Arc<SetupTotpUseCase>,
     pub confirm_totp: Arc<ConfirmTotpUseCase>,
     pub disable_mfa: Arc<DisableMfaUseCase>,
     pub get_mfa_status: Arc<GetMfaStatusUseCase>,
-    // WebAuthn passkeys
     pub register_passkey: Arc<RegisterPasskeyUseCase>,
     pub authenticate_passkey: Arc<AuthenticatePasskeyUseCase>,
     pub discoverable_passkey_login: Arc<DiscoverablePasskeyLoginUseCase>,
@@ -209,17 +207,14 @@ impl AppState {
             .or_else(ferrous_dns_domain::Config::get_config_path)
     }
 
-    /// Returns whether authentication is globally enabled.
     pub async fn auth_enabled(&self) -> bool {
         self.auth.get_auth_status.execute().await.auth_enabled
     }
 
-    /// Records that a saved change only takes effect after a restart.
     pub fn mark_restart_pending(&self) {
         self.restart_pending.store(true, Ordering::Relaxed);
     }
 
-    /// Whether a saved change is still waiting for a restart.
     pub fn is_restart_pending(&self) -> bool {
         self.restart_pending.load(Ordering::Relaxed)
     }

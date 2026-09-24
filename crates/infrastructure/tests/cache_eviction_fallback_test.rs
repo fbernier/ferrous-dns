@@ -88,7 +88,7 @@ fn test_fallback_eviction_returns_instead_of_deadlocking() {
     let evicting = Arc::clone(&cache);
     run_with_deadlock_guard("evict_entries", move || evicting.evict_entries());
 
-    assert_eq!(cache.size(), 0, "the single entry should have been evicted");
+    assert_eq!(cache.len(), 0, "the single entry should have been evicted");
     assert_eq!(
         cache.metrics().evictions.load(Ordering::Relaxed),
         1,
@@ -121,7 +121,7 @@ fn test_fallback_eviction_keeps_permanent_entries() {
     // reloads them, and dropping one here would leave `permanent_records`
     // claiming a name the backing map no longer holds.
     assert_eq!(
-        cache.size(),
+        cache.len(),
         1,
         "only the non-permanent entry should have been evicted"
     );
@@ -145,7 +145,7 @@ fn test_fallback_eviction_terminates_when_every_entry_is_permanent() {
     let evicting = Arc::clone(&cache);
     run_with_deadlock_guard("evict_entries", move || evicting.evict_entries());
 
-    assert_eq!(cache.size(), 2, "permanent entries are never evicted");
+    assert_eq!(cache.len(), 2, "permanent entries are never evicted");
     assert_eq!(
         cache.metrics().evictions.load(Ordering::Relaxed),
         0,

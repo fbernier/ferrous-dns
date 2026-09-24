@@ -9,15 +9,6 @@ struct TrieNode {
     wildcard_mask: u64,
 }
 
-impl TrieNode {
-    fn new() -> Self {
-        Self {
-            children: HashMap::with_hasher(FxBuildHasher),
-            wildcard_mask: 0,
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct SuffixTrie {
     root: TrieNode,
@@ -25,13 +16,6 @@ pub struct SuffixTrie {
 }
 
 impl SuffixTrie {
-    pub fn new() -> Self {
-        Self {
-            root: TrieNode::new(),
-            len: 0,
-        }
-    }
-
     /// True when no wildcard was ever inserted. Callers use this to skip the
     /// suffix lookup entirely on indexes built from exact-only lists.
     #[inline]

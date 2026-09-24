@@ -48,22 +48,21 @@ impl FallbackAdmission {
     }
 }
 
-pub(super) fn create_udp_socket(
-    domain: Domain,
-    socket_addr: SocketAddr,
-) -> anyhow::Result<AsyncFd<std::net::UdpSocket>> {
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    if socket_addr.is_ipv6() {
-        socket.set_only_v6(false)?;
-    }
+/// Binds one SO_REUSEPORT worker socket, always AF_INET6 with `only_v6` off:
+/// an IPv4 `bind` is mapped to `::ffff:a.b.c.d` so the pktinfo path can
+/// assume sockaddr_in6 / in6_pktinfo, and `[::]` serves both families.
+pub(super) fn create_udp_socket(bind: SocketAddr) -> anyhow::Result<AsyncFd<std::net::UdpSocket>> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(false)?;
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
     // 4 MB buffers — accommodate ~128 full batches of 64 × 512-byte packets.
     socket.set_recv_buffer_size(4 * 1024 * 1024)?;
     socket.set_send_buffer_size(4 * 1024 * 1024)?;
-    socket.bind(&socket_addr.into())?;
-    pktinfo::enable_pktinfo(&socket);
+    socket.bind(&pktinfo::v6_mapped_bind_addr(bind).into())?;
+    // Without it every reply would silently leave from a kernel-chosen address.
+    pktinfo::enable_pktinfo(&socket)?;
 
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
@@ -112,8 +111,6 @@ fn spawn_fallback(
     });
 }
 
-// ── Linux: recvmmsg / sendmmsg batch path ─────────────────────────────────────
-
 #[cfg(target_os = "linux")]
 async fn run_udp_worker_batch(
     socket: Arc<AsyncFd<std::net::UdpSocket>>,
@@ -121,10 +118,8 @@ async fn run_udp_worker_batch(
     admission: Arc<FallbackAdmission>,
     worker_id: usize,
 ) {
-    // Pre-allocate batch state once per worker — reused across all iterations.
-    let mut batch = pktinfo::RecvBatch::new(pktinfo::BATCH_SIZE);
-    let mut send_batch = pktinfo::SendBatch::new(pktinfo::BATCH_SIZE);
-    // Pre-allocated wire-data queue — cleared between batches, never reallocated.
+    let mut batch = pktinfo::RecvBatch::new();
+    let mut send_batch = pktinfo::SendBatch::new();
     let mut pending_wire: Vec<pktinfo::PendingWireResponse> =
         Vec::with_capacity(pktinfo::BATCH_SIZE);
 
@@ -138,7 +133,7 @@ async fn run_udp_worker_batch(
         };
 
         loop {
-            let n = match pktinfo::recv_batch(fd, &mut batch) {
+            let n = match batch.recv(fd) {
                 Ok(0) => {
                     guard.clear_ready();
                     break;
@@ -156,7 +151,6 @@ async fn run_udp_worker_batch(
                 }
             };
 
-            // Process each received packet in the batch.
             pending_wire.clear();
             for i in 0..n {
                 let msg = batch.get_msg(i);
@@ -210,14 +204,12 @@ async fn run_udp_worker_batch(
                 spawn_fallback(&socket, &handler, &admission, msg.data, msg.src, msg.dst_ip);
             }
 
-            // Flush A/AAAA responses via sendmmsg (pre-allocated, single syscall).
             if let Err(e) = send_batch.flush(fd) {
                 if e.kind() != io::ErrorKind::WouldBlock {
                     error!(worker = worker_id, error = %e, "UDP sendmmsg error");
                 }
             }
 
-            // Flush wire-data responses (MX, TXT, NS, etc.) individually.
             for resp in &pending_wire {
                 let _ = pktinfo::try_send_with_src_ip(
                     socket.get_ref(),
@@ -245,8 +237,6 @@ async fn run_udp_worker_batch(
         }
     }
 }
-
-// ── Non-Linux: single recvmsg / sendmsg fallback ──────────────────────────────
 
 #[cfg(not(target_os = "linux"))]
 async fn run_udp_worker_single(
@@ -389,8 +379,7 @@ mod tests {
             entered: Notify::new(),
             release: Semaphore::new(0),
         });
-        let bind = pktinfo::v6_mapped_bind_addr("127.0.0.1:0".parse().unwrap());
-        let socket = Arc::new(create_udp_socket(Domain::IPV6, bind).unwrap());
+        let socket = Arc::new(create_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client
             .connect(test_support::unmap_addr(

@@ -1,3 +1,4 @@
+use super::require_group;
 use ferrous_dns_domain::{Client, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
@@ -25,11 +26,7 @@ impl AssignClientGroupUseCase {
 
     #[instrument(skip(self))]
     pub async fn execute(&self, client_id: i64, group_id: i64) -> Result<Client, DomainError> {
-        let group = self
-            .group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        let group = require_group(self.group_repo.as_ref(), group_id).await?;
 
         let _client = self
             .client_repo

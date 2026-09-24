@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{ClientSubnet, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -36,10 +37,7 @@ impl CreateClientSubnetUseCase {
             .parse()
             .map_err(|e| DomainError::InvalidCidr(format!("{}", e)))?;
 
-        self.group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        require_group(self.group_repo.as_ref(), group_id).await?;
 
         if self.subnet_repo.exists(&subnet_cidr).await? {
             return Err(DomainError::SubnetConflict(format!(

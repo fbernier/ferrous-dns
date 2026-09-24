@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::ports::{CreateUserInput, PasswordHasher, UserProvider, UserRepository};
-use ferrous_dns_domain::{DomainError, User};
+use ferrous_dns_domain::{DomainError, User, UserRole};
 
 /// Creates a new user account in the database.
 pub struct CreateUserUseCase {
@@ -28,7 +28,8 @@ impl CreateUserUseCase {
     pub async fn execute(&self, input: CreateUserInput) -> Result<User, DomainError> {
         User::validate_username(&input.username).map_err(DomainError::InvalidUsername)?;
         User::validate_password(&input.password).map_err(DomainError::InvalidPassword)?;
-        User::validate_display_name(&input.display_name).map_err(DomainError::ConfigError)?;
+        User::validate_display_name(&input.display_name).map_err(DomainError::InvalidInput)?;
+        let role = UserRole::parse(&input.role).map_err(DomainError::InvalidInput)?;
 
         // Check uniqueness across all sources (TOML + DB)
         if self
@@ -48,11 +49,11 @@ impl CreateUserUseCase {
                 &input.username,
                 input.display_name.as_deref(),
                 &password_hash,
-                &input.role,
+                role.as_str(),
             )
             .await?;
 
-        info!(username = %input.username, role = %input.role, "User created");
+        info!(username = %input.username, role = role.as_str(), "User created");
         Ok(user)
     }
 }

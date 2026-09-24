@@ -6,15 +6,20 @@ use ferrous_dns_infrastructure::dns::{
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// The configured eviction strategy; an unknown name falls back to the
+/// hit-rate default with a warning rather than failing startup.
+fn eviction_strategy(name: &str) -> EvictionStrategy {
+    name.parse().unwrap_or_else(|e| {
+        warn!(error = %e, "Unknown cache_eviction_strategy, using hit_rate");
+        EvictionStrategy::HitRate
+    })
+}
+
 pub(super) fn build_cache(config: &Config) -> Arc<DnsCache> {
     if config.dns.cache_enabled {
-        let eviction_strategy = match config.dns.cache_eviction_strategy.as_str() {
-            "lfu" => EvictionStrategy::LFU,
-            "lfu-k" => EvictionStrategy::LFUK,
-            _ => EvictionStrategy::HitRate,
-        };
+        let eviction_strategy = eviction_strategy(&config.dns.cache_eviction_strategy);
         info!(
-            strategy = config.dns.cache_eviction_strategy.as_str(),
+            strategy = eviction_strategy.as_str(),
             max_entries = config.dns.cache_max_entries,
             "Cache enabled"
         );
@@ -129,7 +134,7 @@ pub(super) fn preload_local_records_into_cache(
             addresses: Arc::new(vec![ip]),
         });
 
-        let ttl = record.ttl.unwrap_or(300);
+        let ttl = record.ttl_or_default();
 
         cache.insert_permanent(&fqdn, record_type, data, ttl, None);
 
@@ -159,5 +164,23 @@ pub(super) fn preload_local_records_into_cache(
             count = error_count,
             "× Failed to preload {} local DNS record(s)", error_count
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_documented_eviction_strategy_is_honoured() {
+        assert_eq!(eviction_strategy("lru"), EvictionStrategy::LRU);
+        assert_eq!(eviction_strategy("lfu"), EvictionStrategy::LFU);
+        assert_eq!(eviction_strategy("lfu-k"), EvictionStrategy::LFUK);
+        assert_eq!(eviction_strategy("hit_rate"), EvictionStrategy::HitRate);
+    }
+
+    #[test]
+    fn unknown_eviction_strategy_falls_back_to_hit_rate() {
+        assert_eq!(eviction_strategy("fifo"), EvictionStrategy::HitRate);
     }
 }

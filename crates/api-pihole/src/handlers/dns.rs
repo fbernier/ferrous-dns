@@ -46,7 +46,6 @@ pub async fn set_blocking(
     State(state): State<PiholeAppState>,
     Json(body): Json<SetBlockingRequest>,
 ) -> Result<Json<BlockingStatusResponse>, PiholeApiError> {
-    // Cancel any existing timer.
     let mut guard = state.blocking.blocking_timer.lock().await;
     if let Some(handle) = guard.take() {
         handle.abort();
@@ -59,7 +58,6 @@ pub async fn set_blocking(
 
     let timer = body.timer;
 
-    // If disabling with a timer, schedule re-enable.
     if !body.blocking {
         if let Some(seconds) = timer.filter(|&s| s > 0) {
             let engine = Arc::clone(&state.blocking.block_filter_engine);

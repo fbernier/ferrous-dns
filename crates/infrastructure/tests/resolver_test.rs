@@ -2,6 +2,7 @@ use ferrous_dns_infrastructure::dns::transport::resolver;
 use std::time::Duration;
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_resolve_all_returns_multiple_ips() {
     let addrs = resolver::resolve_all("dns.google", 53, Duration::from_secs(5))
         .await
@@ -15,6 +16,7 @@ async fn test_resolve_all_returns_multiple_ips() {
 }
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_resolve_all_includes_ipv6() {
     let addrs = resolver::resolve_all("dns.google", 53, Duration::from_secs(5))
         .await
@@ -29,18 +31,15 @@ async fn test_resolve_all_includes_ipv6() {
 }
 
 #[tokio::test]
-async fn test_resolve_all_preserves_port() {
-    let addrs = resolver::resolve_all("dns.google", 853, Duration::from_secs(5))
+async fn test_resolve_all_preserves_port_for_ipv6_literal() {
+    let addrs = resolver::resolve_all("::1", 853, Duration::from_secs(5))
         .await
-        .expect("dns.google should resolve");
+        .expect("an IPv6 literal resolves without DNS");
 
-    for addr in &addrs {
-        assert_eq!(
-            addr.port(),
-            853,
-            "Port must be preserved in resolved addresses"
-        );
-    }
+    assert_eq!(
+        addrs,
+        vec!["[::1]:853".parse::<std::net::SocketAddr>().unwrap()]
+    );
 }
 
 #[tokio::test]

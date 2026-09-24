@@ -5,5 +5,5 @@ pub mod logging;
 
 pub use config::load_config;
 pub use database::init_database;
-pub use jobs::build_job_runner;
+pub use jobs::spawn_jobs;
 pub use logging::init_logging;

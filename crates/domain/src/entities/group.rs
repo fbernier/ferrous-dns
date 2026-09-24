@@ -31,14 +31,6 @@ impl Group {
         }
     }
 
-    pub fn can_disable(&self) -> bool {
-        !self.is_default
-    }
-
-    pub fn can_delete(&self) -> bool {
-        !self.is_default
-    }
-
     pub fn validate_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("Group name cannot be empty".to_string());
@@ -70,12 +62,4 @@ impl Group {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GroupStats {
-    pub total_groups: u64,
-    pub enabled_groups: u64,
-    pub disabled_groups: u64,
-    pub total_clients: u64,
 }

@@ -1,17 +1,14 @@
 use crate::{
-    dto::{StatsQuery, StatsResponse, TopType, TypeDistribution},
+    dto::{StatsQuery, StatsResponse},
     errors::ApiError,
     state::AppState,
-    utils::{parse_period, validate_period},
+    utils::period_hours,
 };
 use axum::{
     extract::{Query, State},
     Json,
 };
 use tracing::instrument;
-
-const DEFAULT_PERIOD_HOURS: f32 = 24.0;
-const TOP_TYPES_LIMIT: usize = 10;
 
 #[utoipa::path(
     get,
@@ -29,54 +26,10 @@ pub async fn get_stats(
     State(state): State<AppState>,
     Query(params): Query<StatsQuery>,
 ) -> Result<Json<StatsResponse>, ApiError> {
-    let period_hours = parse_period(&params.period)
-        .map(validate_period)
-        .unwrap_or(DEFAULT_PERIOD_HOURS);
-
-    let stats = state.query.get_stats.execute(period_hours).await?;
-
-    let queries_by_type = stats
-        .queries_by_type
-        .iter()
-        .map(|(rt, count)| (rt.as_str().to_string(), *count))
-        .collect();
-
-    let most_queried_type = stats.most_queried_type.map(|rt| rt.as_str().to_string());
-
-    let record_type_distribution = stats
-        .record_type_distribution
-        .iter()
-        .map(|(rt, pct)| TypeDistribution {
-            record_type: rt.as_str().to_string(),
-            percentage: *pct,
-        })
-        .collect();
-
-    let top_10_types = stats
-        .top_types(TOP_TYPES_LIMIT)
-        .into_iter()
-        .map(|(rt, count)| TopType {
-            record_type: rt.as_str().to_string(),
-            count,
-        })
-        .collect();
-
-    Ok(Json(StatsResponse {
-        queries_total: stats.queries_total,
-        queries_blocked: stats.queries_blocked,
-        queries_rate_limited: stats.queries_rate_limited,
-        queries_malware_detected: stats.queries_malware_detected,
-        queries_dnssec_bogus: stats.queries_dnssec_bogus,
-        clients: stats.unique_clients,
-        uptime: stats.uptime_seconds,
-        cache_hit_rate: stats.cache_hit_rate,
-        avg_query_time_ms: stats.avg_query_time_ms,
-        avg_cache_time_ms: stats.avg_cache_time_ms,
-        avg_upstream_time_ms: stats.avg_upstream_time_ms,
-        queries_by_type,
-        most_queried_type,
-        record_type_distribution,
-        top_10_types,
-        source_stats: stats.source_stats,
-    }))
+    let stats = state
+        .query
+        .get_stats
+        .execute(period_hours(&params.period))
+        .await?;
+    Ok(Json(StatsResponse::from(stats)))
 }

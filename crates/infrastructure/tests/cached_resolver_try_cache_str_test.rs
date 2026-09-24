@@ -2,9 +2,7 @@ use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
-use ferrous_dns_infrastructure::dns::{
-    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
-};
+use ferrous_dns_infrastructure::dns::{DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -42,7 +40,6 @@ fn make_resolver(cache: Arc<dyn DnsCacheAccess>) -> Arc<CachedResolver> {
         Arc::new(NullResolver) as Arc<dyn DnsResolver>,
         cache,
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ))
 }
@@ -75,7 +72,6 @@ async fn try_cache_str_returns_hit_after_upstream_resolve_populates_cache() {
         inner_resolver,
         Arc::clone(&cache),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 
@@ -104,13 +100,7 @@ async fn try_cache_str_and_try_cache_return_equivalent_results() {
         Arc::new(Fixed) as Arc<dyn DnsResolver>
     };
 
-    let resolver = Arc::new(CachedResolver::new(
-        inner_resolver,
-        make_cache(),
-        300,
-        Arc::new(NegativeQueryTracker::new()),
-        4,
-    ));
+    let resolver = Arc::new(CachedResolver::new(inner_resolver, make_cache(), 300, 4));
 
     let query = DnsQuery::new("parity.example", RecordType::A);
     resolver.resolve(&query).await.unwrap();
@@ -137,13 +127,7 @@ async fn try_cache_str_misses_for_different_record_type() {
         Arc::new(Fixed) as Arc<dyn DnsResolver>
     };
 
-    let resolver = Arc::new(CachedResolver::new(
-        inner_resolver,
-        make_cache(),
-        300,
-        Arc::new(NegativeQueryTracker::new()),
-        4,
-    ));
+    let resolver = Arc::new(CachedResolver::new(inner_resolver, make_cache(), 300, 4));
 
     let query = DnsQuery::new("typed.example", RecordType::A);
     resolver.resolve(&query).await.unwrap();

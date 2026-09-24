@@ -10,7 +10,6 @@ ferrous-dns-application.workspace = true
 ferrous-dns-domain.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 chrono-tz = "0.10"

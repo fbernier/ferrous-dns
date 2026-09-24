@@ -37,8 +37,6 @@ fn local_dns_resolution(ip: &str) -> DnsResolution {
     }
 }
 
-// ── execute: upstream path ─────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_execute_upstream_resolution_logs_noerror() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -83,8 +81,6 @@ async fn test_execute_local_dns_resolution_logs_local_dns_status() {
     assert_eq!(logs[0].response_status, Some("LOCAL_DNS"));
 }
 
-// ── execute: block path ────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_execute_blocked_domain_returns_error_and_logs_blocked() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -104,8 +100,6 @@ async fn test_execute_blocked_domain_returns_error_and_logs_blocked() {
     assert!(logs[0].blocked);
     assert_eq!(logs[0].response_status, Some("BLOCKED"));
 }
-
-// ── execute: error paths ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_execute_nxdomain_logs_nxdomain_status() {
@@ -194,8 +188,6 @@ async fn test_execute_local_nxdomain_logs_local_dns_and_returns_nxdomain() {
     assert_eq!(logs[0].response_status, Some("LOCAL_DNS"));
 }
 
-// ── execute: cache paths ───────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_execute_cache_hit_logs_cache_hit_true() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -239,8 +231,6 @@ async fn test_execute_negative_cache_hit_returns_nxdomain() {
     assert!(logs[0].cache_hit);
     assert_eq!(logs[0].response_status, Some("NXDOMAIN"));
 }
-
-// ── try_cache_direct ───────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_try_cache_direct_returns_none_on_miss() {
@@ -365,8 +355,6 @@ async fn test_try_cache_direct_returns_none_when_cached_addresses_empty() {
     assert_eq!(log.sync_log_count(), 0);
 }
 
-// ── client tracking ────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_execute_with_client_tracking_updates_last_seen() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -410,8 +398,6 @@ async fn test_execute_without_client_tracking_does_not_create_clients() {
 
     assert_eq!(client_repo.count().await, 0);
 }
-
-// ── CNAME cloaking detection ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_cname_cloaking_blocked_upstream_path() {
@@ -562,8 +548,6 @@ async fn test_try_cache_direct_returns_none_when_domain_blocked() {
     assert_eq!(log.sync_log_count(), 0);
 }
 
-// ── try_cache_wire_direct ──────────────────────────────────────────────────
-
 #[test]
 fn try_cache_wire_direct_returns_none_on_cache_miss() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -682,8 +666,6 @@ fn try_cache_wire_direct_returns_none_when_domain_blocked() {
     assert!(result.is_none());
 }
 
-// ── log metadata ───────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_execute_log_contains_correct_domain_and_record_type() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -725,7 +707,6 @@ async fn test_execute_log_records_response_time() {
     assert!(logs[0].response_time_us.is_some());
 }
 
-// ── Safe Search rewrite ────────────────────────────────────────────────────
 //
 // `resolve` expects callers to have probed the cache, so the rewrite must do
 // it itself or every rewritten query goes upstream.

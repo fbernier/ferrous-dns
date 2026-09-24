@@ -18,7 +18,7 @@ pub use config::{
     ServerConfig, TunnelingAction, TunnelingDetectionConfig, UpstreamPool, UpstreamStrategy,
     WebauthnConfig, DEFAULT_BLOCK_TTL, DEFAULT_DNS64_PREFIX,
 };
-pub use dns_record::{DnsRecord, RecordCategory, RecordType};
+pub use dns_record::RecordType;
 pub use entities::api_token::ApiToken;
 pub use entities::auth_session::AuthSession;
 pub use entities::block_source::BlockSource;
@@ -31,10 +31,10 @@ pub use entities::custom_service::CustomService;
 pub use entities::filter_explanation::{
     AllowMatch, AllowMatchKind, BlockMatch, BlockMatchKind, FilterExplanation, MatchType,
 };
-pub use entities::group::{Group, GroupStats};
+pub use entities::group::Group;
 pub use entities::managed_domain::{DomainAction, ManagedDomain};
 pub use entities::query_log::{
-    CacheStats, ClientProtocol, DnssecStats, DnssecStatus, QueryCategory, QueryLog, QueryLogFilter,
+    ClientProtocol, DnssecStats, DnssecStatus, QueryCategory, QueryLog, QueryLogFilter,
     QuerySource, QueryStats,
 };
 pub use entities::regex_filter::RegexFilter;

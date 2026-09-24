@@ -5,9 +5,9 @@ use std::sync::Arc;
 /// Default corpus size when the caller does not specify one.
 pub const DEFAULT_BACKTEST_LIMIT: u32 = 20_000;
 /// Hard cap on corpus size to bound work and response size.
-pub const MAX_BACKTEST_LIMIT: u32 = 50_000;
+const MAX_BACKTEST_LIMIT: u32 = 50_000;
 /// Max number of affected domains returned as a sample.
-pub const SAMPLE_LIMIT: usize = 100;
+const SAMPLE_LIMIT: usize = 100;
 
 /// Which way the candidate ruleset is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -25,8 +25,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-// ── Minimal port doubles (hand-rolled per crate test-placement convention —
-// application crate mocks aren't reachable from the cli crate's test binary) ──
+// Hand-rolled port doubles: the application crate's mocks are not reachable
+// from the cli crate's test binaries.
 
 /// Resolver whose cache always hits with a fixed set of addresses, regardless
 /// of the query's domain/type.

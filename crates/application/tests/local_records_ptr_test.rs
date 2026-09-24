@@ -8,8 +8,6 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
-// ── Mock ConfigRepository ────────────────────────────────────────────────────
-
 struct MockConfigRepository {
     should_fail: bool,
 }
@@ -34,8 +32,6 @@ impl ConfigRepository for MockConfigRepository {
         }
     }
 }
-
-// ── Mock PtrRecordRegistry ───────────────────────────────────────────────────
 
 #[derive(Default)]
 struct MockPtrRegistry {
@@ -62,8 +58,6 @@ impl PtrRecordRegistry for MockPtrRegistry {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 fn default_config() -> Arc<RwLock<Config>> {
     Arc::new(RwLock::new(Config::default()))
 }
@@ -79,8 +73,6 @@ fn config_with_record(ip: &str) -> Arc<RwLock<Config>> {
     });
     Arc::new(RwLock::new(config))
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_create_local_record_registers_ptr_in_registry() {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use super::login_rate_limiter::LoginRateLimiter;
-use super::session_factory::{build_session, generate_session_id, session_max_age};
+use super::session_factory::{build_session, expires_in, random_hex_256, session_max_age};
 use crate::ports::{MfaRepository, PasswordHasher, SessionRepository, UserProvider};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, MfaChallenge, MfaMethod};
 
@@ -109,11 +109,10 @@ impl LoginUseCase {
         let has_passkeys = self.mfa_repo.has_credentials(username).await?;
 
         if totp_enabled || has_passkeys {
-            let challenge_token = generate_session_id()?;
-            let expires_at = (chrono::Utc::now()
-                + chrono::Duration::seconds(self.auth_config.mfa_challenge_ttl_secs))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+            let challenge_token = random_hex_256()?;
+            let expires_at = expires_in(chrono::Duration::seconds(
+                self.auth_config.mfa_challenge_ttl_secs,
+            ));
 
             self.mfa_repo
                 .create_challenge(&MfaChallenge {

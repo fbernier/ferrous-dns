@@ -3,6 +3,7 @@
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
+use smallvec::SmallVec;
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -112,6 +113,38 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> CountedDashMap<K, V, S> {
         self.retain(|_, _| false);
     }
 
+    /// Makes room for one insert once the map holds `max` entries: drops the
+    /// expired entries among the first `BATCH` it walks, then one arbitrary
+    /// entry if it is still full. The work per insert stays bounded; expired
+    /// entries past the sample are left for a periodic sweep.
+    pub fn evict_if_full<const BATCH: usize>(&self, max: usize, is_expired: impl Fn(&V) -> bool)
+    where
+        K: Clone,
+        [K; BATCH]: smallvec::Array<Item = K>,
+    {
+        if self.len() < max {
+            return;
+        }
+        // Collected first: the iterator holds a shard read lock that `remove`
+        // would deadlock on.
+        let expired: SmallVec<[K; BATCH]> = self
+            .map
+            .iter()
+            .take(BATCH)
+            .filter(|entry| is_expired(entry.value()))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in &expired {
+            self.remove(key);
+        }
+        if self.len() >= max {
+            let fallback = self.map.iter().next().map(|entry| entry.key().clone());
+            if let Some(key) = fallback {
+                self.remove(&key);
+            }
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = RefMulti<'_, K, V>> {
         self.map.iter()
     }
@@ -170,5 +203,27 @@ mod tests {
         assert_eq!(map.len(), map.map.len());
         map.clear();
         assert_eq!((map.len(), map.map.len()), (0, 0));
+    }
+
+    #[test]
+    fn eviction_inspects_a_bounded_sample_and_makes_room() {
+        const MAX: usize = 256;
+        const BATCH: usize = 32;
+        for expired in [false, true] {
+            let map: CountedDashMap<u32, bool> = (0..MAX as u32).map(|k| (k, expired)).collect();
+            let inspected = std::cell::Cell::new(0);
+
+            map.evict_if_full::<BATCH>(MAX, |expired| {
+                inspected.set(inspected.get() + 1);
+                *expired
+            });
+
+            assert_eq!(inspected.get(), BATCH);
+            let removed = if expired { BATCH } else { 1 };
+            assert_eq!(map.len(), MAX - removed);
+
+            map.evict_if_full::<BATCH>(MAX, |_| true);
+            assert_eq!(map.len(), MAX - removed, "a map below `max` is left alone");
+        }
     }
 }

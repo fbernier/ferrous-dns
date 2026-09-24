@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use ferrous_dns_domain::ScheduleAction;
+use ferrous_dns_domain::{DomainError, ScheduleAction};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -165,11 +165,10 @@ async fn add_slot(
     Path(id): Path<i64>,
     Json(req): Json<AddTimeSlotRequest>,
 ) -> Result<(StatusCode, Json<TimeSlotResponse>), ApiError> {
-    let action = req.action.parse::<ScheduleAction>().map_err(|e| {
-        ApiError(ferrous_dns_domain::DomainError::InvalidTimeSlot(
-            e.to_string(),
-        ))
-    })?;
+    let action = req
+        .action
+        .parse::<ScheduleAction>()
+        .map_err(|e| DomainError::InvalidTimeSlot(e.to_string()))?;
 
     let slot = state
         .schedule
@@ -198,8 +197,12 @@ async fn add_slot(
 )]
 async fn delete_slot(
     State(state): State<AppState>,
-    Path((_id, slot_id)): Path<(i64, i64)>,
+    Path((id, slot_id)): Path<(i64, i64)>,
 ) -> Result<StatusCode, ApiError> {
+    let slots = state.schedule.get_profiles.get_slots(id).await?;
+    if !slots.iter().any(|slot| slot.id == Some(slot_id)) {
+        return Err(ApiError(DomainError::TimeSlotNotFound(slot_id)));
+    }
     state.schedule.manage_slots.delete_slot(slot_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -224,9 +227,7 @@ async fn get_group_schedule(
         .get_profiles
         .get_group_assignment(group_id)
         .await?
-        .ok_or(ApiError(
-            ferrous_dns_domain::DomainError::GroupHasNoSchedule(group_id),
-        ))?;
+        .ok_or(ApiError(DomainError::GroupHasNoSchedule(group_id)))?;
     Ok(Json(GroupScheduleResponse {
         group_id,
         profile_id,

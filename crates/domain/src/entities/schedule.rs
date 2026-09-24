@@ -110,17 +110,16 @@ impl TimeSlot {
         Ok(())
     }
 
+    /// Requires zero-padded `HH:MM` because slots are compared as strings.
     pub fn validate_time_format(time: &str) -> Result<(), String> {
-        let parts: Vec<&str> = time.split(':').collect();
-        if parts.len() != 2 {
+        let &[h1, h2, b':', m1, m2] = time.as_bytes() else {
+            return Err(format!("time must be in HH:MM format, got '{time}'"));
+        };
+        if ![h1, h2, m1, m2].iter().all(u8::is_ascii_digit) {
             return Err(format!("time must be in HH:MM format, got '{time}'"));
         }
-        let hours: u8 = parts[0]
-            .parse()
-            .map_err(|_| format!("invalid hours in '{time}'"))?;
-        let minutes: u8 = parts[1]
-            .parse()
-            .map_err(|_| format!("invalid minutes in '{time}'"))?;
+        let hours = (h1 - b'0') * 10 + (h2 - b'0');
+        let minutes = (m1 - b'0') * 10 + (m2 - b'0');
         if hours > 23 {
             return Err(format!("hours must be 0–23, got {hours}"));
         }

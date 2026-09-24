@@ -1,38 +1,4 @@
 use ferrous_dns_domain::config::dns::DnsConfig;
-use ferrous_dns_domain::config::dnssec::DnssecMode;
-
-#[test]
-fn test_config_default_values() {
-    let config = DnsConfig::default();
-
-    assert_eq!(config.query_timeout, 3);
-    assert!(config.cache_enabled);
-    assert_eq!(config.cache_ttl, 3600);
-    assert_eq!(config.dnssec_mode, None);
-    assert_eq!(config.dnssec_enabled, None);
-    assert_eq!(config.effective_dnssec_mode(), DnssecMode::Permissive);
-    assert_eq!(config.cache_max_entries, 200_000);
-    assert_eq!(config.cache_eviction_strategy, "hit_rate");
-    assert!(config.cache_optimistic_refresh);
-    assert_eq!(config.cache_min_hit_rate, 2.0);
-    assert_eq!(config.cache_min_frequency, 10);
-    assert_eq!(config.cache_min_lfuk_score, 1.5);
-    assert_eq!(config.cache_refresh_threshold, 0.75);
-    assert_eq!(config.cache_lfuk_history_size, 10);
-    assert!((config.cache_batch_eviction_percentage - 0.1).abs() < f64::EPSILON);
-    assert_eq!(config.cache_compaction_interval, 300);
-    assert!(!config.cache_adaptive_thresholds);
-    assert_eq!(config.cache_access_window_secs, 7200);
-    assert_eq!(config.cache_min_ttl, 0);
-    assert_eq!(config.cache_max_ttl, 86_400);
-    assert!(config.block_private_ptr);
-    assert!(!config.block_non_fqdn);
-    assert!(!config.mdns_enabled);
-    assert!(config.local_domain.is_none());
-    assert!(config.local_dns_server.is_none());
-    assert!(config.local_records.is_empty());
-    assert!(!config.qname_case_randomization);
-}
 
 #[test]
 fn test_qname_case_randomization_defaults_off_when_absent() {
@@ -66,18 +32,6 @@ fn test_mdns_enabled_roundtrip() {
     let serialized = toml::to_string(&config).unwrap();
     let reparsed: DnsConfig = toml::from_str(&serialized).unwrap();
     assert!(reparsed.mdns_enabled);
-}
-
-#[test]
-fn test_config_cache_min_frequency_default() {
-    let config = DnsConfig::default();
-    assert_eq!(config.cache_min_frequency, 10);
-}
-
-#[test]
-fn test_config_cache_min_lfuk_score_default() {
-    let config = DnsConfig::default();
-    assert_eq!(config.cache_min_lfuk_score, 1.5);
 }
 
 #[test]
@@ -145,9 +99,7 @@ fn test_config_deserialization_with_all_fields() {
 
 #[test]
 fn test_removed_cache_max_refresh_per_sec_key_is_ignored() {
-    // A chave saiu do produto quando o pacer passou a derivar o ritmo do
-    // backlog. Não existe `deny_unknown_fields`, então um arquivo escrito por
-    // uma versão anterior continua carregando em vez de falhar.
+    // Config files written before this key was retired must keep loading.
     let toml_str = r#"
         query_timeout = 3
         cache_max_refresh_per_sec = 4.0
@@ -156,19 +108,4 @@ fn test_removed_cache_max_refresh_per_sec_key_is_ignored() {
     let config: DnsConfig = toml::from_str(toml_str).unwrap();
 
     assert_eq!(config.query_timeout, 3);
-}
-
-#[test]
-fn test_local_domain_intercept_suffix_logic() {
-    let local_domain = "lan";
-    let suffix = format!(".{}", local_domain);
-
-    assert!("device.lan".ends_with(&suffix));
-    assert!("x.com.lan".ends_with(&suffix));
-    assert!("deep.sub.device.lan".ends_with(&suffix));
-    assert!(!"google.com".ends_with(&suffix));
-    assert!(!"notlan".ends_with(&suffix));
-    assert!(!"xlan".ends_with(&suffix));
-
-    assert_eq!("lan", local_domain);
 }

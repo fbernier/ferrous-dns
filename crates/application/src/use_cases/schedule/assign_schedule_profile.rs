@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::DomainError;
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -19,10 +20,7 @@ impl AssignScheduleProfileUseCase {
 
     #[instrument(skip(self))]
     pub async fn assign(&self, group_id: i64, profile_id: i64) -> Result<(), DomainError> {
-        self.group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        require_group(self.group_repo.as_ref(), group_id).await?;
 
         self.repo
             .get_by_id(profile_id)
@@ -38,10 +36,7 @@ impl AssignScheduleProfileUseCase {
 
     #[instrument(skip(self))]
     pub async fn unassign(&self, group_id: i64) -> Result<(), DomainError> {
-        self.group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        require_group(self.group_repo.as_ref(), group_id).await?;
 
         self.repo.unassign_from_group(group_id).await?;
 

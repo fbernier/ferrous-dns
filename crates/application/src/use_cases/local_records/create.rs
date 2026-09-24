@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord, RecordType};
+use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord};
 use tokio::sync::RwLock;
 
+use super::{ensure_wildcard_anchored, parse_record, save_failed, LiveRecordSinks};
 use crate::ports::{
     ConfigRepository, DnsCachePort, LocalRecordCreator, PtrRecordRegistry, WildcardRecordRegistry,
 };
@@ -11,9 +12,7 @@ use crate::ports::{
 pub struct CreateLocalRecordUseCase {
     config: Arc<RwLock<Config>>,
     config_repo: Arc<dyn ConfigRepository>,
-    ptr_registry: Option<Arc<dyn PtrRecordRegistry>>,
-    dns_cache: Option<Arc<dyn DnsCachePort>>,
-    wildcard_registry: Option<Arc<dyn WildcardRecordRegistry>>,
+    sinks: LiveRecordSinks,
 }
 
 impl CreateLocalRecordUseCase {
@@ -21,34 +20,31 @@ impl CreateLocalRecordUseCase {
         Self {
             config,
             config_repo,
-            ptr_registry: None,
-            dns_cache: None,
-            wildcard_registry: None,
+            sinks: LiveRecordSinks::default(),
         }
     }
 
     /// Attaches a live PTR registry so that a successful record creation immediately
     /// registers the new IP → FQDN mapping without requiring a server restart.
     pub fn with_ptr_registry(mut self, registry: Option<Arc<dyn PtrRecordRegistry>>) -> Self {
-        self.ptr_registry = registry;
+        self.sinks.ptr = registry;
         self
     }
 
     /// Attaches a live DNS cache so that a successful record creation immediately
     /// inserts the forward record (A/AAAA) into the cache without requiring a server restart.
     pub fn with_dns_cache(mut self, cache: Option<Arc<dyn DnsCachePort>>) -> Self {
-        self.dns_cache = cache;
+        self.sinks.cache = cache;
         self
     }
 
     /// Attaches the live wildcard index so that a newly created wildcard record
-    /// answers queries immediately. Wildcards never enter the DNS cache — its
-    /// keys are matched exactly, so a `*.example.com` entry there is dead weight.
+    /// answers queries immediately.
     pub fn with_wildcard_registry(
         mut self,
         registry: Option<Arc<dyn WildcardRecordRegistry>>,
     ) -> Self {
-        self.wildcard_registry = registry;
+        self.sinks.wildcard = registry;
         self
     }
 
@@ -60,89 +56,21 @@ impl CreateLocalRecordUseCase {
         record_type: String,
         ttl: Option<u32>,
     ) -> Result<(LocalDnsRecord, usize), DomainError> {
-        LocalDnsRecord::validate_hostname(&hostname).map_err(DomainError::InvalidDomainName)?;
-        if let Some(ref domain) = domain {
-            LocalDnsRecord::validate_domain(domain).map_err(DomainError::InvalidDomainName)?;
-        }
-
-        let parsed_ip = ip
-            .parse::<std::net::IpAddr>()
-            .map_err(|_| DomainError::InvalidIpAddress("Invalid IP address".to_string()))?;
-
-        let record_type_upper = record_type.to_uppercase();
-        let parsed_record_type = record_type_upper
-            .parse::<RecordType>()
-            .ok()
-            .filter(|rt| matches!(rt, RecordType::A | RecordType::AAAA))
-            .ok_or_else(|| {
-                DomainError::InvalidDomainName(
-                    "Invalid record type (must be A or AAAA)".to_string(),
-                )
-            })?;
-
-        let new_record = LocalDnsRecord {
-            hostname,
-            domain,
-            ip,
-            record_type: record_type_upper,
-            ttl,
-        };
+        let parsed = parse_record(hostname, domain, ip, record_type, ttl)?;
 
         let mut config = self.config.write().await;
+        ensure_wildcard_anchored(&parsed.record, &config)?;
 
-        if new_record.is_wildcard()
-            && new_record
-                .wildcard_suffix(&config.dns.local_domain)
-                .is_none()
-        {
-            return Err(DomainError::InvalidDomainName(
-                "A wildcard record needs a domain to anchor it: set the domain field or dns.local_domain".to_string(),
-            ));
-        }
-
-        config.dns.local_records.push(new_record.clone());
+        config.dns.local_records.push(parsed.record.clone());
         let new_index = config.dns.local_records.len() - 1;
 
         if let Err(e) = self.config_repo.save_local_records(&config).await {
             config.dns.local_records.pop();
-            return Err(DomainError::IoError(format!(
-                "Failed to save configuration: {}",
-                e
-            )));
+            return Err(save_failed(e));
         }
 
-        if let Some(suffix) = new_record.wildcard_suffix(&config.dns.local_domain) {
-            if let Some(ref registry) = self.wildcard_registry {
-                registry.register(
-                    &suffix,
-                    parsed_record_type,
-                    parsed_ip,
-                    new_record.ttl_or_default(),
-                );
-            }
-            return Ok((new_record, new_index));
-        }
-
-        let fqdn = new_record.fqdn(&config.dns.local_domain);
-
-        if let Some(ref registry) = self.ptr_registry {
-            registry.register(
-                parsed_ip,
-                Arc::from(fqdn.as_str()),
-                new_record.ttl_or_default(),
-            );
-        }
-
-        if let Some(ref cache) = self.dns_cache {
-            cache.insert_permanent_record(
-                &fqdn,
-                parsed_record_type,
-                vec![parsed_ip],
-                new_record.ttl_or_default(),
-            );
-        }
-
-        Ok((new_record, new_index))
+        self.sinks.install(&parsed, &config.dns.local_domain);
+        Ok((parsed.record, new_index))
     }
 }
 

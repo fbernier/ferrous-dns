@@ -8,7 +8,10 @@ use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    dto::{BlocklistSourceResponse, CreateBlocklistSourceRequest, UpdateBlocklistSourceRequest},
+    dto::{
+        source_common::{create_group_ids, update_group_ids},
+        BlocklistSourceResponse, CreateBlocklistSourceRequest, UpdateBlocklistSourceRequest,
+    },
     errors::ApiError,
     state::AppState,
 };
@@ -74,12 +77,7 @@ async fn sync_blocklist_source(
         .get_blocklist_sources
         .get_by_id(id)
         .await?
-        .ok_or_else(|| {
-            ApiError(DomainError::NotFound(format!(
-                "Blocklist source {} not found",
-                id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::BlocklistSourceNotFound(id)))?;
 
     let started = state.blocking.sync_blocklist_sources.execute().await?;
     Ok(if started {
@@ -109,12 +107,7 @@ async fn get_blocklist_source_by_id(
         .get_blocklist_sources
         .get_by_id(id)
         .await?
-        .ok_or_else(|| {
-            ApiError(DomainError::NotFound(format!(
-                "Blocklist source {} not found",
-                id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::BlocklistSourceNotFound(id)))?;
     Ok(Json(BlocklistSourceResponse::from_source(source)))
 }
 
@@ -133,7 +126,7 @@ async fn create_blocklist_source(
     State(state): State<AppState>,
     Json(req): Json<CreateBlocklistSourceRequest>,
 ) -> Result<(StatusCode, Json<BlocklistSourceResponse>), ApiError> {
-    let group_ids = req.resolved_group_ids(1);
+    let group_ids = create_group_ids(req.group_ids, req.group_id, 1);
     let enabled = req.enabled.unwrap_or(true);
 
     let source = state
@@ -165,7 +158,7 @@ async fn update_blocklist_source(
     Path(id): Path<i64>,
     Json(req): Json<UpdateBlocklistSourceRequest>,
 ) -> Result<Json<BlocklistSourceResponse>, ApiError> {
-    let group_ids = req.resolved_group_ids();
+    let group_ids = update_group_ids(req.group_ids, req.group_id);
     let source = state
         .blocking
         .update_blocklist_source

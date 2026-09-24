@@ -173,7 +173,6 @@ pub enum DomainError {
     #[error("Invalid timezone: {0}")]
     InvalidTimezone(String),
 
-    // Auth errors
     #[error("Invalid credentials")]
     InvalidCredentials,
 
@@ -216,7 +215,6 @@ pub enum DomainError {
     #[error("Insufficient permissions")]
     InsufficientPermissions,
 
-    // MFA / 2FA errors
     #[error("Second factor required")]
     MfaRequired,
 

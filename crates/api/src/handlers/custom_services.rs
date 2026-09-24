@@ -65,12 +65,7 @@ async fn get_custom_service(
         .get_custom_services
         .get_by_service_id(&service_id)
         .await?
-        .ok_or_else(|| {
-            ApiError(DomainError::CustomServiceNotFound(format!(
-                "Custom service '{}' not found",
-                service_id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::CustomServiceNotFound(service_id)))?;
     Ok(Json(CustomServiceResponse::from_entity(cs)))
 }
 

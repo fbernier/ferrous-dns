@@ -1,6 +1,6 @@
+use super::guard_whitelist::GuardWhitelist;
 use ferrous_dns_domain::{DgaDetectionAction, DgaDetectionConfig};
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 /// Outcome of the hot-path DGA check (phase 1).
@@ -13,61 +13,6 @@ pub(super) enum DgaVerdict {
         measured: f32,
         threshold: f32,
     },
-}
-
-/// Parsed CIDR range for client whitelist matching.
-struct CidrRange {
-    network: u128,
-    mask: u128,
-}
-
-impl CidrRange {
-    fn parse(cidr: &str) -> Option<Self> {
-        let (addr_str, prefix_str) = cidr.split_once('/')?;
-        let prefix: u8 = prefix_str.parse().ok()?;
-
-        if let Ok(v4) = addr_str.parse::<Ipv4Addr>() {
-            if prefix > 32 {
-                return None;
-            }
-            let v4_bits = u32::from(v4);
-            let v4_mask = if prefix == 0 {
-                0u32
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            let mapped = (v4_bits as u128) | 0xFFFF_0000_0000u128;
-            let mapped_mask = (v4_mask as u128) | 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_0000_0000u128;
-            Some(Self {
-                network: mapped & mapped_mask,
-                mask: mapped_mask,
-            })
-        } else if let Ok(v6) = addr_str.parse::<Ipv6Addr>() {
-            if prefix > 128 {
-                return None;
-            }
-            let bits = u128::from(v6);
-            let mask = if prefix == 0 {
-                0u128
-            } else {
-                (u128::MAX >> (128 - prefix)) << (128 - prefix)
-            };
-            Some(Self {
-                network: bits & mask,
-                mask,
-            })
-        } else {
-            None
-        }
-    }
-
-    fn contains(&self, ip: IpAddr) -> bool {
-        let bits = match ip {
-            IpAddr::V4(v4) => u32::from(v4) as u128 | 0xFFFF_0000_0000u128,
-            IpAddr::V6(v6) => u128::from(v6),
-        };
-        (bits & self.mask) == self.network
-    }
 }
 
 /// Signal weights for phase-1 hot-path mini-scoring.
@@ -90,12 +35,10 @@ pub(super) struct DgaGuard {
     sld_max_length: usize,
     consonant_ratio_threshold: f32,
     digit_ratio_threshold: f32,
-    domain_whitelist: HashSet<Box<str>>,
-    client_whitelist: Vec<CidrRange>,
+    whitelist: GuardWhitelist,
 }
 
 impl DgaGuard {
-    /// Creates a guard from the domain-layer configuration.
     pub(super) fn from_config(config: &DgaDetectionConfig) -> Self {
         Self {
             enabled: config.enabled,
@@ -105,36 +48,22 @@ impl DgaGuard {
             sld_max_length: config.sld_max_length,
             consonant_ratio_threshold: config.consonant_ratio_threshold,
             digit_ratio_threshold: config.digit_ratio_threshold,
-            domain_whitelist: config
-                .domain_whitelist
-                .iter()
-                .map(|s| s.to_lowercase().into_boxed_str())
-                .collect(),
-            client_whitelist: config
-                .client_whitelist
-                .iter()
-                .filter_map(|s| CidrRange::parse(s))
-                .collect(),
+            whitelist: GuardWhitelist::new(&config.domain_whitelist, &config.client_whitelist),
         }
     }
 
-    /// Creates a disabled guard that never triggers.
     pub(super) fn disabled() -> Self {
         let mut guard = Self::from_config(&DgaDetectionConfig::default());
         guard.enabled = false;
         guard
     }
 
-    /// Returns the configured action for detected DGA domains.
     pub(super) fn action(&self) -> DgaDetectionAction {
         self.action
     }
 
-    /// Returns `true` if the client IP is in the configured whitelist.
     pub(super) fn is_client_whitelisted(&self, client_ip: IpAddr) -> bool {
-        self.client_whitelist
-            .iter()
-            .any(|cidr| cidr.contains(client_ip))
+        self.whitelist.contains_client(client_ip)
     }
 
     /// Performs O(1) DGA checks on the hot path using weighted mini-scoring.
@@ -154,19 +83,8 @@ impl DgaGuard {
             return DgaVerdict::Clean;
         }
 
-        // O(1) HashSet lookup (case-insensitive via pre-lowercased keys)
-        if domain.len() <= 253 {
-            let mut buf = [0u8; 253];
-            let bytes = domain.as_bytes();
-            let len = bytes.len();
-            for (i, &b) in bytes.iter().enumerate() {
-                buf[i] = b.to_ascii_lowercase();
-            }
-            // SAFETY: input is ASCII DNS domain name, lowercasing preserves UTF-8
-            let lower = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
-            if self.domain_whitelist.contains(lower) {
-                return DgaVerdict::Clean;
-            }
+        if self.whitelist.contains_domain(domain) {
+            return DgaVerdict::Clean;
         }
 
         let sld = match extract_sld(domain) {
@@ -175,35 +93,17 @@ impl DgaGuard {
         };
 
         let mut confidence: f32 = 0.0;
-        let mut top_signal: &'static str = "none";
-        let mut top_measured: f32 = 0.0;
-        let mut top_threshold: f32 = 0.0;
-        let mut top_excess: f32 = 0.0;
-
-        // Tracks the signal with the highest relative excess over its threshold,
-        // so logs reflect the most diagnostically useful signal — not just the
-        // heaviest weight.
-        macro_rules! track_signal {
-            ($name:expr, $measured:expr, $threshold:expr) => {
-                let excess = $measured / $threshold;
-                if excess > top_excess {
-                    top_excess = excess;
-                    top_signal = $name;
-                    top_measured = $measured;
-                    top_threshold = $threshold;
-                }
-            };
-        }
+        let mut top = TopSignal::default();
 
         if sld.len() > self.sld_max_length {
             confidence += HP_WEIGHT_SLD_LENGTH;
-            track_signal!("sld_length", sld.len() as f32, self.sld_max_length as f32);
+            top.offer("sld_length", sld.len() as f32, self.sld_max_length as f32);
         }
 
         let entropy = shannon_entropy(sld.as_bytes());
         if entropy > self.sld_entropy_threshold {
             confidence += HP_WEIGHT_SLD_ENTROPY;
-            track_signal!("sld_entropy", entropy, self.sld_entropy_threshold);
+            top.offer("sld_entropy", entropy, self.sld_entropy_threshold);
         }
 
         let (consonants, vowels, digits, total) = char_ratios(sld);
@@ -213,10 +113,10 @@ impl DgaGuard {
                 let consonant_ratio = consonants as f32 / alpha as f32;
                 if consonant_ratio > self.consonant_ratio_threshold {
                     confidence += HP_WEIGHT_CONSONANT_RATIO;
-                    track_signal!(
+                    top.offer(
                         "consonant_ratio",
                         consonant_ratio,
-                        self.consonant_ratio_threshold
+                        self.consonant_ratio_threshold,
                     );
                 }
             }
@@ -224,21 +124,54 @@ impl DgaGuard {
             let digit_ratio = digits as f32 / total as f32;
             if digit_ratio > self.digit_ratio_threshold {
                 confidence += HP_WEIGHT_DIGIT_RATIO;
-                track_signal!("digit_ratio", digit_ratio, self.digit_ratio_threshold);
+                top.offer("digit_ratio", digit_ratio, self.digit_ratio_threshold);
             }
         }
 
-        let _ = top_excess;
-
         if confidence >= self.hot_path_confidence_threshold {
             return DgaVerdict::Detected {
-                signal: top_signal,
-                measured: top_measured,
-                threshold: top_threshold,
+                signal: top.name,
+                measured: top.measured,
+                threshold: top.threshold,
             };
         }
 
         DgaVerdict::Clean
+    }
+}
+
+/// Triggered signal with the highest relative excess over its threshold, so logs
+/// name the most diagnostic signal rather than the heaviest weight.
+struct TopSignal {
+    name: &'static str,
+    measured: f32,
+    threshold: f32,
+    excess: f32,
+}
+
+impl Default for TopSignal {
+    fn default() -> Self {
+        Self {
+            name: "none",
+            measured: 0.0,
+            threshold: 0.0,
+            excess: 0.0,
+        }
+    }
+}
+
+impl TopSignal {
+    #[inline]
+    fn offer(&mut self, name: &'static str, measured: f32, threshold: f32) {
+        let excess = measured / threshold;
+        if excess > self.excess {
+            *self = Self {
+                name,
+                measured,
+                threshold,
+                excess,
+            };
+        }
     }
 }
 

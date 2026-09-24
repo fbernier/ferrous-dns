@@ -1,53 +1,25 @@
 use super::query::query_server;
 use super::strategy::{QueryContext, UpstreamResult};
 use ferrous_dns_domain::DomainError;
-use std::sync::Arc;
 use tracing::{debug, warn};
 
-pub struct FailoverStrategy;
-
-impl FailoverStrategy {
-    pub fn new() -> Self {
-        Self
+/// Tries servers in configured order, moving on only when one fails.
+pub(super) async fn query(ctx: &QueryContext<'_>) -> Result<UpstreamResult, DomainError> {
+    if ctx.servers.is_empty() {
+        return Err(DomainError::TransportNoHealthyServers);
     }
+    debug!(strategy = "failover", servers = ctx.servers.len(), domain = %ctx.domain, "Trying sequentially");
 
-    pub async fn query_refs(&self, ctx: &QueryContext<'_>) -> Result<UpstreamResult, DomainError> {
-        if ctx.servers.is_empty() {
-            return Err(DomainError::TransportNoHealthyServers);
-        }
-        debug!(strategy = "failover", servers = ctx.servers.len(), domain = %ctx.domain, "Trying sequentially");
-
-        for (index, protocol) in ctx.servers.iter().enumerate() {
-            match query_server(
-                protocol,
-                &ctx.query_bytes,
-                ctx.timeout_ms,
-                ctx.validator,
-                ctx.server_displays,
-            )
-            .await
-            {
-                Ok(r) => {
-                    debug!(server = %r.server_addr, latency_ms = r.latency_ms, position = index, "Server responded");
-                    return Ok(UpstreamResult {
-                        response: r.response,
-                        server: r.server_addr,
-                        latency_ms: r.latency_ms,
-                        pool_name: Arc::clone(ctx.pool_name),
-                        server_display: r.server_display,
-                    });
-                }
-                Err(e) => {
-                    warn!(protocol = %protocol, error = %e, position = index, "Failing over");
-                }
+    for (index, protocol) in ctx.servers.iter().enumerate() {
+        match query_server(ctx, protocol).await {
+            Ok(r) => {
+                debug!(server = %r.server, latency_ms = r.latency_ms, position = index, "Server responded");
+                return Ok(r);
+            }
+            Err(e) => {
+                warn!(protocol = %protocol, error = %e, position = index, "Failing over");
             }
         }
-        Err(DomainError::TransportAllServersUnreachable)
     }
-}
-
-impl Default for FailoverStrategy {
-    fn default() -> Self {
-        Self::new()
-    }
+    Err(DomainError::TransportAllServersUnreachable)
 }

@@ -23,7 +23,6 @@ impl ResponseIpFilterGuard {
         }
     }
 
-    /// Creates a disabled guard that never blocks.
     pub(super) fn disabled() -> Self {
         Self {
             action: ResponseIpFilterAction::Block,
@@ -31,7 +30,6 @@ impl ResponseIpFilterGuard {
         }
     }
 
-    /// Returns the configured action for detected C2 IPs.
     pub(super) fn action(&self) -> ResponseIpFilterAction {
         self.action
     }

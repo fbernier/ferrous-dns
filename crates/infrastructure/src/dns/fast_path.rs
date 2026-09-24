@@ -1,3 +1,4 @@
+use super::wire_response::COOKIE_OPTION_CODE;
 use ferrous_dns_domain::RecordType;
 
 const MAX_DOMAIN_LEN: usize = 253;
@@ -72,8 +73,6 @@ impl FastPathQuery {
         Ok(cookie)
     }
 }
-
-const COOKIE_OPTION_CODE: u16 = 10;
 
 pub fn parse_query(buf: &[u8]) -> Option<FastPathQuery> {
     if buf.len() < 17 {

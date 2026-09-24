@@ -2,7 +2,7 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "ferrous-dns")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Ferrous DNS - High-performance DNS server with ad-blocking")]
 pub struct Cli {
     #[arg(short = 'c', long, value_name = "FILE")]

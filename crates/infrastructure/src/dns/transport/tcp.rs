@@ -1,174 +1,166 @@
-use super::{DnsTransport, TransportResponse};
-use async_trait::async_trait;
-use bytes::Buf;
-use dashmap::DashMap;
+use super::require_resolved;
+use bytes::{Buf, Bytes};
 use ferrous_dns_domain::{DomainError, UpstreamAddr};
 use std::net::SocketAddr;
-use std::sync::LazyLock;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{timeout_at, Instant};
 use tracing::debug;
 
-const MAX_TCP_MESSAGE_SIZE: usize = 65535;
 const MAX_IDLE_TCP_PER_HOST: usize = 12;
 
-type TcpConnectionPool = DashMap<UpstreamAddr, Vec<TcpStream>>;
+/// Idle connections to one upstream, handed out most recently parked first.
+pub(crate) struct IdlePool<S> {
+    idle: Mutex<Vec<S>>,
+    max: usize,
+}
 
-static TCP_POOL: LazyLock<TcpConnectionPool> = LazyLock::new(TcpConnectionPool::new);
+impl<S> IdlePool<S> {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            max,
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<S> {
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+    }
+
+    pub(crate) fn park(&self, stream: S) {
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle.len() < self.max {
+            idle.push(stream);
+        }
+    }
+}
 
 pub struct TcpTransport {
     upstream_addr: UpstreamAddr,
+    idle: IdlePool<TcpStream>,
 }
 
 impl TcpTransport {
     pub fn new(upstream_addr: UpstreamAddr) -> Self {
-        Self { upstream_addr }
-    }
-
-    fn resolved_addr(&self) -> Result<SocketAddr, DomainError> {
-        self.upstream_addr.socket_addr().ok_or_else(|| {
-            DomainError::IoError(format!(
-                "TCP transport requires resolved address, got: {}",
-                self.upstream_addr
-            ))
-        })
-    }
-
-    fn take_pooled(&self) -> Option<TcpStream> {
-        TCP_POOL.get_mut(&self.upstream_addr)?.pop()
-    }
-
-    fn return_to_pool(&self, stream: TcpStream) {
-        let mut entry = TCP_POOL.entry(self.upstream_addr.clone()).or_default();
-        if entry.len() < MAX_IDLE_TCP_PER_HOST {
-            entry.push(stream);
+        Self {
+            upstream_addr,
+            idle: IdlePool::new(MAX_IDLE_TCP_PER_HOST),
         }
     }
 
-    async fn connect_new(&self, timeout: Duration) -> Result<TcpStream, DomainError> {
-        let server_addr = self.resolved_addr()?;
-
-        let stream = tokio::time::timeout(timeout, TcpStream::connect(server_addr))
-            .await
-            .map_err(|_| {
-                DomainError::IoError(format!("Timeout connecting to TCP server {}", server_addr))
-            })?
-            .map_err(|e| {
-                DomainError::IoError(format!(
-                    "Connection refused by TCP server {}: {}",
-                    server_addr, e
-                ))
-            })?;
-
-        stream.set_nodelay(true).map_err(|e| {
-            DomainError::IoError(format!(
-                "Failed to set TCP_NODELAY on {}: {}",
-                server_addr, e
-            ))
-        })?;
-
-        let sock_ref = socket2::SockRef::from(&stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(15))
-            .with_interval(Duration::from_secs(5));
-        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-            debug!(server = %server_addr, error = %e, "Failed to set TCP keepalive");
-        }
-
-        Ok(stream)
-    }
-}
-
-#[async_trait]
-impl DnsTransport for TcpTransport {
-    async fn send(
+    pub async fn send(
         &self,
         message_bytes: &[u8],
         timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
-        let server_addr = self.resolved_addr()?;
+    ) -> Result<Bytes, DomainError> {
+        let server_addr = require_resolved(&self.upstream_addr, "TCP")?;
+        // One budget for the whole exchange, reconnect included.
+        let deadline = Instant::now() + timeout;
 
-        let mut stream = match self.take_pooled() {
-            Some(s) => s,
-            None => self.connect_new(timeout).await?,
-        };
-
-        let send_result = tokio::time::timeout(timeout, async {
-            send_with_length_prefix(&mut stream, message_bytes).await
-        })
-        .await;
-
-        let mut stream = match send_result {
-            Ok(Ok(())) => stream,
-            _ => {
-                let mut fresh = self.connect_new(timeout).await?;
-                tokio::time::timeout(timeout, send_with_length_prefix(&mut fresh, message_bytes))
-                    .await
-                    .map_err(|_| {
-                        DomainError::IoError(format!(
-                            "Timeout sending TCP query to {}",
-                            server_addr
-                        ))
-                    })?
-                    .map_err(|e| {
-                        DomainError::IoError(format!(
-                            "Failed to send TCP query to {}: {}",
-                            server_addr, e
-                        ))
-                    })?;
-                fresh
+        if let Some(mut stream) = self.idle.take() {
+            match exchange_framed(&mut stream, message_bytes, deadline, server_addr, "TCP").await {
+                Ok(response) => {
+                    self.idle.park(stream);
+                    return Ok(Bytes::from(response));
+                }
+                Err(e) if Instant::now() >= deadline => return Err(e),
+                // Servers close idle connections (RFC 7766 §6.2.3), and the write
+                // into a half-closed one still succeeds; only the read fails.
+                Err(e) => {
+                    debug!(server = %server_addr, error = %e, "Pooled TCP connection stale, reconnecting");
+                }
             }
-        };
+        }
 
+        let mut stream = connect_tcp(server_addr, deadline, "TCP").await?;
+        let response =
+            exchange_framed(&mut stream, message_bytes, deadline, server_addr, "TCP").await?;
         debug!(
             server = %server_addr,
-            message_len = message_bytes.len(),
-            "TCP query sent"
+            response_len = response.len(),
+            "TCP response received"
         );
+        self.idle.park(stream);
+        Ok(Bytes::from(response))
+    }
+}
 
-        let response_bytes = tokio::time::timeout(timeout, async {
-            read_with_length_prefix(&mut stream).await
-        })
+/// Connects to `server` with `TCP_NODELAY`, so a query on a reused connection
+/// does not wait for the ACK of the previous one, and keepalive.
+pub(crate) async fn connect_tcp(
+    server: SocketAddr,
+    deadline: Instant,
+    label: &str,
+) -> Result<TcpStream, DomainError> {
+    let stream = timeout_at(deadline, TcpStream::connect(server))
+        .await
+        .map_err(|_| {
+            DomainError::IoError(format!("Timeout connecting to {label} server {server}"))
+        })?
+        .map_err(|e| {
+            DomainError::IoError(format!(
+                "Connection refused by {label} server {server}: {e}"
+            ))
+        })?;
+
+    stream
+        .set_nodelay(true)
+        .map_err(|e| DomainError::IoError(format!("Failed to set TCP_NODELAY on {server}: {e}")))?;
+
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(15))
+        .with_interval(Duration::from_secs(5));
+    if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+        debug!(server = %server, error = %e, "Failed to set TCP keepalive");
+    }
+
+    Ok(stream)
+}
+
+/// Writes one length-prefixed query and reads the length-prefixed answer, both
+/// before `deadline`.
+pub(crate) async fn exchange_framed<S>(
+    stream: &mut S,
+    message_bytes: &[u8],
+    deadline: Instant,
+    server: SocketAddr,
+    label: &str,
+) -> Result<Vec<u8>, DomainError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    timeout_at(deadline, send_with_length_prefix(stream, message_bytes))
+        .await
+        .map_err(|_| {
+            DomainError::IoError(format!("Timeout sending {label} query to {server}"))
+        })??;
+
+    timeout_at(deadline, read_with_length_prefix(stream))
         .await
         .map_err(|_| {
             DomainError::IoError(format!(
-                "Timeout waiting for TCP response from {}",
-                server_addr
+                "Timeout waiting for {label} response from {server}"
             ))
-        })??;
-
-        debug!(
-            server = %server_addr,
-            response_len = response_bytes.len(),
-            "TCP response received"
-        );
-
-        self.return_to_pool(stream);
-
-        Ok(TransportResponse {
-            bytes: bytes::Bytes::from(response_bytes),
-            protocol_used: "TCP",
-        })
-    }
-
-    fn protocol_name(&self) -> &'static str {
-        "TCP"
-    }
+        })?
 }
 
 pub(crate) async fn send_with_length_prefix<S>(
     stream: &mut S,
-    message_bytes: &[u8],
+    message: impl Buf,
 ) -> Result<(), DomainError>
 where
-    S: AsyncWriteExt + Unpin,
+    S: AsyncWrite + Unpin,
 {
-    let length_bytes = (message_bytes.len() as u16).to_be_bytes();
+    let length_bytes = (message.remaining() as u16).to_be_bytes();
 
     // One vectored write keeps the prefix and query in one segment or TLS record.
     stream
-        .write_all_buf(&mut Buf::chain(&length_bytes[..], message_bytes))
+        .write_all_buf(&mut Buf::chain(&length_bytes[..], message))
         .await
         .map_err(|e| DomainError::IoError(format!("Failed to write DNS message: {}", e)))?;
     stream
@@ -181,7 +173,7 @@ where
 
 pub(crate) async fn read_with_length_prefix<S>(stream: &mut S) -> Result<Vec<u8>, DomainError>
 where
-    S: AsyncReadExt + Unpin,
+    S: AsyncRead + Unpin,
 {
     let mut len_buf = [0u8; 2];
     stream
@@ -189,15 +181,7 @@ where
         .await
         .map_err(|e| DomainError::IoError(format!("Failed to read response length: {}", e)))?;
 
-    let response_len = u16::from_be_bytes(len_buf) as usize;
-
-    if response_len > MAX_TCP_MESSAGE_SIZE {
-        return Err(DomainError::IoError(format!(
-            "Response too large: {} bytes (max {})",
-            response_len, MAX_TCP_MESSAGE_SIZE
-        )));
-    }
-
+    let response_len = usize::from(u16::from_be_bytes(len_buf));
     let mut response = vec![0u8; response_len];
     stream
         .read_exact(&mut response)

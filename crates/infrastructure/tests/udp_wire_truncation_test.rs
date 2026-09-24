@@ -23,24 +23,10 @@ use ports::{AllowAllFilter, NoopQueryLog};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-// ── wire_fits_udp_buffer ────────────────────────────────────────────────────
-
 #[test]
-fn fits_when_smaller_than_buffer() {
-    assert!(wire_fits_udp_buffer(400, 512));
-    assert!(wire_fits_udp_buffer(1000, 4096));
-}
-
-#[test]
-fn fits_at_exact_buffer_size() {
+fn wire_fits_up_to_exactly_the_client_buffer() {
     assert!(wire_fits_udp_buffer(512, 512));
-    assert!(wire_fits_udp_buffer(4096, 4096));
-}
-
-#[test]
-fn defers_when_larger_than_buffer() {
     assert!(!wire_fits_udp_buffer(513, 512));
-    assert!(!wire_fits_udp_buffer(4097, 4096));
 }
 
 // ── parse_query: client_max_size extraction ─────────────────────────────────

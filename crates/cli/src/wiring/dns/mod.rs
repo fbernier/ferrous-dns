@@ -26,7 +26,7 @@ use ferrous_dns_jobs::{
     DEFAULT_REFRESH_INTERVAL_SECS,
 };
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::Repositories;
 
@@ -34,14 +34,16 @@ pub struct DnsServices {
     pub cache: Arc<DnsCache>,
     pub handler_use_case: Arc<HandleDnsQueryUseCase>,
     pub pool_manager: Arc<PoolManager>,
-    pub dnssec_pool_manager: Arc<PoolManager>,
+    /// Pool manager the DNSSEC validator walks the chain of trust on; absent
+    /// when validation is off.
+    pub dnssec_pool_manager: Option<Arc<PoolManager>>,
     /// Live counters from the DNSSEC validator cache. Reports zeros when DNSSEC
     /// validation is disabled.
     pub dnssec_stats: Arc<dyn DnssecStatsPort>,
     /// Pool manager backing the cache optimistic-refresh resolver, when that
     /// path is enabled. Kept so hot upstream reloads also reach it.
     pub maintenance_pool_manager: Option<Arc<PoolManager>>,
-    pub health_checker: Option<Arc<HealthChecker>>,
+    pub health_checker: Arc<HealthChecker>,
     pub cache_maintenance: Option<Arc<dyn CacheMaintenancePort>>,
     pub ptr_registry: Option<Arc<dyn PtrRecordRegistry>>,
     /// Live wildcard index. Always present, even with no wildcard configured,
@@ -50,10 +52,6 @@ pub struct DnsServices {
     pub tcp_conn_limiter: ConnectionLimiter,
     pub dot_conn_limiter: ConnectionLimiter,
     pub doq_conn_limiter: ConnectionLimiter,
-    pub tunneling_eviction_job: Option<TunnelingEvictionJob>,
-    pub nxdomain_hijack_eviction_job: Option<NxdomainHijackEvictionJob>,
-    pub response_ip_filter_eviction_job: Option<ResponseIpFilterEvictionJob>,
-    pub dga_eviction_job: Option<DgaEvictionJob>,
 }
 
 impl DnsServices {
@@ -62,30 +60,27 @@ impl DnsServices {
         tsc_timer::init();
 
         let health_checker = pool::setup_health_checker(config);
-        let pool_manager = pool::setup_pool_manager(config, health_checker.clone()).await?;
-
-        pool::start_health_checker_task(health_checker.clone(), &pool_manager, config);
-        let stored_health_checker = health_checker.clone();
+        let pool_manager = pool::setup_pool_manager(config, &health_checker).await?;
+        pool::start_health_checker_task(Arc::clone(&health_checker), &pool_manager, config);
 
         let timeout_ms = config.dns.query_timeout * 1000;
-        let pool_manager_clone = Arc::clone(&pool_manager);
 
         // The DNSSEC validator walks the chain of trust on its own pool manager.
         // It needs its own health checker + probe task, otherwise its upstreams
         // are never marked healthy and every chain lookup fails "unreachable" —
         // which would make Strict mode SERVFAIL even correctly-signed domains.
-        let dnssec_health_checker = pool::setup_health_checker(config);
-        let pool_manager_for_dnssec = Arc::new(
-            PoolManager::new(config.dns.pools.clone(), dnssec_health_checker.clone())
-                .await?
-                .with_hardening(pool::hardening_opts(config)),
-        );
-        pool::start_health_checker_task(dnssec_health_checker, &pool_manager_for_dnssec, config);
-        let dnssec_pool_manager_clone = Arc::clone(&pool_manager_for_dnssec);
+        let dnssec_pool_manager = if config.dns.effective_dnssec_mode().validates() {
+            let dnssec_health_checker = pool::setup_health_checker(config);
+            let manager = pool::setup_pool_manager(config, &dnssec_health_checker).await?;
+            pool::start_health_checker_task(dnssec_health_checker, &manager, config);
+            Some(manager)
+        } else {
+            None
+        };
 
         let (mut dns_resolver, dnssec_cache) = resolver::build_resolver(
-            pool_manager,
-            pool_manager_for_dnssec,
+            Arc::clone(&pool_manager),
+            dnssec_pool_manager.clone(),
             config,
             repos,
             timeout_ms,
@@ -102,14 +97,9 @@ impl DnsServices {
                 .with_cache(dns_cache.clone(), config.dns.cache_ttl);
         }
 
-        let (cache_maintenance, maintenance_pool_manager) = Self::setup_cache_maintenance(
-            config,
-            &dns_cache,
-            stored_health_checker.clone(),
-            timeout_ms,
-            repos,
-        )
-        .await?;
+        let (cache_maintenance, maintenance_pool_manager) =
+            Self::setup_cache_maintenance(config, &dns_cache, &health_checker, timeout_ms, repos)
+                .await?;
 
         let ptr_registry: Option<Arc<dyn PtrRecordRegistry>> =
             if !config.dns.local_records.is_empty() {
@@ -126,7 +116,7 @@ impl DnsServices {
 
                 let dummy_inner: Arc<dyn ferrous_dns_application::ports::DnsResolver> =
                     Arc::new(HickoryDnsResolver::new_with_pools(
-                        pool_manager_clone.clone(),
+                        Arc::clone(&pool_manager),
                         timeout_ms,
                         false,
                         None,
@@ -164,17 +154,16 @@ impl DnsServices {
             );
         }
 
-        // DNS Tunneling Detection
-        let (tunneling_detector, tunneling_eviction_job) = if config.dns.tunneling_detection.enabled
-        {
+        let tunneling_detector = if config.dns.tunneling_detection.enabled {
             let (detector, tx, rx) = TunnelingDetector::new(&config.dns.tunneling_detection);
             let detector = Arc::new(detector);
             let detector_clone = Arc::clone(&detector);
             tokio::spawn(async move { detector_clone.run_analysis_loop(rx).await });
-            let eviction_job = TunnelingEvictionJob::new(
+            TunnelingEvictionJob::new(
                 Arc::clone(&detector) as Arc<dyn TunnelingEvictionTarget>,
                 detector.stale_entry_ttl_secs(),
-            );
+            )
+            .spawn();
             info!(
                 action = ?config.dns.tunneling_detection.action,
                 "DNS tunneling detection enabled"
@@ -182,39 +171,35 @@ impl DnsServices {
             if config.dns.tunneling_detection.action
                 == ferrous_dns_domain::TunnelingAction::Throttle
             {
-                tracing::warn!(
-                    "Tunneling action 'throttle' is not yet implemented — treating as 'alert'"
-                );
+                warn!("Tunneling action 'throttle' is not yet implemented — treating as 'alert'");
             }
-            (Some((detector, tx)), Some(eviction_job))
+            Some((detector, tx))
         } else {
-            (None, None)
+            None
         };
 
-        // NXDomain Hijack Detection
-        let (nxdomain_hijack_detector, nxdomain_hijack_eviction_job) =
-            if config.dns.nxdomain_hijack.enabled {
-                let detector = Arc::new(NxdomainHijackDetector::new(&config.dns.nxdomain_hijack));
-                let protocols = pool_manager_clone.get_all_arc_protocols();
-                let detector_clone = Arc::clone(&detector);
-                tokio::spawn(async move {
-                    detector_clone.run_probe_loop(protocols).await;
-                });
-                // Evict at twice the probe frequency so stale IPs are cleaned
-                // before the TTL fully expires.
-                let eviction_interval = config.dns.nxdomain_hijack.hijack_ip_ttl_secs / 2;
-                let eviction_job = NxdomainHijackEvictionJob::new(
-                    Arc::clone(&detector) as Arc<dyn NxdomainHijackProbeTarget>,
-                    eviction_interval,
-                );
-                info!(
-                    action = ?config.dns.nxdomain_hijack.action,
-                    "NXDomain hijack detection enabled"
-                );
-                (Some(detector), Some(eviction_job))
-            } else {
-                (None, None)
-            };
+        let nxdomain_hijack_detector = if config.dns.nxdomain_hijack.enabled {
+            let detector = Arc::new(NxdomainHijackDetector::new(&config.dns.nxdomain_hijack));
+            let protocols = pool_manager.get_all_arc_protocols();
+            let detector_clone = Arc::clone(&detector);
+            tokio::spawn(async move {
+                detector_clone.run_probe_loop(protocols).await;
+            });
+            // Evict at twice the probe frequency so stale IPs are cleaned
+            // before the TTL fully expires.
+            NxdomainHijackEvictionJob::new(
+                Arc::clone(&detector) as Arc<dyn NxdomainHijackProbeTarget>,
+                config.dns.nxdomain_hijack.hijack_ip_ttl_secs / 2,
+            )
+            .spawn();
+            info!(
+                action = ?config.dns.nxdomain_hijack.action,
+                "NXDomain hijack detection enabled"
+            );
+            Some(detector)
+        } else {
+            None
+        };
 
         let mut handler = HandleDnsQueryUseCase::new(
             resolver.clone(),
@@ -235,32 +220,27 @@ impl DnsServices {
         .with_dnssec_enforcement(config.dns.effective_dnssec_mode().enforces())
         .with_query_logging(config.database.log_queries);
 
-        // DNS64 query-log tagging: only when enabled with a valid /96 prefix.
         if config.dns64.enabled {
             if let Some(prefix) = config.dns64.parsed_prefix() {
                 handler = handler.with_dns64(prefix);
             }
         }
 
-        if let Some((ref detector, ref tx)) = tunneling_detector {
+        if let Some((detector, tx)) = &tunneling_detector {
             handler = handler
                 .with_tunneling_detection(&config.dns.tunneling_detection)
                 .with_tunneling_event_sender(tx.clone())
                 .with_tunneling_flag_store(Arc::clone(detector) as Arc<dyn TunnelingFlagStore>);
         }
 
-        if let Some(ref detector) = nxdomain_hijack_detector {
+        if let Some(detector) = &nxdomain_hijack_detector {
             handler = handler.with_nxdomain_hijack_detection(
                 &config.dns.nxdomain_hijack,
                 Arc::clone(detector) as Arc<dyn NxdomainHijackIpStore>,
             );
         }
 
-        // Response IP Filtering (C2 IP blocking)
-        let (response_ip_filter_detector, response_ip_filter_eviction_job) = if config
-            .dns
-            .response_ip_filter
-            .enabled
+        let response_ip_filter_detector = if config.dns.response_ip_filter.enabled
             && !config.dns.response_ip_filter.ip_list_urls.is_empty()
         {
             let detector = Arc::new(ResponseIpFilterDetector::new(
@@ -278,64 +258,64 @@ impl DnsServices {
             tokio::spawn(async move {
                 detector_clone.run_fetch_loop(http_client).await;
             });
-            let eviction_job = ResponseIpFilterEvictionJob::new(
+            ResponseIpFilterEvictionJob::new(
                 Arc::clone(&detector) as Arc<dyn ResponseIpFilterEvictionTarget>,
                 config.dns.response_ip_filter.ip_ttl_secs / 2,
-            );
+            )
+            .spawn();
             if config.dns.response_ip_filter.ip_ttl_secs
                 < config.dns.response_ip_filter.refresh_interval_secs
             {
-                tracing::warn!(
-                        ip_ttl_secs = config.dns.response_ip_filter.ip_ttl_secs,
-                        refresh_interval_secs = config.dns.response_ip_filter.refresh_interval_secs,
-                        "ip_ttl_secs < refresh_interval_secs — IPs will be evicted before the next feed refresh"
-                    );
+                warn!(
+                    ip_ttl_secs = config.dns.response_ip_filter.ip_ttl_secs,
+                    refresh_interval_secs = config.dns.response_ip_filter.refresh_interval_secs,
+                    "ip_ttl_secs < refresh_interval_secs — IPs will be evicted before the next feed refresh"
+                );
             }
             info!(
                 action = ?config.dns.response_ip_filter.action,
                 "Response IP filtering enabled"
             );
-            (Some(detector), Some(eviction_job))
+            Some(detector)
         } else {
-            (None, None)
+            None
         };
 
-        if let Some(ref detector) = response_ip_filter_detector {
+        if let Some(detector) = &response_ip_filter_detector {
             handler = handler.with_response_ip_filter(
                 &config.dns.response_ip_filter,
                 Arc::clone(detector) as Arc<dyn ResponseIpFilterStore>,
             );
         }
 
-        // DGA Detection
-        let (dga_detector, dga_eviction_job) = if config.dns.dga_detection.enabled {
+        let dga_detector = if config.dns.dga_detection.enabled {
             let (detector, tx, rx) = DgaDetector::new(&config.dns.dga_detection);
             let detector = Arc::new(detector);
             let detector_clone = Arc::clone(&detector);
             tokio::spawn(async move { detector_clone.run_analysis_loop(rx).await });
-            let eviction_job = DgaEvictionJob::new(
+            DgaEvictionJob::new(
                 Arc::clone(&detector) as Arc<dyn DgaEvictionTarget>,
                 detector.stale_entry_ttl_secs(),
-            );
+            )
+            .spawn();
             info!(
                 action = ?config.dns.dga_detection.action,
                 "DGA detection enabled"
             );
-            (Some((detector, tx)), Some(eviction_job))
+            Some((detector, tx))
         } else {
-            (None, None)
+            None
         };
 
-        if let Some((ref detector, ref tx)) = dga_detector {
+        if let Some((detector, tx)) = &dga_detector {
             handler = handler
                 .with_dga_detection(&config.dns.dga_detection)
                 .with_dga_event_sender(tx.clone())
                 .with_dga_flag_store(Arc::clone(detector) as Arc<dyn DgaFlagStore>);
         }
 
-        // DNS Cookies (RFC 7873)
         if config.dns.dns_cookies.enabled {
-            let secret = resolve_cookie_secret(&config.dns.dns_cookies);
+            let secret = resolve_cookie_secret(&config.dns.dns_cookies)?;
             let cookie_guard = DnsCookieGuard::from_config(&config.dns.dns_cookies, secret);
             handler = handler.with_dns_cookies(cookie_guard);
             info!(
@@ -358,28 +338,24 @@ impl DnsServices {
         Ok(Self {
             cache: dns_cache,
             handler_use_case,
-            pool_manager: pool_manager_clone,
-            dnssec_pool_manager: dnssec_pool_manager_clone,
+            pool_manager,
+            dnssec_pool_manager,
             dnssec_stats,
             maintenance_pool_manager,
-            health_checker: stored_health_checker,
+            health_checker,
             cache_maintenance,
             ptr_registry,
             wildcard_registry,
             tcp_conn_limiter,
             dot_conn_limiter,
             doq_conn_limiter,
-            tunneling_eviction_job,
-            nxdomain_hijack_eviction_job,
-            response_ip_filter_eviction_job,
-            dga_eviction_job,
         })
     }
 
     async fn setup_cache_maintenance(
         config: &Config,
         cache: &Arc<DnsCache>,
-        health_checker: Option<Arc<HealthChecker>>,
+        health_checker: &Arc<HealthChecker>,
         timeout_ms: u64,
         repos: &Repositories,
     ) -> anyhow::Result<(
@@ -418,17 +394,11 @@ impl DnsServices {
             min_frequency: config.dns.cache_min_frequency,
         };
 
-        let pool_manager_for_maintenance = Arc::new(
-            PoolManager::new(config.dns.pools.clone(), health_checker)
-                .await?
-                .with_hardening(pool::hardening_opts(config)),
-        );
-        // Keep a handle so hot upstream reloads also reach this resolver.
-        let maintenance_pool_manager = Arc::clone(&pool_manager_for_maintenance);
-
+        // Returned too, so hot upstream reloads also reach this resolver.
+        let maintenance_pool_manager = pool::setup_pool_manager(config, health_checker).await?;
         let resolver_for_maintenance: Arc<dyn ferrous_dns_application::ports::DnsResolver> =
             Arc::new(HickoryDnsResolver::new_with_pools(
-                pool_manager_for_maintenance,
+                Arc::clone(&maintenance_pool_manager),
                 timeout_ms,
                 false,
                 None,
@@ -456,33 +426,72 @@ impl DnsServices {
     }
 }
 
-fn resolve_cookie_secret(config: &ferrous_dns_domain::DnsCookiesConfig) -> [u8; 32] {
+/// The DNS Cookie server secret: the configured 64-hex-digit value, or a fresh
+/// random one when none is set.
+fn resolve_cookie_secret(
+    config: &ferrous_dns_domain::DnsCookiesConfig,
+) -> anyhow::Result<[u8; 32]> {
+    let mut secret = [0u8; 32];
     if config.server_secret.is_empty() {
         use ring::rand::SecureRandom;
-        let rng = ring::rand::SystemRandom::new();
-        let mut bytes = [0u8; 32];
-        rng.fill(&mut bytes)
-            .expect("system RNG failure while generating DNS cookie secret");
-        tracing::warn!(
+        ring::rand::SystemRandom::new()
+            .fill(&mut secret)
+            .map_err(|_| anyhow::anyhow!("system RNG failed to generate the DNS cookie secret"))?;
+        warn!(
             "dns_cookies.server_secret is not set — using ephemeral secret \
              (will not survive restart; set a 64-hex-char value in config)"
         );
-        bytes
-    } else {
-        let hex = config.server_secret.trim();
-        assert!(
-            hex.len() == 64,
-            "dns_cookies.server_secret must be exactly 64 hex characters (32 bytes), got {}",
-            hex.len()
-        );
-        let mut bytes = [0u8; 32];
-        for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-            bytes[i] = u8::from_str_radix(
-                std::str::from_utf8(chunk).expect("server_secret contains non-UTF8"),
-                16,
-            )
-            .expect("dns_cookies.server_secret contains invalid hex characters");
+        return Ok(secret);
+    }
+
+    let hex = config.server_secret.trim().as_bytes();
+    anyhow::ensure!(
+        hex.len() == 64,
+        "dns_cookies.server_secret must be exactly 64 hex characters (32 bytes), got {}",
+        hex.len()
+    );
+    let digit = |b: u8| char::from(b).to_digit(16);
+    for (byte, pair) in secret.iter_mut().zip(hex.chunks_exact(2)) {
+        let (Some(high), Some(low)) = (digit(pair[0]), digit(pair[1])) else {
+            anyhow::bail!("dns_cookies.server_secret contains invalid hex characters");
+        };
+        *byte = (high << 4 | low) as u8;
+    }
+    Ok(secret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrous_dns_domain::DnsCookiesConfig;
+
+    fn with_secret(secret: &str) -> DnsCookiesConfig {
+        DnsCookiesConfig {
+            server_secret: secret.to_string(),
+            ..DnsCookiesConfig::default()
         }
-        bytes
+    }
+
+    #[test]
+    fn configured_cookie_secret_is_decoded() {
+        let hex = format!("  {}  ", "0fA1".repeat(16));
+        let secret = resolve_cookie_secret(&with_secret(&hex)).unwrap();
+        assert_eq!(secret[..2], [0x0f, 0xa1]);
+        assert_eq!(secret[30..], [0x0f, 0xa1]);
+    }
+
+    #[test]
+    fn malformed_cookie_secrets_are_errors_not_panics() {
+        for bad in [
+            "abc".to_string(),
+            "zz".repeat(32),
+            "+f".repeat(32),
+            format!("{}é", "a".repeat(62)),
+        ] {
+            assert!(
+                resolve_cookie_secret(&with_secret(&bad)).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
     }
 }

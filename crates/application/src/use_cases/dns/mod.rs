@@ -1,6 +1,7 @@
 pub mod coarse_timer;
 mod cookie_guard;
 mod dga_guard;
+mod guard_whitelist;
 pub mod handle_dns_query;
 mod nxdomain_hijack_guard;
 pub mod rate_limiter;

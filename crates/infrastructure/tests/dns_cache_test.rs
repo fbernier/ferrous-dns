@@ -1,8 +1,6 @@
 use ferrous_dns_domain::RecordType;
 use ferrous_dns_infrastructure::dns::cache::coarse_clock;
-use ferrous_dns_infrastructure::dns::cache::eviction::{
-    EvictionPolicy, HitRatePolicy, LfuPolicy, LfukPolicy, LruPolicy,
-};
+use ferrous_dns_infrastructure::dns::cache::eviction::ActiveEvictionPolicy;
 use ferrous_dns_infrastructure::dns::{
     CachedAddresses, CachedData, CachedDnssecStatus, CachedRecord, DnsCache, DnsCacheConfig,
     EvictionStrategy, RefreshScanOptions,
@@ -118,64 +116,6 @@ fn test_cache_insert_and_get_basic() {
     let result = cache.get(&Arc::from("example.com"), &RecordType::A);
     assert!(result.is_some());
     assert_eq!(cache.len(), 1);
-}
-
-#[test]
-fn test_cache_creation_with_min_frequency() {
-    let cache = create_cache(100, EvictionStrategy::LFU, 10, 0.0);
-
-    cache.insert(
-        "test.com",
-        RecordType::A,
-        make_ip_data("10.0.0.1"),
-        300,
-        None,
-    );
-
-    let result = cache.get(&Arc::from("test.com"), &RecordType::A);
-    assert!(result.is_some());
-    assert_eq!(cache.strategy(), EvictionStrategy::LFU);
-}
-
-#[test]
-fn test_cache_creation_with_min_lfuk_score() {
-    let cache = create_cache(100, EvictionStrategy::LFUK, 0, 1.5);
-
-    cache.insert(
-        "test.com",
-        RecordType::A,
-        make_ip_data("10.0.0.1"),
-        300,
-        None,
-    );
-
-    let result = cache.get(&Arc::from("test.com"), &RecordType::A);
-    assert!(result.is_some());
-    assert_eq!(cache.strategy(), EvictionStrategy::LFUK);
-}
-
-#[test]
-fn test_cache_eviction_strategy_selection() {
-    let strategies = vec![
-        EvictionStrategy::LRU,
-        EvictionStrategy::HitRate,
-        EvictionStrategy::LFU,
-        EvictionStrategy::LFUK,
-    ];
-
-    for strategy in strategies {
-        let cache = create_cache(10, strategy, 5, 1.0);
-        assert_eq!(cache.strategy(), strategy);
-
-        cache.insert(
-            "test.com",
-            RecordType::A,
-            make_ip_data("1.1.1.1"),
-            300,
-            None,
-        );
-        assert_eq!(cache.len(), 1);
-    }
 }
 
 #[test]
@@ -506,16 +446,6 @@ fn test_refresh_record_returns_false_for_missing_entry() {
         !result,
         "refresh_record deve retornar false para entrada inexistente"
     );
-}
-
-#[test]
-fn test_access_window_secs_getter() {
-    // Verifica que o getter access_window_secs() retorna o valor correto.
-    let cache = create_refresh_cache(3600);
-    assert_eq!(cache.access_window_secs(), 3600);
-
-    let cache2 = create_refresh_cache(86400);
-    assert_eq!(cache2.access_window_secs(), 86400);
 }
 
 // ─── Testes do piso de antecedência (min_lead_secs) ──────────────────────────
@@ -878,29 +808,6 @@ fn test_refresh_record_rebases_the_hit_rate_window() {
     );
 }
 
-// ─── Testes de refactoring SOLID das estratégias de eviction ─────────────────
-
-/// strategy() retorna a estratégia correta após o refactoring para ActiveEvictionPolicy.
-#[test]
-fn test_strategy_method_returns_correct_strategy_after_refactoring() {
-    let cases = [
-        (EvictionStrategy::LRU, 0u64, 0.0f64),
-        (EvictionStrategy::HitRate, 0, 0.0),
-        (EvictionStrategy::LFU, 5, 0.0),
-        (EvictionStrategy::LFUK, 0, 1.5),
-    ];
-
-    for (strategy, min_freq, min_score) in cases {
-        let cache = create_cache(10, strategy, min_freq, min_score);
-        assert_eq!(
-            cache.strategy(),
-            strategy,
-            "strategy() deve retornar {:?} após refactoring",
-            strategy
-        );
-    }
-}
-
 /// LRU: entradas acessadas recentemente sobrevivem; menos recentes são evictadas.
 /// Usa coarse_clock::tick() + sleep para garantir timestamps distintos entre inserção e acesso.
 #[test]
@@ -1112,42 +1019,6 @@ fn test_lfu_negative_score_below_min_frequency_leads_to_eviction() {
             .is_some(),
         "high.com com hits acima de min_frequency deve sobreviver"
     );
-}
-
-/// Verifica que access_window_secs() retorna corretamente após o refactoring.
-#[test]
-fn test_access_window_preserved_in_refactored_cache() {
-    for strategy in [
-        EvictionStrategy::LRU,
-        EvictionStrategy::HitRate,
-        EvictionStrategy::LFU,
-        EvictionStrategy::LFUK,
-    ] {
-        let cache = DnsCache::new(DnsCacheConfig {
-            max_entries: 10,
-            eviction_strategy: strategy,
-            min_threshold: 0.0,
-            refresh_threshold: 0.75,
-            batch_eviction_percentage: 0.2,
-            adaptive_thresholds: false,
-            min_frequency: 0,
-            min_lfuk_score: 0.0,
-            shard_amount: 4,
-            access_window_secs: 1800,
-            eviction_sample_size: 8,
-            lfuk_k_value: 0.5,
-            refresh_sample_rate: 1.0,
-            min_ttl: 0,
-            max_ttl: 86_400,
-        });
-
-        assert_eq!(
-            cache.access_window_secs(),
-            1800,
-            "access_window_secs deve ser preservado para estratégia {:?}",
-            strategy
-        );
-    }
 }
 
 /// Single-scan eviction: inserir N+X entradas, verificar que exatamente N são removidas.
@@ -1423,49 +1294,16 @@ fn test_compact_retains_valid_entries() {
 
 // ─── Testes de eviction policies ─────────────────────────────────────────────
 
-fn make_record_with_hits(hits: u64) -> CachedRecord {
-    let record = CachedRecord::new(
-        CachedData::IpAddresses(CachedAddresses {
-            addresses: Arc::new(vec!["1.1.1.1".parse::<IpAddr>().unwrap()]),
-        }),
-        300,
-        RecordType::A,
-        Some(CachedDnssecStatus::Unknown),
-    );
-    for _ in 0..hits {
-        record.record_hit();
-    }
-    record
-}
-
-#[test]
-fn test_lru_score_is_last_access_timestamp() {
-    let cache = DnsCache::new(DnsCacheConfig {
-        max_entries: 10,
-        eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 0.0,
-        refresh_threshold: 0.75,
-        batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
-        min_frequency: 0,
-        min_lfuk_score: 0.0,
-        shard_amount: 4,
-        access_window_secs: 7200,
-        eviction_sample_size: 8,
-        lfuk_k_value: 0.5,
-        refresh_sample_rate: 1.0,
-        min_ttl: 0,
-        max_ttl: 86_400,
-    });
-
-    coarse_clock::tick();
-    cache.insert("a.com", RecordType::A, make_ip_data("1.1.1.1"), 300, None);
-    let _ = cache.get(&Arc::from("a.com"), &RecordType::A);
-
-    let policy = LruPolicy;
-    let result = cache.get(&Arc::from("a.com"), &RecordType::A);
-    assert!(result.is_some(), "Entrada deve existir");
-    let _ = policy;
+/// Scores an entry that was inserted and last read at `now_secs`.
+fn score_at(
+    strategy: EvictionStrategy,
+    min_frequency: u64,
+    min_lfuk_score: f64,
+    hits: u64,
+    now_secs: u64,
+) -> f64 {
+    ActiveEvictionPolicy::from_config(strategy, min_frequency, min_lfuk_score, 0.5)
+        .score(hits, now_secs, now_secs, now_secs)
 }
 
 #[test]
@@ -1505,16 +1343,8 @@ fn test_lru_evicts_least_recently_used() {
 
 #[test]
 fn test_hit_rate_score_increases_with_hits() {
-    let policy = HitRatePolicy;
-    let r0 = make_record_with_hits(0);
-    let r1 = make_record_with_hits(1);
-    let r10 = make_record_with_hits(10);
-    let r100 = make_record_with_hits(100);
-
-    let s0 = policy.compute_score(&r0, 0);
-    let s1 = policy.compute_score(&r1, 0);
-    let s10 = policy.compute_score(&r10, 0);
-    let s100 = policy.compute_score(&r100, 0);
+    let score = |hits| score_at(EvictionStrategy::HitRate, 0, 0.0, hits, 0);
+    let (s0, s1, s10, s100) = (score(0), score(1), score(10), score(100));
 
     assert!(s0 < s1, "0 hits deve ter score menor que 1 hit");
     assert!(s1 < s10, "1 hit deve ter score menor que 10 hits");
@@ -1523,34 +1353,31 @@ fn test_hit_rate_score_increases_with_hits() {
 
 #[test]
 fn test_hit_rate_score_is_bounded_between_zero_and_one() {
-    let policy = HitRatePolicy;
-    let r0 = make_record_with_hits(0);
-    let r_big = make_record_with_hits(1_000_000);
+    let s0 = score_at(EvictionStrategy::HitRate, 0, 0.0, 0, 0);
+    let s_big = score_at(EvictionStrategy::HitRate, 0, 0.0, 1_000_000, 0);
 
-    let s0 = policy.compute_score(&r0, 0);
-    let s_big = policy.compute_score(&r_big, 0);
-
-    assert!(s0 >= 0.0, "Score deve ser >= 0");
+    assert_eq!(s0, 0.0, "0 hits scores exactly zero");
     assert!(s_big < 1.0, "Score deve ser < 1.0 (bounded)");
     assert!(s_big >= 0.0, "Score não pode ser negativo em HitRate");
 }
 
 #[test]
-fn test_hit_rate_score_zero_hits() {
-    let policy = HitRatePolicy;
-    let record = make_record_with_hits(0);
-    let score = policy.compute_score(&record, 0);
-    assert_eq!(score, 0.0);
+fn test_hit_rate_score_decays_with_idle_time() {
+    let policy = ActiveEvictionPolicy::from_config(EvictionStrategy::HitRate, 0, 0.0, 0.5);
+    let fresh = policy.score(10, 1_000, 1_000, 1_000);
+    let idle = policy.score(10, 1_000, 1_000, 1_100);
+    assert!(idle < fresh, "an idle entry must score below a fresh one");
+}
+
+#[test]
+fn test_lru_score_is_last_access() {
+    let policy = ActiveEvictionPolicy::from_config(EvictionStrategy::LRU, 0, 0.0, 0.5);
+    assert!(policy.score(1_000, 10, 0, 50) < policy.score(0, 20, 0, 50));
 }
 
 #[test]
 fn test_lfuk_score_zero_hits_returns_bootstrap_score() {
-    let policy = LfukPolicy {
-        min_lfuk_score: 1.5,
-        k_value: 0.5,
-    };
-    let record = make_record_with_hits(0);
-    let score = policy.compute_score(&record, 1_000_000);
+    let score = score_at(EvictionStrategy::LFUK, 0, 1.5, 0, 1_000_000);
     assert_eq!(
         score, 1.5,
         "Entries com hits=0 devem receber bootstrap score igual a min_lfuk_score"
@@ -1559,12 +1386,7 @@ fn test_lfuk_score_zero_hits_returns_bootstrap_score() {
 
 #[test]
 fn test_lfuk_score_below_min_is_negative_after_first_hit() {
-    let policy = LfukPolicy {
-        min_lfuk_score: 100.0,
-        k_value: 0.5,
-    };
-    let record = make_record_with_hits(1);
-    let score = policy.compute_score(&record, 1_000_000);
+    let score = score_at(EvictionStrategy::LFUK, 0, 100.0, 1, 1_000_000);
     assert!(
         score < 0.0,
         "Entry com poucos hits e alto min_lfuk_score deve ter score negativo: {}",
@@ -1574,28 +1396,16 @@ fn test_lfuk_score_below_min_is_negative_after_first_hit() {
 
 #[test]
 fn test_lfuk_score_with_many_hits_and_recent_access() {
-    let policy = LfukPolicy {
-        min_lfuk_score: 0.0,
-        k_value: 0.5,
-    };
-    let record = make_record_with_hits(20);
-    let now_secs = coarse_clock::coarse_now_secs();
-    let score = policy.compute_score(&record, now_secs);
-    assert!(
-        score >= 0.0,
-        "Entrada com muitos hits recentes deve ter score >= 0"
+    let score = score_at(EvictionStrategy::LFUK, 0, 0.0, 20, 1_000_000);
+    assert_eq!(
+        score, 20.0,
+        "an entry read just now keeps its full hit count"
     );
 }
 
 #[test]
 fn test_lfu_score_below_min_frequency_is_negative() {
-    let policy = LfuPolicy { min_frequency: 10 };
-    let record = make_record_with_hits(3);
-    let score = policy.compute_score(&record, 0);
-    assert!(
-        score < 0.0,
-        "Score deve ser negativo quando hits (3) < min_frequency (10)"
-    );
+    let score = score_at(EvictionStrategy::LFU, 10, 0.0, 3, 0);
     assert_eq!(
         score,
         -(10.0 - 3.0),
@@ -1605,21 +1415,13 @@ fn test_lfu_score_below_min_frequency_is_negative() {
 
 #[test]
 fn test_lfu_score_above_min_frequency_is_positive() {
-    let policy = LfuPolicy { min_frequency: 5 };
-    let record = make_record_with_hits(15);
-    let score = policy.compute_score(&record, 0);
-    assert!(
-        score > 0.0,
-        "Score deve ser positivo quando hits (15) >= min_frequency (5)"
-    );
+    let score = score_at(EvictionStrategy::LFU, 5, 0.0, 15, 0);
     assert_eq!(score, 15.0);
 }
 
 #[test]
 fn test_lfu_score_zero_min_frequency_returns_raw_hits() {
-    let policy = LfuPolicy { min_frequency: 0 };
-    let record = make_record_with_hits(7);
-    let score = policy.compute_score(&record, 0);
+    let score = score_at(EvictionStrategy::LFU, 0, 0.0, 7, 0);
     assert_eq!(
         score, 7.0,
         "Com min_frequency=0, score deve ser raw hit_count"

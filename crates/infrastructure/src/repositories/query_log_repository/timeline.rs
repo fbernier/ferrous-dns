@@ -1,8 +1,10 @@
 use super::helpers::window_start_bucket;
+use crate::repositories::{db_err, sql_ts};
+use chrono::DateTime;
 use ferrous_dns_application::ports::{TimeGranularity, TimelineBucket};
 use ferrous_dns_domain::DomainError;
 use sqlx::{Row, SqlitePool};
-use tracing::{debug, error, instrument};
+use tracing::{debug, instrument};
 
 /// Every width divides a UTC day, so epoch-aligned buckets match wall-clock ones.
 fn bucket_width_secs(granularity: TimeGranularity) -> i64 {
@@ -16,10 +18,7 @@ fn bucket_width_secs(granularity: TimeGranularity) -> i64 {
 }
 
 fn format_bucket(unix_secs: i64) -> String {
-    chrono::DateTime::from_timestamp(unix_secs, 0)
-        .unwrap_or_default()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    sql_ts(DateTime::from_timestamp(unix_secs, 0).unwrap_or_default())
 }
 
 #[instrument(skip(pool))]
@@ -46,10 +45,7 @@ pub(super) async fn get_timeline(
     .bind(since)
     .fetch_all(pool)
     .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch timeline");
-        DomainError::DatabaseError(e.to_string())
-    })?;
+    .map_err(db_err("Failed to fetch timeline"))?;
 
     let timeline: Vec<TimelineBucket> = rows
         .into_iter()

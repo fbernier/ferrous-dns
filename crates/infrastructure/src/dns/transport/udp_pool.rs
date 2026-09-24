@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -38,9 +38,6 @@ pub struct UdpSocketPool {
     semaphore: Semaphore,
 
     total_created: AtomicU64,
-
-    total_reused: AtomicU64,
-
     total_retired: AtomicU64,
 }
 
@@ -54,7 +51,6 @@ impl UdpSocketPool {
             max_per_server,
             semaphore: Semaphore::new(total_limit),
             total_created: AtomicU64::new(0),
-            total_reused: AtomicU64::new(0),
             total_retired: AtomicU64::new(0),
         }
     }
@@ -73,8 +69,6 @@ impl UdpSocketPool {
 
         if let Some(mut entry) = self.pools.get_mut(&server) {
             if let Some(pooled) = entry.pop() {
-                self.total_reused.fetch_add(1, Ordering::Relaxed);
-
                 return Ok(PooledUdpSocket {
                     socket: pooled.socket,
                     uses: pooled.uses.saturating_add(1),
@@ -104,25 +98,17 @@ impl UdpSocketPool {
     async fn create_socket(&self, server: SocketAddr) -> Result<UdpSocket, std::io::Error> {
         use socket2::{Domain, Protocol, Socket, Type};
 
-        let domain = if server.is_ipv4() {
-            Domain::IPV4
+        let (domain, bind_addr) = if server.is_ipv4() {
+            (Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
         } else {
-            Domain::IPV6
+            (Domain::IPV6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))
         };
 
+        // No SO_REUSEADDR: with it, Linux may hand an ephemeral port already held
+        // by another pooled socket, and one of the two then never sees its answers.
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-
-        socket.set_reuse_address(true)?;
-
         socket.set_recv_buffer_size(64 * 1024)?;
         socket.set_send_buffer_size(128 * 1024)?;
-
-        let bind_addr: SocketAddr = if server.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
-
         socket.bind(&bind_addr.into())?;
         socket.set_nonblocking(true)?;
 
@@ -139,25 +125,11 @@ impl UdpSocketPool {
     }
 
     pub fn stats(&self) -> PoolStats {
-        let total_pooled: usize = self.pools.iter().map(|e| e.len()).sum();
-
         PoolStats {
             total_created: self.total_created.load(Ordering::Relaxed),
-            total_reused: self.total_reused.load(Ordering::Relaxed),
             total_retired: self.total_retired.load(Ordering::Relaxed),
-            total_pooled,
-            servers: self.pools.len(),
+            total_pooled: self.pools.iter().map(|e| e.len()).sum(),
         }
-    }
-
-    pub fn clear_server(&self, server: &SocketAddr) {
-        self.pools.remove(server);
-    }
-
-    pub fn clear_all(&self) {
-        let count: usize = self.pools.iter().map(|e| e.len()).sum();
-        self.pools.clear();
-        info!(count, "Cleared all socket pools");
     }
 }
 
@@ -213,22 +185,8 @@ impl<'a> Drop for PooledUdpSocket<'a> {
 pub struct PoolStats {
     pub total_created: u64,
 
-    pub total_reused: u64,
-
     /// Sockets dropped on release because their port hit the rotation budget.
     pub total_retired: u64,
 
     pub total_pooled: usize,
-
-    pub servers: usize,
-}
-
-impl PoolStats {
-    pub fn reuse_rate(&self) -> f64 {
-        if self.total_created == 0 {
-            0.0
-        } else {
-            self.total_reused as f64 / self.total_created as f64
-        }
-    }
 }

@@ -1,19 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct LoggingConfig {
-    #[serde(default = "default_log_level")]
     pub level: String,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: default_log_level(),
+            level: "info".to_string(),
         }
     }
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
 }

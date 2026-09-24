@@ -28,7 +28,7 @@ impl LocalRecordDto {
             fqdn,
             ip: record.ip.clone(),
             record_type: record.record_type.clone(),
-            ttl: record.ttl.unwrap_or(300),
+            ttl: record.ttl_or_default(),
             created_at: None,
         }
     }

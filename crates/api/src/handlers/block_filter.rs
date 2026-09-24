@@ -58,7 +58,12 @@ pub async fn test_domain(
     State(state): State<AppState>,
     Json(req): Json<FilterTestRequest>,
 ) -> Result<Json<FilterTestResponse>, ApiError> {
-    let client = req.client.as_deref().and_then(|s| s.parse::<IpAddr>().ok());
+    let client = req
+        .client
+        .as_deref()
+        .map(str::parse::<IpAddr>)
+        .transpose()
+        .map_err(|e| DomainError::InvalidIpAddress(format!("client: {e}")))?;
     let explanation = state
         .blocking
         .test_domain
@@ -86,19 +91,20 @@ pub async fn backtest_blocklists(
     State(state): State<AppState>,
     Json(req): Json<BacktestRequestDto>,
 ) -> Result<Json<BacktestResponse>, ApiError> {
-    let action = match req.action.to_ascii_lowercase().as_str() {
-        "deny" => CandidateAction::Deny,
-        "allow" => CandidateAction::Allow,
-        other => {
-            return Err(ApiError(DomainError::InvalidDomainName(format!(
-                "invalid action '{other}': must be 'deny' or 'allow'"
-            ))))
-        }
+    let action = if req.action.eq_ignore_ascii_case("deny") {
+        CandidateAction::Deny
+    } else if req.action.eq_ignore_ascii_case("allow") {
+        CandidateAction::Allow
+    } else {
+        return Err(ApiError(DomainError::InvalidInput(format!(
+            "invalid action '{}': must be 'deny' or 'allow'",
+            req.action
+        ))));
     };
     let has_candidate = req.list.iter().any(|l| !l.trim().is_empty())
         || req.regexes.iter().any(|r| !r.trim().is_empty());
     if !has_candidate {
-        return Err(ApiError(DomainError::InvalidDomainName(
+        return Err(ApiError(DomainError::InvalidInput(
             "provide at least one domain/list line or regex".to_string(),
         )));
     }

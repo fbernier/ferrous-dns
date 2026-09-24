@@ -5,16 +5,14 @@ use ferrous_dns_domain::{evaluate_slots, GroupOverride, ScheduleAction};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+const INTERVAL_SECS: u64 = 60;
 
 pub struct ScheduleEvaluatorJob {
     repo: Arc<dyn ScheduleProfileRepository>,
     state: Arc<dyn ScheduleStatePort>,
-    interval_secs: u64,
-    shutdown: CancellationToken,
-    active_groups: Mutex<HashSet<i64>>,
+    active_groups: HashSet<i64>,
 }
 
 impl ScheduleEvaluatorJob {
@@ -25,46 +23,29 @@ impl ScheduleEvaluatorJob {
         Self {
             repo,
             state,
-            interval_secs: 60,
-            shutdown: CancellationToken::new(),
-            active_groups: Mutex::new(HashSet::new()),
+            active_groups: HashSet::new(),
         }
     }
 
-    pub fn with_interval(mut self, interval_secs: u64) -> Self {
-        self.interval_secs = interval_secs;
-        self
-    }
-
-    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
-        self.shutdown = token;
-        self
-    }
-
-    pub async fn start(self: Arc<Self>) {
+    pub fn spawn(mut self) {
         info!(
-            interval_secs = self.interval_secs,
+            interval_secs = INTERVAL_SECS,
             "Starting schedule evaluator job"
         );
 
-        let mut interval = tokio::time::interval(Duration::from_secs(self.interval_secs));
-        interval.tick().await;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(INTERVAL_SECS));
+            interval.tick().await;
 
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => {
-                    info!("ScheduleEvaluatorJob: shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    self.state.sweep_expired();
-                    self.evaluate_all_schedules().await;
-                }
+            loop {
+                interval.tick().await;
+                self.state.sweep_expired();
+                self.evaluate_all_schedules().await;
             }
-        }
+        });
     }
 
-    async fn evaluate_all_schedules(&self) {
+    async fn evaluate_all_schedules(&mut self) {
         let assignments = match self.repo.get_all_group_assignments().await {
             Ok(a) => a,
             Err(e) => {
@@ -74,18 +55,10 @@ impl ScheduleEvaluatorJob {
         };
 
         let current_group_ids: HashSet<i64> = assignments.iter().map(|(gid, _)| *gid).collect();
-
-        {
-            let mut prev = self.active_groups.lock().await;
-            for stale_id in prev.difference(&current_group_ids) {
-                self.state.clear(*stale_id);
-            }
-            *prev = current_group_ids;
+        for stale_id in self.active_groups.difference(&current_group_ids) {
+            self.state.clear(*stale_id);
         }
-
-        if assignments.is_empty() {
-            return;
-        }
+        self.active_groups = current_group_ids;
 
         for (group_id, profile_id) in &assignments {
             let profile = match self.repo.get_by_id(*profile_id).await {

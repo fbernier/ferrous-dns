@@ -4,8 +4,8 @@ use ferrous_dns_domain::{DomainError, RecordType};
 use hickory_proto::rr::Name;
 use std::str::FromStr;
 
-const CLIENT_COOKIE_LEN: usize = 8;
-const COOKIE_OPTION_CODE: u16 = 10;
+pub(super) const CLIENT_COOKIE_LEN: usize = 8;
+pub(super) const COOKIE_OPTION_CODE: u16 = 10;
 /// RFC 1035 §3.1: a wire-format name is at most 255 octets.
 const MAX_QNAME_LEN: usize = 255;
 
@@ -16,27 +16,28 @@ const MAX_QNAME_LEN: usize = 255;
 /// matters twice over — middleboxes routinely drop IP fragments (which shows up
 /// as an unexplained timeout, not an error), and fragment-based cache poisoning
 /// depends on the second fragment, which carries neither UDP header nor TXID.
-/// Responses that no longer fit come back with TC=1 and are retried over TCP by
-/// [`query_server`](crate::dns::load_balancer::query::query_server).
+/// Responses that no longer fit come back with TC=1 and are retried over TCP.
 pub const EDNS_MAX_PAYLOAD: u16 = 1232;
 
 /// Anti-spoofing measures for an upstream query, applied to every record type.
-///
-/// They used to be restricted to A/AAAA because other types are cached and
-/// replayed to clients as raw upstream wire, which would have leaked our
-/// randomized QNAME case. That leak is now closed at the source — responses are
-/// canonicalized before they reach the cache (see
-/// [`ResponseValidator::canonicalize`](super::ResponseValidator::canonicalize))
-/// — so the restriction is gone. It mattered: DS/DNSKEY, MX/TXT (SPF/DKIM/DMARC)
-/// and HTTPS/SVCB (ipv4hint/ipv6hint, ECH) were the least-protected queries in
-/// the resolver.
-#[derive(Clone, Copy, Debug, Default)]
+/// The default sends a DNS Cookie (graceful, so always safe) and leaves 0x20 off,
+/// since some upstreams normalize QNAME case.
+#[derive(Clone, Copy, Debug)]
 pub struct HardeningOpts {
     /// Inject a random client DNS Cookie (RFC 7873, EDNS option 10) and validate
     /// its echo on the response.
     pub cookie: bool,
     /// Randomize QNAME letter case (draft-vixie-dns-0x20) and validate the echo.
     pub qname_0x20: bool,
+}
+
+impl Default for HardeningOpts {
+    fn default() -> Self {
+        Self {
+            cookie: true,
+            qname_0x20: false,
+        }
+    }
 }
 
 pub struct MessageBuilder;
@@ -47,31 +48,24 @@ impl MessageBuilder {
         record_type: &RecordType,
         dnssec_ok: bool,
     ) -> Result<Vec<u8>, DomainError> {
-        let (_, bytes) = Self::build_query_with_id(domain, record_type, dnssec_ok)?;
-        Ok(bytes)
-    }
-
-    pub fn build_query_with_id(
-        domain: &str,
-        record_type: &RecordType,
-        dnssec_ok: bool,
-    ) -> Result<(u16, Vec<u8>), DomainError> {
         let qname = QName::encode(domain)?;
         let mut id = [0u8; 2];
         Self::fill_random(&mut id);
-        let id = u16::from_be_bytes(id);
         let qtype = u16::from(RecordTypeMapper::to_hickory(record_type));
-        Ok((id, assemble_query(id, &qname, qtype, dnssec_ok, None)))
+        Ok(assemble_query(
+            u16::from_be_bytes(id),
+            &qname,
+            qtype,
+            dnssec_ok,
+            None,
+        ))
     }
 
     /// Builds an upstream query with optional anti-spoofing hardening and returns
     /// the wire bytes alongside a [`ResponseValidator`] capturing the per-query
     /// expectations (txid, question name/type, client cookie).
     ///
-    /// Both measures apply to every record type; `opts` alone decides. Cookies
-    /// are graceful (an upstream that does not echo one is accepted), so they are
-    /// always on; 0x20 stays opt-in because some upstreams normalize QNAME case.
-    /// Transaction-ID and question validation apply regardless.
+    /// Transaction-ID and question validation apply whatever `opts` says.
     pub fn build_query_hardened(
         domain: &str,
         record_type: &RecordType,
@@ -252,7 +246,7 @@ mod tests {
     use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::opt::EdnsOption;
 
-    /// The hickory encoding the wire builder replaced, as the reference.
+    /// Reference encoding of the same query through hickory.
     fn hickory_query(
         id: u16,
         domain: &str,

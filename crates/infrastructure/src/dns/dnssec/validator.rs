@@ -1,18 +1,16 @@
 use super::cache::DnssecCache;
-use super::crypto::SignatureVerifier;
 use super::trust_anchor::TrustAnchorStore;
-use super::validation::authority as auth_check;
+use super::validation::authority::{self as auth_check, now_secs, to_fqdn};
 use super::validation::denial::{
     prove_denial, prove_wildcard_expansion, VerifiedNsec, VerifiedNsec3,
 };
-use super::validation::{ChainVerifier, ValidationResult};
+use super::validation::ChainVerifier;
 use crate::dns::forwarding::record_type_map::RecordTypeMapper;
 use crate::dns::load_balancer::PoolManager;
-use ferrous_dns_domain::{DomainError, RecordType};
+use ferrous_dns_domain::{DnssecStatus, DomainError, RecordType};
 use hickory_proto::dnssec::rdata::DNSSECRData;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RData, Record};
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -24,59 +22,6 @@ use tracing::{debug, warn};
 /// ceiling is well above any real case while bounding the walk fan-out.
 const MAX_SIGNER_ZONES: usize = 8;
 
-/// Current UNIX time in seconds, clamped to `u32` (RRSIG timestamp domain).
-fn now_secs() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
-}
-
-#[derive(Debug, Clone)]
-pub struct ValidatedResponse {
-    pub validation_status: ValidationResult,
-
-    pub records: Vec<String>,
-
-    pub domain: String,
-
-    pub record_type: RecordType,
-
-    pub response_time_ms: u64,
-
-    pub upstream_server: Option<String>,
-}
-
-impl ValidatedResponse {
-    pub fn new(
-        validation_status: ValidationResult,
-        records: Vec<String>,
-        domain: String,
-        record_type: RecordType,
-    ) -> Self {
-        Self {
-            validation_status,
-            records,
-            domain,
-            record_type,
-            response_time_ms: 0,
-            upstream_server: None,
-        }
-    }
-
-    pub fn is_secure(&self) -> bool {
-        matches!(self.validation_status, ValidationResult::Secure)
-    }
-
-    pub fn is_insecure(&self) -> bool {
-        matches!(self.validation_status, ValidationResult::Insecure)
-    }
-
-    pub fn is_bogus(&self) -> bool {
-        matches!(self.validation_status, ValidationResult::Bogus)
-    }
-}
-
 pub struct DnssecValidator {
     pool_manager: Arc<PoolManager>,
 
@@ -86,64 +31,27 @@ pub struct DnssecValidator {
 }
 
 impl DnssecValidator {
-    pub fn new(pool_manager: Arc<PoolManager>) -> Self {
-        let trust_store = TrustAnchorStore::new();
-        let dnssec_cache = Arc::new(DnssecCache::new());
-        let chain_verifier = ChainVerifier::new(pool_manager.clone(), trust_store, dnssec_cache);
-
-        Self {
-            pool_manager,
-            chain_verifier,
-            timeout_ms: 5000,
-        }
-    }
-
-    pub fn with_cache(pool_manager: Arc<PoolManager>, dnssec_cache: Arc<DnssecCache>) -> Self {
-        let trust_store = TrustAnchorStore::new();
-        let chain_verifier = ChainVerifier::new(pool_manager.clone(), trust_store, dnssec_cache);
-
-        Self {
-            pool_manager,
-            chain_verifier,
-            timeout_ms: 5000,
-        }
-    }
-
-    pub fn with_trust_store(pool_manager: Arc<PoolManager>, trust_store: TrustAnchorStore) -> Self {
-        let dnssec_cache = Arc::new(DnssecCache::new());
-        let chain_verifier = ChainVerifier::new(pool_manager.clone(), trust_store, dnssec_cache);
-
-        Self {
-            pool_manager,
-            chain_verifier,
-            timeout_ms: 5000,
-        }
-    }
-
-    pub fn with_trust_store_and_cache(
+    pub fn new(
         pool_manager: Arc<PoolManager>,
         trust_store: TrustAnchorStore,
         dnssec_cache: Arc<DnssecCache>,
+        timeout_ms: u64,
     ) -> Self {
-        let chain_verifier = ChainVerifier::new(pool_manager.clone(), trust_store, dnssec_cache);
+        let chain_verifier =
+            ChainVerifier::new(pool_manager.clone(), trust_store, dnssec_cache, timeout_ms);
 
         Self {
             pool_manager,
             chain_verifier,
-            timeout_ms: 5000,
+            timeout_ms,
         }
-    }
-
-    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
-        self.timeout_ms = timeout_ms;
-        self
     }
 
     pub async fn validate_query(
         &mut self,
         domain: &str,
         record_type: RecordType,
-    ) -> Result<ValidatedResponse, DomainError> {
+    ) -> Result<DnssecStatus, DomainError> {
         debug!(
             domain = %domain,
             record_type = ?record_type,
@@ -167,7 +75,7 @@ impl DnssecValidator {
 
         let validation_status = self
             .validate_message(domain, record_type, &upstream_result.response.message)
-            .await?;
+            .await;
 
         let elapsed = start.elapsed().as_millis() as u64;
 
@@ -178,21 +86,7 @@ impl DnssecValidator {
             "DNSSEC validation completed"
         );
 
-        let response = ValidatedResponse {
-            validation_status,
-            records: upstream_result
-                .response
-                .addresses
-                .iter()
-                .map(|ip| ip.to_string())
-                .collect(),
-            domain: domain.to_string(),
-            record_type,
-            response_time_ms: elapsed,
-            upstream_server: Some(upstream_result.server.to_string()),
-        };
-
-        Ok(response)
+        Ok(validation_status)
     }
 
     pub async fn validate_with_message(
@@ -200,7 +94,7 @@ impl DnssecValidator {
         domain: &str,
         record_type: RecordType,
         message: &hickory_proto::op::Message,
-    ) -> Result<ValidatedResponse, DomainError> {
+    ) -> DnssecStatus {
         debug!(
             domain = %domain,
             record_type = ?record_type,
@@ -209,7 +103,7 @@ impl DnssecValidator {
 
         let start = std::time::Instant::now();
 
-        let validation_status = self.validate_message(domain, record_type, message).await?;
+        let validation_status = self.validate_message(domain, record_type, message).await;
 
         let elapsed = start.elapsed().as_millis() as u64;
 
@@ -220,44 +114,7 @@ impl DnssecValidator {
             "DNSSEC validation completed (pre-fetched)"
         );
 
-        Ok(ValidatedResponse {
-            validation_status,
-            records: vec![],
-            domain: domain.to_string(),
-            record_type,
-            response_time_ms: elapsed,
-            upstream_server: None,
-        })
-    }
-
-    pub async fn validate_simple(
-        &mut self,
-        domain: &str,
-        record_type: RecordType,
-    ) -> Result<ValidationResult, DomainError> {
-        let response = self.validate_query(domain, record_type).await?;
-        Ok(response.validation_status)
-    }
-
-    pub async fn has_dnssec(&self, domain: &str) -> Result<bool, DomainError> {
-        debug!(domain = %domain, "Checking DNSSEC availability");
-
-        let domain_arc: Arc<str> = Arc::from(domain);
-        let result = self
-            .pool_manager
-            .query(&domain_arc, &RecordType::DS, self.timeout_ms, true)
-            .await;
-
-        match result {
-            Ok(_upstream_result) => {
-                debug!(domain = %domain, "DNSSEC check: DS query successful");
-                Ok(true)
-            }
-            Err(_) => {
-                debug!(domain = %domain, "DNSSEC check: No DS records");
-                Ok(false)
-            }
-        }
+        validation_status
     }
 
     pub fn insert_zone_keys_for_test(
@@ -266,13 +123,6 @@ impl DnssecValidator {
         keys: Vec<crate::dns::dnssec::types::DnskeyRecord>,
     ) {
         self.chain_verifier.insert_zone_keys_for_test(zone, keys);
-    }
-
-    pub fn stats(&self) -> ValidatorStats {
-        ValidatorStats {
-            timeout_ms: self.timeout_ms,
-            trust_anchors_count: self.chain_verifier.trust_anchor_count(),
-        }
     }
 
     fn extract_signer_zone(answers: &[Record]) -> Option<String> {
@@ -310,16 +160,14 @@ impl DnssecValidator {
     /// Combines per-zone chain-validation outcomes for a multi-signer answer.
     /// The answer is only `Secure` when every signer zone validates; otherwise
     /// the most severe outcome wins (Bogus > Indeterminate > Insecure).
-    fn combine_chain_status(a: ValidationResult, b: ValidationResult) -> ValidationResult {
+    fn combine_chain_status(a: DnssecStatus, b: DnssecStatus) -> DnssecStatus {
         match (a, b) {
-            (ValidationResult::Bogus, _) | (_, ValidationResult::Bogus) => ValidationResult::Bogus,
-            (ValidationResult::Indeterminate, _) | (_, ValidationResult::Indeterminate) => {
-                ValidationResult::Indeterminate
+            (DnssecStatus::Bogus, _) | (_, DnssecStatus::Bogus) => DnssecStatus::Bogus,
+            (DnssecStatus::Indeterminate, _) | (_, DnssecStatus::Indeterminate) => {
+                DnssecStatus::Indeterminate
             }
-            (ValidationResult::Insecure, _) | (_, ValidationResult::Insecure) => {
-                ValidationResult::Insecure
-            }
-            _ => ValidationResult::Secure,
+            (DnssecStatus::Insecure, _) | (_, DnssecStatus::Insecure) => DnssecStatus::Insecure,
+            (DnssecStatus::Secure, DnssecStatus::Secure) => DnssecStatus::Secure,
         }
     }
 
@@ -331,7 +179,7 @@ impl DnssecValidator {
         domain: &str,
         record_type: RecordType,
         message: &hickory_proto::op::Message,
-    ) -> Result<ValidationResult, DomainError> {
+    ) -> DnssecStatus {
         if message.answers.is_empty() {
             return self.validate_negative(domain, record_type, message).await;
         }
@@ -356,29 +204,28 @@ impl DnssecValidator {
                 zones = signer_zones.len(),
                 "answer names too many signer zones; refusing chain walk (possible amplification)"
             );
-            return Ok(ValidationResult::Bogus);
+            return DnssecStatus::Bogus;
         }
 
-        let mut status = ValidationResult::Secure;
+        let mut status = DnssecStatus::Secure;
         for zone in &signer_zones {
-            let zone_status = self.chain_verifier.verify_chain(zone, record_type).await?;
+            let zone_status = self.chain_verifier.verify_chain(zone).await;
             status = Self::combine_chain_status(status, zone_status);
             // Bogus is terminal under `combine_chain_status` (it dominates every
             // other outcome), so once any zone is Bogus the remaining walks
             // cannot change the verdict — stop and save the queries.
-            if status == ValidationResult::Bogus {
+            if status == DnssecStatus::Bogus {
                 break;
             }
         }
 
-        if status == ValidationResult::Secure {
-            let all_answers: Vec<Record> = message.answers.to_vec();
-            status = self.verify_rrset_signatures(domain, &all_answers);
-            if status == ValidationResult::Secure {
-                status = self.verify_wildcard_proof(domain, &all_answers, &message.authorities);
+        if status == DnssecStatus::Secure {
+            status = self.verify_rrset_signatures(domain, &message.answers);
+            if status == DnssecStatus::Secure {
+                status = self.verify_wildcard_proof(domain, &message.answers, &message.authorities);
             }
         }
-        Ok(status)
+        status
     }
 
     /// Validates a negative response. Anchors the chain at the authority's signer
@@ -388,10 +235,10 @@ impl DnssecValidator {
         domain: &str,
         record_type: RecordType,
         message: &hickory_proto::op::Message,
-    ) -> Result<ValidationResult, DomainError> {
+    ) -> DnssecStatus {
         let Some(zone) = Self::extract_signer_zone(&message.authorities) else {
             // No signed authority section: unsigned negative, serve without AD.
-            return Ok(ValidationResult::Insecure);
+            return DnssecStatus::Insecure;
         };
 
         // The authority's signer zone must enclose the queried name. Otherwise a
@@ -400,75 +247,52 @@ impl DnssecValidator {
         // would happily anchor that real zone, and the NSEC/NSEC3 owners would
         // be checked against it — never against the victim name. Reject it as
         // Bogus before doing any of that work.
-        match (Self::to_name(domain), Self::to_name(&zone)) {
-            (Some(qname), Some(zone_name)) if Self::name_encloses(&zone_name, &qname) => {}
+        match (to_fqdn(domain), to_fqdn(&zone)) {
+            (Some(qname), Some(zone_name)) if auth_check::name_encloses(&zone_name, &qname) => {}
             _ => {
                 warn!(
                     domain = %domain,
                     zone = %zone,
                     "negative-answer signer zone does not enclose the queried name"
                 );
-                return Ok(ValidationResult::Bogus);
+                return DnssecStatus::Bogus;
             }
         }
 
-        let chain_status = self.chain_verifier.verify_chain(&zone, record_type).await?;
-        if chain_status != ValidationResult::Secure {
-            return Ok(chain_status);
+        let chain_status = self.chain_verifier.verify_chain(&zone).await;
+        if chain_status != DnssecStatus::Secure {
+            return chain_status;
         }
-        Ok(self.validate_denial(
+        self.validate_denial(
             domain,
             record_type,
             message.response_code,
             &zone,
             &message.authorities,
-        ))
+        )
     }
 
-    /// Builds an FQDN (trailing dot) hickory [`Name`], or `None` on parse error.
-    fn to_name(domain: &str) -> Option<Name> {
-        let fqdn = if domain.ends_with('.') {
-            domain.to_owned()
-        } else {
-            format!("{domain}.")
-        };
-        Name::from_str(&fqdn).ok()
-    }
-
-    /// True when `zone` is `qname` itself or one of its ancestors, i.e. `zone`
-    /// encloses `qname`. Label comparison is the DNS-canonical (case-folded)
-    /// equality of [`Name`].
-    fn name_encloses(zone: &Name, qname: &Name) -> bool {
-        auth_check::name_encloses(zone, qname)
-    }
-
-    /// True when the `rrset` (every record sharing `owner` + `rtype`) is covered
-    /// by a valid RRSIG in `sigs`, signed by a key already established in the
-    /// chain of trust. Used both for single-record NSEC/NSEC3 authority RRsets
-    /// and for multi-record positive-answer RRsets.
+    /// [`auth_check::rrset_is_authentic`] against the zone keys this walk has established.
     fn rrset_is_authentic(
         &self,
         owner: &Name,
         rtype: hickory_proto::rr::RecordType,
         rrset: &[Record],
         sigs: &[Record],
-        crypto: &SignatureVerifier,
         now_secs: u32,
     ) -> bool {
-        auth_check::rrset_is_authentic(owner, rtype, rrset, sigs, crypto, now_secs, &|zone| {
+        auth_check::rrset_is_authentic(owner, rtype, rrset, sigs, now_secs, &|zone| {
             self.chain_verifier.get_zone_keys(zone).cloned()
         })
     }
 
-    /// Collects the cryptographically-authentic NSEC3 and NSEC records from an
-    /// authority section.
+    /// [`auth_check::collect_verified_denial`] against the zone keys this walk has established.
     fn collect_verified_denial<'a>(
         &self,
         authority: &'a [Record],
-        crypto: &SignatureVerifier,
         now_secs: u32,
     ) -> (Vec<VerifiedNsec3<'a>>, Vec<VerifiedNsec<'a>>) {
-        auth_check::collect_verified_denial(authority, crypto, now_secs, &|zone| {
+        auth_check::collect_verified_denial(authority, now_secs, &|zone| {
             self.chain_verifier.get_zone_keys(zone).cloned()
         })
     }
@@ -483,19 +307,16 @@ impl DnssecValidator {
         rcode: ResponseCode,
         soa_zone: &str,
         authority: &[Record],
-    ) -> ValidationResult {
-        let now = now_secs();
-        let crypto = SignatureVerifier;
-        let (nsec3s, nsecs) = self.collect_verified_denial(authority, &crypto, now);
+    ) -> DnssecStatus {
+        let (nsec3s, nsecs) = self.collect_verified_denial(authority, now_secs());
 
         if nsec3s.is_empty() && nsecs.is_empty() {
             // Signed zone but no authenticated denial records: stripped / forged.
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         }
 
-        let (Some(qname_name), Some(soa_name)) = (Self::to_name(qname), Self::to_name(soa_zone))
-        else {
-            return ValidationResult::Insecure;
+        let (Some(qname_name), Some(soa_name)) = (to_fqdn(qname), to_fqdn(soa_zone)) else {
+            return DnssecStatus::Insecure;
         };
         let qtype_hickory = RecordTypeMapper::to_hickory(&qtype);
 
@@ -528,7 +349,7 @@ impl DnssecValidator {
         qname: &str,
         answers: &[Record],
         authority: &[Record],
-    ) -> ValidationResult {
+    ) -> DnssecStatus {
         let mut wildcard_labels: Option<u8> = None;
         for record in answers {
             if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data {
@@ -543,23 +364,17 @@ impl DnssecValidator {
             }
         }
         let Some(wildcard_labels) = wildcard_labels else {
-            return ValidationResult::Secure;
+            return DnssecStatus::Secure;
         };
 
-        let now = now_secs();
-        let crypto = SignatureVerifier;
-        let (nsec3s, nsecs) = self.collect_verified_denial(authority, &crypto, now);
-        let Some(qname_name) = Self::to_name(qname) else {
-            return ValidationResult::Insecure;
+        let (nsec3s, nsecs) = self.collect_verified_denial(authority, now_secs());
+        let Some(qname_name) = to_fqdn(qname) else {
+            return DnssecStatus::Insecure;
         };
         prove_wildcard_expansion(&qname_name, wildcard_labels, &nsec3s, &nsecs)
     }
 
-    pub fn verify_rrset_signatures(
-        &self,
-        domain: &str,
-        all_answers: &[Record],
-    ) -> ValidationResult {
+    pub fn verify_rrset_signatures(&self, domain: &str, all_answers: &[Record]) -> DnssecStatus {
         let mut has_data = false;
         let mut has_rrsig = false;
         for record in all_answers {
@@ -578,14 +393,13 @@ impl DnssecValidator {
             // before reaching here; treat any stray empty RRset as undecided
             // rather than blindly authentic.
             debug!(domain = %domain, "No answer RRset to verify");
-            return ValidationResult::Indeterminate;
+            return DnssecStatus::Indeterminate;
         }
         if !has_rrsig {
             debug!(domain = %domain, "No RRSIG for RRset — returning Bogus");
-            return ValidationResult::Bogus;
+            return DnssecStatus::Bogus;
         }
 
-        let crypto_verifier = SignatureVerifier;
         let now = now_secs();
 
         // Group the answer records into RRsets keyed by (owner, type). EVERY
@@ -611,31 +425,18 @@ impl DnssecValidator {
         }
 
         for (owner, rtype, records) in &rrsets {
-            if !self.rrset_is_authentic(
-                owner,
-                *rtype,
-                records.as_slice(),
-                all_answers,
-                &crypto_verifier,
-                now,
-            ) {
+            if !self.rrset_is_authentic(owner, *rtype, records.as_slice(), all_answers, now) {
                 warn!(
                     domain = %domain,
                     owner = %owner,
                     rtype = ?rtype,
                     "answer RRset not covered by a valid RRSIG — returning Bogus"
                 );
-                return ValidationResult::Bogus;
+                return DnssecStatus::Bogus;
             }
         }
 
         debug!(domain = %domain, rrsets = rrsets.len(), "all answer RRsets verified");
-        ValidationResult::Secure
+        DnssecStatus::Secure
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ValidatorStats {
-    pub timeout_ms: u64,
-    pub trust_anchors_count: usize,
 }

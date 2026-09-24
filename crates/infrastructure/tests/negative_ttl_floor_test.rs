@@ -1,5 +1,3 @@
-//! Tests for Phase 2 of the cache optimization plan: negative cache TTL floor.
-//!
 //! The negative cache must enforce a `[300s, 3600s]` window on its TTLs so that
 //! upstream responses with TTL=0 for NXDOMAIN (plus `cache_min_ttl=0` on the
 //! general cache config) do not cause every repeated miss to escape to upstream.

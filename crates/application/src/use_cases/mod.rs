@@ -37,8 +37,7 @@ pub use auth::{
 pub use backup::{BackupSnapshot, ExportConfigUseCase, ImportConfigUseCase, ImportSummary};
 pub use block_filter::{
     AffectedDomain, BacktestBlocklistsUseCase, BacktestReport, BacktestRequest, CandidateAction,
-    GetBlockFilterStatsUseCase, TestDomainUseCase, DEFAULT_BACKTEST_LIMIT, MAX_BACKTEST_LIMIT,
-    SAMPLE_LIMIT,
+    GetBlockFilterStatsUseCase, TestDomainUseCase, DEFAULT_BACKTEST_LIMIT,
 };
 pub use blocked_services::{
     BlockServiceUseCase, GetBlockedServicesUseCase, GetServiceCatalogUseCase, UnblockServiceUseCase,
@@ -54,7 +53,7 @@ pub use client_subnets::{
 };
 pub use clients::{
     CleanupOldClientsUseCase, CreateManualClientUseCase, DeleteClientUseCase, GetClientsUseCase,
-    SyncArpCacheUseCase, SyncHostnamesUseCase, TrackClientUseCase, UpdateClientUseCase,
+    SyncArpCacheUseCase, SyncHostnamesUseCase, UpdateClientUseCase,
 };
 pub use config::ReloadConfigUseCase;
 pub use custom_services::{

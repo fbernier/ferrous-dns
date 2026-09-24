@@ -1,34 +1,34 @@
+use crate::DomainError;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Source that caused a DNS query to be blocked.
 ///
-/// Numeric values from [`as_u8`]/[`from_u8`] are persisted in the database.
-/// **Never reorder or reuse values** — doing so would corrupt historical records.
+/// The [`BlockSource::to_str`] names are persisted in the query log, so never
+/// rename them. The `u8` codes only live in the in-memory decision cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u8)]
 pub enum BlockSource {
     /// Matched a domain in a downloaded blocklist.
-    Blocklist,
+    Blocklist = 0,
     /// Matched a manually managed (custom) blocked domain.
-    ManagedDomain,
-    /// Matched a user-defined regex filter.
-    RegexFilter,
+    ManagedDomain = 1,
+    RegexFilter = 2,
     /// Blocked because a CNAME chain pointed to a blocked domain.
-    CnameCloaking,
-    /// Blocked by a time-based schedule rule (ScheduleAction::BlockAll slot active).
-    Schedule,
-    /// Blocked because a public domain resolved to a private/RFC1918 IP address.
-    DnsRebinding,
-    /// Blocked by DNS query rate limiting.
-    RateLimit,
-    /// Blocked by DNS tunneling detection.
-    DnsTunneling,
-    /// Blocked by NXDomain hijack detection (ISP intercepting NXDOMAIN responses).
-    NxdomainHijack,
-    /// Blocked by response IP filtering (known C2 IP in DNS response).
-    ResponseIpFilter,
-    /// Blocked by DGA (Domain Generation Algorithm) detection.
-    DgaDetection,
+    CnameCloaking = 3,
+    /// A `ScheduleAction::BlockAll` slot was active.
+    Schedule = 4,
+    /// A public domain resolved to a private/RFC1918 address.
+    DnsRebinding = 5,
+    RateLimit = 6,
+    DnsTunneling = 7,
+    /// An ISP rewrote an NXDOMAIN into an answer.
+    NxdomainHijack = 8,
+    /// The response carried a known C2 IP.
+    ResponseIpFilter = 9,
+    /// Domain Generation Algorithm detection.
+    DgaDetection = 10,
 }
 
 impl BlockSource {
@@ -66,37 +66,38 @@ impl BlockSource {
         }
     }
 
+    /// Every variant, indexed by its `u8` code.
+    pub const ALL: [BlockSource; 11] = [
+        BlockSource::Blocklist,
+        BlockSource::ManagedDomain,
+        BlockSource::RegexFilter,
+        BlockSource::CnameCloaking,
+        BlockSource::Schedule,
+        BlockSource::DnsRebinding,
+        BlockSource::RateLimit,
+        BlockSource::DnsTunneling,
+        BlockSource::NxdomainHijack,
+        BlockSource::ResponseIpFilter,
+        BlockSource::DgaDetection,
+    ];
+
     pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(BlockSource::Blocklist),
-            1 => Some(BlockSource::ManagedDomain),
-            2 => Some(BlockSource::RegexFilter),
-            3 => Some(BlockSource::CnameCloaking),
-            4 => Some(BlockSource::Schedule),
-            5 => Some(BlockSource::DnsRebinding),
-            6 => Some(BlockSource::RateLimit),
-            7 => Some(BlockSource::DnsTunneling),
-            8 => Some(BlockSource::NxdomainHijack),
-            9 => Some(BlockSource::ResponseIpFilter),
-            10 => Some(BlockSource::DgaDetection),
-            _ => None,
-        }
+        Self::ALL.get(usize::from(v)).copied()
     }
 
     pub fn as_u8(&self) -> u8 {
-        match self {
-            BlockSource::Blocklist => 0,
-            BlockSource::ManagedDomain => 1,
-            BlockSource::RegexFilter => 2,
-            BlockSource::CnameCloaking => 3,
-            BlockSource::Schedule => 4,
-            BlockSource::DnsRebinding => 5,
-            BlockSource::RateLimit => 6,
-            BlockSource::DnsTunneling => 7,
-            BlockSource::NxdomainHijack => 8,
-            BlockSource::ResponseIpFilter => 9,
-            BlockSource::DgaDetection => 10,
-        }
+        *self as u8
+    }
+}
+
+impl FromStr for BlockSource {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|source| source.to_str() == s)
+            .ok_or_else(|| DomainError::InvalidInput(format!("unknown block source: '{s}'")))
     }
 }
 

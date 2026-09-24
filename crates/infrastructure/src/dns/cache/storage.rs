@@ -1,35 +1,24 @@
 use super::bloom::AtomicBloom;
 use super::coarse_clock::coarse_now_secs;
 use super::eviction::{ActiveEvictionPolicy, EvictionStrategy};
-use super::key::{BorrowedKey, CacheKey};
+use super::key::{normalize_domain, BorrowedKey, CacheKey};
 use super::l1::{l1_clear, l1_get, l1_insert};
 use super::negative_cache::NegativeDnsCache;
 use super::port::{DnsCacheAccess, LocalRecordStatus};
 use super::{CacheMetrics, CachedData, CachedDnssecStatus, CachedRecord};
 use compact_str::CompactString;
+use dashmap::mapref::one::RefMut;
 use dashmap::DashMap;
 use ferrous_dns_domain::RecordType;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-/// Normalizes a domain to ASCII-lowercase for cache key lookups. DNS is
-/// case-insensitive (RFC 1035 §2.3.3), so queries for `Example.COM` and
-/// `example.com` must hit the same cache entry. Returns `Cow::Borrowed`
-/// when the input is already lowercase (zero-alloc fast path).
-#[inline]
-fn normalize_domain(domain: &str) -> Cow<'_, str> {
-    if domain.bytes().all(|b| !b.is_ascii_uppercase()) {
-        Cow::Borrowed(domain)
-    } else {
-        Cow::Owned(domain.to_ascii_lowercase())
-    }
-}
+type PermanentTypes = SmallVec<[RecordType; 2]>;
 
 struct EvictionCandidate {
     score: f64,
@@ -96,22 +85,20 @@ pub struct DnsCacheConfig {
 }
 
 pub struct DnsCache {
-    pub(super) cache: Arc<DashMap<CacheKey, CachedRecord, FxBuildHasher>>,
+    pub(super) cache: DashMap<CacheKey, CachedRecord, FxBuildHasher>,
     pub(super) max_entries: usize,
     pub(super) eviction_policy: ActiveEvictionPolicy,
     pub(super) min_threshold_bits: AtomicU64,
     pub(super) refresh_threshold: f64,
     pub(super) batch_eviction_percentage: f64,
     pub(super) adaptive_thresholds: bool,
-    pub(super) metrics: Arc<CacheMetrics>,
-    pub(super) compaction_counter: Arc<AtomicUsize>,
-    pub(super) use_probabilistic_eviction: bool,
-    pub(super) bloom: Arc<AtomicBloom>,
+    pub(super) metrics: CacheMetrics,
+    pub(super) bloom: AtomicBloom,
     pub(super) access_window_secs: u64,
     pub(super) eviction_sample_size: usize,
     pub(super) refresh_sample_period: u64,
     pub(super) negative: NegativeDnsCache,
-    permanent_records: DashMap<CompactString, SmallVec<[RecordType; 2]>, FxBuildHasher>,
+    permanent_records: DashMap<CompactString, PermanentTypes, FxBuildHasher>,
     min_ttl: u32,
     max_ttl: u32,
     refresh_senders: OnceLock<RefreshSenders>,
@@ -128,7 +115,7 @@ impl DnsCache {
 
         info!(
             max_entries = config.max_entries,
-            eviction_strategy = eviction_policy.strategy().as_str(),
+            eviction_strategy = config.eviction_strategy.as_str(),
             config.min_threshold,
             config.refresh_threshold,
             config.adaptive_thresholds,
@@ -143,17 +130,15 @@ impl DnsCache {
         let bloom = AtomicBloom::new(config.max_entries * 2, BLOOM_TARGET_FP_RATE);
 
         Self {
-            cache: Arc::new(cache),
+            cache,
             max_entries: config.max_entries,
             eviction_policy,
             min_threshold_bits: AtomicU64::new(config.min_threshold.to_bits()),
             refresh_threshold: config.refresh_threshold,
             batch_eviction_percentage: config.batch_eviction_percentage,
             adaptive_thresholds: config.adaptive_thresholds,
-            metrics: Arc::new(CacheMetrics::default()),
-            compaction_counter: Arc::new(AtomicUsize::new(0)),
-            use_probabilistic_eviction: true,
-            bloom: Arc::new(bloom),
+            metrics: CacheMetrics::default(),
+            bloom,
             access_window_secs: config.access_window_secs,
             eviction_sample_size: config.eviction_sample_size.max(1),
             refresh_sample_period: {
@@ -230,7 +215,7 @@ impl DnsCache {
             return None;
         }
 
-        let key = CacheKey::new(domain, *record_type);
+        let key = CacheKey::from_lowercase(domain, *record_type);
 
         if let Some(entry) = self.cache.get(&key) {
             let record = entry.value();
@@ -272,15 +257,7 @@ impl DnsCache {
             } else {
                 self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
                 record.record_hit();
-                // A permanent entry never expires, so the distance to
-                // `expires_at_secs` (u64::MAX) is meaningless — serve the TTL the
-                // record was configured with instead, or the client is told to
-                // hold the answer for the next eighty years.
-                let remaining_ttl = if record.is_permanent() {
-                    record.ttl
-                } else {
-                    record.expires_at_secs.saturating_sub(now_secs) as u32
-                };
+                let remaining_ttl = record.remaining_ttl_at_secs(now_secs);
                 self.promote_to_l1(domain, record_type, record, now_secs);
                 return Some((
                     record.data.clone(),
@@ -312,7 +289,7 @@ impl DnsCache {
 
         if data.is_negative() {
             // Negative cache enforces its own `[MIN_NEGATIVE_TTL, MAX_NEGATIVE_TTL]`
-            // window (see `negative_cache::clamp_negative_ttl`). Do NOT apply
+            // window. Do NOT apply
             // `clamp_ttl` here: the general `cache_min_ttl`/`cache_max_ttl` from
             // config is meant for positive records; inflating positives would
             // break the refresh/access-window cycle, while deflating negatives
@@ -323,13 +300,8 @@ impl DnsCache {
         }
 
         let ttl = self.clamp_ttl(ttl);
-        let key = CacheKey::new(domain, record_type);
-
-        let maybe_l1_addresses = if let CachedData::IpAddresses(ref entry) = data {
-            Some(Arc::clone(&entry.addresses))
-        } else {
-            None
-        };
+        let key = CacheKey::from_lowercase(domain, record_type);
+        let maybe_l1_addresses = data.as_ip_addresses().cloned();
 
         let record = CachedRecord::new(data, ttl, record_type, dnssec_status);
         let expires_secs = record.expires_at_secs;
@@ -375,29 +347,16 @@ impl DnsCache {
     ) {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
-        let key = CacheKey::new(domain, record_type);
+        let key = CacheKey::from_lowercase(domain, record_type);
         self.bloom.set(&key);
 
         if self.cache.len() >= self.max_entries {
             self.evict_entries();
         }
 
-        let maybe_l1_addresses = if let CachedData::IpAddresses(ref entry) = data {
-            Some(Arc::clone(&entry.addresses))
-        } else {
-            None
-        };
-
+        let maybe_l1_addresses = data.as_ip_addresses().cloned();
         let record = CachedRecord::permanent(data, ttl, record_type);
-        // Lock ownership before the backing cache, as remove() does, so a
-        // concurrent removal cannot discard a newly inserted name or family.
-        let mut types = self
-            .permanent_records
-            .entry(key.domain.clone())
-            .or_default();
-        if !types.contains(&record_type) {
-            types.push(record_type);
-        }
+        let _owner = self.claim_permanent(&key.domain, record_type);
         self.cache.insert(key, record);
 
         if let Some(addresses) = maybe_l1_addresses {
@@ -427,7 +386,7 @@ impl DnsCache {
     pub fn remove(&self, domain: &str, record_type: &RecordType) -> bool {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
-        let key = CacheKey::new(domain, *record_type);
+        let key = CacheKey::from_lowercase(domain, *record_type);
 
         let permanent_entry = self.permanent_records.entry(key.domain.clone());
         if self.cache.remove(&key).is_some() {
@@ -460,7 +419,7 @@ impl DnsCache {
                     record_type,
                 };
                 if let Some(record) = self.cache.get(&key) {
-                    preserved.push((key, record.data.clone(), record.ttl, record.record_type));
+                    preserved.push((key, record.data.clone(), record.ttl));
                 }
             }
         }
@@ -475,17 +434,11 @@ impl DnsCache {
         self.metrics.evictions.store(0, AtomicOrdering::Relaxed);
 
         let restored = preserved.len();
-        for (key, data, ttl, record_type) in preserved {
+        for (key, data, ttl) in preserved {
             self.bloom.set(&key);
-            let mut types = self
-                .permanent_records
-                .entry(key.domain.clone())
-                .or_default();
-            if !types.contains(&record_type) {
-                types.push(record_type);
-            }
-            self.cache
-                .insert(key, CachedRecord::permanent(data, ttl, record_type));
+            let _owner = self.claim_permanent(&key.domain, key.record_type);
+            let record = CachedRecord::permanent(data, ttl, key.record_type);
+            self.cache.insert(key, record);
         }
 
         info!(
@@ -494,12 +447,23 @@ impl DnsCache {
         );
     }
 
-    pub fn metrics(&self) -> Arc<CacheMetrics> {
-        Arc::clone(&self.metrics)
+    /// Registers `record_type` as permanent at `domain` and keeps the name's
+    /// entry locked: callers write the backing map under it, as `remove` does,
+    /// so a concurrent removal cannot discard a newly inserted name or family.
+    fn claim_permanent(
+        &self,
+        domain: &CompactString,
+        record_type: RecordType,
+    ) -> RefMut<'_, CompactString, PermanentTypes> {
+        let mut types = self.permanent_records.entry(domain.clone()).or_default();
+        if !types.contains(&record_type) {
+            types.push(record_type);
+        }
+        types
     }
 
-    pub fn size(&self) -> usize {
-        self.cache.len()
+    pub fn metrics(&self) -> &CacheMetrics {
+        &self.metrics
     }
 
     pub fn get_ttl(&self, domain: &str, record_type: &RecordType) -> Option<u32> {
@@ -511,23 +475,16 @@ impl DnsCache {
         let key = CacheKey::new(domain, *record_type);
         self.cache
             .get(&key)
-            .map(|entry| entry.expires_at_secs.saturating_sub(coarse_now_secs()) as u32)
-    }
-
-    pub fn strategy(&self) -> EvictionStrategy {
-        self.eviction_policy.strategy()
+            .map(|entry| entry.remaining_ttl_at_secs(coarse_now_secs()))
     }
 
     /// Rotates the two-slot aging bloom and re-seeds it from the live cache.
     ///
-    /// The filter is an authoritative negative gate in [`Self::get`]: when a
-    /// key's bits are absent the lookup reports a miss without ever consulting
-    /// the backing map. Bits are otherwise written only by `insert` and by a
-    /// read hit, so an entry that went unread across two rotations used to
-    /// become invisible while still holding a valid TTL — the query left for
-    /// upstream and the optimistic refresh job had no way to prevent it.
-    /// Re-seeding ties bloom membership to what the cache actually holds
-    /// rather than to how recently a key was read.
+    /// The filter is an authoritative negative gate in [`Self::get`]: a key
+    /// whose bits are absent is reported as a miss without consulting the map,
+    /// and reads never set bits. Re-seeding every live entry ties membership to
+    /// what the cache holds, so an entry nobody wrote to for two rotations
+    /// stays reachable for as long as its TTL allows.
     ///
     /// Returns how many keys were re-seeded into the new active slot.
     pub fn rotate_bloom(&self) -> usize {
@@ -561,10 +518,6 @@ impl DnsCache {
 
     pub fn min_ttl(&self) -> u32 {
         self.min_ttl
-    }
-
-    pub fn access_window_secs(&self) -> u64 {
-        self.access_window_secs
     }
 
     pub fn set_refresh_senders(&self, senders: RefreshSenders) {
@@ -636,7 +589,7 @@ impl DnsCache {
     ) -> bool {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
-        let key = CacheKey::new(domain, *record_type);
+        let key = CacheKey::from_lowercase(domain, *record_type);
         let now = coarse_now_secs();
 
         if let Some(mut entry) = self.cache.get_mut(&key) {
@@ -657,11 +610,7 @@ impl DnsCache {
             record.clear_refreshing();
             record.clear_refresh_queued();
 
-            let maybe_l1_addresses = if let CachedData::IpAddresses(ref entry) = new_data {
-                Some(Arc::clone(&entry.addresses))
-            } else {
-                None
-            };
+            let maybe_l1_addresses = new_data.as_ip_addresses().cloned();
             record.data = new_data;
 
             if let Some(addresses) = maybe_l1_addresses {
@@ -692,7 +641,7 @@ impl DnsCache {
         record: &CachedRecord,
         now_secs: u64,
     ) {
-        if let CachedData::IpAddresses(ref entry) = record.data {
+        if let CachedData::IpAddresses(entry) = &record.data {
             if record.expires_at_secs <= now_secs {
                 return;
             }
@@ -756,7 +705,7 @@ impl DnsCache {
         let num_to_evict = ((self.max_entries as f64) * self.batch_eviction_percentage) as usize;
         let num_to_evict = num_to_evict.max(1);
 
-        if self.use_probabilistic_eviction && self.cache.len() > self.max_entries / 2 {
+        if self.cache.len() > self.max_entries / 2 {
             self.evict_by_strategy(num_to_evict);
         } else {
             self.evict_arbitrary_entries(num_to_evict);
@@ -776,7 +725,6 @@ impl DnsCache {
             hit_count: u64,
             last_access: u64,
             inserted_at: u64,
-            expires_at: u64,
             is_expired: bool,
         }
 
@@ -796,7 +744,6 @@ impl DnsCache {
                 hit_count: record.counters.hit_count.load(AtomicOrdering::Relaxed),
                 last_access: record.counters.last_access.load(AtomicOrdering::Relaxed),
                 inserted_at: record.inserted_at_secs,
-                expires_at: record.expires_at_secs,
                 is_expired: record.is_expired_at_secs(now_secs),
             });
             sampled += 1;
@@ -816,11 +763,10 @@ impl DnsCache {
                 }
             }
 
-            let score = self.eviction_policy.compute_score_from_snapshot(
+            let score = self.eviction_policy.score(
                 snap.hit_count,
                 snap.last_access,
                 snap.inserted_at,
-                snap.expires_at,
                 now_secs,
             );
             let candidate = EvictionCandidate {
@@ -885,7 +831,7 @@ impl DnsCache {
 
 impl ferrous_dns_application::ports::DnsCachePort for DnsCache {
     fn cache_size(&self) -> usize {
-        self.size()
+        self.len()
     }
 
     fn cache_metrics_snapshot(&self) -> ferrous_dns_application::ports::CacheMetricsSnapshot {
@@ -893,7 +839,7 @@ impl ferrous_dns_application::ports::DnsCachePort for DnsCache {
         let hits = metrics.hits.load(AtomicOrdering::Relaxed);
         let misses = metrics.misses.load(AtomicOrdering::Relaxed);
         ferrous_dns_application::ports::CacheMetricsSnapshot {
-            total_entries: self.size(),
+            total_entries: self.len(),
             hits,
             misses,
             insertions: metrics.insertions.load(AtomicOrdering::Relaxed),
@@ -984,7 +930,6 @@ impl DnsCacheAccess for DnsCache {
         DnsCache::insert(self, domain, record_type, data, ttl, dnssec_status);
     }
 
-    #[inline]
     fn record_transient_upstream_error(&self) {
         self.metrics
             .transient_upstream_errors

@@ -1,7 +1,7 @@
-use ferrous_dns_domain::{RecordType, UpstreamPool, UpstreamStrategy};
+use ferrous_dns_domain::{DnssecStatus, RecordType, UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::dnssec::trust_anchor::TrustAnchorStore;
 use ferrous_dns_infrastructure::dns::dnssec::{
-    DnskeyRecord, DnssecValidator, DnssecValidatorPool, ValidationResult,
+    DnskeyRecord, DnssecCache, DnssecValidator, DnssecValidatorPool,
 };
 use ferrous_dns_infrastructure::dns::PoolManager;
 use hickory_proto::op::{Message, MessageType, OpCode};
@@ -29,7 +29,12 @@ async fn make_pool_manager(server: String) -> Arc<PoolManager> {
 fn make_validator() -> DnssecValidator {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let pm = rt.block_on(make_pool_manager("udp://127.0.0.1:5353".into()));
-    DnssecValidator::with_trust_store(pm, TrustAnchorStore::empty())
+    DnssecValidator::new(
+        pm,
+        TrustAnchorStore::empty(),
+        Arc::new(DnssecCache::new()),
+        5000,
+    )
 }
 
 fn make_a_record(name: &str, ip: Ipv4Addr) -> Record {
@@ -45,7 +50,7 @@ fn test_verify_rrset_empty_records_returns_indeterminate() {
     let validator = make_validator();
     assert_eq!(
         validator.verify_rrset_signatures("example.com.", &[]),
-        ValidationResult::Indeterminate
+        DnssecStatus::Indeterminate
     );
 }
 
@@ -55,7 +60,7 @@ fn test_verify_rrset_a_records_only_no_rrsig_returns_bogus() {
     let a = make_a_record("example.com.", Ipv4Addr::new(1, 2, 3, 4));
     assert_eq!(
         validator.verify_rrset_signatures("example.com.", &[a]),
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     );
 }
 
@@ -72,7 +77,7 @@ fn test_verify_rrset_multiple_a_records_no_rrsig_returns_bogus() {
     .collect();
     assert_eq!(
         validator.verify_rrset_signatures("example.com.", &records),
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     );
 }
 
@@ -116,7 +121,7 @@ fn test_verify_rrset_rrsig_present_no_zone_keys_returns_bogus() {
     let answers = vec![a_record, rrsig_record];
     assert_eq!(
         validator.verify_rrset_signatures("example.com.", &answers),
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     );
 }
 
@@ -169,7 +174,7 @@ fn test_verify_rrset_valid_ed25519_rrsig_returns_secure() {
     let answers = vec![a_record, rrsig_record];
     assert_eq!(
         validator.verify_rrset_signatures("example.com.", &answers),
-        ValidationResult::Secure
+        DnssecStatus::Secure
     );
 }
 
@@ -224,7 +229,7 @@ fn test_verify_rrset_wrong_zone_key_returns_bogus() {
     let answers = vec![a_record, rrsig_record];
     assert_eq!(
         validator.verify_rrset_signatures("example.com.", &answers),
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     );
 }
 
@@ -288,7 +293,7 @@ fn test_verify_rrset_signer_not_enclosing_owner_returns_bogus() {
     let answers = vec![a_record, rrsig_record];
     assert_eq!(
         validator.verify_rrset_signatures("victim.bank.com.", &answers),
-        ValidationResult::Bogus
+        DnssecStatus::Bogus
     );
 }
 
@@ -322,6 +327,7 @@ async fn next_free_validator_serves_the_oldest_waiter() {
         60_000,
         NonZeroUsize::new(2).unwrap(),
         TrustAnchorStore::new(),
+        Arc::new(DnssecCache::new()),
     );
     let mut first = Box::pin(pool.validate_query("first.example.", RecordType::A));
     observe_query(&upstream, &mut first, "first.example.").await;
@@ -347,7 +353,7 @@ async fn next_free_validator_serves_the_oldest_waiter() {
         .await
         .expect("the oldest waiter must not wait for the still-busy first validator")
         .unwrap();
-    assert_eq!(result.validation_status, ValidationResult::Insecure);
+    assert_eq!(result, DnssecStatus::Insecure);
     observe_query(&upstream, &mut younger, "younger.example.").await;
 }
 
@@ -360,6 +366,7 @@ async fn cancelled_validation_and_waiters_restore_pool_capacity() {
         60_000,
         NonZeroUsize::MIN,
         TrustAnchorStore::empty(),
+        Arc::new(DnssecCache::new()),
     );
     let mut active = Box::pin(pool.validate_query("active.example.", RecordType::A));
     observe_query(&upstream, &mut active, "active.example.").await;
@@ -383,5 +390,5 @@ async fn cancelled_validation_and_waiters_restore_pool_capacity() {
         .await
         .expect("cancellation must return both the validator and its capacity")
         .unwrap();
-    assert_eq!(result.validation_status, ValidationResult::Insecure);
+    assert_eq!(result, DnssecStatus::Insecure);
 }

@@ -46,8 +46,6 @@ async fn resolver_with_ip(domain: &str, ip: &str) -> MockDnsResolver {
     resolver
 }
 
-// ── Block action ─────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn blocked_c2_ip_returns_error() {
     let resolver = resolver_with_ip("malware.com", C2_IP).await;
@@ -83,8 +81,6 @@ async fn clean_response_passes_with_block_action() {
     assert!(result.is_ok());
 }
 
-// ── Alert action ─────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn c2_ip_allowed_in_alert_mode() {
     let resolver = resolver_with_ip("malware.com", C2_IP).await;
@@ -99,8 +95,6 @@ async fn c2_ip_allowed_in_alert_mode() {
 
     assert!(result.is_ok(), "alert mode should allow C2 IP response");
 }
-
-// ── Disabled detection ───────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn disabled_detection_allows_c2_response() {
@@ -117,8 +111,6 @@ async fn disabled_detection_allows_c2_response() {
 
     assert!(result.is_ok());
 }
-
-// ── Cache direct path ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn cache_hit_with_c2_ip_falls_through() {
@@ -144,8 +136,6 @@ async fn cache_hit_with_c2_ip_falls_through() {
     assert_eq!(logs[0].block_source, Some(BlockSource::ResponseIpFilter));
 }
 
-// ── Empty store never blocks ─────────────────────────────────────────────────
-
 #[tokio::test]
 async fn empty_store_never_blocks() {
     let resolver = resolver_with_ip("example.com", "1.2.3.4").await;
@@ -159,8 +149,6 @@ async fn empty_store_never_blocks() {
 
     assert!(result.is_ok());
 }
-
-// ── Multiple IPs in response ─────────────────────────────────────────────────
 
 #[tokio::test]
 async fn blocks_when_one_of_multiple_ips_is_c2() {

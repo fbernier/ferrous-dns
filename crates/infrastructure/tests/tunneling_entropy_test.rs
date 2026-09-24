@@ -2,8 +2,6 @@ use ferrous_dns_infrastructure::dns::tunneling::entropy::{
     extract_apex, extract_subdomain, shannon_entropy,
 };
 
-// ── Shannon entropy ─────────────────────────────────────────────────────────
-
 #[test]
 fn entropy_of_english_word_is_low() {
     let e = shannon_entropy(b"google");
@@ -58,8 +56,6 @@ fn normal_subdomain_has_low_entropy() {
     assert!(e < 2.0, "expected < 2.0, got {e}");
 }
 
-// ── extract_subdomain ───────────────────────────────────────────────────────
-
 #[test]
 fn extract_subdomain_returns_none_for_apex() {
     assert_eq!(extract_subdomain("example.com"), None);
@@ -84,8 +80,6 @@ fn extract_subdomain_returns_multiple_labels_before_apex() {
 fn extract_subdomain_deeply_nested() {
     assert_eq!(extract_subdomain("a.b.c.d.example.com"), Some("a.b.c.d"));
 }
-
-// ── extract_apex ────────────────────────────────────────────────────────────
 
 #[test]
 fn extract_apex_two_labels() {

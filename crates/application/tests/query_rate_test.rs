@@ -154,20 +154,3 @@ async fn test_get_query_rate_different_units() {
     assert_eq!(result_hour.queries, 9500);
     assert_eq!(result_hour.rate, "9.5k q/h");
 }
-
-#[tokio::test]
-async fn test_rate_unit_conversion() {
-    let repository_mock = Arc::new(MockQueryLogRepository::new());
-    let use_case = GetQueryRateUseCase::new(
-        repository_mock.clone() as Arc<dyn ferrous_dns_application::ports::QueryLogRepository>
-    );
-
-    let second_result = use_case.execute(RateUnit::Second).await.unwrap();
-    assert!(second_result.rate.ends_with("q/s"));
-
-    let minute_result = use_case.execute(RateUnit::Minute).await.unwrap();
-    assert!(minute_result.rate.ends_with("q/m"));
-
-    let hour_result = use_case.execute(RateUnit::Hour).await.unwrap();
-    assert!(hour_result.rate.ends_with("q/h"));
-}

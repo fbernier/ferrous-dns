@@ -23,20 +23,16 @@ impl WhitelistSet {
                     match addr {
                         IpAddr::V4(v4) => {
                             let bits = u32::from(v4);
-                            let mask = if prefix_len >= 32 {
-                                u32::MAX
-                            } else {
-                                u32::MAX << (32 - prefix_len)
-                            };
+                            let mask = u32::MAX
+                                .checked_shl(32u32.saturating_sub(prefix_len))
+                                .unwrap_or(0);
                             v4_entries.push((bits & mask, mask));
                         }
                         IpAddr::V6(v6) => {
                             let bits = u128::from(v6);
-                            let mask = if prefix_len >= 128 {
-                                u128::MAX
-                            } else {
-                                u128::MAX << (128 - prefix_len)
-                            };
+                            let mask = u128::MAX
+                                .checked_shl(128u32.saturating_sub(prefix_len))
+                                .unwrap_or(0);
                             v6_entries.push((bits & mask, mask));
                         }
                     }
@@ -98,5 +94,12 @@ mod tests {
         let ws = WhitelistSet::from_cidrs(&["10.0.0.1".to_string()]);
         assert!(ws.contains("10.0.0.1".parse().unwrap()));
         assert!(!ws.contains("10.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn whitelist_zero_prefix_matches_every_address() {
+        let ws = WhitelistSet::from_cidrs(&["0.0.0.0/0".to_string(), "::/0".to_string()]);
+        assert!(ws.contains("203.0.113.9".parse().unwrap()));
+        assert!(ws.contains("2001:db8::1".parse().unwrap()));
     }
 }
