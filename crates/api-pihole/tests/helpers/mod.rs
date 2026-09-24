@@ -414,7 +414,10 @@ async fn build_pihole_state(
             get_groups: Arc::new(GetGroupsUseCase::new(group_repo.clone())),
             create_group: Arc::new(CreateGroupUseCase::new(group_repo.clone())),
             update_group: Arc::new(UpdateGroupUseCase::new(group_repo.clone())),
-            delete_group: Arc::new(DeleteGroupUseCase::new(group_repo.clone())),
+            delete_group: Arc::new(DeleteGroupUseCase::new(
+                group_repo.clone(),
+                block_filter_engine.clone(),
+            )),
         },
         clients: PiholeClientState {
             get_clients: Arc::new(GetClientsUseCase::new(client_repo.clone())),

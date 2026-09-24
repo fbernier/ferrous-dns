@@ -1,4 +1,9 @@
+use chrono::Datelike;
 use serde::{Deserialize, Serialize};
+
+/// Last year auth timestamps can store: they are compared as `%Y-…` strings in
+/// SQL, and a five-digit year (`+10000-…`) would sort before every current one.
+pub const MAX_STORED_EXPIRY_YEAR: i32 = 9999;
 
 /// Authentication configuration, defined in `[auth]` section of `ferrous-dns.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -50,10 +55,12 @@ impl AuthConfig {
     }
 }
 
-/// The instant `ttl_secs` from now, or `None` when chrono cannot represent it.
+/// The instant `ttl_secs` from now, or `None` when chrono cannot represent it
+/// or it falls past [`MAX_STORED_EXPIRY_YEAR`].
 pub fn expiry_from_now(ttl_secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::TimeDelta::try_seconds(ttl_secs)
         .and_then(|ttl| chrono::Utc::now().checked_add_signed(ttl))
+        .filter(|at| at.year() <= MAX_STORED_EXPIRY_YEAR)
 }
 
 /// WebAuthn relying-party configuration, `[auth.webauthn]`.

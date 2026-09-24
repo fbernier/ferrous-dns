@@ -255,7 +255,10 @@ impl TestAppBuilder {
                 get_groups: Arc::new(GetGroupsUseCase::new(group_repo.clone())),
                 create_group: Arc::new(CreateGroupUseCase::new(group_repo.clone())),
                 update_group: Arc::new(UpdateGroupUseCase::new(group_repo.clone())),
-                delete_group: Arc::new(DeleteGroupUseCase::new(group_repo.clone())),
+                delete_group: Arc::new(DeleteGroupUseCase::new(
+                    group_repo.clone(),
+                    null_engine.clone(),
+                )),
                 assign_client_group: Arc::new(AssignClientGroupUseCase::new(
                     client_repo.clone(),
                     group_repo.clone(),

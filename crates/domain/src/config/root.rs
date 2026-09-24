@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::auth::{expiry_from_now, AuthConfig};
+use super::auth::{expiry_from_now, AuthConfig, MAX_STORED_EXPIRY_YEAR};
 use super::blocking::BlockingConfig;
 use super::database::DatabaseConfig;
 use super::dns::DnsConfig;
@@ -228,8 +228,8 @@ impl Config {
     }
 
     /// Rejects values whose derived duration overflows where it is used:
-    /// session and MFA-challenge expiries are `now + ttl`, and the upstream
-    /// timeout is taken in milliseconds.
+    /// session and MFA-challenge expiries are `now + ttl` and must be storable
+    /// with a four-digit year, and the upstream timeout is taken in milliseconds.
     fn validate_derived_durations(&self) -> Result<(), DomainError> {
         let auth = &self.auth;
         for (field, ttl_secs) in [
@@ -239,7 +239,7 @@ impl Config {
         ] {
             if expiry_from_now(ttl_secs).is_none() {
                 return Err(DomainError::ConfigError(format!(
-                    "{field} is too large: an expiry {ttl_secs}s from now is not a representable date"
+                    "{field} is too large: an expiry {ttl_secs}s from now is past year {MAX_STORED_EXPIRY_YEAR}"
                 )));
             }
         }

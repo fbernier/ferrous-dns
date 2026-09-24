@@ -186,7 +186,7 @@ impl GroupRepository for SqliteGroupRepository {
             .map_err(|e| {
                 if is_fk_violation(&e) {
                     DomainError::GroupInUse(format!(
-                        "group {id} is still referenced by regex filters or Safe Search settings"
+                        "group {id} is still referenced by regex filters"
                     ))
                 } else {
                     db_err("Failed to delete group")(e)

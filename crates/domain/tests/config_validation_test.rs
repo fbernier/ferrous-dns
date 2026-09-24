@@ -239,6 +239,30 @@ fn long_but_representable_durations_are_accepted() {
     config.validate().unwrap();
 }
 
+/// Auth timestamps are compared as strings in SQL: a year past 9999 renders as
+/// `+10000-…`, sorts before today, and cleanup would delete it as expired.
+#[test]
+fn expiries_past_year_9999_are_rejected_naming_the_key() {
+    // About 8,200 years: representable by chrono, but not as a four-digit year.
+    let cases: [(&str, BreakConfig); 2] = [
+        ("auth.remember_me_days", |c| {
+            c.auth.remember_me_days = 3_000_000
+        }),
+        ("auth.mfa_challenge_ttl_secs", |c| {
+            c.auth.mfa_challenge_ttl_secs = 86_400 * 365 * 8_200
+        }),
+    ];
+    for (field, break_it) in cases {
+        let mut config = valid_config();
+        break_it(&mut config);
+        let message = validation_message(&config);
+        assert!(
+            message.contains(field) && message.contains("9999"),
+            "{field}: the message should name the key and the limit: {message}"
+        );
+    }
+}
+
 /// Older builds saved a bare router IP, which must still boot as port 53.
 #[test]
 fn a_local_dns_server_is_an_ip_with_port_53_unless_one_is_given() {

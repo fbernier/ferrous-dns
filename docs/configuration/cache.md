@@ -127,7 +127,7 @@ cache_access_window_secs = 43200
     Every eligible entry is queued for renewal. `cache_min_hit_rate` and `cache_min_frequency` only come into play when a cycle finds more candidates than the queue can hold: candidates are ordered by how much their loss would cost -- entries that clear both thresholds first, and within each group the ones closest to being unusable -- and the tail is dropped. On a healthy deployment nothing is dropped and neither threshold has any effect on refresh. Watch `cache_optimistic_refresh_shed` on `/metrics`: a sustained non-zero value means the working set has outgrown the queue, which is sized from `cache_max_entries`.
 
 !!! note "Serve-stale is never paced"
-    Pacing applies only to background pre-expiry refreshes. When an entry has expired but is still inside its stale-serve grace period, the client is handed the stale answer and a refresh is queued -- those bypass the pacer entirely, because someone is already waiting on the fresh result.
+    Pacing applies only to background pre-expiry refreshes. When an entry has expired but is still inside its stale-serve grace period, the client is handed the stale answer and a refresh is queued -- those bypass the pacer entirely, because someone is already waiting on the fresh result. Serve-stale repairs run whenever the cache is enabled, including with `cache_optimistic_refresh = false`; that option only turns off the pre-expiry scan.
 
 !!! note
     `cache_min_ttl` should be >= 240 seconds so the refresh job has time to act before expiry.

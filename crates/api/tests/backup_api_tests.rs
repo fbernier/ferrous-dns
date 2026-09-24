@@ -372,6 +372,55 @@ async fn test_import_existing_local_record_is_skipped() {
 }
 
 #[tokio::test]
+async fn test_import_aaaa_beside_existing_a_for_same_name_is_added() {
+    let TestApp {
+        router: app,
+        config,
+        ..
+    } = test_app().await;
+
+    {
+        let mut cfg = config.write().await;
+        cfg.dns.local_records.push(LocalDnsRecord {
+            hostname: "nas".to_string(),
+            domain: Some("lan".to_string()),
+            ip: "10.0.0.2".parse().unwrap(),
+            record_type: LocalRecordType::A,
+            ttl: Some(300),
+        });
+    }
+
+    let mut backup = minimal_backup_json();
+    backup["data"]["local_records"] = json!([{
+        "hostname": "nas",
+        "domain": "lan",
+        "ip": "fd00::2",
+        "record_type": "AAAA",
+        "ttl": 300
+    }]);
+
+    let payload = serde_json::to_vec(&backup).unwrap();
+    let response = app.oneshot(import_request(&payload)).await.unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["summary"]["local_records_imported"], 1);
+    assert_eq!(json["summary"]["local_records_skipped"], 0);
+    let cfg = config.read().await;
+    let mut types: Vec<_> = cfg
+        .dns
+        .local_records
+        .iter()
+        .filter(|r| r.hostname == "nas")
+        .map(|r| r.record_type.as_str())
+        .collect();
+    types.sort_unstable();
+    assert_eq!(types, ["A", "AAAA"]);
+}
+
+#[tokio::test]
 async fn test_import_is_idempotent() {
     let import_uc = test_app().await.state.backup.import;
 

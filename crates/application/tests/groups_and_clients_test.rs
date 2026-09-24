@@ -1,4 +1,7 @@
-use ferrous_dns_application::use_cases::{CreateGroupUseCase, UpdateClientUseCase};
+use ferrous_dns_application::ports::GroupRepository;
+use ferrous_dns_application::use_cases::{
+    CreateGroupUseCase, DeleteGroupUseCase, UpdateClientUseCase,
+};
 use ferrous_dns_domain::{Client, DomainError};
 use std::sync::Arc;
 
@@ -56,4 +59,30 @@ async fn test_create_group_honours_enabled_flag() {
 
     assert!(!disabled.enabled);
     assert!(enabled.enabled);
+}
+
+#[tokio::test]
+async fn test_delete_group_reloads_block_filter() {
+    let groups = Arc::new(MockGroupRepository::new());
+    let engine = Arc::new(MockBlockFilterEngine::new());
+    let group = groups.create("Kids".to_string(), None, true).await.unwrap();
+    let use_case = DeleteGroupUseCase::new(groups, engine.clone());
+
+    use_case.execute(group.id.unwrap()).await.unwrap();
+
+    assert_eq!(engine.reload_count().await, 1);
+}
+
+#[tokio::test]
+async fn test_delete_protected_group_does_not_reload_block_filter() {
+    let engine = Arc::new(MockBlockFilterEngine::new());
+    let use_case = DeleteGroupUseCase::new(Arc::new(MockGroupRepository::new()), engine.clone());
+
+    let result = use_case.execute(1).await;
+
+    assert!(matches!(
+        result,
+        Err(DomainError::ProtectedGroupCannotBeDeleted)
+    ));
+    assert_eq!(engine.reload_count().await, 0);
 }

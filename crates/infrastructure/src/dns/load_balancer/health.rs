@@ -175,9 +175,13 @@ impl HealthChecker {
     }
 
     pub fn is_healthy(&self, protocol: &Arc<DnsProtocol>) -> bool {
+        // Unknown stays in rotation: a server leaves only after failure_threshold failures.
         self.health_map
             .get(protocol)
-            .map(|h| h.status == ServerStatus::Healthy)
+            .map(|h| match h.status {
+                ServerStatus::Healthy | ServerStatus::Unknown => true,
+                ServerStatus::Unhealthy => false,
+            })
             .unwrap_or(true)
     }
 
@@ -190,5 +194,32 @@ impl HealthChecker {
 
     pub fn get_health_info(&self, protocol: &Arc<DnsProtocol>) -> Option<ServerHealth> {
         self.health_map.get(protocol).map(|h| h.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proto() -> Arc<DnsProtocol> {
+        Arc::new("udp://127.0.0.1:53".parse::<DnsProtocol>().unwrap())
+    }
+
+    #[test]
+    fn server_stays_in_rotation_until_failure_threshold() {
+        let checker = HealthChecker::new(3, 1);
+        let server = proto();
+
+        checker.mark_failed(&server, None, "timeout".into());
+        checker.mark_failed(&server, None, "timeout".into());
+        assert_eq!(checker.get_status(&server), ServerStatus::Unknown);
+        assert!(
+            checker.is_healthy(&server),
+            "below threshold must stay in rotation"
+        );
+
+        checker.mark_failed(&server, None, "timeout".into());
+        assert_eq!(checker.get_status(&server), ServerStatus::Unhealthy);
+        assert!(!checker.is_healthy(&server));
     }
 }

@@ -285,10 +285,14 @@ impl ImportConfigUseCase {
         for record in &snapshot.data.local_records {
             {
                 let config = self.destination.config.read().await;
+                // A and AAAA for the same name are distinct records, so the type is part of the key.
                 let already_exists = config.dns.local_records.iter().any(|r| {
                     r.hostname == record.hostname
                         && r.domain.as_deref().unwrap_or("")
                             == record.domain.as_deref().unwrap_or("")
+                        && r.record_type
+                            .as_str()
+                            .eq_ignore_ascii_case(&record.record_type)
                 });
                 if already_exists {
                     skipped += 1;

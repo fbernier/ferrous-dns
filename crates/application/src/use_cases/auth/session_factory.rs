@@ -27,7 +27,8 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Timestamp `ttl_secs` from now, in [`TIMESTAMP_FMT`]. Config validation
-/// rejects TTLs past chrono's range; this refuses the login instead of panicking.
+/// rejects TTLs whose expiry cannot be stored; this refuses the login instead
+/// of panicking or writing a five-digit year.
 pub(crate) fn expires_in(ttl_secs: i64) -> Result<String, DomainError> {
     expiry_from_now(ttl_secs)
         .map(|at| at.format(TIMESTAMP_FMT).to_string())

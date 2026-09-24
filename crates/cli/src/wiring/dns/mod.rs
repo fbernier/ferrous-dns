@@ -41,12 +41,12 @@ pub struct DnsServices {
     /// Live counters from the DNSSEC validator cache. Reports zeros when DNSSEC
     /// validation is disabled.
     pub dnssec_stats: Arc<dyn DnssecStatsPort>,
-    /// Pool manager backing the cache optimistic-refresh resolver, when that
-    /// path is enabled. Kept so hot upstream reloads also reach it.
+    /// Pool manager backing the cache background-refresh resolver, present
+    /// whenever the cache is enabled. Kept so hot upstream reloads also reach it.
     pub maintenance_pool_manager: Option<Arc<PoolManager>>,
     pub health_checker: Arc<HealthChecker>,
-    /// Present whenever the cache is enabled; refresh is on only with
-    /// `cache_optimistic_refresh`.
+    /// Present whenever the cache is enabled; the optimistic scan runs only
+    /// with `cache_optimistic_refresh`, serve-stale repairs always.
     pub cache_maintenance: Option<Arc<dyn CacheMaintenancePort>>,
     /// Live PTR map for local records. Always present, so a record added from
     /// the admin UI reverse-resolves without a restart.
@@ -367,19 +367,19 @@ impl DnsServices {
 
         // Eviction and compaction run regardless: nothing else bounds the cache.
         let maintenance = DnsCacheMaintenance::new(cache.clone(), DEFAULT_REFRESH_INTERVAL_SECS);
-        if !config.dns.cache_optimistic_refresh {
-            return Ok((
-                Some(Arc::new(maintenance) as Arc<dyn CacheMaintenancePort>),
-                None,
-            ));
-        }
+        let optimistic = config.dns.cache_optimistic_refresh;
 
         // The optimistic queue holds one cycle's backlog. A cycle produces
         // roughly `entries * interval / ttl` candidates, so it is sized off the
         // cache rather than fixed: a constant that fits a small deployment
         // silently caps how much of a large one can stay warm. The clamp keeps
-        // both ends sane — the upper bound is ~0.8 MB of queued keys.
-        let optimistic_capacity = (config.dns.cache_max_entries / 4).clamp(1024, 32_768);
+        // both ends sane — the upper bound is ~0.8 MB of queued keys. With the
+        // scan off nothing enqueues there, so it gets the minimum.
+        let optimistic_capacity = if optimistic {
+            (config.dns.cache_max_entries / 4).clamp(1024, 32_768)
+        } else {
+            1
+        };
         // The stale queue is shallower on purpose: those items are
         // latency-sensitive and drained unpaced, so it only has to absorb a
         // burst, not a backlog — the client interaction is over long before a
@@ -408,6 +408,7 @@ impl DnsServices {
             .builder(Arc::clone(&maintenance_pool_manager))
             .build();
 
+        // Started even with the optimistic scan off: serve-stale repairs arrive on the stale queue.
         DnsCacheMaintenance::start_refresh_worker(
             cache.clone(),
             resolver_for_maintenance,
@@ -418,11 +419,14 @@ impl DnsServices {
             scan_opts.min_lead_secs,
         );
 
+        let maintenance = if optimistic {
+            maintenance.with_optimistic_refresh(scan_opts, pace_tx)
+        } else {
+            maintenance
+        };
+
         Ok((
-            Some(
-                Arc::new(maintenance.with_optimistic_refresh(scan_opts, pace_tx))
-                    as Arc<dyn CacheMaintenancePort>,
-            ),
+            Some(Arc::new(maintenance) as Arc<dyn CacheMaintenancePort>),
             Some(maintenance_pool_manager),
         ))
     }
@@ -453,14 +457,21 @@ mod tests {
     use super::*;
     use ferrous_dns_domain::{UpstreamPool, UpstreamStrategy};
 
-    async fn build_services(mut config: Config) -> (tempfile::TempDir, DnsServices) {
+    async fn build_services(config: Config) -> (tempfile::TempDir, DnsServices) {
+        build_services_with_upstream(config, "127.0.0.1:9").await
+    }
+
+    async fn build_services_with_upstream(
+        mut config: Config,
+        upstream: &str,
+    ) -> (tempfile::TempDir, DnsServices) {
         let dir = tempfile::tempdir().unwrap();
         config.database.path = dir.path().join("ferrous.db").display().to_string();
         config.dns.pools = vec![UpstreamPool {
-            name: "unreachable".to_string(),
+            name: "test".to_string(),
             strategy: UpstreamStrategy::Parallel,
             priority: 1,
-            servers: vec!["127.0.0.1:9".to_string()],
+            servers: vec![upstream.to_string()],
             weight: None,
         }];
 
@@ -541,9 +552,69 @@ mod tests {
             services.cache.len() < before,
             "eviction cycle removed nothing from an over-capacity cache"
         );
+    }
+
+    /// Serve-stale repairs don't depend on the optimistic scan: with it off, a
+    /// stale hit must still send the entry's refresh upstream in the background.
+    #[tokio::test]
+    async fn stale_hit_is_repaired_with_optimistic_refresh_off() {
+        use ferrous_dns_domain::RecordType;
+        use ferrous_dns_infrastructure::dns::cache::coarse_clock;
+        use ferrous_dns_infrastructure::dns::{CachedAddresses, CachedData};
+        use std::time::Duration;
+
+        const DOMAIN: &str = "stale-repair.example.com";
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.dns.cache_enabled = true;
+        config.dns.cache_optimistic_refresh = false;
+        config.dns.cache_min_ttl = 0;
+        let (_dir, services) =
+            build_services_with_upstream(config, &upstream.local_addr().unwrap().to_string()).await;
+
+        coarse_clock::tick();
+        services.cache.insert(
+            DOMAIN,
+            RecordType::A,
+            CachedData::IpAddresses(CachedAddresses {
+                addresses: Arc::new(vec!["192.0.2.1".parse().unwrap()]),
+            }),
+            2,
+            None,
+        );
+        // Past expiry, still inside the two-TTL stale grace period.
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        coarse_clock::tick();
+        assert!(services.cache.get(DOMAIN, &RecordType::A).is_some());
+        assert_eq!(
+            services
+                .cache
+                .metrics()
+                .stale_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // The health checker probes this socket too, so wait for our qname
+        // (compared case-insensitively: queries may carry 0x20 case randomization).
+        let qname: &[u8] = b"\x0cstale-repair\x07example\x03com\x00";
+        let mut buf = [0u8; 512];
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (len, _) = upstream.recv_from(&mut buf).await.unwrap();
+                if buf[..len]
+                    .windows(qname.len())
+                    .any(|w| w.eq_ignore_ascii_case(qname))
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+
         assert!(
-            services.maintenance_pool_manager.is_none(),
-            "refresh resolver started although optimistic refresh is off"
+            received.is_ok(),
+            "stale hit was never refreshed upstream in the background"
         );
     }
 
