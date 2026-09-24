@@ -8,20 +8,18 @@
 //! - `DnsServerHandler::handle_raw_udp_fallback` (the slow path truncates for
 //!   plain UDP only — every other transport frames its own length).
 
+#[path = "support/ports.rs"]
+mod ports;
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use ferrous_dns_application::ports::{
-    BlockFilterEnginePort, CacheStats, DnsResolution, DnsResolver, FilterDecision,
-    PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
-};
+use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
-use ferrous_dns_domain::{
-    BlockResponseMode, ClientProtocol, DnsQuery, DnssecStats, DomainError, QueryLog,
-    QueryLogFilter, QueryStats, RecordType,
-};
+use ferrous_dns_domain::{BlockResponseMode, ClientProtocol, DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::fast_path::parse_query;
 use ferrous_dns_infrastructure::dns::server::{BlockPolicy, DnsServerHandler};
 use ferrous_dns_infrastructure::dns::wire_response::wire_fits_udp_buffer;
+use ports::{AllowAllFilter, NoopQueryLog};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -126,110 +124,6 @@ impl DnsResolver for CannedWireResolver {
         res.min_ttl = Some(self.ttl);
         res.upstream_wire_data = Some(Bytes::from(self.wire.clone()));
         Some(res)
-    }
-}
-
-/// Allows every domain; assigns the default group.
-struct AllowAllFilter;
-
-#[async_trait]
-impl BlockFilterEnginePort for AllowAllFilter {
-    fn resolve_group(&self, _ip: IpAddr) -> i64 {
-        0
-    }
-    fn check(&self, _domain: &str, _group_id: i64) -> FilterDecision {
-        FilterDecision::Allow
-    }
-    fn store_cname_decision(&self, _domain: &str, _group_id: i64, _ttl_secs: u64) {}
-    async fn reload(&self) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn load_client_groups(&self) -> Result<(), DomainError> {
-        Ok(())
-    }
-    fn compiled_domain_count(&self) -> usize {
-        0
-    }
-    fn is_blocking_enabled(&self) -> bool {
-        false
-    }
-    fn set_blocking_enabled(&self, _enabled: bool) {}
-}
-
-/// Drops every logged query.
-struct NoopQueryLog;
-
-#[async_trait]
-impl QueryLogRepository for NoopQueryLog {
-    async fn log_query(&self, _query: &QueryLog) -> Result<(), DomainError> {
-        Ok(())
-    }
-    async fn get_recent(
-        &self,
-        _limit: u32,
-        _period_hours: f32,
-    ) -> Result<Vec<QueryLog>, DomainError> {
-        unimplemented!()
-    }
-    async fn get_recent_paged(
-        &self,
-        _limit: u32,
-        _offset: u32,
-        _period_hours: f32,
-        _cursor: Option<i64>,
-        _filter: &QueryLogFilter,
-    ) -> Result<PagedQueryResult, DomainError> {
-        unimplemented!()
-    }
-    async fn get_stats(&self, _period_hours: f32) -> Result<QueryStats, DomainError> {
-        unimplemented!()
-    }
-    async fn get_dnssec_stats(&self, _period_hours: f32) -> Result<DnssecStats, DomainError> {
-        unimplemented!()
-    }
-    async fn get_timeline(
-        &self,
-        _period_hours: u32,
-        _granularity: TimeGranularity,
-    ) -> Result<Vec<TimelineBucket>, DomainError> {
-        unimplemented!()
-    }
-    async fn count_queries_since(&self, _seconds_ago: i64) -> Result<u64, DomainError> {
-        unimplemented!()
-    }
-    async fn get_cache_stats(&self, _period_hours: f32) -> Result<CacheStats, DomainError> {
-        unimplemented!()
-    }
-    async fn get_top_blocked_domains(
-        &self,
-        _limit: u32,
-        _period_hours: f32,
-    ) -> Result<Vec<(String, u64)>, DomainError> {
-        unimplemented!()
-    }
-    async fn get_top_allowed_domains(
-        &self,
-        _limit: u32,
-        _period_hours: f32,
-    ) -> Result<Vec<(String, u64)>, DomainError> {
-        unimplemented!()
-    }
-    async fn get_distinct_recent_domains(
-        &self,
-        _limit: u32,
-        _period_hours: f32,
-    ) -> Result<Vec<(String, u64)>, DomainError> {
-        unimplemented!()
-    }
-    async fn get_top_clients(
-        &self,
-        _limit: u32,
-        _period_hours: f32,
-    ) -> Result<Vec<(String, Option<String>, u64)>, DomainError> {
-        unimplemented!()
-    }
-    async fn delete_older_than(&self, _days: u32) -> Result<u64, DomainError> {
-        unimplemented!()
     }
 }
 

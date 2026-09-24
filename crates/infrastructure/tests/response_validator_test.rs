@@ -85,6 +85,55 @@ fn accepts_qname_case_difference_when_not_0x20() {
     assert!(v.validate(&resp, &udp()).is_ok());
 }
 
+/// Labels must match one for one; a shared prefix, suffix or the same bytes
+/// under other label boundaries is a spoof in every mode (0x20 or not, over
+/// Do53 or an encrypted transport).
+#[test]
+fn qname_must_match_label_for_label() {
+    let cases = [
+        ("example.com", "example.com", true),
+        ("a.bc", "a.bc", true),
+        (".", ".", true),
+        ("example.com", "example.net", false),
+        ("example.com", "exam.com", false),
+        ("example.com", "examples.com", false),
+        ("example.com", "example.com.evil", false),
+        ("example.com", "www.example.com", false),
+        ("example.com", "com", false),
+        ("example.com", ".", false),
+        (".", "com", false),
+        ("a.bc", "ab.c", false),
+        ("ab.c", "a.bc", false),
+    ];
+    let labels = |name: &'static str| -> Vec<&'static [u8]> {
+        name.split('.')
+            .filter(|l| !l.is_empty())
+            .map(str::as_bytes)
+            .collect()
+    };
+    for (case_sensitive, protocol) in [
+        (true, udp()),
+        (false, udp()),
+        (true, https()),
+        (false, https()),
+    ] {
+        for (sent, got, accepted) in cases {
+            let v = validator(None, case_sensitive, &labels(sent));
+            let resp = response(ID, &labels(got), RecordType::A, None);
+            let result = v.validate(&resp, &protocol);
+            let verdict = if accepted {
+                result.is_ok()
+            } else {
+                is_spoof(result)
+            };
+            assert!(
+                verdict,
+                "'{got}' for '{sent}' (0x20: {case_sensitive}, {protocol:?})"
+            );
+        }
+    }
+}
+
 #[test]
 fn rejects_qtype_mismatch() {
     let v = validator(None, false, &[b"example", b"com"]);

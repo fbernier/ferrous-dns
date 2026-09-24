@@ -538,4 +538,20 @@ mod tests {
             });
         assert_eq!(routed, hickory);
     }
+
+    /// RFC 6891 §6.1.1 makes two OPT records a FORMERR. The wire parser must
+    /// decline such a query, or the cache fast path would answer what hickory
+    /// rejects; both routes then treat it identically.
+    #[test]
+    fn query_with_two_opt_records_is_left_to_hickory() {
+        let mut raw = encode(1, (0x0100, "example.com", 1, Some((1232, false, &[]))));
+        raw.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+        raw[11] = 2;
+
+        assert!(fast_path::parse_query(&raw).is_none());
+        let routed = parse_client_query(&raw, CLIENT, ClientProtocol::Udp).map(|(q, _)| q.id);
+        let hickory =
+            parse_client_query_hickory(&raw, CLIENT, ClientProtocol::Udp).map(|(q, _)| q.id);
+        assert_eq!(routed, hickory);
+    }
 }

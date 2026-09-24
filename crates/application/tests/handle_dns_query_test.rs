@@ -1,6 +1,10 @@
 mod helpers;
 
-use ferrous_dns_application::{ports::DnsResolution, use_cases::HandleDnsQueryUseCase};
+use async_trait::async_trait;
+use ferrous_dns_application::{
+    ports::{DnsResolution, SafeSearchEnginePort},
+    use_cases::HandleDnsQueryUseCase,
+};
 use ferrous_dns_domain::{BlockSource, ClientProtocol, DnsRequest, DomainError, RecordType};
 use helpers::{
     DnsResolutionBuilder, MockBlockFilterEngine, MockClientRepository, MockDnsResolver,
@@ -719,4 +723,62 @@ async fn test_execute_log_records_response_time() {
 
     let logs = log.get_sync_logs();
     assert!(logs[0].response_time_us.is_some());
+}
+
+// ── Safe Search rewrite ────────────────────────────────────────────────────
+//
+// `resolve` expects callers to have probed the cache, so the rewrite must do
+// it itself or every rewritten query goes upstream.
+
+const SAFE_TARGET: &str = "forcesafesearch.google.com";
+
+struct ForceSafeSearch;
+
+#[async_trait]
+impl SafeSearchEnginePort for ForceSafeSearch {
+    fn cname_for(&self, domain: &str, _group_id: i64) -> Option<&'static str> {
+        (domain == "www.google.com").then_some(SAFE_TARGET)
+    }
+    async fn reload(&self) -> Result<(), DomainError> {
+        Ok(())
+    }
+}
+
+/// Rewrites `www.google.com` with `cached` in the target's cache entry and
+/// `resolved` as its upstream answer (unset: resolving fails the query).
+async fn safe_search(
+    cached: Option<DnsResolution>,
+    resolved: Option<DnsResolution>,
+) -> DnsResolution {
+    let resolver = Arc::new(MockDnsResolver::new());
+    if let Some(cached) = cached {
+        resolver.set_cached_response(SAFE_TARGET, cached);
+    }
+    if let Some(resolved) = resolved {
+        resolver.set_response(SAFE_TARGET, resolved).await;
+    }
+    let use_case = make_use_case(
+        resolver,
+        Arc::new(MockBlockFilterEngine::new()),
+        Arc::new(MockQueryLogRepository::new()),
+    )
+    .with_safe_search(Arc::new(ForceSafeSearch));
+    use_case
+        .execute(&DnsRequest::new("www.google.com", RecordType::A, CLIENT_IP))
+        .await
+        .expect("rewrite answered")
+}
+
+#[tokio::test]
+async fn test_safe_search_target_is_served_from_cache_without_resolving() {
+    let result = safe_search(Some(cached_resolution("216.239.38.120")), None).await;
+    assert!(result.cache_hit);
+}
+
+#[tokio::test]
+async fn test_safe_search_target_resolves_on_a_miss_or_a_negative_entry() {
+    let upstream = || Some(upstream_resolution("216.239.38.120"));
+    assert!(!safe_search(None, upstream()).await.cache_hit);
+    let negative = Some(DnsResolution::new(Vec::new(), true));
+    assert!(!safe_search(negative, upstream()).await.cache_hit);
 }
