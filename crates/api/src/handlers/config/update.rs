@@ -1,16 +1,37 @@
 use crate::{
     dto::{
         config::{
-            block_mode_from_str, parse_dns64_prefix, parse_sinkhole_ipv4, parse_sinkhole_ipv6,
-            ConfigSaveResponse, PoolUpdate,
+            parse_dns64_prefix, parse_sinkhole_ipv4, parse_sinkhole_ipv6, ConfigSaveResponse,
+            PoolUpdate,
         },
         SettingsDto, UpdateConfigRequest,
     },
     state::AppState,
 };
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use ferrous_dns_domain::{Config, DnsProtocol, DnssecMode, UpstreamPool, UpstreamStrategy};
 use tracing::{debug, error, info, instrument};
+
+type SaveResponse = (StatusCode, Json<ConfigSaveResponse>);
+
+/// The request itself is invalid.
+fn rejected(error: impl Into<String>) -> SaveResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ConfigSaveResponse::failure(error)),
+    )
+}
+
+/// The request was valid but could not be carried out.
+fn not_saved(error: impl Into<String>) -> SaveResponse {
+    (StatusCode::OK, Json(ConfigSaveResponse::failure(error)))
+}
+
+fn pools_applied_but_not_saved(error: impl std::fmt::Display) -> String {
+    format!(
+        "Upstream pools were applied to the running server but the configuration file could not be saved, so a restart would revert them. Retry the save. ({error})"
+    )
+}
 
 fn config_differs(before: &Config, after: &Config) -> bool {
     serde_json::to_value(before).ok() != serde_json::to_value(after).ok()
@@ -20,20 +41,20 @@ fn non_empty(value: String) -> Option<String> {
     Some(value).filter(|v| !v.is_empty())
 }
 
-async fn get_writable_config_path(state: &AppState) -> Result<String, ConfigSaveResponse> {
-    let path = state.resolve_config_path().ok_or_else(|| {
+async fn get_writable_config_path(state: &AppState) -> Result<String, SaveResponse> {
+    let path = state.config_path.as_deref().ok_or_else(|| {
         error!("No config file found");
-        ConfigSaveResponse::failure("No config file found. Cannot update configuration.")
+        not_saved("No config file found. Cannot update configuration.")
     })?;
-    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+    if let Ok(metadata) = tokio::fs::metadata(path).await {
         if metadata.permissions().readonly() {
             error!("Config file is read-only");
-            return Err(ConfigSaveResponse::failure(
+            return Err(not_saved(
                 "Permission denied: Config file is read-only. Please check file permissions.",
             ));
         }
     }
-    Ok(path)
+    Ok(path.to_string())
 }
 
 /// Drops blank servers and serverless pools; rejects any server string the
@@ -77,6 +98,18 @@ fn parse_pools(pools: Vec<PoolUpdate>) -> Result<Vec<UpstreamPool>, String> {
         return Err("At least one pool with a valid server is required".to_string());
     }
     Ok(validated)
+}
+
+/// Merges `request` into a copy of `current` and validates the result; also
+/// returns whether the upstream pools were replaced.
+fn merge_config_update(
+    current: &Config,
+    request: UpdateConfigRequest,
+) -> Result<(Config, bool), String> {
+    let mut merged = current.clone();
+    let pools_provided = apply_config_update(&mut merged, request)?;
+    merged.validate().map_err(|e| e.to_string())?;
+    Ok((merged, pools_provided))
 }
 
 /// Merges `request` into `cfg`; returns whether the upstream pools were replaced.
@@ -226,7 +259,7 @@ fn apply_config_update(cfg: &mut Config, request: UpdateConfigRequest) -> Result
             cfg.blocking.whitelist = v;
         }
         if let Some(v) = blocking.block_mode {
-            cfg.blocking.block_mode = block_mode_from_str(&v);
+            cfg.blocking.block_mode = v.parse()?;
         }
         if let Some(v) = blocking.block_ttl {
             cfg.blocking.block_ttl = v;
@@ -265,7 +298,7 @@ fn apply_settings(cfg: &mut Config, request: SettingsDto) -> Result<(), String> 
     cfg.dns.block_private_ptr = request.never_forward_reverse_lookups;
     cfg.dns.local_domain = non_empty(request.local_domain);
     cfg.dns.local_dns_server = non_empty(request.local_dns_server);
-    cfg.blocking.block_mode = block_mode_from_str(&request.block_mode);
+    cfg.blocking.block_mode = request.block_mode.parse()?;
     cfg.blocking.block_ttl = request.block_ttl;
     cfg.blocking.sinkhole_ipv4 = parse_sinkhole_ipv4(&request.sinkhole_ipv4)?;
     cfg.blocking.sinkhole_ipv6 = parse_sinkhole_ipv6(&request.sinkhole_ipv6)?;
@@ -273,7 +306,7 @@ fn apply_settings(cfg: &mut Config, request: SettingsDto) -> Result<(), String> 
     if !request.nat64_prefix.trim().is_empty() {
         cfg.dns64.prefix = parse_dns64_prefix(&request.nat64_prefix)?;
     }
-    Ok(())
+    cfg.validate().map_err(|e| e.to_string())
 }
 
 #[utoipa::path(
@@ -282,7 +315,8 @@ fn apply_settings(cfg: &mut Config, request: SettingsDto) -> Result<(), String> 
     tag = "config",
     request_body = UpdateConfigRequest,
     responses(
-        (status = 200, description = "Save outcome; `success` is false when the update was rejected", body = ConfigSaveResponse),
+        (status = 200, description = "Save outcome; `success` is false when the update could not be saved", body = ConfigSaveResponse),
+        (status = 400, description = "The update carries an invalid value; nothing was applied", body = ConfigSaveResponse),
     ),
     security(("session_cookie" = []), ("api_key" = [])),
 )]
@@ -290,22 +324,48 @@ fn apply_settings(cfg: &mut Config, request: SettingsDto) -> Result<(), String> 
 pub async fn update_config(
     State(state): State<AppState>,
     Json(request): Json<UpdateConfigRequest>,
-) -> Json<ConfigSaveResponse> {
+) -> SaveResponse {
     debug!("Updating configuration");
 
     let config_path = match get_writable_config_path(&state).await {
         Ok(p) => p,
-        Err(e) => return Json(e),
+        Err(e) => return e,
     };
 
-    // Held until the new config is stored, so a concurrent writer (local
-    // records, password change, another save) is never overwritten by a
-    // stale copy and live pools always match the saved ones.
+    let _writer = state.config_writer.lock().await;
+
+    // Checked before anything is applied, so a rejected request never reaches the live pools.
+    let (candidate, pools_provided) =
+        match merge_config_update(&*state.config.read().await, request.clone()) {
+            Ok(merged) => merged,
+            Err(e) => return rejected(e),
+        };
+
+    // No config lock is held here: resolving upstream hostnames can take seconds.
+    // reload_pools swaps only once every manager rebuilt, so a failure leaves
+    // both the resolver and the file untouched.
+    if pools_provided {
+        if let Err(e) = state
+            .dns
+            .reload_upstream
+            .reload_pools(candidate.dns.pools)
+            .await
+        {
+            error!(error = %e, "Failed to hot-reload upstream pools; configuration not saved");
+            return not_saved(format!(
+                "Failed to apply upstream pools live; configuration not saved: {e}"
+            ));
+        }
+        info!("Upstream pools applied live");
+    }
+
+    // Local-record and password writers don't take `config_writer`, so the
+    // request is merged again into whatever they stored meanwhile.
     let mut config = state.config.write().await;
-    let mut new_config = config.clone();
-    let pools_provided = match apply_config_update(&mut new_config, request) {
-        Ok(pools_provided) => pools_provided,
-        Err(e) => return Json(ConfigSaveResponse::failure(e)),
+    let new_config = match merge_config_update(&config, request) {
+        Ok((merged, _)) => merged,
+        Err(e) if pools_provided => return not_saved(pools_applied_but_not_saved(e)),
+        Err(e) => return rejected(e),
     };
 
     // Upstream pools are hot-applied; every other field requires a restart.
@@ -317,35 +377,16 @@ pub async fn update_config(
         config_differs(&before, &after)
     };
 
-    // Applied before persisting: reload_pools swaps only once every manager
-    // rebuilt, so a failure leaves both the resolver and the file untouched.
-    if pools_provided {
-        if let Err(e) = state
-            .dns
-            .reload_upstream
-            .reload_pools(new_config.dns.pools.clone())
-            .await
-        {
-            error!(error = %e, "Failed to hot-reload upstream pools; configuration not saved");
-            return Json(ConfigSaveResponse::failure(format!(
-                "Failed to apply upstream pools live; configuration not saved: {e}"
-            )));
-        }
-        info!("Upstream pools applied live");
-    }
-
     if let Err(e) = state
         .config_file_persistence
         .save_config_to_file(&new_config, &config_path)
     {
         error!(error = %e, "Failed to save configuration");
-        return Json(ConfigSaveResponse::failure(if pools_provided {
-            format!(
-                "Upstream pools were applied to the running server but the configuration file could not be saved, so a restart would revert them. Retry the save. ({e})"
-            )
+        return not_saved(if pools_provided {
+            pools_applied_but_not_saved(e)
         } else {
             format!("Failed to save configuration: {e}")
-        }));
+        });
     }
 
     *config = new_config;
@@ -361,10 +402,13 @@ pub async fn update_config(
     } else {
         "Configuration saved successfully."
     };
-    Json(
-        ConfigSaveResponse::success(message)
-            .restart_required(restart_required)
-            .reload_available(),
+    (
+        StatusCode::OK,
+        Json(
+            ConfigSaveResponse::success(message)
+                .restart_required(restart_required)
+                .reload_available(),
+        ),
     )
 }
 
@@ -374,7 +418,8 @@ pub async fn update_config(
     tag = "config",
     request_body = SettingsDto,
     responses(
-        (status = 200, description = "Save outcome; `success` is false when the update was rejected", body = ConfigSaveResponse),
+        (status = 200, description = "Save outcome; `success` is false when the update could not be saved", body = ConfigSaveResponse),
+        (status = 400, description = "The settings carry an invalid value; nothing was applied", body = ConfigSaveResponse),
     ),
     security(("session_cookie" = []), ("api_key" = [])),
 )]
@@ -382,16 +427,17 @@ pub async fn update_config(
 pub async fn update_settings(
     State(state): State<AppState>,
     Json(request): Json<SettingsDto>,
-) -> Json<ConfigSaveResponse> {
+) -> SaveResponse {
     let config_path = match get_writable_config_path(&state).await {
         Ok(p) => p,
-        Err(e) => return Json(e),
+        Err(e) => return e,
     };
 
+    let _writer = state.config_writer.lock().await;
     let mut config = state.config.write().await;
     let mut new_config = config.clone();
     if let Err(e) = apply_settings(&mut new_config, request) {
-        return Json(ConfigSaveResponse::failure(e));
+        return rejected(e);
     }
 
     // These fields only take effect after a restart, like every non-pool field.
@@ -402,9 +448,7 @@ pub async fn update_settings(
         .save_config_to_file(&new_config, &config_path)
     {
         error!(error = %e, "Failed to save DNS settings");
-        return Json(ConfigSaveResponse::failure(format!(
-            "Failed to save settings: {e}"
-        )));
+        return not_saved(format!("Failed to save settings: {e}"));
     }
 
     *config = new_config;
@@ -412,9 +456,12 @@ pub async fn update_settings(
         state.mark_restart_pending();
     }
     info!("DNS settings updated successfully");
-    Json(
-        ConfigSaveResponse::success("DNS settings saved successfully.")
-            .restart_required(restart_required),
+    (
+        StatusCode::OK,
+        Json(
+            ConfigSaveResponse::success("DNS settings saved successfully.")
+                .restart_required(restart_required),
+        ),
     )
 }
 
@@ -431,12 +478,17 @@ pub async fn update_settings(
 pub async fn reload_config(State(state): State<AppState>) -> Json<ConfigSaveResponse> {
     info!("Config reload requested");
 
-    let Some(config_path) = state.resolve_config_path() else {
+    let Some(config_path) = state.config_path.as_deref() else {
         error!("No config file found");
         return Json(ConfigSaveResponse::failure("No config file found"));
     };
 
-    match Config::load(Some(&config_path), Default::default()) {
+    let _writer = state.config_writer.lock().await;
+    let loaded = state
+        .config_file_persistence
+        .load_config_from_file(config_path)
+        .and_then(|config| config.validate().map(|()| config));
+    match loaded {
         Ok(new_config) => {
             *state.config.write().await = new_config;
             info!("Configuration reloaded successfully");

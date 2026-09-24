@@ -7,39 +7,44 @@ use axum::{
 };
 use ferrous_dns_api::{create_api_router_with_openapi, metrics_routes, AppState};
 use ferrous_dns_api_pihole::{create_pihole_router_with_openapi, PiholeAppState};
-use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use utoipa::openapi::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
+use super::doh::{dns_query_handler, DohContext};
 use super::web_tls;
 
-pub async fn start_doh_server(
-    bind_addr: SocketAddr,
-    handler: Arc<DnsServerHandler>,
-) -> anyhow::Result<()> {
+pub async fn start_doh_server(bind_addr: SocketAddr, doh: Arc<DohContext>) -> anyhow::Result<()> {
     info!(
         bind_address = %bind_addr,
         endpoint = format!("http://{}/dns-query", bind_addr),
         "Starting DoH server (DNS-over-HTTPS, RFC 8484)"
     );
 
-    let app = Router::new()
-        .route(
-            "/dns-query",
-            get(crate::server::doh::dns_query_handler).post(crate::server::doh::dns_query_handler),
-        )
-        .layer(axum::Extension(handler));
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let listener = TcpListener::bind(&bind_addr).await?;
 
     info!("DoH server ready on {}", bind_addr);
 
-    axum::serve(listener, app).await?;
+    serve_doh(listener, doh).await
+}
+
+/// Serves the dedicated plain-HTTP DoH endpoint on an already bound listener.
+pub async fn serve_doh(listener: TcpListener, doh: Arc<DohContext>) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/dns-query", get(dns_query_handler).post(dns_query_handler))
+        .layer(axum::Extension(doh));
+
+    // The handler attributes each query to the socket peer.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -50,7 +55,7 @@ pub async fn start_web_server(
     pihole_state: Option<PiholeAppState>,
     cors_allowed_origins: &[String],
     metrics_enabled: bool,
-    doh_handler: Option<Arc<DnsServerHandler>>,
+    doh: Option<Arc<DohContext>>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> anyhow::Result<()> {
     let scheme = if tls_config.is_some() {
@@ -81,14 +86,14 @@ pub async fn start_web_server(
         pihole_state,
         cors_allowed_origins,
         metrics_enabled,
-        doh_handler,
+        doh,
     );
 
     if let Some(tls_cfg) = tls_config {
         info!("Web server started successfully (HTTPS)");
         web_tls::start_https_web_server(bind_addr, app, tls_cfg).await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(&bind_addr).await?;
         info!("Web server started successfully");
         axum::serve(
             listener,
@@ -163,7 +168,7 @@ fn create_app(
     pihole_state: Option<PiholeAppState>,
     cors_allowed_origins: &[String],
     metrics_enabled: bool,
-    doh_handler: Option<Arc<DnsServerHandler>>,
+    doh: Option<Arc<DohContext>>,
 ) -> Router {
     let pihole_compat = pihole_state.is_some();
     // Clone before the state is moved into the API router so the bare
@@ -234,14 +239,10 @@ fn create_app(
         app = app.merge(metrics_routes(state));
     }
 
-    if let Some(handler) = doh_handler {
+    if let Some(doh) = doh {
         app = app
-            .route(
-                "/dns-query",
-                get(crate::server::doh::dns_query_handler)
-                    .post(crate::server::doh::dns_query_handler),
-            )
-            .layer(axum::Extension(handler));
+            .route("/dns-query", get(dns_query_handler).post(dns_query_handler))
+            .layer(axum::Extension(doh));
     }
 
     app

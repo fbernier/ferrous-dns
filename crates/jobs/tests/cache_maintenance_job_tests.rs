@@ -84,17 +84,6 @@ async fn test_cache_maintenance_job_compaction_runs_on_its_own_interval() {
 }
 
 #[tokio::test]
-async fn test_cache_maintenance_job_zero_interval_does_not_kill_task() {
-    let mock = Arc::new(MockCacheMaintenancePort::default());
-    CacheMaintenanceJob::new(mock.clone(), 0, 0).spawn();
-
-    sleep(Duration::from_millis(1500)).await;
-
-    assert!(mock.refresh_call_count() >= 1);
-    assert!(mock.compaction_call_count() >= 1);
-}
-
-#[tokio::test]
 async fn test_cache_maintenance_job_refresh_error_is_non_fatal() {
     let mock = Arc::new(MockCacheMaintenancePort::failing_refresh());
 

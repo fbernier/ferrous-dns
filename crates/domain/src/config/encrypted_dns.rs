@@ -1,13 +1,19 @@
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
+
+use super::server::deserialize_optional_bind_host;
 
 /// Configuration for DoT, DoH, and DoQ server-side listeners.
 ///
-/// All three protocols are disabled by default. Enabling any requires a valid TLS
-/// certificate and private key in PEM format. Default paths point to `/data/`,
-/// the standard Docker volume mount for Ferrous DNS containers.
+/// All three protocols are disabled by default. DoT and DoQ need a TLS
+/// certificate and private key in PEM format; default paths point to `/data/`,
+/// the standard Docker volume mount for Ferrous DNS containers. DoH is served
+/// over plain HTTP (TLS is terminated by a reverse proxy, or by `[server.web_tls]`
+/// for the endpoint co-hosted on `web_port`), so it needs no certificate here.
 ///
-/// If the cert/key files are absent at startup, the affected listeners are skipped
-/// with a warning — the server continues to serve plain DNS normally.
+/// If the cert/key files are absent at startup, DoT and DoQ are skipped with a
+/// warning — the server continues to serve plain DNS normally.
 ///
 /// Each listener binds to `[server].bind_address` unless it carries its own
 /// `*_bind_address`, which lets a single deployment expose, say, DoT on every
@@ -23,7 +29,8 @@ pub struct EncryptedDnsConfig {
 
     /// Address the DoT listener binds to; falls back to `[server].bind_address`.
     /// `"[::]"` serves IPv4 and IPv6 clients on one dual-stack socket.
-    pub dot_bind_address: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bind_host")]
+    pub dot_bind_address: Option<IpAddr>,
 
     /// Enable the DNS-over-HTTPS endpoint `/dns-query` (RFC 8484).
     /// HTTPS termination is handled by a reverse proxy (nginx/Traefik/Caddy).
@@ -39,7 +46,8 @@ pub struct EncryptedDnsConfig {
     /// Address the dedicated DoH listener binds to; falls back to
     /// `[server].bind_address`. Ignored when `doh_port` is absent, since
     /// `/dns-query` is then co-hosted on the web listener.
-    pub doh_bind_address: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bind_host")]
+    pub doh_bind_address: Option<IpAddr>,
 
     /// Enable the DNS-over-QUIC listener (RFC 9250) on `doq_port`.
     pub doq_enabled: bool,
@@ -50,12 +58,13 @@ pub struct EncryptedDnsConfig {
 
     /// Address the DoQ listener binds to; falls back to `[server].bind_address`.
     /// `"[::]"` serves IPv4 and IPv6 clients on one dual-stack socket.
-    pub doq_bind_address: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bind_host")]
+    pub doq_bind_address: Option<IpAddr>,
 
-    /// Path to the PEM certificate file shared by DoT, DoH, and DoQ.
+    /// Path to the PEM certificate file shared by DoT and DoQ.
     pub tls_cert_path: String,
 
-    /// Path to the PEM private key file shared by DoT, DoH, and DoQ.
+    /// Path to the PEM private key file shared by DoT and DoQ.
     pub tls_key_path: String,
 }
 

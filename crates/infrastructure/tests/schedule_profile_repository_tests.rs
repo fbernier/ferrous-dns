@@ -1,10 +1,15 @@
 #[path = "support/db.rs"]
 mod db;
 
+use chrono::NaiveTime;
 use ferrous_dns_application::ports::ScheduleProfileRepository;
-use ferrous_dns_domain::{DomainError, ScheduleAction};
+use ferrous_dns_domain::{DomainError, ScheduleAction, TimeSlot};
 use ferrous_dns_infrastructure::repositories::schedule_profile_repository::SqliteScheduleProfileRepository;
 use sqlx::SqlitePool;
+
+fn hm(time: &str) -> NaiveTime {
+    TimeSlot::parse_time(time).unwrap()
+}
 
 async fn repo() -> (SqliteScheduleProfileRepository, SqlitePool) {
     let pool = db::migrated_pool().await;
@@ -12,7 +17,7 @@ async fn repo() -> (SqliteScheduleProfileRepository, SqlitePool) {
 }
 
 async fn profile(repo: &SqliteScheduleProfileRepository, name: &str) -> i64 {
-    repo.create(name.to_string(), "UTC".to_string(), None)
+    repo.create(name.to_string(), chrono_tz::UTC, None)
         .await
         .unwrap()
         .id
@@ -20,27 +25,21 @@ async fn profile(repo: &SqliteScheduleProfileRepository, name: &str) -> i64 {
 }
 
 async fn slot(repo: &SqliteScheduleProfileRepository, pid: i64, start: &str, end: &str) -> i64 {
-    repo.add_slot(
-        pid,
-        31,
-        start.to_string(),
-        end.to_string(),
-        ScheduleAction::BlockAll,
-    )
-    .await
-    .unwrap()
-    .id
-    .unwrap()
+    repo.add_slot(pid, 31, hm(start), hm(end), ScheduleAction::BlockAll)
+        .await
+        .unwrap()
+        .id
+        .unwrap()
 }
 
 #[tokio::test]
 async fn test_create_profile_returns_profile_with_id() {
-    let (repo, _pool) = repo().await;
+    let (repo, pool) = repo().await;
 
     let created = repo
         .create(
             "Test".to_string(),
-            "Europe/Lisbon".to_string(),
+            chrono_tz::Europe::Lisbon,
             Some("c".to_string()),
         )
         .await
@@ -48,8 +47,29 @@ async fn test_create_profile_returns_profile_with_id() {
 
     let fetched = repo.get_by_id(created.id.unwrap()).await.unwrap().unwrap();
     assert_eq!(fetched.name.as_ref(), "Test");
-    assert_eq!(fetched.timezone.as_ref(), "Europe/Lisbon");
+    assert_eq!(fetched.timezone, chrono_tz::Europe::Lisbon);
     assert_eq!(fetched.comment.as_deref(), Some("c"));
+    let (stored,): (String,) = sqlx::query_as("SELECT timezone FROM schedule_profiles")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, "Europe/Lisbon");
+}
+
+#[tokio::test]
+async fn test_unparsable_stored_timezone_reads_as_utc() {
+    let (repo, pool) = repo().await;
+    let id = profile(&repo, "Legacy").await;
+    sqlx::query("UPDATE schedule_profiles SET timezone = 'Mars/Olympus' WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let fetched = repo.get_by_id(id).await.unwrap().unwrap();
+
+    assert_eq!(fetched.timezone, chrono_tz::UTC);
+    assert_eq!(repo.get_all().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -57,9 +77,7 @@ async fn test_create_profile_duplicate_name_returns_error() {
     let (repo, _pool) = repo().await;
     profile(&repo, "Dup").await;
 
-    let result = repo
-        .create("Dup".to_string(), "UTC".to_string(), None)
-        .await;
+    let result = repo.create("Dup".to_string(), chrono_tz::UTC, None).await;
 
     assert!(
         matches!(&result, Err(DomainError::DuplicateScheduleProfileName(n)) if n == "Dup"),
@@ -95,11 +113,7 @@ async fn test_get_all_ordered_by_name() {
 async fn test_update_profile_name_and_timezone_keeps_comment() {
     let (repo, _pool) = repo().await;
     let id = repo
-        .create(
-            "Old".to_string(),
-            "UTC".to_string(),
-            Some("keep".to_string()),
-        )
+        .create("Old".to_string(), chrono_tz::UTC, Some("keep".to_string()))
         .await
         .unwrap()
         .id
@@ -109,14 +123,14 @@ async fn test_update_profile_name_and_timezone_keeps_comment() {
         .update(
             id,
             Some("New".to_string()),
-            Some("Europe/Lisbon".to_string()),
+            Some(chrono_tz::Europe::Lisbon),
             None,
         )
         .await
         .unwrap();
 
     assert_eq!(updated.name.as_ref(), "New");
-    assert_eq!(updated.timezone.as_ref(), "Europe/Lisbon");
+    assert_eq!(updated.timezone.name(), "Europe/Lisbon");
     assert_eq!(updated.comment.as_deref(), Some("keep"));
 }
 
@@ -131,7 +145,7 @@ async fn test_update_comment_only() {
         .unwrap();
 
     assert_eq!(updated.name.as_ref(), "Name");
-    assert_eq!(updated.timezone.as_ref(), "UTC");
+    assert_eq!(updated.timezone, chrono_tz::UTC);
     assert_eq!(updated.comment.as_deref(), Some("note"));
 }
 
@@ -185,17 +199,11 @@ async fn test_delete_missing_profile_returns_not_found() {
 
 #[tokio::test]
 async fn test_add_slot_and_get_slots_for_profile() {
-    let (repo, _pool) = repo().await;
+    let (repo, pool) = repo().await;
     let pid = profile(&repo, "Slots").await;
 
     let created = repo
-        .add_slot(
-            pid,
-            31,
-            "09:00".to_string(),
-            "18:00".to_string(),
-            ScheduleAction::AllowAll,
-        )
+        .add_slot(pid, 31, hm("09:00"), hm("18:00"), ScheduleAction::AllowAll)
         .await
         .unwrap();
 
@@ -203,8 +211,32 @@ async fn test_add_slot_and_get_slots_for_profile() {
     let slots = repo.get_slots(pid).await.unwrap();
     assert_eq!(slots.len(), 1);
     assert_eq!(slots[0].action, ScheduleAction::AllowAll);
-    assert_eq!(slots[0].start_time.as_ref(), "09:00");
-    assert_eq!(slots[0].end_time.as_ref(), "18:00");
+    assert_eq!(slots[0].start_time, hm("09:00"));
+    assert_eq!(slots[0].end_time, hm("18:00"));
+    let (start, end): (String, String) =
+        sqlx::query_as("SELECT start_time, end_time FROM time_slots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((start.as_str(), end.as_str()), ("09:00", "18:00"));
+}
+
+#[tokio::test]
+async fn test_get_slots_skips_row_with_malformed_time() {
+    let (repo, pool) = repo().await;
+    let pid = profile(&repo, "Malformed").await;
+    slot(&repo, pid, "08:00", "12:00").await;
+    let bad = slot(&repo, pid, "13:00", "17:00").await;
+    sqlx::query("UPDATE time_slots SET start_time = '9:00' WHERE id = ?")
+        .bind(bad)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let slots = repo.get_slots(pid).await.unwrap();
+
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].start_time, hm("08:00"));
 }
 
 #[tokio::test]
@@ -212,13 +244,7 @@ async fn test_add_slot_to_missing_profile_returns_not_found() {
     let (repo, _pool) = repo().await;
 
     let result = repo
-        .add_slot(
-            999,
-            31,
-            "08:00".to_string(),
-            "12:00".to_string(),
-            ScheduleAction::BlockAll,
-        )
+        .add_slot(999, 31, hm("08:00"), hm("12:00"), ScheduleAction::BlockAll)
         .await;
 
     assert!(

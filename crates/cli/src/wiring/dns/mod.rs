@@ -424,74 +424,29 @@ impl DnsServices {
     }
 }
 
-/// The DNS Cookie server secret: the configured 64-hex-digit value, or a fresh
-/// random one when none is set.
+/// The DNS Cookie server secret: the configured one, or a fresh random one
+/// when none is set.
 fn resolve_cookie_secret(
     config: &ferrous_dns_domain::DnsCookiesConfig,
 ) -> anyhow::Result<[u8; 32]> {
-    let mut secret = [0u8; 32];
-    if config.server_secret.is_empty() {
-        use ring::rand::SecureRandom;
-        ring::rand::SystemRandom::new()
-            .fill(&mut secret)
-            .map_err(|_| anyhow::anyhow!("system RNG failed to generate the DNS cookie secret"))?;
-        warn!(
-            "dns_cookies.server_secret is not set — using ephemeral secret \
-             (will not survive restart; set a 64-hex-char value in config)"
-        );
+    if let Some(secret) = config.server_secret {
         return Ok(secret);
     }
-
-    let hex = config.server_secret.trim().as_bytes();
-    anyhow::ensure!(
-        hex.len() == 64,
-        "dns_cookies.server_secret must be exactly 64 hex characters (32 bytes), got {}",
-        hex.len()
+    let mut secret = [0u8; 32];
+    use ring::rand::SecureRandom;
+    ring::rand::SystemRandom::new()
+        .fill(&mut secret)
+        .map_err(|_| anyhow::anyhow!("system RNG failed to generate the DNS cookie secret"))?;
+    warn!(
+        "dns_cookies.server_secret is not set — using ephemeral secret \
+         (will not survive restart; set a 64-hex-char value in config)"
     );
-    let digit = |b: u8| char::from(b).to_digit(16);
-    for (byte, pair) in secret.iter_mut().zip(hex.chunks_exact(2)) {
-        let (Some(high), Some(low)) = (digit(pair[0]), digit(pair[1])) else {
-            anyhow::bail!("dns_cookies.server_secret contains invalid hex characters");
-        };
-        *byte = (high << 4 | low) as u8;
-    }
     Ok(secret)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrous_dns_domain::DnsCookiesConfig;
-
-    fn with_secret(secret: &str) -> DnsCookiesConfig {
-        DnsCookiesConfig {
-            server_secret: secret.to_string(),
-            ..DnsCookiesConfig::default()
-        }
-    }
-
-    #[test]
-    fn configured_cookie_secret_is_decoded() {
-        let hex = format!("  {}  ", "0fA1".repeat(16));
-        let secret = resolve_cookie_secret(&with_secret(&hex)).unwrap();
-        assert_eq!(secret[..2], [0x0f, 0xa1]);
-        assert_eq!(secret[30..], [0x0f, 0xa1]);
-    }
-
-    #[test]
-    fn malformed_cookie_secrets_are_errors_not_panics() {
-        for bad in [
-            "abc".to_string(),
-            "zz".repeat(32),
-            "+f".repeat(32),
-            format!("{}é", "a".repeat(62)),
-        ] {
-            assert!(
-                resolve_cookie_secret(&with_secret(&bad)).is_err(),
-                "{bad:?} was accepted"
-            );
-        }
-    }
 
     /// With no local record at startup, a PTR registered later — what the
     /// create use case does — must still be answered by the running resolver.

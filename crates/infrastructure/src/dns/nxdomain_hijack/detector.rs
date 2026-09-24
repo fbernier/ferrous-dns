@@ -51,9 +51,8 @@ impl NxdomainHijackDetector {
             "NXDomain hijack probe loop starting"
         );
 
-        // `interval` panics on a zero period, which would silently kill the probe task.
         let mut interval =
-            tokio::time::interval(Duration::from_secs(self.config.probe_interval_secs.max(1)));
+            tokio::time::interval(Duration::from_secs(self.config.probe_interval_secs));
 
         loop {
             interval.tick().await;

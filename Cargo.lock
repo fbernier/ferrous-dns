@@ -954,6 +954,7 @@ dependencies = [
  "hickory-proto",
  "hyper",
  "hyper-util",
+ "ipnetwork",
  "libc",
  "mimalloc",
  "quinn",
@@ -984,6 +985,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "chrono-tz",
  "ferrous-dns-application",
  "ferrous-dns-domain",
  "ferrous-dns-infrastructure",
@@ -1030,6 +1032,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "chrono-tz",
  "dashmap",
  "ferrous-dns-domain",
  "ipnetwork",
@@ -1056,6 +1059,8 @@ dependencies = [
 name = "ferrous-dns-domain"
 version = "0.9.18"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "ipnetwork",
  "serde",
  "thiserror 2.0.20",
@@ -1132,6 +1137,7 @@ dependencies = [
  "chrono-tz",
  "ferrous-dns-application",
  "ferrous-dns-domain",
+ "parking_lot",
  "sqlx",
  "tokio",
  "tracing",
@@ -1855,6 +1861,9 @@ name = "ipnetwork"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"

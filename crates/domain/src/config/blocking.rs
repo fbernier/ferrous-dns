@@ -36,6 +36,22 @@ impl BlockResponseMode {
     }
 }
 
+impl std::str::FromStr for BlockResponseMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "null_ip" => Ok(Self::NullIp),
+            "nxdomain" => Ok(Self::NxDomain),
+            "nodata" => Ok(Self::NoData),
+            "refused" => Ok(Self::Refused),
+            _ => Err(format!(
+                "Invalid block_mode '{s}': expected null_ip, nxdomain, nodata or refused"
+            )),
+        }
+    }
+}
+
 /// Default TTL (seconds) for blocked answers; shared as the single source of
 /// truth for the config default and the API DTO default.
 pub const DEFAULT_BLOCK_TTL: u32 = 60;
@@ -114,6 +130,25 @@ mod tests {
             let config: BlockingConfig =
                 toml::from_str(&format!("enabled = true\nblock_mode = \"{text}\"")).unwrap();
             assert_eq!(config.block_mode, expected);
+        }
+    }
+
+    #[test]
+    fn block_mode_parses_its_own_string_form() {
+        for mode in [
+            BlockResponseMode::NullIp,
+            BlockResponseMode::NxDomain,
+            BlockResponseMode::NoData,
+            BlockResponseMode::Refused,
+        ] {
+            assert_eq!(mode.as_str().parse::<BlockResponseMode>(), Ok(mode));
+        }
+    }
+
+    #[test]
+    fn unknown_block_mode_string_is_rejected() {
+        for bad in ["bogus", "", "NULL_IP"] {
+            assert!(bad.parse::<BlockResponseMode>().is_err(), "{bad:?}");
         }
     }
 

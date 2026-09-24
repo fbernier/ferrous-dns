@@ -1390,24 +1390,6 @@ async fn test_logged_protocol_is_persisted() {
 }
 
 #[tokio::test]
-async fn test_zero_flush_interval_still_persists_queries() {
-    let pool = migrated_pool().await;
-    let cfg = DatabaseConfig {
-        query_log_flush_interval_ms: 0,
-        ..DatabaseConfig::default()
-    };
-    repo_with(&pool, &cfg)
-        .log_query(&client_query("zero.example.com", None))
-        .await
-        .unwrap();
-
-    assert!(
-        wait_for_flush(&pool).await,
-        "a zero flush interval must not kill the writer task"
-    );
-}
-
-#[tokio::test]
 async fn test_unparseable_created_at_reads_back_without_timestamp() {
     let pool = migrated_pool().await;
     insert(

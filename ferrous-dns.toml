@@ -28,6 +28,12 @@ pihole_compat = true
 # unauthenticated (the standard scrape convention). Opt-in; disabled by default.
 # metrics_enabled = true
 
+# Reverse proxies allowed to name the DoH client through X-Forwarded-For /
+# X-Real-IP. Every other DoH request is attributed to its connecting address,
+# so a client cannot pick another device's group. Setting the list replaces the
+# default; add your proxy's address when it does not run on this host.
+# trusted_proxies = ["127.0.0.0/8", "::1/128"]
+
 
 # ── Web HTTPS (TLS for Dashboard / API) ──────────────────────────────────────
 # When enabled, the web dashboard and REST API are served over HTTPS on the
@@ -44,24 +50,25 @@ tls_key_path  = "/data/key.pem"
 # ── Encrypted DNS (DoT / DoH / DoQ) ───────────────────────────────────────────
 # Serves DNS-over-TLS (RFC 7858), DNS-over-HTTPS (RFC 8484), and/or
 # DNS-over-QUIC (RFC 9250).
-# Requires a TLS certificate and private key in PEM format.
+# DoT and DoQ need a TLS certificate and private key in PEM format.
 # Default paths point to /data/ — the standard Docker volume for Ferrous DNS.
-# If the cert/key files are absent at startup, the affected listeners are skipped
-# with a warning; the server continues to serve plain DNS normally.
-# For DoH, HTTPS termination is handled by a reverse proxy (nginx/Traefik/Caddy).
+# If the cert/key files are absent at startup, DoT and DoQ are skipped with a
+# warning; the server continues to serve plain DNS normally.
+# DoH is plain HTTP and needs no certificate: HTTPS termination is handled by a
+# reverse proxy (nginx/Traefik/Caddy), or by [server.web_tls] on web_port.
 
 # [server.encrypted_dns]
 # dot_enabled   = true                    # Enable DoT listener on dot_port
 # dot_port      = 853                     # TCP port for DNS-over-TLS (standard: 853)
 # dot_bind_address = "[::]"               # Address for the DoT listener (omit to inherit [server].bind_address)
 # doh_enabled   = true                    # Enable /dns-query endpoint on web_port or doh_port
-# doh_port      = 443                     # Dedicated port for DoH (omit to co-host on web_port)
+# doh_port      = 8053                    # Dedicated plain-HTTP port for DoH behind a proxy (omit to co-host on web_port)
 # doh_bind_address = "[::]"               # Address for the dedicated DoH listener (ignored when doh_port is omitted)
 # doq_enabled   = true                    # Enable DoQ listener on doq_port
 # doq_port      = 853                     # UDP port for DNS-over-QUIC (standard: 853; no collision with TCP dot_port)
 # doq_bind_address = "[::]"               # Address for the DoQ listener (omit to inherit [server].bind_address)
-# tls_cert_path = "/data/cert.pem"
-# tls_key_path  = "/data/key.pem"
+# tls_cert_path = "/data/cert.pem"         # DoT/DoQ certificate
+# tls_key_path  = "/data/key.pem"          # DoT/DoQ private key
 
 
 # ── DNS Resolution ────────────────────────────────────────────────────────────

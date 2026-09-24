@@ -51,7 +51,11 @@ impl LocalRecordCreator for StubLocalRecordCreator {
 struct NullConfigFilePersistence;
 
 impl ConfigFilePersistence for NullConfigFilePersistence {
-    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), String> {
+    fn load_config_from_file(&self, _path: &str) -> Result<Config, DomainError> {
+        Ok(Config::default())
+    }
+
+    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), DomainError> {
         Ok(())
     }
 }

@@ -126,7 +126,11 @@ impl ConfigRepository for NullConfigRepository {
 pub struct NullConfigFilePersistence;
 
 impl ConfigFilePersistence for NullConfigFilePersistence {
-    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), String> {
+    fn load_config_from_file(&self, _path: &str) -> Result<Config, DomainError> {
+        Ok(Config::default())
+    }
+
+    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), DomainError> {
         Ok(())
     }
 }
@@ -174,7 +178,7 @@ impl ScheduleProfileRepository for NullScheduleProfileRepository {
     async fn create(
         &self,
         _name: String,
-        _tz: String,
+        _tz: chrono_tz::Tz,
         _comment: Option<String>,
     ) -> Result<ScheduleProfile, DomainError> {
         unimplemented!()
@@ -189,7 +193,7 @@ impl ScheduleProfileRepository for NullScheduleProfileRepository {
         &self,
         _id: i64,
         _name: Option<String>,
-        _tz: Option<String>,
+        _tz: Option<chrono_tz::Tz>,
         _comment: Option<String>,
     ) -> Result<ScheduleProfile, DomainError> {
         unimplemented!()
@@ -204,8 +208,8 @@ impl ScheduleProfileRepository for NullScheduleProfileRepository {
         &self,
         _pid: i64,
         _days: u8,
-        _start: String,
-        _end: String,
+        _start: chrono::NaiveTime,
+        _end: chrono::NaiveTime,
         _action: ScheduleAction,
     ) -> Result<TimeSlot, DomainError> {
         unimplemented!()

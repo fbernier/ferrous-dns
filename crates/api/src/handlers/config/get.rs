@@ -23,7 +23,7 @@ use tracing::{debug, instrument};
 pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
     debug!("Fetching current configuration");
 
-    let config_path = state.resolve_config_path();
+    let config_path = state.config_path.as_deref().map(String::from);
     let writable = match &config_path {
         Some(path) => tokio::fs::metadata(path)
             .await
@@ -36,7 +36,7 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
         server: ServerConfigResponse {
             dns_port: config.server.dns_port,
             web_port: config.server.web_port,
-            bind_address: config.server.bind_address.clone(),
+            bind_address: config.server.bind_address.to_string(),
             pihole_compat: config.server.pihole_compat,
             web_tls: WebTlsConfigResponse {
                 enabled: config.server.web_tls.enabled,

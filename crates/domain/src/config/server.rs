@@ -1,4 +1,7 @@
-use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use ipnetwork::{IpNetwork, Ipv4Network};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::encrypted_dns::EncryptedDnsConfig;
 use super::web_tls::WebTlsConfig;
@@ -10,10 +13,10 @@ pub struct ServerConfig {
     pub web_port: u16,
 
     /// Default address every listener binds to. `"0.0.0.0"` covers all IPv4
-    /// interfaces; `"[::]"` covers both families on one dual-stack socket.
-    /// A bare `"::"` is accepted too — the brackets are added when the
-    /// listen address is built.
-    pub bind_address: String,
+    /// interfaces; `"[::]"` (or a bare `"::"`) covers both families on one
+    /// dual-stack socket.
+    #[serde(deserialize_with = "deserialize_bind_host")]
+    pub bind_address: IpAddr,
 
     #[serde(default = "default_cors_origins")]
     pub cors_allowed_origins: Vec<String>,
@@ -38,68 +41,99 @@ pub struct ServerConfig {
     /// on the web port, unauthenticated. Opt-in; defaults to `false`.
     #[serde(default)]
     pub metrics_enabled: bool,
+
+    /// Peers whose `X-Forwarded-For` / `X-Real-IP` headers are believed on DoH
+    /// requests; every other request is attributed to its socket peer, so a
+    /// client cannot pick its own identity (and with it its group's policy).
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<IpNetwork>,
 }
 
 fn default_cors_origins() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+fn default_trusted_proxies() -> Vec<IpNetwork> {
+    [
+        Ipv4Network::new_checked(Ipv4Addr::new(127, 0, 0, 0), 8).map(IpNetwork::V4),
+        Some(IpNetwork::from(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 impl ServerConfig {
     /// Listen address for plain DNS (Do53), shared by the UDP and TCP listeners.
-    pub fn dns_listen_address(&self) -> String {
-        join_host_port(&self.bind_address, self.dns_port)
+    pub fn dns_listen_address(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_address, self.dns_port)
     }
 
     /// Listen address for the web dashboard and REST API.
-    pub fn web_listen_address(&self) -> String {
-        join_host_port(&self.bind_address, self.web_port)
+    pub fn web_listen_address(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_address, self.web_port)
     }
 
     /// Listen address for the DoT listener, honouring
     /// `[server.encrypted_dns].dot_bind_address` when it is set.
-    pub fn dot_listen_address(&self) -> String {
-        join_host_port(
+    pub fn dot_listen_address(&self) -> SocketAddr {
+        SocketAddr::new(
             self.encrypted_dns
                 .dot_bind_address
-                .as_deref()
-                .unwrap_or(&self.bind_address),
+                .unwrap_or(self.bind_address),
             self.encrypted_dns.dot_port,
         )
     }
 
     /// Listen address for the DoQ listener, honouring
     /// `[server.encrypted_dns].doq_bind_address` when it is set.
-    pub fn doq_listen_address(&self) -> String {
-        join_host_port(
+    pub fn doq_listen_address(&self) -> SocketAddr {
+        SocketAddr::new(
             self.encrypted_dns
                 .doq_bind_address
-                .as_deref()
-                .unwrap_or(&self.bind_address),
+                .unwrap_or(self.bind_address),
             self.encrypted_dns.doq_port,
         )
     }
 
     /// Listen address for the dedicated DoH listener, or `None` when
     /// `doh_port` is absent and `/dns-query` is co-hosted on `web_port`.
-    pub fn doh_listen_address(&self) -> Option<String> {
+    pub fn doh_listen_address(&self) -> Option<SocketAddr> {
         let port = self.encrypted_dns.doh_port?;
-        Some(join_host_port(
+        Some(SocketAddr::new(
             self.encrypted_dns
                 .doh_bind_address
-                .as_deref()
-                .unwrap_or(&self.bind_address),
+                .unwrap_or(self.bind_address),
             port,
         ))
     }
 }
 
-/// Joins a bind host with a port. A bare IPv6 literal is bracketed, so both
-/// `"::"` and `"[::]"` yield an address that parses as a `SocketAddr`.
-fn join_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        return format!("[{host}]:{port}");
-    }
-    format!("{host}:{port}")
+/// Parses a listener host: an IPv4 literal, or an IPv6 literal with or
+/// without brackets (`"::"` and `"[::]"` are the same address).
+pub fn parse_bind_host(host: &str) -> Result<IpAddr, String> {
+    let parsed = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<Ipv6Addr>().map(IpAddr::V6).ok(),
+        None => host.parse::<IpAddr>().ok(),
+    };
+    parsed.ok_or_else(|| {
+        format!(
+            "invalid bind address '{host}': it must be an IPv4 or IPv6 literal such as 0.0.0.0 or [::], not a hostname"
+        )
+    })
+}
+
+fn deserialize_bind_host<'de, D: Deserializer<'de>>(deserializer: D) -> Result<IpAddr, D::Error> {
+    let host = String::deserialize(deserializer)?;
+    parse_bind_host(&host).map_err(serde::de::Error::custom)
+}
+
+pub(super) fn deserialize_optional_bind_host<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<IpAddr>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|host| parse_bind_host(&host).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 impl Default for ServerConfig {
@@ -107,13 +141,14 @@ impl Default for ServerConfig {
         Self {
             dns_port: 53,
             web_port: 8080,
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             cors_allowed_origins: default_cors_origins(),
             encrypted_dns: EncryptedDnsConfig::default(),
             proxy_protocol_enabled: false,
             pihole_compat: false,
             web_tls: WebTlsConfig::default(),
             metrics_enabled: false,
+            trusted_proxies: default_trusted_proxies(),
         }
     }
 }

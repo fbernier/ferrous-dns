@@ -123,7 +123,7 @@ sqlite_mmap_size_mb = 64
 
 Ferrous DNS uses SQLite in **WAL (Write-Ahead Logging)** mode, which allows concurrent readers while a write is in progress. This is critical for keeping the dashboard responsive while the query log is being written.
 
-With `wal_autocheckpoint = 0` (default), checkpointing is handled by a background job at `wal_checkpoint_interval_secs` intervals. This avoids sudden I/O spikes under heavy write load.
+With `wal_autocheckpoint = 0` (default), checkpointing is handled by a background job at `wal_checkpoint_interval_secs` intervals. This avoids sudden I/O spikes under heavy write load. A PASSIVE checkpoint never waits for readers, so a long-running reader can leave part of the WAL uncopied; the job then logs a warning with the frame counts (`WAL passive checkpoint partial` / `blocked by a busy lock`) instead of reporting completion. A warning that repeats every cycle means something keeps a read transaction open and the WAL file will keep growing.
 
 ---
 

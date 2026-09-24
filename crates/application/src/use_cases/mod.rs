@@ -8,7 +8,6 @@ pub mod blocklist_sources;
 pub mod cache;
 pub mod client_subnets;
 pub mod clients;
-pub mod config;
 pub mod custom_services;
 pub mod dns;
 pub mod groups;
@@ -55,7 +54,6 @@ pub use clients::{
     CleanupOldClientsUseCase, CreateManualClientUseCase, DeleteClientUseCase, GetClientsUseCase,
     SyncArpCacheUseCase, SyncHostnamesUseCase, UpdateClientUseCase,
 };
-pub use config::ReloadConfigUseCase;
 pub use custom_services::{
     CreateCustomServiceUseCase, DeleteCustomServiceUseCase, GetCustomServicesUseCase,
     UpdateCustomServiceUseCase,

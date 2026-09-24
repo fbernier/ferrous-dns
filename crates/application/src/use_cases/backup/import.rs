@@ -103,20 +103,11 @@ impl ImportConfigUseCase {
     }
 
     async fn apply_config(&self, snapshot: &BackupSnapshot, errors: &mut Vec<String>) -> bool {
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
-            None => {
-                let discovered = Config::get_config_path();
-                match discovered {
-                    Some(p) => p,
-                    None => {
-                        let msg = "No config file path available — config section not restored.";
-                        warn!(msg);
-                        errors.push(msg.to_string());
-                        return false;
-                    }
-                }
-            }
+        let Some(path) = &self.config_path else {
+            let msg = "No config file path available — config section not restored.";
+            warn!(msg);
+            errors.push(msg.to_string());
+            return false;
         };
 
         let mut new_config = self.config.read().await.clone();
@@ -124,7 +115,13 @@ impl ImportConfigUseCase {
         let sc = &snapshot.config;
         new_config.server.dns_port = sc.server.dns_port;
         new_config.server.web_port = sc.server.web_port;
-        new_config.server.bind_address = sc.server.bind_address.clone();
+        match ferrous_dns_domain::config::server::parse_bind_host(&sc.server.bind_address) {
+            Ok(ip) => new_config.server.bind_address = ip,
+            Err(e) => {
+                errors.push(format!("Config section not restored: {e}"));
+                return false;
+            }
+        }
         new_config.server.pihole_compat = sc.server.pihole_compat;
         new_config.server.web_tls.enabled = sc.server.tls_enabled;
         new_config.server.web_tls.tls_cert_path = sc.server.tls_cert_path.clone();
@@ -183,9 +180,14 @@ impl ImportConfigUseCase {
         new_config.auth.webauthn.rp_id = sc.auth.webauthn_rp_id.clone();
         new_config.auth.webauthn.rp_origin = sc.auth.webauthn_rp_origin.clone();
 
+        if let Err(e) = new_config.validate() {
+            errors.push(format!("Config section not restored: {e}"));
+            return false;
+        }
+
         match self
             .config_file_persistence
-            .save_config_to_file(&new_config, &path)
+            .save_config_to_file(&new_config, path)
         {
             Ok(_) => {
                 *self.config.write().await = new_config;

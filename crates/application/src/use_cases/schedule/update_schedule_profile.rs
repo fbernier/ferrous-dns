@@ -29,9 +29,11 @@ impl UpdateScheduleProfileUseCase {
         if let Some(ref n) = name {
             ScheduleProfile::validate_name(n).map_err(DomainError::InvalidScheduleProfile)?;
         }
-        if let Some(ref tz) = timezone {
-            ScheduleProfile::validate_timezone(tz).map_err(DomainError::InvalidScheduleProfile)?;
-        }
+        let timezone = timezone
+            .as_deref()
+            .map(ScheduleProfile::parse_timezone)
+            .transpose()
+            .map_err(DomainError::InvalidScheduleProfile)?;
 
         let profile = self.repo.update(id, name, timezone, comment).await?;
 

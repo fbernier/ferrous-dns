@@ -14,7 +14,7 @@ const SECRET: [u8; 32] = [0xDEu8; 32];
 fn cookies_config(require_valid: bool) -> DnsCookiesConfig {
     DnsCookiesConfig {
         enabled: true,
-        server_secret: String::new(),
+        server_secret: None,
         secret_rotation_secs: 3600,
         require_valid_cookie: require_valid,
     }

@@ -86,7 +86,7 @@ fn config_with_records(records: Vec<LocalDnsRecord>) -> Config {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("base.toml");
     std::fs::write(&path, minimal_toml()).unwrap();
-    let mut config = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let mut config = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     config.dns.local_records = records;
     config
 }
@@ -140,7 +140,7 @@ async fn test_save_local_records_roundtrips_multiple_records() {
     let repo = TomlConfigRepository::new(path.to_str().unwrap().to_string());
     repo.save_local_records(&config).await.unwrap();
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(reloaded.dns.local_records, config.dns.local_records);
 }
 
@@ -160,7 +160,7 @@ async fn test_save_local_records_clears_records_when_empty() {
     let repo = TomlConfigRepository::new(path.to_str().unwrap().to_string());
     repo.save_local_records(&config).await.unwrap();
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(reloaded.dns.local_records.is_empty());
 }
 

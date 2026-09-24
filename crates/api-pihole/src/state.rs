@@ -1,4 +1,4 @@
-use ferrous_dns_application::ports::BlockFilterEnginePort;
+use ferrous_dns_application::ports::{BlockFilterEnginePort, ConfigFilePersistence};
 use ferrous_dns_application::use_cases::{
     AppPasswordLoginUseCase, GetTopAllowedDomainsUseCase, LoginUseCase, LogoutUseCase,
     ValidateSessionUseCase, VerifyMfaUseCase,
@@ -118,6 +118,7 @@ pub struct PiholeClientState {
 pub struct PiholeSystemState {
     pub cleanup_query_logs: Arc<CleanupOldQueryLogsUseCase>,
     pub config: Arc<RwLock<Config>>,
+    pub config_file_persistence: Arc<dyn ConfigFilePersistence>,
     pub config_path: Option<Arc<str>>,
     pub process_start: std::time::Instant,
 }

@@ -7,6 +7,7 @@ use ferrous_dns_api_pihole::{
 };
 use ferrous_dns_application::ports::BlockFilterEnginePort;
 use ferrous_dns_domain::Config;
+use ferrous_dns_infrastructure::repositories::TomlConfigFilePersistence;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -68,6 +69,7 @@ pub fn build_pihole_state(
         system: PiholeSystemState {
             cleanup_query_logs: use_cases.cleanup_query_logs.clone(),
             config,
+            config_file_persistence: Arc::new(TomlConfigFilePersistence),
             config_path,
             process_start: std::time::Instant::now(),
         },

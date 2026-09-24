@@ -2,7 +2,6 @@ use ferrous_dns_application::ports::{NxdomainHijackIpStore, NxdomainHijackProbeT
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
 use ferrous_dns_domain::NxdomainHijackConfig;
 use ferrous_dns_infrastructure::dns::NxdomainHijackDetector;
-use std::sync::Arc;
 
 fn test_config() -> NxdomainHijackConfig {
     NxdomainHijackConfig {
@@ -72,18 +71,4 @@ fn unbounded_ttl_never_evicts() {
 
     detector.evict_stale_ips();
     assert!(detector.is_hijack_ip(&ip));
-}
-
-#[tokio::test]
-async fn zero_probe_interval_does_not_kill_the_probe_loop() {
-    let detector = Arc::new(NxdomainHijackDetector::new(&NxdomainHijackConfig {
-        probe_interval_secs: 0,
-        ..test_config()
-    }));
-
-    let probe_loop = tokio::spawn(Arc::clone(&detector).run_probe_loop(Vec::new()));
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    assert!(!probe_loop.is_finished(), "probe loop exited (panicked)");
-    probe_loop.abort();
 }

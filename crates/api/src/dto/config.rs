@@ -127,18 +127,6 @@ pub struct BlockingConfigResponse {
     pub sinkhole_ipv6: String,
 }
 
-/// Parses an API block-mode string; unknown values fall back to the default
-/// (`NullIp`) rather than erroring, so a bad UI value can't break saving.
-pub fn block_mode_from_str(value: &str) -> ferrous_dns_domain::BlockResponseMode {
-    use ferrous_dns_domain::BlockResponseMode;
-    match value {
-        "nxdomain" => BlockResponseMode::NxDomain,
-        "nodata" => BlockResponseMode::NoData,
-        "refused" => BlockResponseMode::Refused,
-        _ => BlockResponseMode::NullIp,
-    }
-}
-
 /// Formats an optional sinkhole address as an API string (empty when unset).
 pub fn sinkhole_to_string(addr: Option<impl ToString>) -> String {
     addr.map(|a| a.to_string()).unwrap_or_default()
@@ -205,7 +193,7 @@ pub struct DatabaseConfigResponse {
     pub log_queries: bool,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct UpdateConfigRequest {
     pub server: Option<ServerConfigUpdate>,
     pub dns: Option<DnsConfigUpdate>,
@@ -213,7 +201,7 @@ pub struct UpdateConfigRequest {
     pub auth: Option<AuthConfigUpdate>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct AuthConfigUpdate {
     pub enabled: Option<bool>,
     pub session_ttl_hours: Option<u32>,
@@ -222,20 +210,20 @@ pub struct AuthConfigUpdate {
     pub login_rate_limit_window_secs: Option<u64>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct ServerConfigUpdate {
     pub pihole_compat: Option<bool>,
     pub web_tls: Option<WebTlsConfigUpdate>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct WebTlsConfigUpdate {
     pub enabled: Option<bool>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct PoolUpdate {
     pub name: String,
     pub strategy: String,
@@ -247,7 +235,7 @@ pub struct PoolUpdate {
     pub weight: Option<u32>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct DnsConfigUpdate {
     pub pools: Option<Vec<PoolUpdate>>,
     pub upstream_servers: Option<Vec<String>>,
@@ -277,7 +265,7 @@ pub struct DnsConfigUpdate {
     pub rate_limit: Option<RateLimitConfigUpdate>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct RateLimitConfigUpdate {
     pub enabled: Option<bool>,
     pub queries_per_second: Option<u32>,
@@ -294,7 +282,7 @@ pub struct RateLimitConfigUpdate {
     pub doq_max_connections_per_ip: Option<u32>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct BlockingConfigUpdate {
     pub enabled: Option<bool>,
     pub custom_blocked: Option<Vec<String>>,

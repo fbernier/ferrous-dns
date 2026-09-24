@@ -105,7 +105,7 @@ impl ExportConfigUseCase {
             server: SnapshotServerConfig {
                 dns_port: config.server.dns_port,
                 web_port: config.server.web_port,
-                bind_address: config.server.bind_address.clone(),
+                bind_address: config.server.bind_address.to_string(),
                 pihole_compat: config.server.pihole_compat,
                 tls_cert_path: config.server.web_tls.tls_cert_path.clone(),
                 tls_key_path: config.server.web_tls.tls_key_path.clone(),

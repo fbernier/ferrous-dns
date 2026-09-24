@@ -16,6 +16,5 @@ impl TomlConfigRepository {
 impl ConfigRepository for TomlConfigRepository {
     async fn save_local_records(&self, config: &Config) -> Result<(), DomainError> {
         super::config_persistence::save_local_records_to_file(config, &self.config_path)
-            .map_err(|e| DomainError::ConfigError(e.to_string()))
     }
 }

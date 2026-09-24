@@ -28,9 +28,9 @@ impl ManageTimeSlotsUseCase {
             .ok_or(DomainError::ScheduleProfileNotFound(profile_id))?;
 
         TimeSlot::validate_days(days).map_err(DomainError::InvalidTimeSlot)?;
-        TimeSlot::validate_time_format(&start_time).map_err(DomainError::InvalidTimeSlot)?;
-        TimeSlot::validate_time_format(&end_time).map_err(DomainError::InvalidTimeSlot)?;
-        TimeSlot::validate_time_range(&start_time, &end_time)
+        let start_time = TimeSlot::parse_time(&start_time).map_err(DomainError::InvalidTimeSlot)?;
+        let end_time = TimeSlot::parse_time(&end_time).map_err(DomainError::InvalidTimeSlot)?;
+        TimeSlot::validate_time_range(start_time, end_time)
             .map_err(DomainError::InvalidTimeSlot)?;
 
         let slot = self

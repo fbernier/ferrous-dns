@@ -1,5 +1,7 @@
 use crate::repositories::{db_err, is_fk_violation, is_unique_violation};
 use async_trait::async_trait;
+use chrono::NaiveTime;
+use chrono_tz::Tz;
 use ferrous_dns_application::ports::ScheduleProfileRepository;
 use ferrous_dns_domain::{DomainError, ScheduleAction, ScheduleProfile, TimeSlot};
 use sqlx::SqlitePool;
@@ -20,10 +22,15 @@ impl SqliteScheduleProfileRepository {
 
     fn row_to_profile(row: ProfileRow) -> ScheduleProfile {
         let (id, name, timezone, comment, created_at, updated_at) = row;
+        // An unparsable stored name falls back to UTC so the profile stays readable and enforced.
+        let timezone = ScheduleProfile::parse_timezone(&timezone).unwrap_or_else(|e| {
+            warn!(profile_id = id, error = %e, "Invalid schedule profile timezone in database, using UTC");
+            chrono_tz::UTC
+        });
         ScheduleProfile {
             id: Some(id),
             name: Arc::from(name.as_str()),
-            timezone: Arc::from(timezone.as_str()),
+            timezone,
             comment: comment.as_deref().map(Arc::from),
             created_at: Some(Arc::from(created_at.as_str())),
             updated_at: Some(Arc::from(updated_at.as_str())),
@@ -38,13 +45,20 @@ impl SqliteScheduleProfileRepository {
                 warn!(action = %action_str, slot_id = id, "Unknown schedule action in database, skipping slot");
             })
             .ok()?;
+        let parse_time = |time: &str| {
+            TimeSlot::parse_time(time)
+                .map_err(|e| {
+                    warn!(slot_id = id, error = %e, "Invalid time slot time in database, skipping slot");
+                })
+                .ok()
+        };
         Some(TimeSlot {
             id: Some(id),
             profile_id,
             // The column's CHECK constraint keeps days within 1..=127.
             days: days as u8,
-            start_time: Arc::from(start_time.as_str()),
-            end_time: Arc::from(end_time.as_str()),
+            start_time: parse_time(&start_time)?,
+            end_time: parse_time(&end_time)?,
             action,
             created_at: Some(Arc::from(created_at.as_str())),
         })
@@ -56,7 +70,7 @@ impl ScheduleProfileRepository for SqliteScheduleProfileRepository {
     async fn create(
         &self,
         name: String,
-        timezone: String,
+        timezone: Tz,
         comment: Option<String>,
     ) -> Result<ScheduleProfile, DomainError> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -67,7 +81,7 @@ impl ScheduleProfileRepository for SqliteScheduleProfileRepository {
              RETURNING id, name, timezone, comment, created_at, updated_at",
         )
         .bind(&name)
-        .bind(&timezone)
+        .bind(timezone.name())
         .bind(&comment)
         .bind(&now)
         .bind(&now)
@@ -113,7 +127,7 @@ impl ScheduleProfileRepository for SqliteScheduleProfileRepository {
         &self,
         id: i64,
         name: Option<String>,
-        timezone: Option<String>,
+        timezone: Option<Tz>,
         comment: Option<String>,
     ) -> Result<ScheduleProfile, DomainError> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -128,7 +142,7 @@ impl ScheduleProfileRepository for SqliteScheduleProfileRepository {
              RETURNING id, name, timezone, comment, created_at, updated_at",
         )
         .bind(&name)
-        .bind(&timezone)
+        .bind(timezone.map(Tz::name))
         .bind(&comment)
         .bind(&now)
         .bind(id)
@@ -178,8 +192,8 @@ impl ScheduleProfileRepository for SqliteScheduleProfileRepository {
         &self,
         profile_id: i64,
         days: u8,
-        start_time: String,
-        end_time: String,
+        start_time: NaiveTime,
+        end_time: NaiveTime,
         action: ScheduleAction,
     ) -> Result<TimeSlot, DomainError> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -191,8 +205,8 @@ impl ScheduleProfileRepository for SqliteScheduleProfileRepository {
         )
         .bind(profile_id)
         .bind(i64::from(days))
-        .bind(&start_time)
-        .bind(&end_time)
+        .bind(start_time.format(TimeSlot::TIME_FORMAT).to_string())
+        .bind(end_time.format(TimeSlot::TIME_FORMAT).to_string())
         .bind(action.to_str())
         .bind(&now)
         .fetch_one(&self.pool)

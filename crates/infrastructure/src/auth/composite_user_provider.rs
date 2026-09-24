@@ -105,9 +105,7 @@ impl CompositeUserProvider {
         if let Some(path) = &self.config_path {
             if let Err(e) = self.config_persistence.save_config_to_file(&config, path) {
                 config.auth.admin.password_hash = previous;
-                return Err(DomainError::ConfigError(format!(
-                    "Failed to save config: {e}"
-                )));
+                return Err(e);
             }
         }
 

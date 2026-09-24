@@ -1,11 +1,24 @@
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ferrous_dns_application::ports::ConfigFilePersistence;
-use ferrous_dns_domain::{config::errors::ConfigError, Config};
+use ferrous_dns_domain::{Config, DomainError};
 
 pub struct TomlConfigFilePersistence;
 
 impl ConfigFilePersistence for TomlConfigFilePersistence {
-    fn save_config_to_file(&self, config: &Config, path: &str) -> Result<(), String> {
-        save_config_to_file(config, path).map_err(|e| e.to_string())
+    fn load_config_from_file(&self, path: &str) -> Result<Config, DomainError> {
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            DomainError::ConfigError(format!("Failed to read config file {path}: {e}"))
+        })?;
+        Config::from_toml_str(&contents)
+    }
+
+    fn save_config_to_file(&self, config: &Config, path: &str) -> Result<(), DomainError> {
+        save_config_to_file(config, path)
     }
 }
 
@@ -41,13 +54,13 @@ fn str_array(values: &[String]) -> toml_edit::Value {
 fn ensure_table<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     key: &str,
-) -> Result<&'a mut toml_edit::Table, ConfigError> {
+) -> Result<&'a mut toml_edit::Table, DomainError> {
     if doc.get(key).is_none() {
         doc.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
     }
     doc.get_mut(key)
         .and_then(|item| item.as_table_mut())
-        .ok_or_else(|| ConfigError::Parse(format!("Failed to ensure table '{key}'")))
+        .ok_or_else(|| DomainError::ConfigError(format!("Failed to ensure table '{key}'")))
 }
 
 /// Gets a mutable reference to a sub-table inside a parent table,
@@ -55,45 +68,152 @@ fn ensure_table<'a>(
 fn ensure_subtable<'a>(
     parent: &'a mut toml_edit::Table,
     key: &str,
-) -> Result<&'a mut toml_edit::Table, ConfigError> {
+) -> Result<&'a mut toml_edit::Table, DomainError> {
     if parent.get(key).is_none() {
         parent.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
     }
     parent
         .get_mut(key)
         .and_then(|item| item.as_table_mut())
-        .ok_or_else(|| ConfigError::Parse(format!("Failed to ensure subtable '{key}'")))
+        .ok_or_else(|| DomainError::ConfigError(format!("Failed to ensure subtable '{key}'")))
 }
 
 /// Reads and parses the file at `path`, applies `edit`, and writes the document back,
 /// so every key and comment the edit doesn't touch survives the save.
 fn edit_config_file(
     path: &str,
-    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), ConfigError>,
-) -> Result<(), ConfigError> {
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), DomainError>,
+) -> Result<(), DomainError> {
     let existing = std::fs::read_to_string(path)
-        .map_err(|e| ConfigError::FileRead(path.to_string(), e.to_string()))?;
+        .map_err(|e| DomainError::ConfigError(format!("Failed to read config file {path}: {e}")))?;
 
-    let mut doc = existing
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| ConfigError::Parse(format!("Failed to parse config file: {}", e)))?;
+    let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        DomainError::ConfigError(format!("Failed to parse config file {path}: {e}"))
+    })?;
 
     edit(&mut doc)?;
 
-    std::fs::write(path, doc.to_string())
-        .map_err(|e| ConfigError::FileWrite(path.to_string(), e.to_string()))
+    replace_file(Path::new(path), doc.to_string().as_bytes(), |from, to| {
+        std::fs::rename(from, to)
+    })
+    .map_err(|e| DomainError::ConfigError(format!("Failed to write config file {path}: {e}")))
 }
 
-pub fn save_config_to_file(config: &Config, path: &str) -> Result<(), ConfigError> {
+/// Replaces the file at `path` with `contents` so that a crash leaves either
+/// the old or the new document, never a truncated one: the bytes go to a
+/// synced sibling temp file that is renamed over the target. Where the target
+/// cannot be replaced (a single-file bind mount, a read-only or unwritable
+/// directory), the file is rewritten in place instead.
+fn replace_file(
+    path: &Path,
+    contents: &[u8],
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // Renaming over a symlink would replace the link, not the file it names.
+    let target = std::fs::canonicalize(path)?;
+    let temp = temp_path_for(&target)?;
+
+    if let Err(e) = write_synced_temp(&temp, &target, contents) {
+        remove_temp(&temp);
+        return if needs_in_place_write(&e) {
+            overwrite_in_place(&target, contents)
+        } else {
+            Err(e)
+        };
+    }
+
+    if let Err(e) = rename(&temp, &target) {
+        remove_temp(&temp);
+        return if needs_in_place_write(&e) {
+            overwrite_in_place(&target, contents)
+        } else {
+            Err(e)
+        };
+    }
+
+    // The rename is only durable once the directory entry itself is synced.
+    match target.parent() {
+        Some(dir) => File::open(dir)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+/// EBUSY / EXDEV: the target is a mount point (Docker single-file bind mount)
+/// or lives on another filesystem. EACCES / EROFS on the temp file: the
+/// directory is not writable although the file may be.
+fn needs_in_place_write(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ResourceBusy
+            | io::ErrorKind::CrossesDevices
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::ReadOnlyFilesystem
+    )
+}
+
+fn temp_path_for(target: &Path) -> io::Result<PathBuf> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} does not name a file", target.display()),
+        )
+    })?;
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    Ok(target.with_file_name(temp_name))
+}
+
+fn write_synced_temp(temp: &Path, target: &Path, contents: &[u8]) -> io::Result<()> {
+    let permissions = std::fs::metadata(target)?.permissions();
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // Private until the target's mode is copied: the file holds the admin password hash.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(temp)?;
+    file.set_permissions(permissions)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+fn overwrite_in_place(target: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).truncate(true).open(target)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+fn remove_temp(temp: &Path) {
+    if let Err(e) = std::fs::remove_file(temp) {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(path = %temp.display(), error = %e, "Failed to remove temporary config file");
+        }
+    }
+}
+
+/// Bind hosts are written the way the sample config spells them, IPv6 bracketed.
+fn bind_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+pub fn save_config_to_file(config: &Config, path: &str) -> Result<(), DomainError> {
     edit_config_file(path, |doc| write_config(doc, config))
 }
 
-fn write_config(doc: &mut toml_edit::DocumentMut, config: &Config) -> Result<(), ConfigError> {
+fn write_config(doc: &mut toml_edit::DocumentMut, config: &Config) -> Result<(), DomainError> {
     {
         let t = ensure_table(doc, "server")?;
         set_val(t, "dns_port", config.server.dns_port as i64);
         set_val(t, "web_port", config.server.web_port as i64);
-        set_val(t, "bind_address", config.server.bind_address.as_str());
+        set_val(t, "bind_address", bind_host(config.server.bind_address));
         t.remove("api_key");
         set_val(t, "pihole_compat", config.server.pihole_compat);
     }
@@ -448,14 +568,14 @@ fn write_config(doc: &mut toml_edit::DocumentMut, config: &Config) -> Result<(),
     Ok(())
 }
 
-pub fn save_local_records_to_file(config: &Config, path: &str) -> Result<(), ConfigError> {
+pub fn save_local_records_to_file(config: &Config, path: &str) -> Result<(), DomainError> {
     edit_config_file(path, |doc| write_local_records(doc, config))
 }
 
 fn write_local_records(
     doc: &mut toml_edit::DocumentMut,
     config: &Config,
-) -> Result<(), ConfigError> {
+) -> Result<(), DomainError> {
     let dns = ensure_table(doc, "dns")?;
     if config.dns.local_records.is_empty() {
         dns.remove("local_records");
@@ -483,6 +603,54 @@ fn write_local_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_with(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    fn only_entry_is_the_config(dir: &tempfile::TempDir) -> bool {
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names == ["config.toml"]
+    }
+
+    #[test]
+    fn a_rename_refused_by_a_bind_mount_falls_back_to_an_in_place_write() {
+        for kind in [io::ErrorKind::ResourceBusy, io::ErrorKind::CrossesDevices] {
+            let (dir, path) = file_with("old = 1\n");
+
+            replace_file(&path, b"new = 2\n", |_, _| Err(io::Error::from(kind))).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "new = 2\n",
+                "{kind:?}"
+            );
+            assert!(
+                only_entry_is_the_config(&dir),
+                "{kind:?}: temp file left behind"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_rename_failure_is_reported_and_keeps_the_original() {
+        let (dir, path) = file_with("old = 1\n");
+
+        let err = replace_file(&path, b"new = 2\n", |_, _| {
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = 1\n");
+        assert!(only_entry_is_the_config(&dir), "temp file left behind");
+    }
 
     #[test]
     fn test_set_val_preserves_inline_comment() {

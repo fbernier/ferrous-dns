@@ -29,7 +29,7 @@ fn parses_per_protocol_bind_addresses_from_toml() {
         doq_bind_address = "192.168.1.10"
     "#;
     let config: EncryptedDnsConfig = toml::from_str(toml).unwrap();
-    assert_eq!(config.dot_bind_address.as_deref(), Some("[::]"));
-    assert_eq!(config.doh_bind_address.as_deref(), Some("127.0.0.1"));
-    assert_eq!(config.doq_bind_address.as_deref(), Some("192.168.1.10"));
+    assert_eq!(config.dot_bind_address, "::".parse().ok());
+    assert_eq!(config.doh_bind_address, "127.0.0.1".parse().ok());
+    assert_eq!(config.doq_bind_address, "192.168.1.10".parse().ok());
 }

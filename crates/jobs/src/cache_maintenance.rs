@@ -23,11 +23,10 @@ impl CacheMaintenanceJob {
         refresh_interval_secs: u64,
         compaction_interval_secs: u64,
     ) -> Self {
-        // `tokio::time::interval` panics on a zero period, and config does not reject 0.
         Self {
             maintenance,
-            refresh_interval_secs: refresh_interval_secs.max(1),
-            compaction_interval_secs: compaction_interval_secs.max(1),
+            refresh_interval_secs,
+            compaction_interval_secs,
         }
     }
 

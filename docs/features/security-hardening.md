@@ -178,4 +178,5 @@ Published so you can plan around it rather than discover it.
 - [ ] Consider `dnssec_mode = "strict"` once you have watched `permissive` for a while without false Bogus.
 - [ ] Try `qname_case_randomization = true` and watch upstream failure counts before keeping it.
 - [ ] Keep `metrics_enabled = false` unless the port is reachable only from your monitoring host.
+- [ ] Serving DoH through a reverse proxy on another host or container? List only that proxy in `[server] trusted_proxies`; every peer in the list can name any client (and so choose its group's filtering). See [DoH client identity](../configuration/server.md#doh-client-identity).
 - [ ] Put the dashboard behind HTTPS and enable TOTP or a passkey — the login lockout slows password guessing but does not replace a second factor.

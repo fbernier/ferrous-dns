@@ -12,8 +12,12 @@ mod db;
 struct FailingPersistence;
 
 impl ConfigFilePersistence for FailingPersistence {
-    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), String> {
-        Err("disk full".into())
+    fn load_config_from_file(&self, _path: &str) -> Result<Config, DomainError> {
+        Err(DomainError::ConfigError("disk full".into()))
+    }
+
+    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), DomainError> {
+        Err(DomainError::ConfigError("disk full".into()))
     }
 }
 

@@ -102,8 +102,7 @@ pub(super) async fn flush_loop(
     flush_interval_ms: u64,
 ) {
     let mut batch: Vec<QueryLogEntry> = Vec::with_capacity(max_batch_size);
-    // `interval` panics on a zero period, which would silently kill this task.
-    let mut flush_interval = tokio::time::interval(Duration::from_millis(flush_interval_ms.max(1)));
+    let mut flush_interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
 
     loop {
         tokio::select! {

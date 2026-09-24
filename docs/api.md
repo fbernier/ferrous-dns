@@ -235,13 +235,17 @@ Partial update — only include the sections you want to change:
 }
 ```
 
+The merged configuration is validated before anything is applied. An invalid value — an unknown `block_mode` or `dnssec_mode`, an unparseable server or sinkhole address, a `local_dns_server` that is not `IP:port`, or a zero interval, timeout or capacity such as `cache_compaction_interval: 0` — returns **400** with `{ "success": false, "error": "…" }` naming the key, and neither the live server nor the file changes. A request that is valid but cannot be carried out (no writable config file, a failed pool hot-reload or file write) returns 200 with `success: false`.
+
+The file is rewritten atomically (a synced temp file renamed over it), so a crash mid-save leaves the old or the new file, never a truncated one. When the file cannot be replaced — a Docker single-file bind mount, or a directory the server cannot write — it is rewritten in place instead.
+
 ### Reload Config
 
 ```http
 POST /api/config/reload
 ```
 
-Reloads the configuration from the TOML file without restarting the server. DNS, blocking, and cache settings take effect immediately. Server-level settings (ports, pihole_compat) require a full restart.
+Reloads the configuration from the TOML file without restarting the server. DNS, blocking, and cache settings take effect immediately. Server-level settings (ports, pihole_compat) require a full restart. A file that fails to parse or validate is reported with `success: false` and the running configuration is kept.
 
 ### Get Settings
 
@@ -272,7 +276,7 @@ POST /api/settings
 }
 ```
 
-`sinkhole_ipv4` / `sinkhole_ipv6` set a custom block target for `null_ip` mode (empty string = the null address `0.0.0.0` / `::`). A non-empty value that is not a valid address of the matching family is rejected with `{ "success": false, "error": "Invalid IPv4 sinkhole address: …" }` and nothing is saved. See [Custom Sinkhole IP](configuration/blocking.md#custom-sinkhole-ip).
+`sinkhole_ipv4` / `sinkhole_ipv6` set a custom block target for `null_ip` mode (empty string = the null address `0.0.0.0` / `::`). A non-empty value that is not a valid address of the matching family is rejected with **400** and `{ "success": false, "error": "Invalid IPv4 sinkhole address: …" }`, and nothing is saved. See [Custom Sinkhole IP](configuration/blocking.md#custom-sinkhole-ip). The same 400 applies to an unknown `block_mode` (`null_ip`, `nxdomain`, `nodata` or `refused`), a `local_dns_server` that is not `IP:port`, and a DNS64 prefix that is not a `/96`.
 
 The response carries `restart_required`: `true` when the save changed a setting (these only take effect after a restart), `false` when the form was saved unchanged.
 

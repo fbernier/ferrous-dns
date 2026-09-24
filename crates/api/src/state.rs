@@ -33,7 +33,7 @@ use ferrous_dns_application::use_cases::{
 use ferrous_dns_domain::Config;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct QueryUseCases {
@@ -180,6 +180,10 @@ pub struct AppState {
     pub auth: AuthUseCases,
     pub backup: BackupUseCases,
     pub config: Arc<RwLock<Config>>,
+    /// Serializes the API's config read-modify-write so the live upstream
+    /// pools always match the last saved ones; `config` stays readable while
+    /// a save waits on the pool hot-reload.
+    pub config_writer: Arc<Mutex<()>>,
     pub config_file_persistence: Arc<dyn ConfigFilePersistence>,
     pub config_path: Option<Arc<str>>,
     pub tls_cert: Arc<dyn TlsCertificatePort>,
@@ -197,14 +201,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Resolves the effective config file path: explicit CLI path first, then auto-discovery.
-    pub fn resolve_config_path(&self) -> Option<String> {
-        self.config_path
-            .as_deref()
-            .map(String::from)
-            .or_else(ferrous_dns_domain::Config::get_config_path)
-    }
-
     pub async fn auth_enabled(&self) -> bool {
         self.auth.get_auth_status.execute().await.auth_enabled
     }

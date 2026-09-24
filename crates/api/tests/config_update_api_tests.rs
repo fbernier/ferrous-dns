@@ -99,7 +99,7 @@ async fn test_update_config_rejects_invalid_server() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["success"], false);
     assert!(
         json["error"].as_str().unwrap().contains("Invalid server"),
@@ -130,7 +130,7 @@ async fn test_update_config_rejects_pool_with_only_blank_servers() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["success"], false);
     assert!(
         json["error"]
@@ -277,7 +277,7 @@ async fn test_update_config_rejects_invalid_sinkhole_ipv4() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["success"], false);
     assert!(
         json["error"]
@@ -300,7 +300,7 @@ async fn test_update_config_rejects_invalid_sinkhole_ipv6() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["success"], false);
     assert!(
         json["error"]
@@ -459,7 +459,7 @@ async fn test_update_settings_rejects_invalid_dns64_prefix() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["success"], false);
     assert!(
         json["error"]
@@ -626,5 +626,186 @@ async fn test_tls_certificate_generation_leaves_restart_pending() {
     assert_eq!(
         json["restart_required"], true,
         "a new certificate is only served after a restart"
+    );
+}
+
+#[tokio::test]
+async fn test_update_config_keeps_config_readable_during_pool_reload() {
+    let pool = create_test_db().await;
+    let (TestApp { mut state, .. }, _path) = test_app(pool).await;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    state.dns.reload_upstream = Arc::new(GatedReload {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let config = state.config.clone();
+    let app = create_api_router_with_openapi(state).0;
+
+    let save = tokio::spawn(post_config(
+        app,
+        serde_json::json!({
+            "dns": { "pools": [
+                { "name": "p1", "strategy": "parallel", "priority": 1,
+                  "servers": ["udp://9.9.9.9:53"] }
+            ] }
+        }),
+    ));
+    started.notified().await;
+
+    // Upstream hostname resolution can take seconds; readers must not queue behind it.
+    let reader = tokio::time::timeout(Duration::from_secs(1), config.read()).await;
+    assert!(reader.is_ok(), "a reader waited for the pool hot-reload");
+    drop(reader);
+
+    release.notify_one();
+    let (status, json) = save.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["success"], true);
+}
+
+#[tokio::test]
+async fn test_update_config_rejects_a_zero_compaction_interval() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, path) = test_app(pool).await;
+    let before = config.read().await.dns.cache_compaction_interval;
+
+    let (status, json) = post_config(
+        router,
+        serde_json::json!({ "dns": { "cache_compaction_interval": 0 } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("dns.cache_compaction_interval"),
+        "error should name the key, got: {}",
+        json["error"]
+    );
+    assert_eq!(config.read().await.dns.cache_compaction_interval, before);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+}
+
+#[tokio::test]
+async fn test_update_config_rejects_an_unknown_block_mode() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, _path) = test_app(pool).await;
+
+    let (status, json) = post_config(
+        router,
+        serde_json::json!({ "blocking": { "block_mode": "bogus" } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("block_mode"),
+        "error should name the key, got: {}",
+        json["error"]
+    );
+    assert_eq!(
+        config.read().await.blocking.block_mode,
+        ferrous_dns_domain::BlockResponseMode::NullIp
+    );
+}
+
+#[tokio::test]
+async fn test_update_settings_rejects_an_unknown_block_mode() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, _path) = test_app(pool).await;
+    config.write().await.blocking.block_mode = ferrous_dns_domain::BlockResponseMode::NxDomain;
+
+    let (status, json) = post_settings(
+        router,
+        serde_json::json!({
+            "never_forward_non_fqdn": false,
+            "never_forward_reverse_lookups": false,
+            "block_mode": "bogus"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["success"], false);
+    // An unknown value must not silently reset the mode to null_ip.
+    assert_eq!(
+        config.read().await.blocking.block_mode,
+        ferrous_dns_domain::BlockResponseMode::NxDomain
+    );
+}
+
+#[tokio::test]
+async fn test_update_settings_rejects_a_local_dns_server_without_a_port() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, _path) = test_app(pool).await;
+
+    let (status, json) = post_settings(
+        router,
+        serde_json::json!({
+            "never_forward_non_fqdn": false,
+            "never_forward_reverse_lookups": false,
+            "local_domain": "lan",
+            "local_dns_server": "192.168.1.1"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("dns.local_dns_server"),
+        "error should name the key, got: {}",
+        json["error"]
+    );
+    assert_eq!(config.read().await.dns.local_dns_server, None);
+}
+
+#[tokio::test]
+async fn test_reload_keeps_the_running_config_when_the_file_fails_validation() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, path) = test_app(pool).await;
+    std::fs::write(
+        &path,
+        "[server]\ndns_port = 53\nweb_port = 8080\nbind_address = \"0.0.0.0\"\n\
+         [dns]\nupstream_servers = [\"1.1.1.1:53\"]\n[blocking]\nenabled = true\n\
+         [logging]\nlevel = \"info\"\n[database]\nwal_checkpoint_interval_secs = 0\n",
+    )
+    .unwrap();
+    let before = config.read().await.database.wal_checkpoint_interval_secs;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/config/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("database.wal_checkpoint_interval_secs"),
+        "error should name the key, got: {}",
+        json["error"]
+    );
+    assert_eq!(
+        config.read().await.database.wal_checkpoint_interval_secs,
+        before
     );
 }

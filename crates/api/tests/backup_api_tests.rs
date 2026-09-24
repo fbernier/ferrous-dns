@@ -940,3 +940,27 @@ async fn test_mdns_enabled_survives_export_import_round_trip() {
 
     assert!(config.read().await.dns.mdns_enabled);
 }
+
+#[tokio::test]
+async fn test_import_does_not_restore_a_config_section_that_fails_validation() {
+    let TestApp { router, config, .. } = test_app().await;
+    let before = config.read().await.dns.cache_compaction_interval;
+    let mut backup = minimal_backup_json();
+    backup["config"]["dns"]["cache_compaction_interval"] = json!(0);
+    let payload = serde_json::to_vec(&backup).unwrap();
+
+    let response = router.oneshot(import_request(&payload)).await.unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["summary"]["config_updated"], false);
+    let errors = json["errors"].as_array().unwrap();
+    assert!(
+        errors.iter().any(|e| e
+            .as_str()
+            .unwrap_or_default()
+            .contains("dns.cache_compaction_interval")),
+        "the error should name the key, got: {errors:?}"
+    );
+    assert_eq!(config.read().await.dns.cache_compaction_interval, before);
+}

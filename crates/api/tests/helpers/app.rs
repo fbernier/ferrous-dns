@@ -159,7 +159,7 @@ impl TestAppBuilder {
         };
         let safe_search_engine: Arc<dyn SafeSearchEnginePort> = Arc::new(NullSafeSearchEnginePort);
 
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = Arc::new(RwLock::new(Config::builtin()));
         let cache = Arc::new(DnsCache::new(DnsCacheConfig {
             max_entries: self.cache_max_entries,
             eviction_strategy: EvictionStrategy::LRU,
@@ -431,6 +431,7 @@ impl TestAppBuilder {
             auth: build_test_auth_use_cases(),
             backup,
             config: config.clone(),
+            config_writer: Default::default(),
             config_file_persistence: Arc::new(TomlConfigFilePersistence),
             config_path: self.config_path,
             tls_cert: Arc::new(MockTlsCertificateService),

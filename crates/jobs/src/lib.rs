@@ -22,4 +22,4 @@ pub use retention::RetentionJob;
 pub use schedule_evaluator::ScheduleEvaluatorJob;
 pub use session_cleanup::SessionCleanupJob;
 pub use tunneling_eviction::TunnelingEvictionJob;
-pub use wal_checkpoint::WalCheckpointJob;
+pub use wal_checkpoint::{WalCheckpointJob, WalCheckpointOutcome};

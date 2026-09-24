@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use chrono::NaiveTime;
+use chrono_tz::Tz;
 use ferrous_dns_domain::{DomainError, ScheduleAction, ScheduleProfile, TimeSlot};
 
 #[async_trait]
@@ -6,7 +8,7 @@ pub trait ScheduleProfileRepository: Send + Sync {
     async fn create(
         &self,
         name: String,
-        timezone: String,
+        timezone: Tz,
         comment: Option<String>,
     ) -> Result<ScheduleProfile, DomainError>;
 
@@ -18,7 +20,7 @@ pub trait ScheduleProfileRepository: Send + Sync {
         &self,
         id: i64,
         name: Option<String>,
-        timezone: Option<String>,
+        timezone: Option<Tz>,
         comment: Option<String>,
     ) -> Result<ScheduleProfile, DomainError>;
 
@@ -30,8 +32,8 @@ pub trait ScheduleProfileRepository: Send + Sync {
         &self,
         profile_id: i64,
         days: u8,
-        start_time: String,
-        end_time: String,
+        start_time: NaiveTime,
+        end_time: NaiveTime,
         action: ScheduleAction,
     ) -> Result<TimeSlot, DomainError>;
 

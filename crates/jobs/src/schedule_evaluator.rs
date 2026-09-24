@@ -1,5 +1,3 @@
-use chrono::{Datelike, Timelike};
-use chrono_tz::Tz;
 use ferrous_dns_application::ports::{ScheduleProfileRepository, ScheduleStatePort};
 use ferrous_dns_domain::{evaluate_slots, GroupOverride, ScheduleAction};
 use std::collections::HashSet;
@@ -35,17 +33,18 @@ impl ScheduleEvaluatorJob {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(INTERVAL_SECS));
-            interval.tick().await;
 
             loop {
+                // The first tick completes immediately, so schedules are enforced right at startup.
                 interval.tick().await;
-                self.state.sweep_expired();
-                self.evaluate_all_schedules().await;
+                self.evaluate_once().await;
             }
         });
     }
 
-    async fn evaluate_all_schedules(&mut self) {
+    pub async fn evaluate_once(&mut self) {
+        self.state.sweep_expired();
+
         let assignments = match self.repo.get_all_group_assignments().await {
             Ok(a) => a,
             Err(e) => {
@@ -61,13 +60,16 @@ impl ScheduleEvaluatorJob {
         self.active_groups = current_group_ids;
 
         for (group_id, profile_id) in &assignments {
+            // A transient load failure keeps the group's last override so enforcement does not flap.
             let profile = match self.repo.get_by_id(*profile_id).await {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     warn!(
+                        group_id,
                         profile_id,
-                        "ScheduleEvaluatorJob: profile not found, skipping"
+                        "ScheduleEvaluatorJob: assigned profile not found, clearing override"
                     );
+                    self.state.clear(*group_id);
                     continue;
                 }
                 Err(e) => {
@@ -84,23 +86,11 @@ impl ScheduleEvaluatorJob {
                 }
             };
 
-            let tz: Tz = match profile.timezone.parse() {
-                Ok(tz) => tz,
-                Err(_) => {
-                    warn!(
-                        timezone = %profile.timezone,
-                        profile_id,
-                        "ScheduleEvaluatorJob: invalid timezone, using UTC"
-                    );
-                    chrono_tz::UTC
-                }
-            };
+            let now = chrono::Utc::now()
+                .with_timezone(&profile.timezone)
+                .naive_local();
 
-            let now = chrono::Utc::now().with_timezone(&tz);
-            let weekday_bit = 1u8 << now.weekday().num_days_from_monday();
-            let now_time = format!("{:02}:{:02}", now.hour(), now.minute());
-
-            match evaluate_slots(&slots, weekday_bit, &now_time) {
+            match evaluate_slots(&slots, now) {
                 Some(ScheduleAction::BlockAll) => {
                     self.state.set(*group_id, GroupOverride::BlockAll);
                 }

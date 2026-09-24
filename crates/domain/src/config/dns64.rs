@@ -16,6 +16,7 @@ fn default_dns64_prefix() -> String {
 /// the `/96` NAT64 `prefix`. This only produces working answers when a NAT64
 /// gateway is present on the network, so it is **off by default**.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Dns64Config {
     /// Off by default — synthesizing without a NAT64 gateway breaks IPv6 clients.
     pub enabled: bool,
@@ -23,7 +24,6 @@ pub struct Dns64Config {
     /// NAT64 prefix in CIDR form. Only `/96` is supported; any other length or a
     /// malformed value disables DNS64 with a warning (fail-soft) — see
     /// [`Dns64Config::parsed_prefix`].
-    #[serde(default = "default_dns64_prefix")]
     pub prefix: String,
 }
 

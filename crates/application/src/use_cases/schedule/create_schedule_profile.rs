@@ -21,7 +21,7 @@ impl CreateScheduleProfileUseCase {
         comment: Option<String>,
     ) -> Result<ScheduleProfile, DomainError> {
         ScheduleProfile::validate_name(&name).map_err(DomainError::InvalidScheduleProfile)?;
-        ScheduleProfile::validate_timezone(&timezone)
+        let timezone = ScheduleProfile::parse_timezone(&timezone)
             .map_err(DomainError::InvalidScheduleProfile)?;
         ScheduleProfile::validate_comment(&comment.as_deref().map(Arc::from))
             .map_err(DomainError::InvalidScheduleProfile)?;

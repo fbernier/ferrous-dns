@@ -1,4 +1,4 @@
-use axum::extract::{Query, Request};
+use axum::extract::{ConnectInfo, Query, Request};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
@@ -9,13 +9,21 @@ use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query as DnsQuery};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType as HickoryRecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use ipnetwork::IpNetwork;
 use serde_json::{json, Value};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
 const DNS_MESSAGE_CONTENT_TYPE: &str = "application/dns-message";
 const DNS_JSON_CONTENT_TYPE: &str = "application/dns-json; charset=utf-8";
+
+/// Everything a DoH request needs besides the request itself.
+pub struct DohContext {
+    pub handler: Arc<DnsServerHandler>,
+    /// `[server].trusted_proxies`: peers allowed to name the client.
+    pub trusted_proxies: Vec<IpNetwork>,
+}
 
 #[derive(serde::Deserialize)]
 pub struct DnsQueryParams {
@@ -29,16 +37,18 @@ pub struct DnsQueryParams {
 ///
 /// Wire format: `GET ?dns=<base64url>` or `POST` with `Content-Type: application/dns-message`.
 /// JSON format: `GET ?name=<domain>&type=<A|AAAA|...>` with `Accept: application/dns-json`.
-/// Client IP is extracted from `X-Real-IP` / `X-Forwarded-For` for correct blocklist attribution.
+/// The client is the socket peer; see [`client_ip`] for requests relayed by a
+/// trusted proxy.
 ///
 /// Injected via `Extension` to avoid a state-type conflict with the main Axum `AppState`.
 pub async fn dns_query_handler(
-    Extension(handler): Extension<Arc<DnsServerHandler>>,
+    Extension(doh): Extension<Arc<DohContext>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<DnsQueryParams>,
     request: Request,
 ) -> Response {
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = client_ip(peer.ip(), &headers, &doh.trusted_proxies);
     let json_response = wants_json(&headers);
 
     let wire = if *request.method() == Method::POST {
@@ -62,7 +72,8 @@ pub async fn dns_query_handler(
         }
     };
 
-    match handler
+    match doh
+        .handler
         .handle_raw_udp_fallback(&wire, client_ip, ClientProtocol::Doh)
         .await
     {
@@ -93,14 +104,56 @@ fn wants_json(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_client_ip(headers: &HeaderMap) -> IpAddr {
-    headers
-        .get("x-real-ip")
-        .or_else(|| headers.get("x-forwarded-for"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+/// The client a DoH request is attributed to, and so the group policy it gets.
+///
+/// Only a peer inside `trusted` may name another client, since any client can
+/// send these headers. Each proxy appends the address it received from to
+/// `X-Forwarded-For`, so the hops are walked right to left and the first one
+/// that is not itself a trusted proxy is the client; hops left of it are
+/// client-supplied. Without `X-Forwarded-For`, a trusted peer's `X-Real-IP`
+/// is used.
+fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNetwork]) -> IpAddr {
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|net| net.contains(ip));
+    let peer = peer.to_canonical();
+    if !is_trusted(peer) {
+        return peer;
+    }
+
+    let mut hops = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .rev()
+        .flat_map(|value| value.to_str().unwrap_or_default().rsplit(','))
+        .peekable();
+    if hops.peek().is_none() {
+        return headers
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_forwarded_ip)
+            .unwrap_or(peer);
+    }
+
+    let mut client = peer;
+    for hop in hops {
+        // A garbled hop ends the chain: whatever lies left of it is unverifiable.
+        let Some(ip) = parse_forwarded_ip(hop) else {
+            break;
+        };
+        client = ip;
+        if !is_trusted(ip) {
+            break;
+        }
+    }
+    client
+}
+
+/// A forwarded address as proxies write it: a bare IP, `ip:port` or `[v6]:port`.
+fn parse_forwarded_ip(text: &str) -> Option<IpAddr> {
+    let text = text.trim();
+    text.parse::<IpAddr>()
+        .or_else(|_| text.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .ok()
+        .map(|ip| ip.to_canonical())
 }
 
 fn decode_base64url(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
@@ -198,5 +251,126 @@ fn format_rdata(data: &RData) -> String {
             soa.mname, soa.rname, soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum
         ),
         _ => data.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    fn nets(cidrs: &[&str]) -> Vec<IpNetwork> {
+        cidrs.iter().map(|cidr| cidr.parse().unwrap()).collect()
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(*name, HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    const LOOPBACK: [&str; 2] = ["127.0.0.0/8", "::1/128"];
+
+    #[test]
+    fn without_headers_the_client_is_the_socket_peer() {
+        let none = HeaderMap::new();
+        assert_eq!(
+            client_ip(ip("192.168.1.50"), &none, &nets(&LOOPBACK)),
+            ip("192.168.1.50")
+        );
+        assert_eq!(
+            client_ip(ip("127.0.0.1"), &none, &nets(&LOOPBACK)),
+            ip("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn forwarding_headers_from_an_untrusted_peer_are_ignored() {
+        let spoofed = headers(&[("x-forwarded-for", "10.9.9.9"), ("x-real-ip", "10.8.8.8")]);
+        assert_eq!(
+            client_ip(ip("192.168.1.50"), &spoofed, &nets(&LOOPBACK)),
+            ip("192.168.1.50")
+        );
+    }
+
+    #[test]
+    fn a_trusted_proxy_chain_resolves_to_the_right_most_untrusted_hop() {
+        // 6.6.6.6 was sent by the client itself; the edge proxy appended the
+        // real client, 203.0.113.7; the inner proxy appended the edge proxy.
+        let relayed = headers(&[("x-forwarded-for", "6.6.6.6, 203.0.113.7, 10.0.0.2")]);
+        assert_eq!(
+            client_ip(
+                ip("127.0.0.1"),
+                &relayed,
+                &nets(&["127.0.0.0/8", "10.0.0.0/8"])
+            ),
+            ip("203.0.113.7")
+        );
+    }
+
+    #[test]
+    fn repeated_forwarded_for_headers_form_one_chain() {
+        let relayed = headers(&[
+            ("x-forwarded-for", "6.6.6.6, 203.0.113.7"),
+            ("x-forwarded-for", "10.0.0.2"),
+        ]);
+        assert_eq!(
+            client_ip(
+                ip("127.0.0.1"),
+                &relayed,
+                &nets(&["127.0.0.0/8", "10.0.0.0/8"])
+            ),
+            ip("203.0.113.7")
+        );
+    }
+
+    #[test]
+    fn a_chain_of_only_trusted_hops_resolves_to_the_left_most() {
+        let relayed = headers(&[("x-forwarded-for", "10.0.0.3, 10.0.0.2")]);
+        assert_eq!(
+            client_ip(
+                ip("127.0.0.1"),
+                &relayed,
+                &nets(&["127.0.0.0/8", "10.0.0.0/8"])
+            ),
+            ip("10.0.0.3")
+        );
+    }
+
+    #[test]
+    fn a_garbled_hop_stops_the_walk_at_the_last_verified_address() {
+        let relayed = headers(&[("x-forwarded-for", "203.0.113.7, not-an-ip, 10.0.0.2")]);
+        assert_eq!(
+            client_ip(
+                ip("127.0.0.1"),
+                &relayed,
+                &nets(&["127.0.0.0/8", "10.0.0.0/8"])
+            ),
+            ip("10.0.0.2")
+        );
+    }
+
+    #[test]
+    fn a_trusted_peer_without_forwarded_for_may_use_x_real_ip() {
+        let relayed = headers(&[("x-real-ip", "192.168.1.50")]);
+        assert_eq!(
+            client_ip(ip("127.0.0.1"), &relayed, &nets(&LOOPBACK)),
+            ip("192.168.1.50")
+        );
+    }
+
+    #[test]
+    fn forwarded_hops_may_carry_ports_and_v4_mapped_peers_are_unmapped() {
+        let relayed = headers(&[("x-forwarded-for", "203.0.113.7:51234, [2001:db8::7]:443")]);
+        assert_eq!(
+            client_ip(ip("::ffff:127.0.0.1"), &relayed, &nets(&LOOPBACK)),
+            ip("2001:db8::7")
+        );
     }
 }

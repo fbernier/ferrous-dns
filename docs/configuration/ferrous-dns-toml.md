@@ -19,6 +19,12 @@ FERROUS_CONFIG=path/to/ferrous-dns.toml ferrous-dns
 !!! info "All sections are optional"
     Every section and every key has a built-in default. You only need to include what you want to override.
 
+!!! warning "Invalid values stop startup"
+    The file is parsed and validated once, at startup (and again on a reload or an API save), and a bad value is reported with the key it came from instead of surfacing later as a crashed background task. Rejected values include: a bind address that is not an IP literal, a `trusted_proxies` entry that is not a CIDR or address, a `server_secret` that is neither empty nor 64 hex digits, an unknown `block_mode`, a `local_dns_server` that is not `IP:port`, `cache_shard_amount` / `cache_inflight_shards` that are not a power of two of at least 2, `cache_min_ttl` above `cache_max_ttl`, and **0** for any interval, timeout, TTL or capacity whose zero would panic, spin or silently disable a component: `query_timeout`, `cache_max_entries`, `cache_compaction_interval`, `cache_eviction_sample_size`, `health_check.interval` / `timeout`, `rate_limit.queries_per_second` / `burst_size` / `stale_entry_ttl_secs`, the tunneling and DGA `stale_entry_ttl_secs`, `nxdomain_hijack.probe_interval_secs` / `probe_timeout_ms` / `hijack_ip_ttl_secs`, `response_ip_filter.refresh_interval_secs` / `ip_ttl_secs`, `queries_log_stored`, `query_log_channel_capacity` / `query_log_max_batch_size` / `query_log_flush_interval_ms`, `client_channel_capacity`, the three `*_pool_max_connections`, `write_busy_timeout_secs`, `read_acquire_timeout_secs`, `wal_checkpoint_interval_secs`, `session_ttl_hours`, `remember_me_days`, `login_rate_limit_window_secs` and `mfa_challenge_ttl_secs`. Zeros that have a documented meaning (`cache_min_ttl`, `slip_ratio`, the `*_max_connections_per_ip` limits, `wal_autocheckpoint`, `sqlite_mmap_size_mb`, `read_busy_timeout_secs`, `login_rate_limit_attempts`, `block_ttl`) stay allowed.
+
+!!! info "Saves are atomic"
+    Dashboard and API saves write a synced temp file next to the config and rename it over the original, so a crash leaves either the old or the new file. A symlinked config is followed and its target rewritten. When the file cannot be replaced — a Docker single-file bind mount, or a directory the server cannot write — it is rewritten in place instead.
+
 ---
 
 ## Quick Reference {#quick-reference}
@@ -61,6 +67,7 @@ bind_address             = "0.0.0.0"
 pihole_compat            = false
 proxy_protocol_enabled   = false
 metrics_enabled          = false
+trusted_proxies          = ["127.0.0.0/8", "::1/128"]
 ```
 
 | Option | Type | Default | Description |
@@ -72,6 +79,7 @@ metrics_enabled          = false
 | `proxy_protocol_enabled` | `bool` | `false` | Enable PROXY Protocol v2 on TCP DNS and DoT listeners |
 | `metrics_enabled` | `bool` | `false` | Serve an unauthenticated Prometheus text-exposition endpoint at `/metrics` on the web port |
 | `cors_allowed_origins` | `list` | _(dashboard origin)_ | Browser origins allowed to call the REST API via CORS |
+| `trusted_proxies` | `list` | `["127.0.0.0/8", "::1/128"]` | Reverse proxies (CIDRs or addresses) whose `X-Forwarded-For` / `X-Real-IP` name the DoH client; any other DoH request is attributed to its socket peer. Setting it replaces the default. See [DoH client identity](server.md#doh-client-identity) |
 
 !!! warning "PROXY Protocol"
     Only enable `proxy_protocol_enabled` when a trusted load balancer always sits in front of Ferrous DNS. Without a load balancer, all TCP DNS connections will be rejected because the server expects a PROXY Protocol header on every connection.
@@ -104,7 +112,7 @@ tls_key_path  = "/data/key.pem"
 
 ## `[server.encrypted_dns]` {#encrypted-dns}
 
-Enables DNS-over-TLS (DoT), DNS-over-HTTPS (DoH), and DNS-over-QUIC (DoQ) server-side listeners. This section is commented out by default. If the cert or key files are missing at startup, the affected listeners are skipped with a warning; plain DNS continues normally.
+Enables DNS-over-TLS (DoT), DNS-over-HTTPS (DoH), and DNS-over-QUIC (DoQ) server-side listeners. This section is commented out by default. The certificate is used by DoT and DoQ only; if the cert or key files are missing at startup, those two are skipped with a warning while DoH and plain DNS continue normally. DoH is plain HTTP meant for a TLS-terminating reverse proxy.
 
 ```toml title="ferrous-dns.toml"
 [server.encrypted_dns]
@@ -124,13 +132,13 @@ tls_key_path  = "/data/key.pem"
 | `dot_port` | `int` | `853` | TCP port for DoT (RFC 7858 standard: 853) |
 | `dot_bind_address` | `str` | — | Address for the DoT listener; inherits `bind_address` when omitted |
 | `doh_enabled` | `bool` | `false` | Enable the `/dns-query` DoH endpoint |
-| `doh_port` | `int` | — | Dedicated HTTPS port for DoH; omit to co-host on `web_port` |
+| `doh_port` | `int` | — | Dedicated plain-HTTP port for DoH (behind a reverse proxy); omit to co-host on `web_port` |
 | `doh_bind_address` | `str` | — | Address for the dedicated DoH listener; ignored when `doh_port` is omitted |
 | `doq_enabled` | `bool` | `false` | Enable the DNS-over-QUIC listener |
 | `doq_port` | `int` | `853` | UDP port for DoQ (RFC 9250 standard: 853) |
 | `doq_bind_address` | `str` | — | Address for the DoQ listener; inherits `bind_address` when omitted |
-| `tls_cert_path` | `str` | `"/data/cert.pem"` | Path to the PEM-encoded TLS certificate |
-| `tls_key_path` | `str` | `"/data/key.pem"` | Path to the PEM-encoded TLS private key |
+| `tls_cert_path` | `str` | `"/data/cert.pem"` | Path to the PEM-encoded TLS certificate for DoT and DoQ |
+| `tls_key_path` | `str` | `"/data/key.pem"` | Path to the PEM-encoded TLS private key for DoT and DoQ |
 
 See [Encrypted DNS](../features/encrypted-dns.md).
 
@@ -649,7 +657,7 @@ prefix  = "64:ff9b::/96"
 
 | Option | Type | Default | Description |
 |:-------|:-----|:--------|:------------|
-| `enabled` | `bool` | `false` | Enable DNS64 AAAA synthesis; only turn on with a NAT64 gateway present |
+| `enabled` | `bool` | `false` | Enable DNS64 AAAA synthesis; only turn on with a NAT64 gateway present. May be omitted (off) |
 | `prefix` | `str` | `"64:ff9b::/96"` | NAT64 prefix; only `/96` is supported (well-known prefix per RFC 6052) |
 
 See [DNS64](../features/dns64.md).

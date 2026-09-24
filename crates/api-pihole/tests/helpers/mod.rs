@@ -422,6 +422,9 @@ async fn build_pihole_state(
         system: PiholeSystemState {
             cleanup_query_logs: Arc::new(CleanupOldQueryLogsUseCase::new(query_log_repo)),
             config: Arc::new(RwLock::new(config)),
+            config_file_persistence: Arc::new(
+                ferrous_dns_infrastructure::repositories::TomlConfigFilePersistence,
+            ),
             config_path: None,
             process_start: std::time::Instant::now(),
         },

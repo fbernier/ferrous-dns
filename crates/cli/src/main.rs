@@ -5,9 +5,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use anyhow::Context;
 use clap::Parser;
-use ferrous_dns_domain::CliOverrides;
 use ferrous_dns_infrastructure::dns::server::{BlockPolicy, DnsServerHandler};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -33,15 +31,8 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     let cli = args::Cli::parse();
 
-    let cli_overrides = CliOverrides {
-        dns_port: cli.dns_port,
-        web_port: cli.web_port,
-        bind_address: cli.bind.clone(),
-        database_path: cli.database.clone(),
-        log_level: cli.log_level.clone(),
-    };
-
-    let config = bootstrap::load_config(cli.config.as_deref(), cli_overrides)?;
+    let config_path = bootstrap::resolve_config_path(cli.config.as_deref());
+    let config = bootstrap::load_config(config_path.as_deref(), &cli)?;
 
     bootstrap::init_logging(&config);
 
@@ -79,10 +70,7 @@ async fn async_main() -> anyhow::Result<()> {
         dns_services.cache_maintenance.clone(),
     );
 
-    let effective_config_path: Option<Arc<str>> =
-        cli.config.as_deref().map(Arc::from).or_else(|| {
-            ferrous_dns_domain::Config::get_config_path().map(|p| Arc::from(p.as_str()))
-        });
+    let effective_config_path: Option<Arc<str>> = config_path.as_deref().map(Arc::from);
 
     let auth =
         wiring::build_auth_services(&repos, config_arc.clone(), effective_config_path.as_deref())
@@ -124,11 +112,7 @@ async fn async_main() -> anyhow::Result<()> {
     )
     .await;
 
-    let dns_addr: SocketAddr = config
-        .server
-        .dns_listen_address()
-        .parse()
-        .context("Invalid DNS bind address")?;
+    let dns_addr = config.server.dns_listen_address();
     let handler_use_case = dns_services.handler_use_case;
     let tcp_conn_limiter = dns_services.tcp_conn_limiter;
     let dot_conn_limiter = dns_services.dot_conn_limiter;
@@ -161,25 +145,15 @@ async fn async_main() -> anyhow::Result<()> {
         tokio::spawn(server::start_mdns_listener());
     }
 
-    let tls_config =
-        if config.server.encrypted_dns.dot_enabled || config.server.encrypted_dns.doh_enabled {
-            server::load_server_tls_config(
-                &config.server.encrypted_dns.tls_cert_path,
-                &config.server.encrypted_dns.tls_key_path,
-                "DoT/DoH",
-                &[],
-            )?
-        } else {
-            None
-        };
-
     if config.server.encrypted_dns.dot_enabled {
-        if let Some(tls_cfg) = tls_config.clone() {
-            let dot_addr: SocketAddr = config
-                .server
-                .dot_listen_address()
-                .parse()
-                .context("Invalid DoT bind address")?;
+        let dot_tls_config = server::load_server_tls_config(
+            &config.server.encrypted_dns.tls_cert_path,
+            &config.server.encrypted_dns.tls_key_path,
+            "DoT",
+            &[],
+        )?;
+        if let Some(tls_cfg) = dot_tls_config {
+            let dot_addr = config.server.dot_listen_address();
             let dot_handler = Arc::new(DnsServerHandler::new(
                 handler_use_case.clone(),
                 block_policy,
@@ -209,11 +183,7 @@ async fn async_main() -> anyhow::Result<()> {
             &[b"doq"],
         )?;
         if let Some(tls_cfg) = doq_tls_config {
-            let doq_addr: SocketAddr = config
-                .server
-                .doq_listen_address()
-                .parse()
-                .context("Invalid DoQ bind address")?;
+            let doq_addr = config.server.doq_listen_address();
             let doq_handler = Arc::new(DnsServerHandler::new(
                 handler_use_case.clone(),
                 block_policy,
@@ -228,35 +198,27 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    let doh_handler = if config.server.encrypted_dns.doh_enabled {
-        if let Some(doh_bind_addr) = config.server.doh_listen_address() {
-            if tls_config.is_some() {
-                let doh_addr: SocketAddr =
-                    doh_bind_addr.parse().context("Invalid DoH bind address")?;
-                let dedicated_doh_handler = Arc::new(DnsServerHandler::new(
-                    handler_use_case.clone(),
-                    block_policy,
-                ));
-                tokio::spawn(async move {
-                    if let Err(e) = server::start_doh_server(doh_addr, dedicated_doh_handler).await
-                    {
-                        error!(error = %e, "DoH server error");
-                    }
-                });
-            }
+    // DoH is plain HTTP here (TLS is terminated in front of it, or by the web
+    // listener), so unlike DoT and DoQ it needs no certificate.
+    let doh = config.server.encrypted_dns.doh_enabled.then(|| {
+        Arc::new(server::DohContext {
+            handler: Arc::new(DnsServerHandler::new(handler_use_case, block_policy)),
+            trusted_proxies: config.server.trusted_proxies.clone(),
+        })
+    });
+    let web_doh = match (doh, config.server.doh_listen_address()) {
+        (Some(doh), Some(doh_addr)) => {
+            tokio::spawn(async move {
+                if let Err(e) = server::start_doh_server(doh_addr, doh).await {
+                    error!(error = %e, "DoH server error");
+                }
+            });
             None
-        } else {
-            tls_config.map(|_| Arc::new(DnsServerHandler::new(handler_use_case, block_policy)))
         }
-    } else {
-        None
+        (doh, _) => doh,
     };
 
-    let web_addr: SocketAddr = config
-        .server
-        .web_listen_address()
-        .parse()
-        .context("Invalid web bind address")?;
+    let web_addr = config.server.web_listen_address();
 
     server::start_web_server(
         web_addr,
@@ -264,7 +226,7 @@ async fn async_main() -> anyhow::Result<()> {
         pihole_state,
         &config.server.cors_allowed_origins,
         config.server.metrics_enabled,
-        doh_handler,
+        web_doh,
         web_tls_config,
     )
     .await?;

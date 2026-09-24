@@ -19,13 +19,10 @@ use tokio::sync::RwLock;
 
 use super::{DnsServices, Repositories, UseCases};
 
-/// The config file the server reads and rewrites: the path it was started with,
-/// else the one `Config` discovers, else `ferrous-dns.toml` in the working dir.
+/// The config file the server rewrites: the one it was started with, else
+/// `ferrous-dns.toml` in the working dir.
 pub(super) fn resolve_config_file(config_path: Option<&str>) -> String {
-    config_path
-        .map(String::from)
-        .or_else(Config::get_config_path)
-        .unwrap_or_else(|| "ferrous-dns.toml".to_string())
+    config_path.unwrap_or("ferrous-dns.toml").to_string()
 }
 
 /// Builds the shared API state.
@@ -186,6 +183,7 @@ pub async fn build_app_state(
         tls_enabled: https_active,
         restart_pending: Default::default(),
         config,
+        config_writer: Default::default(),
         config_file_persistence: config_persistence,
         config_path,
         tls_cert: Arc::new(TlsCertificateService),
