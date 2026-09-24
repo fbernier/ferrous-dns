@@ -3,7 +3,6 @@ mod pool;
 mod resolver;
 
 use crate::server::dns::connection_limiter::ConnectionLimiter;
-use anyhow::Context;
 use ferrous_dns_application::ports::{
     CacheMaintenancePort, DgaEvictionTarget, DgaFlagStore, DnssecStatsPort, NxdomainHijackIpStore,
     NxdomainHijackProbeTarget, PtrRecordRegistry, ResponseIpFilterEvictionTarget,
@@ -86,13 +85,7 @@ impl DnsServices {
             None
         };
 
-        let local_dns_server = config
-            .dns
-            .local_dns_server
-            .as_deref()
-            .map(str::parse::<SocketAddr>)
-            .transpose()
-            .context("dns.local_dns_server must be an IP:port address such as 192.168.1.1:53")?;
+        let local_dns_server = config.dns.local_dns_server_addr()?;
 
         let upstream_layers = resolver::UpstreamLayers::from_config(
             config,
@@ -551,6 +544,19 @@ mod tests {
         assert!(
             services.maintenance_pool_manager.is_none(),
             "refresh resolver started although optimistic refresh is off"
+        );
+    }
+
+    /// Older builds saved the router's bare IP; startup must take it as port 53.
+    #[tokio::test]
+    async fn a_bare_local_dns_server_ip_starts_on_port_53() {
+        let mut config = Config::default();
+        config.dns.local_dns_server = Some("192.168.1.1".to_string());
+        let (_dir, services) = build_services(config).await;
+
+        assert_eq!(
+            services.local_dns_server,
+            Some("192.168.1.1:53".parse().unwrap())
         );
     }
 }

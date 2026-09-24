@@ -4,15 +4,17 @@ use axum::{
     Router,
 };
 use ferrous_dns_api::create_api_router_with_openapi;
-use ferrous_dns_application::ports::UpstreamReloadPort;
-use ferrous_dns_domain::{DomainError, UpstreamPool};
+use ferrous_dns_application::ports::{ConfigFilePersistence, UpstreamReloadPort};
+use ferrous_dns_application::use_cases::{ConfigOverrides, ReloadConfigUseCase};
+use ferrous_dns_domain::{Config, DomainError, UpstreamPool};
+use ferrous_dns_infrastructure::repositories::TomlConfigFilePersistence;
 use helpers::{create_test_db, TestApp};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock, RwLockWriteGuard};
 use tower::ServiceExt;
 
 mod helpers;
@@ -775,7 +777,7 @@ async fn test_update_settings_rejects_an_unknown_block_mode() {
 }
 
 #[tokio::test]
-async fn test_update_settings_rejects_a_local_dns_server_without_a_port() {
+async fn test_update_settings_rejects_a_local_dns_server_that_is_not_an_ip() {
     let pool = create_test_db().await;
     let (TestApp { router, config, .. }, _path) = test_app(pool).await;
 
@@ -785,7 +787,7 @@ async fn test_update_settings_rejects_a_local_dns_server_without_a_port() {
             "never_forward_non_fqdn": false,
             "never_forward_reverse_lookups": false,
             "local_domain": "lan",
-            "local_dns_server": "192.168.1.1"
+            "local_dns_server": "router.lan:53"
         }),
     )
     .await;
@@ -800,6 +802,44 @@ async fn test_update_settings_rejects_a_local_dns_server_without_a_port() {
         json["error"]
     );
     assert_eq!(config.read().await.dns.local_dns_server, None);
+}
+
+/// A bare router IP means port 53, and is saved with the port spelled out.
+#[tokio::test]
+async fn test_a_local_dns_server_without_a_port_is_saved_with_port_53() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, path) = test_app(pool).await;
+
+    let (status, json) = post_settings(
+        router.clone(),
+        serde_json::json!({
+            "never_forward_non_fqdn": false,
+            "never_forward_reverse_lookups": false,
+            "local_domain": "lan",
+            "local_dns_server": "192.168.1.1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(
+        config.read().await.dns.local_dns_server.as_deref(),
+        Some("192.168.1.1:53")
+    );
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("local_dns_server = \"192.168.1.1:53\""));
+
+    let (_, json) = post_config(
+        router,
+        serde_json::json!({ "dns": { "local_dns_server": "fe80::1" } }),
+    )
+    .await;
+    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(
+        config.read().await.dns.local_dns_server.as_deref(),
+        Some("[fe80::1]:53")
+    );
 }
 
 #[tokio::test]
@@ -923,5 +963,143 @@ async fn test_reload_waits_for_an_in_flight_config_save() {
     assert_eq!(
         config.read().await.dns.pools[0].servers,
         ["udp://9.9.9.9:53"]
+    );
+}
+
+/// Holds a hot-reload until released, then applies it to the live pools.
+struct GatedLiveReload {
+    live: Arc<dyn UpstreamReloadPort>,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    applied: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl UpstreamReloadPort for GatedLiveReload {
+    async fn reload_pools(&self, pools: Vec<UpstreamPool>) -> Result<(), DomainError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        self.live.reload_pools(pools).await?;
+        self.applied.notify_one();
+        Ok(())
+    }
+}
+
+impl GatedLiveReload {
+    fn wrap(live: Arc<dyn UpstreamReloadPort>) -> Arc<Self> {
+        Arc::new(Self {
+            live,
+            started: Arc::default(),
+            release: Arc::default(),
+            applied: Arc::default(),
+        })
+    }
+
+    /// Drives `request` until its pools are live and it waits on the config
+    /// held by another writer, then drops it like a disconnected client.
+    async fn drop_once_applied<'c>(
+        &self,
+        config: &'c RwLock<Config>,
+        request: impl std::future::Future,
+    ) -> RwLockWriteGuard<'c, Config> {
+        let mut request = std::pin::pin!(request);
+        tokio::select! {
+            _ = &mut request => panic!("the request finished before its pool reload"),
+            () = self.started.notified() => {}
+        }
+        // Stands in for a local-record or password writer holding the config across its save.
+        let held = config.write().await;
+        self.release.notify_one();
+        tokio::select! {
+            _ = &mut request => panic!("the request finished while the config was held"),
+            () = self.applied.notified() => {}
+        }
+        held
+    }
+}
+
+fn persisted_pools(path: &str) -> Vec<UpstreamPool> {
+    TomlConfigFilePersistence
+        .load_config_from_file(path)
+        .unwrap()
+        .dns
+        .pools
+}
+
+#[tokio::test]
+async fn test_a_dropped_config_update_still_saves_the_pools_it_applied() {
+    let (
+        TestApp {
+            mut state,
+            config,
+            pool_manager,
+            ..
+        },
+        path,
+    ) = test_app(create_test_db().await).await;
+    let gate = GatedLiveReload::wrap(state.dns.reload_upstream.clone());
+    state.dns.reload_upstream = gate.clone();
+    let writer = state.config_writer.clone();
+    let router = create_api_router_with_openapi(state).0;
+
+    let request = post_config(
+        router,
+        serde_json::json!({
+            "dns": { "pools": [
+                { "name": "p1", "strategy": "parallel", "priority": 1,
+                  "servers": ["udp://9.9.9.9:53"] }
+            ] }
+        }),
+    );
+    let held = gate.drop_once_applied(&config, request).await;
+    drop(held);
+    // The save keeps the writer lock until it has finished.
+    drop(writer.lock().await);
+
+    let memory = config.read().await.dns.pools.clone();
+    assert_eq!(memory[0].servers, ["udp://9.9.9.9:53"]);
+    assert_eq!(persisted_pools(&path), memory);
+    let live = live_servers(&pool_manager);
+    assert!(
+        live.iter().any(|s| s == "9.9.9.9:53") && !live.iter().any(|s| s == "8.8.8.8:53"),
+        "{live:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_a_dropped_reload_still_swaps_in_the_pools_it_applied() {
+    let (
+        TestApp {
+            mut state,
+            config,
+            pool_manager,
+            ..
+        },
+        path,
+    ) = test_app(create_test_db().await).await;
+    std::fs::write(&path, RELOADED_FILE).unwrap();
+    let gate = GatedLiveReload::wrap(state.dns.reload_upstream.clone());
+    state.reload_config = Some(Arc::new(ReloadConfigUseCase::new(
+        config.clone(),
+        state.config_writer.clone(),
+        Arc::new(TomlConfigFilePersistence),
+        Arc::from(path.as_str()),
+        gate.clone(),
+        ConfigOverrides::default(),
+    )));
+    let writer = state.config_writer.clone();
+    let router = create_api_router_with_openapi(state).0;
+
+    let held = gate.drop_once_applied(&config, post_reload(router)).await;
+    drop(held);
+    // The reload keeps the writer lock until it has finished.
+    drop(writer.lock().await);
+
+    let memory = config.read().await.dns.pools.clone();
+    assert_eq!(memory, persisted_pools(&path));
+    let live = live_servers(&pool_manager);
+    assert!(
+        live.iter().any(|s| s == "9.9.9.9:53") && !live.iter().any(|s| s == "8.8.8.8:53"),
+        "{live:?}"
     );
 }

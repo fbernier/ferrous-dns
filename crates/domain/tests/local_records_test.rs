@@ -1,4 +1,4 @@
-use ferrous_dns_domain::{LocalDnsRecord, LocalRecordType};
+use ferrous_dns_domain::{Config, LocalDnsRecord, LocalRecordType};
 
 fn record(hostname: &str, domain: Option<&str>) -> LocalDnsRecord {
     LocalDnsRecord {
@@ -10,34 +10,44 @@ fn record(hostname: &str, domain: Option<&str>) -> LocalDnsRecord {
     }
 }
 
-fn parse_toml(body: &str) -> Result<LocalDnsRecord, toml::de::Error> {
-    toml::from_str(body)
+const MINIMAL_TOML: &str = "[server]\ndns_port = 53\nweb_port = 8080\nbind_address = \"0.0.0.0\"\n\
+     [dns]\nupstream_servers = [\"1.1.1.1:53\"]\n[blocking]\nenabled = true\n\
+     [logging]\nlevel = \"info\"\n[database]\n";
+
+fn load_records(entries: &str) -> Vec<LocalDnsRecord> {
+    Config::from_toml_str(&format!("{MINIMAL_TOML}{entries}"))
+        .expect("the config must load")
+        .dns
+        .local_records
 }
 
 #[test]
 fn test_record_type_parses_case_insensitively_and_writes_canonically() {
-    let record = parse_toml("hostname = \"nas\"\nip = \"fd00::1\"\nrecord_type = \"aaaa\"\n")
-        .expect("lowercase record type must load");
+    let records = load_records(
+        "[[dns.local_records]]\nhostname = \"nas\"\nip = \"fd00::1\"\nrecord_type = \"aaaa\"\n",
+    );
 
-    assert_eq!(record.record_type, LocalRecordType::AAAA);
-    let written = toml::to_string(&record).unwrap();
+    assert_eq!(records[0].record_type, LocalRecordType::AAAA);
+    let written = toml::to_string(&records[0]).unwrap();
     assert!(written.contains("record_type = \"AAAA\""), "{written}");
 }
 
+/// Older builds saved these unchecked; one of them must not stop the server from starting.
 #[test]
-fn test_record_rejects_an_address_of_the_wrong_family() {
-    let err = parse_toml("hostname = \"nas\"\nip = \"fd00::1\"\nrecord_type = \"A\"\n")
-        .expect_err("an A record with an IPv6 address must not load");
+fn test_a_record_that_cannot_be_served_is_dropped_and_the_rest_load() {
+    for invalid in [
+        "ip = \"fd00::1\"\nrecord_type = \"A\"",
+        "ip = \"10.0.0.1\"\nrecord_type = \"AAAA\"",
+        "ip = \"nas.lan\"\nrecord_type = \"A\"",
+        "ip = \"10.0.0.1\"\nrecord_type = \"CNAME\"",
+    ] {
+        let records = load_records(&format!(
+            "[[dns.local_records]]\nhostname = \"bad\"\n{invalid}\n\
+             [[dns.local_records]]\nhostname = \"nas\"\nip = \"192.168.1.10\"\nrecord_type = \"A\"\n"
+        ));
 
-    assert!(err.to_string().contains("IPv4"), "{err}");
-}
-
-#[test]
-fn test_record_rejects_an_unparseable_address_or_type() {
-    assert!(parse_toml("hostname = \"nas\"\nip = \"nas.lan\"\nrecord_type = \"A\"\n").is_err());
-    assert!(
-        parse_toml("hostname = \"nas\"\nip = \"10.0.0.1\"\nrecord_type = \"CNAME\"\n").is_err()
-    );
+        assert_eq!(records, [record("nas", None)], "{invalid}");
+    }
 }
 
 #[test]

@@ -2,8 +2,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use ferrous_dns_domain::{Config, DomainError};
-use tokio::sync::{Mutex, RwLock};
-use tracing::{info, instrument};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tracing::{info, instrument, Instrument};
 
 use crate::ports::{ConfigFilePersistence, UpstreamReloadPort};
 
@@ -69,11 +69,19 @@ impl ReloadConfigUseCase {
         }
     }
 
-    /// On any error the running config and upstream pools are left untouched.
+    /// On any error the running config and upstream pools are left untouched;
+    /// a dropped caller does not stop a reload that has taken the writer lock.
     #[instrument(skip(self), name = "reload_config")]
-    pub async fn execute(&self) -> Result<(), DomainError> {
+    pub async fn execute(self: Arc<Self>) -> Result<(), DomainError> {
+        let writer = Arc::clone(&self.config_writer).lock_owned().await;
+        // Pools go live before the running config is swapped, so the swap must not be cancellable.
+        tokio::spawn(async move { self.reload(writer).await }.in_current_span())
+            .await
+            .map_err(|e| DomainError::ConfigError(format!("Config reload failed: {e}")))?
+    }
+
+    async fn reload(&self, _writer: OwnedMutexGuard<()>) -> Result<(), DomainError> {
         let path = &*self.config_path;
-        let _writer = self.config_writer.lock().await;
         let mut new_config = self.config_file_persistence.load_config_from_file(path)?;
         self.overrides.apply(&mut new_config);
         new_config.validate()?;

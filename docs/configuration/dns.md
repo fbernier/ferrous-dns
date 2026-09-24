@@ -29,7 +29,7 @@ local_dns_server = "10.0.0.1:53"
 | `block_private_ptr` | `true` | Block PTR lookups for private/RFC-1918 IP ranges |
 | `block_non_fqdn` | `false` | Block queries for non-fully-qualified domain names |
 | `local_domain` | — | Local domain suffix appended to short hostnames |
-| `local_dns_server` | — | Router/DHCP server used for PTR lookups and client hostname resolution |
+| `local_dns_server` | — | Router/DHCP server used for PTR lookups and client hostname resolution: `IP:port`, or a bare IP for port 53 |
 | `mdns_enabled` | `false` | Enable the passive mDNS/Bonjour listener (UDP 5353 multicast) for device discovery. In Docker this needs host networking — see [Installation](../getting-started/installation.md#docker) |
 | `rebinding_protection_enabled` | `true` | Block public domains that resolve to private/RFC-1918 (or IPv6 ULA/link-local) addresses — see [DNS Rebinding Protection](../features/malware-detection.md#dns-rebinding-protection) |
 | `rebinding_allowlist` | `[]` | Exact domain names exempt from rebinding protection regardless of resolved IP (split-horizon DNS) |
@@ -160,11 +160,11 @@ ttl = 300
 | `record_type` | `"A"` for IPv4, `"AAAA"` for IPv6 (case-insensitive) |
 | `ttl` | Time-to-live in seconds (default `300`) |
 
-Each record is checked when the file is loaded: an `ip` that is not an address
-literal, a `record_type` other than `A`/`AAAA`, or an address of the wrong
-family (`A` with an IPv6 address, `AAAA` with an IPv4 one) stops startup with an
-error naming the record, instead of being skipped. The API rejects the same
-mistakes with a `400`.
+Each record is checked when the file is loaded: a record whose `ip` is not an
+address literal, whose `record_type` is not `A`/`AAAA`, or whose address is of
+the wrong family (`A` with an IPv6 address, `AAAA` with an IPv4 one) is skipped
+with a warning naming it, and the other records still load. The API rejects the
+same mistakes with a `400`.
 
 Several records may share a name and type, or an address. The last one in the
 list answers, and deleting or editing one of them hands the name (or the PTR)

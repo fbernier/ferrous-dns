@@ -2,7 +2,8 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tracing::warn;
 
 use crate::dns_record::RecordType;
 use crate::errors::domain_error::DomainError;
@@ -68,15 +69,7 @@ impl Serialize for LocalRecordType {
     }
 }
 
-impl<'de> Deserialize<'de> for LocalRecordType {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "LocalDnsRecordFields")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalDnsRecord {
     pub hostname: String,
     pub domain: Option<String>,
@@ -85,33 +78,65 @@ pub struct LocalDnsRecord {
     pub ttl: Option<u32>,
 }
 
-/// The config-file shape of a record, checked into a [`LocalDnsRecord`] so an
-/// address of the wrong family fails the load instead of being served.
+/// The config-file shape of a record. Address and type stay text so that one
+/// entry the resolver cannot serve is dropped instead of failing the load.
 #[derive(Deserialize)]
 struct LocalDnsRecordFields {
     hostname: String,
     #[serde(default)]
     domain: Option<String>,
-    ip: IpAddr,
-    record_type: LocalRecordType,
+    ip: String,
+    record_type: String,
     #[serde(default)]
     ttl: Option<u32>,
 }
 
-impl TryFrom<LocalDnsRecordFields> for LocalDnsRecord {
-    type Error = String;
-
-    fn try_from(fields: LocalDnsRecordFields) -> Result<Self, Self::Error> {
-        Self::validate_address(fields.record_type, fields.ip)
-            .map_err(|e| format!("local record '{}': {e}", fields.hostname))?;
-        Ok(Self {
-            hostname: fields.hostname,
-            domain: fields.domain,
-            ip: fields.ip,
-            record_type: fields.record_type,
-            ttl: fields.ttl,
-        })
+impl LocalDnsRecordFields {
+    /// The typed address and type, or why the entry cannot be served.
+    fn address(&self) -> Result<(IpAddr, LocalRecordType), DomainError> {
+        let (ip, record_type) = parse_address(&self.ip, &self.record_type)?;
+        LocalDnsRecord::validate_address(record_type, ip).map_err(DomainError::InvalidIpAddress)?;
+        Ok((ip, record_type))
     }
+}
+
+/// Deserializes `dns.local_records`, dropping with a warning each entry with
+/// an unparseable address, an unsupported type or an address of the wrong
+/// family. Older builds saved such entries and ran with them, so rejecting
+/// the file would stop an upgraded server from starting.
+pub(super) fn deserialize_lenient<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<LocalDnsRecord>, D::Error> {
+    let entries = Vec::<LocalDnsRecordFields>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|fields| match fields.address() {
+            Ok((ip, record_type)) => Some(LocalDnsRecord {
+                hostname: fields.hostname,
+                domain: fields.domain,
+                ip,
+                record_type,
+                ttl: fields.ttl,
+            }),
+            Err(e) => {
+                warn!(
+                    hostname = %fields.hostname,
+                    ip = %fields.ip,
+                    record_type = %fields.record_type,
+                    error = %e,
+                    "Skipping a dns.local_records entry that cannot be served"
+                );
+                None
+            }
+        })
+        .collect())
+}
+
+fn parse_address(ip: &str, record_type: &str) -> Result<(IpAddr, LocalRecordType), DomainError> {
+    let ip = ip
+        .parse()
+        .map_err(|_| DomainError::InvalidIpAddress(ip.to_string()))?;
+    Ok((ip, record_type.parse()?))
 }
 
 impl LocalDnsRecord {
@@ -123,13 +148,12 @@ impl LocalDnsRecord {
         record_type: &str,
         ttl: Option<u32>,
     ) -> Result<Self, DomainError> {
+        let (ip, record_type) = parse_address(ip, record_type)?;
         Ok(Self {
             hostname,
             domain,
-            ip: ip
-                .parse()
-                .map_err(|_| DomainError::InvalidIpAddress(ip.to_string()))?,
-            record_type: record_type.parse()?,
+            ip,
+            record_type,
             ttl,
         })
     }

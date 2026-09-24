@@ -235,9 +235,9 @@ Partial update — only include the sections you want to change:
 }
 ```
 
-The merged configuration is validated before anything is applied. An invalid value — an unknown `block_mode` or `dnssec_mode`, an unparseable server or sinkhole address, a `local_dns_server` that is not `IP:port`, a zero interval, timeout or capacity such as `cache_compaction_interval: 0`, or a session lifetime whose expiry is past the latest representable date such as `session_ttl_hours: 4294967295` — returns **400** with `{ "success": false, "error": "…" }` naming the key, and neither the live server nor the file changes. A request that is valid but cannot be carried out (no writable config file, a failed pool hot-reload or file write) returns 200 with `success: false`.
+The merged configuration is validated before anything is applied. An invalid value — an unknown `block_mode` or `dnssec_mode`, an unparseable server or sinkhole address, a `local_dns_server` that is not an IP address or `IP:port`, a zero interval, timeout or capacity such as `cache_compaction_interval: 0`, or a session lifetime whose expiry is past the latest representable date such as `session_ttl_hours: 4294967295` — returns **400** with `{ "success": false, "error": "…" }` naming the key, and neither the live server nor the file changes. A request that is valid but cannot be carried out (no writable config file, a failed pool hot-reload or file write) returns 200 with `success: false`.
 
-The file is rewritten atomically (a synced temp file renamed over it), so a crash mid-save leaves the old or the new file, never a truncated one. When the file cannot be replaced — a Docker single-file bind mount, or a directory the server cannot write — it is rewritten in place instead.
+The file is rewritten atomically (a synced temp file renamed over it), so a crash mid-save leaves the old or the new file, never a truncated one. The new file keeps the old one's mode, owner and group. When the file cannot be replaced — a Docker single-file bind mount, a directory the server cannot write, or an owner or group the server cannot give the new file — it is rewritten in place instead.
 
 ### Reload Config
 
@@ -278,7 +278,7 @@ POST /api/settings
 }
 ```
 
-`sinkhole_ipv4` / `sinkhole_ipv6` set a custom block target for `null_ip` mode (empty string = the null address `0.0.0.0` / `::`). A non-empty value that is not a valid address of the matching family is rejected with **400** and `{ "success": false, "error": "Invalid IPv4 sinkhole address: …" }`, and nothing is saved. See [Custom Sinkhole IP](configuration/blocking.md#custom-sinkhole-ip). The same 400 applies to an unknown `block_mode` (`null_ip`, `nxdomain`, `nodata` or `refused`), a `local_dns_server` that is not `IP:port`, and a DNS64 prefix that is not a `/96`.
+`sinkhole_ipv4` / `sinkhole_ipv6` set a custom block target for `null_ip` mode (empty string = the null address `0.0.0.0` / `::`). A non-empty value that is not a valid address of the matching family is rejected with **400** and `{ "success": false, "error": "Invalid IPv4 sinkhole address: …" }`, and nothing is saved. See [Custom Sinkhole IP](configuration/blocking.md#custom-sinkhole-ip). The same 400 applies to an unknown `block_mode` (`null_ip`, `nxdomain`, `nodata` or `refused`), a `local_dns_server` that is not an IP address or `IP:port`, and a DNS64 prefix that is not a `/96`. A `local_dns_server` given as a bare IP is saved as `IP:53`.
 
 The response carries `restart_required`: `true` when the save changed a setting (these only take effect after a restart), `false` when the form was saved unchanged.
 

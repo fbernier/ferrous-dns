@@ -1,3 +1,5 @@
+use std::net::{IpAddr, SocketAddr};
+
 use serde::{Deserialize, Serialize};
 
 use super::cache_eviction::CacheEvictionStrategy;
@@ -5,13 +7,14 @@ use super::dga_detection::DgaDetectionConfig;
 use super::dns_cookies::DnsCookiesConfig;
 use super::dnssec::DnssecMode;
 use super::health::HealthCheckConfig;
-use super::local_records::LocalDnsRecord;
+use super::local_records::{self, LocalDnsRecord};
 use super::nxdomain_hijack::NxdomainHijackConfig;
 use super::rate_limit::RateLimitConfig;
 use super::response_ip_filter::ResponseIpFilterConfig;
 use super::tunneling::TunnelingDetectionConfig;
 use super::upstream::UpstreamPool;
 use super::upstream::UpstreamStrategy;
+use crate::errors::domain_error::DomainError;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -80,8 +83,10 @@ pub struct DnsConfig {
 
     pub local_domain: Option<String>,
 
+    /// `IP:port`; a bare IP, as older builds saved it, means port 53.
     pub local_dns_server: Option<String>,
 
+    #[serde(deserialize_with = "local_records::deserialize_lenient")]
     pub local_records: Vec<LocalDnsRecord>,
 
     /// Whether DNS rebinding protection is enabled. When `true`, responses that
@@ -183,6 +188,26 @@ impl DnsConfig {
             Some(false) => DnssecMode::Off,
             None => DnssecMode::default(),
         }
+    }
+
+    /// `local_dns_server` as the address the forwarder queries.
+    pub fn local_dns_server_addr(&self) -> Result<Option<SocketAddr>, DomainError> {
+        self.local_dns_server
+            .as_deref()
+            .map(Self::parse_local_dns_server)
+            .transpose()
+    }
+
+    /// Parses a `local_dns_server` value: `IP:port`, or a bare IP for port 53.
+    pub fn parse_local_dns_server(value: &str) -> Result<SocketAddr, DomainError> {
+        value
+            .parse::<SocketAddr>()
+            .or_else(|_| value.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+            .map_err(|_| {
+                DomainError::ConfigError(format!(
+                    "dns.local_dns_server '{value}' must be an IP address or IP:port such as 192.168.1.1:53"
+                ))
+            })
     }
 }
 

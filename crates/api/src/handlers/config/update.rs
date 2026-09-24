@@ -9,8 +9,11 @@ use crate::{
     state::AppState,
 };
 use axum::{extract::State, http::StatusCode, Json};
-use ferrous_dns_domain::{Config, DnsProtocol, DnssecMode, UpstreamPool, UpstreamStrategy};
-use tracing::{debug, error, info, instrument};
+use ferrous_dns_domain::{
+    Config, DnsConfig, DnsProtocol, DnssecMode, UpstreamPool, UpstreamStrategy,
+};
+use tokio::sync::OwnedMutexGuard;
+use tracing::{debug, error, info, instrument, Instrument};
 
 type SaveResponse = (StatusCode, Json<ConfigSaveResponse>);
 
@@ -39,6 +42,14 @@ fn config_differs(before: &Config, after: &Config) -> bool {
 
 fn non_empty(value: String) -> Option<String> {
     Some(value).filter(|v| !v.is_empty())
+}
+
+/// Saved as `IP:port`, so a bare router IP is stored with its implied port 53.
+fn local_dns_server(value: String) -> Result<Option<String>, String> {
+    non_empty(value)
+        .map(|v| DnsConfig::parse_local_dns_server(&v).map(|addr| addr.to_string()))
+        .transpose()
+        .map_err(|e| e.to_string())
 }
 
 async fn get_writable_config_path(state: &AppState) -> Result<String, SaveResponse> {
@@ -201,7 +212,7 @@ fn apply_config_update(cfg: &mut Config, request: UpdateConfigRequest) -> Result
             cfg.dns.local_domain = non_empty(v);
         }
         if let Some(v) = dns.local_dns_server {
-            cfg.dns.local_dns_server = non_empty(v);
+            cfg.dns.local_dns_server = local_dns_server(v)?;
         }
         if let Some(v) = dns.mdns_enabled {
             cfg.dns.mdns_enabled = v;
@@ -299,7 +310,7 @@ fn apply_settings(cfg: &mut Config, request: SettingsDto) -> Result<(), String> 
     cfg.dns.block_non_fqdn = request.never_forward_non_fqdn;
     cfg.dns.block_private_ptr = request.never_forward_reverse_lookups;
     cfg.dns.local_domain = non_empty(request.local_domain);
-    cfg.dns.local_dns_server = non_empty(request.local_dns_server);
+    cfg.dns.local_dns_server = local_dns_server(request.local_dns_server)?;
     cfg.blocking.block_mode = request.block_mode.parse()?;
     cfg.blocking.block_ttl = request.block_ttl;
     cfg.blocking.sinkhole_ipv4 = parse_sinkhole_ipv4(&request.sinkhole_ipv4)?;
@@ -334,8 +345,22 @@ pub async fn update_config(
         Err(e) => return e,
     };
 
-    let _writer = state.config_writer.lock().await;
+    let writer = state.config_writer.clone().lock_owned().await;
+    // Pools go live before the save, so a dropped request must not abandon it half-way.
+    tokio::spawn(save_config_update(state, request, config_path, writer).in_current_span())
+        .await
+        .unwrap_or_else(|e| {
+            error!(error = %e, "Configuration save task failed");
+            not_saved(format!("Configuration save failed: {e}"))
+        })
+}
 
+async fn save_config_update(
+    state: AppState,
+    request: UpdateConfigRequest,
+    config_path: String,
+    _writer: OwnedMutexGuard<()>,
+) -> SaveResponse {
     // Checked before anything is applied, so a rejected request never reaches the live pools.
     let (candidate, pools_provided) =
         match merge_config_update(&*state.config.read().await, request.clone()) {
@@ -480,7 +505,7 @@ pub async fn update_settings(
 pub async fn reload_config(State(state): State<AppState>) -> Json<ConfigSaveResponse> {
     info!("Config reload requested");
 
-    let Some(reload) = state.reload_config.as_deref() else {
+    let Some(reload) = state.reload_config.clone() else {
         error!("No config file found");
         return Json(ConfigSaveResponse::failure("No config file found"));
     };

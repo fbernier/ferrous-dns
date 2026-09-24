@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+tracing.workspace = true
 toml.workspace = true
 ipnetwork = { version = "0.21", features = ["serde"] }
 chrono.workspace = true

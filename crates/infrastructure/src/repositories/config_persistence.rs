@@ -103,7 +103,7 @@ fn edit_config_file(
 /// the old or the new document, never a truncated one: the bytes go to a
 /// synced sibling temp file that is renamed over the target. Where the target
 /// cannot be replaced (a single-file bind mount, a read-only or unwritable
-/// directory), the file is rewritten in place instead.
+/// directory) or its owner cannot be kept, the file is rewritten in place.
 fn replace_file(
     path: &Path,
     contents: &[u8],
@@ -113,13 +113,20 @@ fn replace_file(
     let target = std::fs::canonicalize(path)?;
     let temp = temp_path_for(&target)?;
 
-    if let Err(e) = write_synced_temp(&temp, &target, contents) {
-        remove_temp(&temp);
-        return if needs_in_place_write(&e) {
-            overwrite_in_place(&target, contents)
-        } else {
-            Err(e)
-        };
+    match write_synced_temp(&temp, &target, contents) {
+        Ok(Replacement::Atomic) => {}
+        Ok(Replacement::InPlace) => {
+            remove_temp(&temp);
+            return overwrite_in_place(&target, contents);
+        }
+        Err(e) => {
+            remove_temp(&temp);
+            return if needs_in_place_write(&e) {
+                overwrite_in_place(&target, contents)
+            } else {
+                Err(e)
+            };
+        }
     }
 
     if let Err(e) = rename(&temp, &target) {
@@ -131,10 +138,42 @@ fn replace_file(
         };
     }
 
-    // The rename is only durable once the directory entry itself is synced.
-    match target.parent() {
-        Some(dir) => File::open(dir)?.sync_all(),
-        None => Ok(()),
+    // The new document is already in place; a failed sync only delays its durability.
+    if let Some(dir) = target.parent() {
+        if let Err(e) = File::open(dir).and_then(|dir| dir.sync_all()) {
+            tracing::warn!(path = %dir.display(), error = %e, "Failed to sync the config directory after saving");
+        }
+    }
+    Ok(())
+}
+
+/// How the target is rewritten.
+#[derive(Debug, PartialEq, Eq)]
+enum Replacement {
+    /// The synced temp file is renamed over the target.
+    Atomic,
+    /// The target is overwritten, keeping its inode, owner and group.
+    InPlace,
+}
+
+/// A renamed temp file would hand the config to the daemon's user and group,
+/// so it takes the target's `(uid, gid)` first; when `chown` cannot give it
+/// them, e.g. for an unprivileged daemon, the target is rewritten in place.
+#[cfg(unix)]
+fn replacement_for(
+    created: (u32, u32),
+    target: (u32, u32),
+    chown: impl FnOnce() -> io::Result<()>,
+) -> Replacement {
+    if created == target {
+        return Replacement::Atomic;
+    }
+    match chown() {
+        Ok(()) => Replacement::Atomic,
+        Err(e) => {
+            tracing::debug!(error = %e, "Cannot give the temporary config file the target's owner; rewriting in place");
+            Replacement::InPlace
+        }
     }
 }
 
@@ -169,17 +208,31 @@ fn temp_path_for(target: &Path) -> io::Result<PathBuf> {
     Ok(target.with_file_name(temp_name))
 }
 
-fn write_synced_temp(temp: &Path, target: &Path, contents: &[u8]) -> io::Result<()> {
-    let permissions = std::fs::metadata(target)?.permissions();
+fn write_synced_temp(temp: &Path, target: &Path, contents: &[u8]) -> io::Result<Replacement> {
+    let metadata = std::fs::metadata(target)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     // Private until the target's mode is copied: the file holds the admin password hash.
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(temp)?;
-    file.set_permissions(permissions)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let created = file.metadata()?;
+        let (uid, gid) = (metadata.uid(), metadata.gid());
+        let replacement = replacement_for((created.uid(), created.gid()), (uid, gid), || {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+        });
+        if replacement == Replacement::InPlace {
+            return Ok(Replacement::InPlace);
+        }
+    }
+    // After the chown, which clears the setuid and setgid bits.
+    file.set_permissions(metadata.permissions())?;
     file.write_all(contents)?;
-    file.sync_all()
+    file.sync_all()?;
+    Ok(Replacement::Atomic)
 }
 
 fn overwrite_in_place(target: &Path, contents: &[u8]) -> io::Result<()> {
@@ -650,6 +703,63 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::StorageFull);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = 1\n");
         assert!(only_entry_is_the_config(&dir), "temp file left behind");
+    }
+
+    #[test]
+    fn a_failed_directory_sync_after_the_rename_still_reports_the_save() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("config");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "old = 1\n").unwrap();
+        let moved = root.path().join("moved");
+
+        // Moving the directory away once the file is renamed makes its sync fail.
+        replace_file(&path, b"new = 2\n", |from, to| {
+            std::fs::rename(from, to)?;
+            std::fs::rename(&dir, &moved)
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(moved.join("config.toml")).unwrap(),
+            "new = 2\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn refused() -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_file_already_owned_like_the_target_is_renamed_without_a_chown() {
+        assert_eq!(
+            replacement_for((1000, 1000), (1000, 1000), refused),
+            Replacement::Atomic
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_file_given_the_target_owner_is_renamed() {
+        assert_eq!(
+            replacement_for((0, 0), (1000, 100), || Ok(())),
+            Replacement::Atomic
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_owner_the_daemon_cannot_hand_over_is_rewritten_in_place() {
+        for target in [(0, 1000), (1000, 0)] {
+            assert_eq!(
+                replacement_for((1000, 1000), target, refused),
+                Replacement::InPlace,
+                "{target:?}"
+            );
+        }
     }
 
     #[test]

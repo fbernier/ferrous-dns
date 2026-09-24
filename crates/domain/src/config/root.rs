@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use super::auth::{expiry_from_now, AuthConfig};
 use super::blocking::BlockingConfig;
@@ -67,13 +66,7 @@ impl Config {
         self.validate_non_zero()?;
         self.validate_derived_durations()?;
 
-        if let Some(server) = &self.dns.local_dns_server {
-            if server.parse::<SocketAddr>().is_err() {
-                return Err(DomainError::ConfigError(format!(
-                    "dns.local_dns_server '{server}' must be an IP:port literal such as 192.168.1.1:53"
-                )));
-            }
-        }
+        self.dns.local_dns_server_addr()?;
 
         if self.dns.pools.is_empty() && self.dns.upstream_servers.is_empty() {
             return Err(DomainError::ConfigError(

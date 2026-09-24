@@ -239,13 +239,30 @@ fn long_but_representable_durations_are_accepted() {
     config.validate().unwrap();
 }
 
+/// Older builds saved a bare router IP, which must still boot as port 53.
 #[test]
-fn a_local_dns_server_must_be_an_ip_and_port() {
-    let mut config = valid_config();
-    config.dns.local_dns_server = Some("192.168.1.1:53".to_string());
-    config.validate().unwrap();
+fn a_local_dns_server_is_an_ip_with_port_53_unless_one_is_given() {
+    for (value, addr) in [
+        ("192.168.1.1:5353", "192.168.1.1:5353"),
+        ("192.168.1.1", "192.168.1.1:53"),
+        ("[fe80::1]:53", "[fe80::1]:53"),
+        ("fe80::1", "[fe80::1]:53"),
+    ] {
+        let mut config = valid_config();
+        config.dns.local_dns_server = Some(value.to_string());
+        config.validate().unwrap();
+        assert_eq!(
+            config.dns.local_dns_server_addr().unwrap(),
+            Some(addr.parse().unwrap()),
+            "{value}"
+        );
+    }
+}
 
-    for bad in ["192.168.1.1", "router.lan:53", ""] {
+#[test]
+fn a_local_dns_server_must_be_an_ip_address() {
+    let mut config = valid_config();
+    for bad in ["router.lan:53", "router.lan", ""] {
         config.dns.local_dns_server = Some(bad.to_string());
         assert!(
             validation_message(&config).contains("dns.local_dns_server"),

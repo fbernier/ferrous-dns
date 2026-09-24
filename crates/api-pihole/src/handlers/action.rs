@@ -41,7 +41,7 @@ pub async fn gravity(
 pub async fn restartdns(
     State(state): State<PiholeAppState>,
 ) -> Result<Json<ActionResponse>, PiholeApiError> {
-    if let Some(reload) = &state.system.reload_config {
+    if let Some(reload) = state.system.reload_config.clone() {
         reload.execute().await?;
     }
 
