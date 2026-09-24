@@ -11,7 +11,7 @@ use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_application::use_cases::dns::DnsCookieGuard;
 use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
 use ferrous_dns_domain::{
-    BlockResponseMode, ClientProtocol, DnsCookiesConfig, DnsQuery, DomainError,
+    BlockResponseMode, ClientProtocol, DnsCookiesConfig, DnsQuery, DnssecStatus, DomainError,
 };
 use ferrous_dns_infrastructure::dns::server::{BlockPolicy, DnsServerHandler};
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
@@ -51,15 +51,27 @@ fn server(outcome: Result<DnsResolution, DomainError>) -> (DnsServerHandler, Vec
     .with_dns_cookies(DnsCookieGuard::from_config(&cookies, [7; 32]));
     let server_cookie = use_case
         .cookie_guard()
+        .expect("cookies are enabled")
         .generate_server_cookie(CLIENT, &CLIENT_COOKIE);
-    let policy = BlockPolicy {
-        mode: BlockResponseMode::NullIp,
-        ttl: 60,
-        sinkhole_ipv4: None,
-        sinkhole_ipv6: None,
-    };
-    let handler = DnsServerHandler::new(Arc::new(use_case), policy);
+    let handler = DnsServerHandler::new(Arc::new(use_case), POLICY);
     (handler, [&CLIENT_COOKIE[..], &server_cookie].concat())
+}
+
+const POLICY: BlockPolicy = BlockPolicy {
+    mode: BlockResponseMode::NullIp,
+    ttl: 60,
+    sinkhole_ipv4: None,
+    sinkhole_ipv6: None,
+};
+
+/// A handler with `[dns_cookies] enabled = false`: no cookie guard at all.
+fn server_without_cookies(outcome: Result<DnsResolution, DomainError>) -> DnsServerHandler {
+    let use_case = HandleDnsQueryUseCase::new(
+        Arc::new(Scripted(outcome)),
+        Arc::new(AllowAllFilter),
+        Arc::new(NoopQueryLog),
+    );
+    DnsServerHandler::new(Arc::new(use_case), POLICY)
 }
 
 fn name() -> Name {
@@ -68,6 +80,16 @@ fn name() -> Name {
 
 /// `edns: Some(dnssec_ok)` sends an OPT, carrying `CLIENT_COOKIE` if `cookie`.
 fn query(qtype: RecordType, edns: Option<bool>, cookie: bool, cd: bool) -> Vec<u8> {
+    query_with_cookie(qtype, edns, cookie.then_some(&CLIENT_COOKIE[..]), cd)
+}
+
+/// Like [`query`], with the COOKIE option carrying exactly `cookie`.
+fn query_with_cookie(
+    qtype: RecordType,
+    edns: Option<bool>,
+    cookie: Option<&[u8]>,
+    cd: bool,
+) -> Vec<u8> {
     let mut msg = Message::new(ID, MessageType::Query, OpCode::Query);
     msg.metadata.recursion_desired = true;
     msg.metadata.checking_disabled = cd;
@@ -75,9 +97,9 @@ fn query(qtype: RecordType, edns: Option<bool>, cookie: bool, cd: bool) -> Vec<u
     if let Some(dnssec_ok) = edns {
         let mut opt = Edns::new();
         opt.set_max_payload(1232).set_dnssec_ok(dnssec_ok);
-        if cookie {
+        if let Some(cookie) = cookie {
             opt.options_mut()
-                .insert(EdnsOption::Unknown(10, CLIENT_COOKIE.to_vec()));
+                .insert(EdnsOption::Unknown(10, cookie.to_vec()));
         }
         msg.set_edns(opt);
     }
@@ -107,7 +129,7 @@ fn option(msg: &Message, code: u16) -> Option<Vec<u8>> {
     })
 }
 
-fn answer(status: Option<&'static str>) -> DnsResolution {
+fn answer(status: Option<DnssecStatus>) -> DnsResolution {
     DnsResolution {
         dnssec_status: status,
         ..DnsResolution::new(vec!["192.0.2.10".parse().unwrap()], false)
@@ -115,7 +137,7 @@ fn answer(status: Option<&'static str>) -> DnsResolution {
 }
 
 /// A cached upstream TXT answer with its own OPT and COOKIE echo.
-fn relayed(status: Option<&'static str>) -> DnsResolution {
+fn relayed(status: Option<DnssecStatus>) -> DnsResolution {
     let mut msg = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
     msg.metadata.recursion_desired = true;
     msg.add_query(Query::query(name(), RecordType::TXT));
@@ -201,13 +223,28 @@ async fn built_answers_carry_opt_exactly_when_the_query_did() {
 #[tokio::test]
 async fn ad_bit_needs_a_secure_answer_to_a_do_client_without_cd() {
     let cases = [
-        (answer(Some("Secure")), Some(true), false, true),
-        (answer(Some("Secure")), Some(false), false, false),
-        (answer(Some("Secure")), None, false, false),
-        (answer(Some("Secure")), Some(true), true, false),
-        (answer(Some("Insecure")), Some(true), false, false),
-        (relayed(Some("Secure")), Some(true), false, true),
-        (relayed(Some("Secure")), Some(false), false, false),
+        (answer(Some(DnssecStatus::Secure)), Some(true), false, true),
+        (
+            answer(Some(DnssecStatus::Secure)),
+            Some(false),
+            false,
+            false,
+        ),
+        (answer(Some(DnssecStatus::Secure)), None, false, false),
+        (answer(Some(DnssecStatus::Secure)), Some(true), true, false),
+        (
+            answer(Some(DnssecStatus::Insecure)),
+            Some(true),
+            false,
+            false,
+        ),
+        (relayed(Some(DnssecStatus::Secure)), Some(true), false, true),
+        (
+            relayed(Some(DnssecStatus::Secure)),
+            Some(false),
+            false,
+            false,
+        ),
     ];
     for (resolution, edns, cd, ad) in cases {
         let label = format!("{:?}, DO {edns:?}, CD {cd}", resolution.dnssec_status);
@@ -238,4 +275,66 @@ async fn relayed_answers_keep_upstream_records_under_our_id_and_cookie() {
         Some(our_cookie),
         "upstream cookie swapped for ours"
     );
+}
+
+/// RFC 6891 §7: a query without OPT gets a reply without one, even when the
+/// cached upstream answer carries its own OPT (and COOKIE echo). RD comes from
+/// the query, not from the upstream exchange, which always sets it.
+#[tokio::test]
+async fn relayed_answers_to_a_query_without_opt_carry_no_opt() {
+    let (handler, _) = server(Ok(relayed(None)));
+    let upstream = Message::from_vec(&relayed(None).upstream_wire_data.unwrap()).unwrap();
+
+    let mut q = Message::from_vec(&query(RecordType::TXT, None, false, false)).unwrap();
+    q.metadata.recursion_desired = false;
+    let reply = Message::from_vec(&ask_raw(&handler, &q.to_bytes().unwrap()).await).unwrap();
+
+    assert!(reply.edns.is_none(), "OPT without one in the query");
+    assert_eq!(reply.metadata.id, ID);
+    assert!(
+        !reply.metadata.recursion_desired,
+        "RD is copied from the query"
+    );
+    assert_eq!(reply.answers, upstream.answers);
+}
+
+/// With `[dns_cookies] enabled = false` the server does not speak RFC 7873:
+/// a client cookie gets no COOKIE option back, on built or relayed answers.
+#[tokio::test]
+async fn disabled_cookies_are_never_echoed() {
+    let q = query(RecordType::TXT, Some(false), true, false);
+    for outcome in [Ok(answer(None)), Ok(relayed(None))] {
+        let label = format!("{outcome:?}");
+        let reply = ask(&server_without_cookies(outcome), &q).await;
+        assert!(reply.edns.is_some(), "{label}: OPT echoed");
+        let echoed = option(&reply, 10);
+        assert!(
+            echoed.is_none() || relayed_echo(&echoed),
+            "{label}: server cookie {echoed:?}"
+        );
+    }
+}
+
+/// The relayed fixture's own upstream COOKIE echo, which the verbatim relay
+/// hands through untouched; anything else would be a server cookie of ours.
+fn relayed_echo(echoed: &Option<Vec<u8>>) -> bool {
+    echoed.as_deref() == Some(&[9u8; 24][..])
+}
+
+/// RFC 7873 §5.2.2: a COOKIE option that is not 8 or 16..=40 bytes long is a
+/// FORMERR, not a cookie silently cut down to 40 bytes.
+#[tokio::test]
+async fn malformed_cookie_lengths_are_formerr() {
+    let (handler, _) = server(Ok(answer(None)));
+    for len in [7usize, 12, 41] {
+        let cookie = vec![0xAB; len];
+        let q = query_with_cookie(RecordType::A, Some(false), Some(&cookie), false);
+        let reply = ask(&handler, &q).await;
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::FormErr,
+            "{len} bytes"
+        );
+        assert!(reply.answers.is_empty(), "{len} bytes");
+    }
 }

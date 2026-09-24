@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
-use ferrous_dns_domain::{BlockResponseMode, ClientProtocol, DnsQuery, DomainError, RecordType};
+use ferrous_dns_domain::{BlockResponseMode, ClientProtocol, DnsQuery, DomainError};
 use ferrous_dns_infrastructure::dns::fast_path::parse_query;
 use ferrous_dns_infrastructure::dns::server::{BlockPolicy, DnsServerHandler};
 use ferrous_dns_infrastructure::dns::wire_response::wire_fits_udp_buffer;
@@ -67,7 +67,7 @@ fn client_max_size_reflects_advertised_buffer() {
     append_opt_record(&mut buf, 4096);
     let q = parse_query(&buf).expect("valid EDNS query");
     assert_eq!(q.client_max_size, 4096);
-    assert!(q.has_edns);
+    assert!(q.has_edns());
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn client_max_size_defaults_to_512_without_edns() {
     let buf = build_a_query_with_arcount("example.com", 0);
     let q = parse_query(&buf).expect("valid non-EDNS query");
     assert_eq!(q.client_max_size, 512);
-    assert!(!q.has_edns);
+    assert!(!q.has_edns());
 }
 
 // ── try_fast_path_wire end-to-end ───────────────────────────────────────────
@@ -93,7 +93,7 @@ fn client_max_size_defaults_to_512_without_edns() {
 // hit of a controllable size. Only the cache-hit path is exercised; the unused
 // trait methods are never called.
 
-/// Resolver whose cache always hits with a wire-data answer of a fixed size.
+/// Resolver whose cache always hits with the same wire-data answer.
 struct CannedWireResolver {
     wire: Vec<u8>,
     ttl: u32,
@@ -113,12 +113,9 @@ impl DnsResolver for CannedWireResolver {
     }
 }
 
-/// Builds a handler whose wire-data cache hit is `wire_len` bytes long.
-fn handler_with_cached_wire(wire_len: usize) -> DnsServerHandler {
-    let resolver: Arc<dyn DnsResolver> = Arc::new(CannedWireResolver {
-        wire: vec![0u8; wire_len],
-        ttl: 60,
-    });
+/// Builds a handler whose wire-data cache hit is `wire`.
+fn handler_with_cached_wire(wire: Vec<u8>) -> DnsServerHandler {
+    let resolver: Arc<dyn DnsResolver> = Arc::new(CannedWireResolver { wire, ttl: 60 });
     let use_case = Arc::new(HandleDnsQueryUseCase::new(
         resolver,
         Arc::new(AllowAllFilter),
@@ -135,45 +132,124 @@ fn handler_with_cached_wire(wire_len: usize) -> DnsServerHandler {
     )
 }
 
+/// An MX query for `mail.example.com`, with an OPT advertising `udp_payload`.
+fn mx_query(udp_payload: Option<u16>) -> Vec<u8> {
+    let mut buf = build_a_query_with_arcount("mail.example.com", u16::from(udp_payload.is_some()));
+    let qtype = buf.len() - 4;
+    buf[qtype..qtype + 2].copy_from_slice(&15u16.to_be_bytes());
+    if let Some(udp_payload) = udp_payload {
+        append_opt_record(&mut buf, udp_payload);
+    }
+    buf
+}
+
+fn serve_wire(handler: &DnsServerHandler, query: &[u8]) -> Option<Vec<u8>> {
+    let query = parse_query(query).expect("valid MX query");
+    handler.try_fast_path_wire(&query, IpAddr::V4(Ipv4Addr::LOCALHOST), ClientProtocol::Udp)
+}
+
 #[test]
 fn wire_fast_path_defers_when_answer_exceeds_client_buffer() {
-    let handler = handler_with_cached_wire(600);
-    let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let handler = handler_with_cached_wire(vec![0u8; 600]);
     // 600-byte cached answer vs a 512 buffer → must defer (None) so the slow
     // path can truncate it with TC=1 instead of serving oversized wire.
-    let result = handler.try_fast_path_wire(
-        "mail.example.com",
-        RecordType::MX,
-        client_ip,
-        0x1234,
-        512,
-        ClientProtocol::Udp,
-    );
     assert!(
-        result.is_none(),
+        serve_wire(&handler, &mx_query(Some(512))).is_none(),
         "oversized wire-data hit must defer to the slow path"
     );
 }
 
 #[test]
 fn wire_fast_path_serves_when_answer_fits_client_buffer() {
-    let handler = handler_with_cached_wire(600);
-    let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let handler = handler_with_cached_wire(vec![0u8; 600]);
     // Same 600-byte answer, but the client advertised 4096 → it fits, so the
     // fast path serves it verbatim with the query id patched in.
-    let (bytes, ttl) = handler
-        .try_fast_path_wire(
-            "mail.example.com",
-            RecordType::MX,
-            client_ip,
-            0x1234,
-            4096,
-            ClientProtocol::Udp,
-        )
+    let bytes = serve_wire(&handler, &mx_query(Some(4096)))
         .expect("answer within the client buffer must be served on the fast path");
-    assert_eq!(ttl, 60);
     assert_eq!(bytes.len(), 600);
     assert_eq!(&bytes[0..2], &[0x12, 0x34], "query id must be patched");
+}
+
+/// A cached upstream TXT answer past 512 bytes, without an OPT to strip.
+fn large_answer() -> Vec<u8> {
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{rdata::TXT, Name, RData, Record};
+    let name = Name::from_ascii("mail.example.com.").unwrap();
+    let mut msg = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::query(
+        name.clone(),
+        hickory_proto::rr::RecordType::TXT,
+    ));
+    msg.add_answer(Record::from_rdata(
+        name,
+        300,
+        RData::TXT(TXT::new(vec![
+            "x".repeat(250),
+            "y".repeat(250),
+            "z".repeat(90),
+        ])),
+    ));
+    let wire = msg.to_vec().unwrap();
+    assert!(wire.len() > 512);
+    wire
+}
+
+/// A cached upstream MX answer: RD set (every upstream query sets it) and an
+/// OPT of its own, last in the additional section.
+fn upstream_mx() -> Vec<u8> {
+    use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{rdata::MX, Name, RData, Record};
+    let name = Name::from_ascii("mail.example.com.").unwrap();
+    let mut msg = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.metadata.recursion_available = true;
+    msg.add_query(Query::query(
+        name.clone(),
+        hickory_proto::rr::RecordType::MX,
+    ));
+    msg.add_answer(Record::from_rdata(
+        name,
+        300,
+        RData::MX(MX::new(10, Name::from_ascii("mx1.example.com.").unwrap())),
+    ));
+    let mut opt = Edns::new();
+    opt.set_max_payload(1232);
+    msg.set_edns(opt);
+    msg.to_vec().unwrap()
+}
+
+/// RFC 6891 §7: a query without OPT gets a reply without one, which the
+/// cached upstream bytes cannot provide verbatim; RD is the query's.
+#[test]
+fn wire_fast_path_strips_the_upstream_opt_for_a_query_without_one() {
+    use hickory_proto::op::Message;
+    let upstream = Message::from_vec(&upstream_mx()).unwrap();
+    let handler = handler_with_cached_wire(upstream_mx());
+
+    let mut plain = mx_query(None);
+    plain[2] &= !0x01; // RD=0
+    let reply = Message::from_vec(&serve_wire(&handler, &plain).expect("served")).unwrap();
+    assert!(
+        reply.edns.is_none(),
+        "no OPT in the query, none in the reply"
+    );
+    assert_eq!(reply.metadata.id, 0x1234);
+    assert!(
+        !reply.metadata.recursion_desired,
+        "RD copied from the query"
+    );
+    assert_eq!(reply.answers, upstream.answers);
+
+    let mut edns = mx_query(Some(1232));
+    edns[2] &= !0x01;
+    let reply = Message::from_vec(&serve_wire(&handler, &edns).expect("served")).unwrap();
+    assert!(reply.edns.is_some(), "an EDNS client keeps the OPT");
+    assert!(
+        !reply.metadata.recursion_desired,
+        "RD copied from the query"
+    );
+    assert_eq!(reply.answers, upstream.answers);
 }
 
 // ── handle_raw_udp_fallback: the 512-byte limit is plain-UDP only ───────────
@@ -182,9 +258,9 @@ fn wire_fast_path_serves_when_answer_fits_client_buffer() {
 const TC_FLAG: u8 = 0x02;
 
 /// Runs the slow path over `protocol` for a query with no EDNS (so the UDP
-/// buffer is the 512-byte default) whose cached answer is 600 bytes.
+/// buffer is the 512-byte default) whose cached answer is [`large_answer`].
 async fn slow_path_answer_over(protocol: ClientProtocol) -> Vec<u8> {
-    let handler = handler_with_cached_wire(600);
+    let handler = handler_with_cached_wire(large_answer());
     let raw = build_a_query_with_arcount("mail.example.com", 0);
     handler
         .handle_raw_udp_fallback(&raw, IpAddr::V4(Ipv4Addr::LOCALHOST), protocol)
@@ -196,8 +272,8 @@ async fn slow_path_answer_over(protocol: ClientProtocol) -> Vec<u8> {
 async fn slow_path_truncates_an_oversized_answer_over_plain_udp() {
     let response = slow_path_answer_over(ClientProtocol::Udp).await;
     assert!(
-        response.len() < 600,
-        "a 600-byte answer must not be sent whole to a 512-byte UDP client"
+        response.len() <= 512,
+        "an oversized answer must not be sent whole to a 512-byte UDP client"
     );
     assert_eq!(
         response[2] & TC_FLAG,
@@ -212,7 +288,7 @@ async fn slow_path_does_not_truncate_over_doq() {
     // transport would cap this at 512 and strand the answer behind a TC=1 retry
     // a QUIC client has no reason to make (RFC 9250 frames its own length).
     let response = slow_path_answer_over(ClientProtocol::Doq).await;
-    assert_eq!(response.len(), 600);
+    assert_eq!(response.len(), large_answer().len());
     assert_eq!(response[2] & TC_FLAG, 0, "TC must stay clear over DoQ");
 }
 
@@ -224,7 +300,11 @@ async fn slow_path_does_not_truncate_over_the_stream_transports() {
         ClientProtocol::Doh,
     ] {
         let response = slow_path_answer_over(protocol).await;
-        assert_eq!(response.len(), 600, "{protocol} must not be truncated");
+        assert_eq!(
+            response.len(),
+            large_answer().len(),
+            "{protocol} must not be truncated"
+        );
         assert_eq!(response[2] & TC_FLAG, 0, "{protocol} must not set TC");
     }
 }

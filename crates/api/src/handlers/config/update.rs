@@ -154,7 +154,9 @@ fn apply_config_update(cfg: &mut Config, request: UpdateConfigRequest) -> Result
             });
         }
         if let Some(v) = dns.cache_eviction_strategy {
-            cfg.dns.cache_eviction_strategy = v;
+            cfg.dns.cache_eviction_strategy = v
+                .parse::<ferrous_dns_domain::config::CacheEvictionStrategy>()
+                .map_err(|e| e.to_string())?;
         }
         if let Some(v) = dns.cache_max_entries {
             cfg.dns.cache_max_entries = v;

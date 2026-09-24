@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 pub const TTL_SECS: u64 = 60;
 const L0_CAPACITY: NonZeroUsize = match NonZeroUsize::new(256) {
@@ -54,29 +54,19 @@ fn decode_verdict(val: u8) -> Verdict {
     }
 }
 
-static DECISION_HASH_STATE: OnceLock<AHashRandomState> = OnceLock::new();
-
-#[inline]
-fn decision_hash_state() -> &'static AHashRandomState {
-    DECISION_HASH_STATE.get_or_init(|| {
-        AHashRandomState::with_seeds(
-            0xf4a5_f3e1_c2b0_a9d7,
-            0x8e6b_4c2a_0f1d_e3c9,
-            0x7a2c_1e5b_9d4f_6a8e,
-            0x3c7a_2e4b_6f8d_0a1c,
-        )
-    })
-}
+/// Seeded randomly once per process: with public seeds a crafted domain could
+/// be computed to collide with a cached allow verdict and inherit it.
+static DECISION_HASH_STATE: LazyLock<AHashRandomState> = LazyLock::new(AHashRandomState::new);
 
 #[inline]
 pub fn decision_key(domain: &str, group_id: i64) -> u64 {
-    let mut h = decision_hash_state().build_hasher();
+    let mut h = DECISION_HASH_STATE.build_hasher();
     domain.hash(&mut h);
     group_id.hash(&mut h);
     h.finish()
 }
 
-/// Cached entry: (encoded_verdict, inserted_at_secs, epoch_at_insert).
+/// Cached entry: (encoded_verdict, expires_at_secs, epoch_at_insert).
 type BlockL0Cache = LruCache<u64, (u8, u64, u64), FxBuildHasher>;
 
 thread_local! {
@@ -89,8 +79,8 @@ pub fn decision_l0_get_by_key(key: u64) -> Option<Verdict> {
     let current_epoch = DECISION_EPOCH.load(Ordering::Acquire);
     BLOCK_L0.with(|c| {
         let mut c = c.borrow_mut();
-        if let Some(&(encoded, inserted_at, epoch)) = c.get(&key) {
-            if epoch == current_epoch && coarse_now_secs().saturating_sub(inserted_at) < TTL_SECS {
+        if let Some(&(encoded, expires_at, epoch)) = c.get(&key) {
+            if epoch == current_epoch && coarse_now_secs() < expires_at {
                 return Some(decode_verdict(encoded));
             }
             c.pop(&key);
@@ -99,14 +89,13 @@ pub fn decision_l0_get_by_key(key: u64) -> Option<Verdict> {
     })
 }
 
+/// `expires_at` is the L1 entry's, so this copy never outlives it.
 #[inline]
-pub fn decision_l0_set_by_key(key: u64, verdict: Verdict) {
+pub fn decision_l0_set_by_key(key: u64, verdict: Verdict, expires_at: u64) {
     let current_epoch = DECISION_EPOCH.load(Ordering::Acquire);
     BLOCK_L0.with(|c| {
-        c.borrow_mut().put(
-            key,
-            (encode_verdict(verdict), coarse_now_secs(), current_epoch),
-        );
+        c.borrow_mut()
+            .put(key, (encode_verdict(verdict), expires_at, current_epoch));
     });
 }
 
@@ -164,26 +153,31 @@ impl BlockDecisionCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The live verdict for `key` and when it expires.
     #[inline]
-    pub fn get_by_key(&self, key: u64) -> Option<Verdict> {
+    pub fn get_by_key(&self, key: u64) -> Option<(Verdict, u64)> {
         let mut shard = self.lock_shard(key);
         let (encoded, expires_at) = *shard.get(&key)?;
         if coarse_now_secs() < expires_at {
-            return Some(decode_verdict(encoded));
+            return Some((decode_verdict(encoded), expires_at));
         }
         shard.pop(&key);
         None
     }
 
+    /// Caches `verdict` for [`TTL_SECS`]; returns when it expires.
     #[inline]
-    pub fn set_by_key(&self, key: u64, verdict: Verdict) {
-        self.set_by_key_with_ttl(key, verdict, TTL_SECS);
+    pub fn set_by_key(&self, key: u64, verdict: Verdict) -> u64 {
+        self.set_by_key_with_ttl(key, verdict, TTL_SECS)
     }
 
+    /// Caches `verdict` for `ttl_secs`; returns when it expires.
     #[inline]
-    pub fn set_by_key_with_ttl(&self, key: u64, verdict: Verdict, ttl_secs: u64) {
+    pub fn set_by_key_with_ttl(&self, key: u64, verdict: Verdict, ttl_secs: u64) -> u64 {
+        let expires_at = coarse_now_secs().saturating_add(ttl_secs);
         self.lock_shard(key)
-            .put(key, (encode_verdict(verdict), coarse_now_secs() + ttl_secs));
+            .put(key, (encode_verdict(verdict), expires_at));
+        expires_at
     }
 
     pub fn clear(&self) {
@@ -229,20 +223,24 @@ mod tests {
         BlockSource::DgaDetection,
     ];
 
+    fn verdict(cache: &BlockDecisionCache, key: u64) -> Option<Verdict> {
+        cache.get_by_key(key).map(|(verdict, _)| verdict)
+    }
+
     #[test]
     fn roundtrips_every_verdict() {
         let cache = BlockDecisionCache::with_capacity(4096);
 
         cache.set_by_key(1, Verdict::NoMatch);
         assert_eq!(
-            cache.get_by_key(1),
+            verdict(&cache, 1),
             Some(Verdict::NoMatch),
             "no-match must survive a roundtrip"
         );
 
         cache.set_by_key(2, Verdict::ManualAllow);
         assert_eq!(
-            cache.get_by_key(2),
+            verdict(&cache, 2),
             Some(Verdict::ManualAllow),
             "an explicit allow must survive a roundtrip"
         );
@@ -251,7 +249,7 @@ mod tests {
             let key = 100 + i as u64;
             cache.set_by_key(key, Verdict::Block(*source));
             assert_eq!(
-                cache.get_by_key(key),
+                verdict(&cache, key),
                 Some(Verdict::Block(*source)),
                 "{source:?} must survive a roundtrip"
             );
@@ -259,7 +257,7 @@ mod tests {
             let manual_key = 200 + i as u64;
             cache.set_by_key(manual_key, Verdict::ManualDeny(*source));
             assert_eq!(
-                cache.get_by_key(manual_key),
+                verdict(&cache, manual_key),
                 Some(Verdict::ManualDeny(*source)),
                 "manual {source:?} must not decode as a plain block"
             );
@@ -269,7 +267,7 @@ mod tests {
     #[test]
     fn missing_key_reads_as_absent_not_as_allow() {
         let cache = BlockDecisionCache::with_capacity(64);
-        assert_eq!(cache.get_by_key(999), None);
+        assert_eq!(verdict(&cache, 999), None);
     }
 
     #[test]
@@ -277,7 +275,7 @@ mod tests {
         let cache = BlockDecisionCache::with_capacity(64);
         cache.set_by_key_with_ttl(7, Verdict::Block(BlockSource::Blocklist), 0);
         assert_eq!(
-            cache.get_by_key(7),
+            verdict(&cache, 7),
             None,
             "a zero-TTL entry is already expired"
         );
@@ -296,7 +294,7 @@ mod tests {
         }
         assert_eq!(cache.len(), 1);
         assert_eq!(
-            cache.get_by_key(42),
+            verdict(&cache, 42),
             Some(Verdict::Block(BlockSource::Blocklist))
         );
     }
@@ -351,7 +349,7 @@ mod tests {
             cache.set_by_key(k.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1, Verdict::NoMatch);
             if k % 1_000 == 0 {
                 assert_eq!(
-                    cache.get_by_key(pinned),
+                    verdict(&cache, pinned),
                     Some(Verdict::Block(BlockSource::Blocklist)),
                     "a recently used entry was evicted while its shard had room"
                 );

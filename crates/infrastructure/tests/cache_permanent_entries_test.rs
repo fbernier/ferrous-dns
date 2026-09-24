@@ -15,10 +15,8 @@ fn make_cache() -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.0,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -48,13 +46,7 @@ fn addresses_of(data: &CachedData) -> Vec<IpAddr> {
 #[test]
 fn test_permanent_entry_reports_its_configured_ttl() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
 
     let (_, _, remaining) = cache
         .get("nas.home.lan", &RecordType::A)
@@ -66,13 +58,7 @@ fn test_permanent_entry_reports_its_configured_ttl() {
 #[test]
 fn test_permanent_entry_remaining_ttl_is_its_configured_ttl() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
 
     assert_eq!(
         cache.get_remaining_ttl("nas.home.lan", &RecordType::A),
@@ -89,7 +75,6 @@ fn test_permanent_entry_ttl_survives_a_second_read_from_l1() {
         RecordType::A,
         make_ip_data("10.0.0.6"),
         120,
-        None,
     );
 
     // First read promotes into the thread-local L1; the second is served from it.
@@ -108,13 +93,7 @@ fn test_permanent_entry_ttl_survives_a_second_read_from_l1() {
 #[test]
 fn test_clear_preserves_permanent_entries() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
     cache.insert(
         "example.com",
         RecordType::A,
@@ -144,13 +123,7 @@ fn test_clear_preserves_permanent_entries() {
 #[test]
 fn test_is_permanent_distinguishes_the_two_kinds() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
     cache.insert(
         "example.com",
         RecordType::A,
@@ -169,13 +142,7 @@ fn test_is_permanent_distinguishes_the_two_kinds() {
 #[test]
 fn test_removed_permanent_entry_is_no_longer_permanent() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
 
     assert!(cache.remove("nas.home.lan", &RecordType::A));
 

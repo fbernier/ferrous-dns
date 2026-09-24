@@ -1,3 +1,4 @@
+use ferrous_dns_domain::config::CacheEvictionStrategy;
 use serde::{Deserialize, Serialize};
 
 /// Full configuration snapshot exported by the backup use case.
@@ -52,7 +53,7 @@ pub struct SnapshotDnsConfig {
     /// Deprecated: older snapshots stored a boolean. Read for back-compat.
     #[serde(default)]
     pub dnssec_enabled: Option<bool>,
-    pub cache_eviction_strategy: String,
+    pub cache_eviction_strategy: CacheEvictionStrategy,
     pub cache_max_entries: usize,
     pub cache_min_hit_rate: f64,
     pub cache_min_frequency: u64,

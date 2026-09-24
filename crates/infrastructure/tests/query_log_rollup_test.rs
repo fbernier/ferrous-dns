@@ -5,7 +5,7 @@
 
 use ferrous_dns_application::ports::QueryLogRepository;
 use ferrous_dns_domain::config::DatabaseConfig;
-use ferrous_dns_domain::{BlockSource, QueryLog, QuerySource, RecordType};
+use ferrous_dns_domain::{BlockSource, DnssecStatus, QueryLog, QuerySource, RecordType};
 use ferrous_dns_infrastructure::repositories::query_log_repository::SqliteQueryLogRepository;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -60,11 +60,10 @@ fn random_query(rng: &mut fastrand::Rng) -> QueryLog {
             rng,
             &[
                 None,
-                Some("Secure"),
-                Some("Insecure"),
-                Some("Bogus"),
-                Some("Indeterminate"),
-                Some("Unknown"),
+                Some(DnssecStatus::Secure),
+                Some(DnssecStatus::Insecure),
+                Some(DnssecStatus::Bogus),
+                Some(DnssecStatus::Indeterminate),
             ],
         ),
         dns64_synthesized: rng.u8(..8) == 0,

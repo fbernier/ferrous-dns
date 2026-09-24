@@ -1,6 +1,6 @@
 use super::block_source::BlockSource;
 use crate::dns_record::RecordType;
-use crate::errors::domain_error::DomainError;
+use crate::DomainError;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -22,10 +22,8 @@ pub struct QueryLogFilter {
     pub record_type: Option<RecordType>,
     /// Exact match on upstream server address.
     pub upstream: Option<String>,
-    /// DNSSEC validation status filter. The sentinel `"any"` matches every
-    /// row that received a determination (non-NULL status); any other value
-    /// is an exact match on the stored status string.
-    pub dnssec_status: Option<String>,
+    /// DNSSEC validation outcome filter.
+    pub dnssec_status: Option<DnssecStatusFilter>,
     /// `Some(true)` keeps only DNS64-synthesized AAAA answers, `Some(false)`
     /// only non-synthesized rows; `None` does not filter.
     pub dns64_synthesized: Option<bool>,
@@ -163,7 +161,7 @@ pub struct QueryLog {
     pub response_time_us: Option<u64>,
     pub cache_hit: bool,
     pub cache_refresh: bool,
-    pub dnssec_status: Option<&'static str>,
+    pub dnssec_status: Option<DnssecStatus>,
     /// `true` when the AAAA answer was synthesized by DNS64 (RFC 6147).
     pub dns64_synthesized: bool,
     /// Resolved A/AAAA addresses of the answer. `None` for blocked queries and
@@ -210,12 +208,8 @@ pub struct QueryStats {
     pub record_type_distribution: Vec<(RecordType, f64)>,
 }
 
-/// Canonical DNSSEC validation outcome. This is the single source of truth for
-/// the status strings persisted in the query log (`dnssec_status` column) and
-/// threaded through `DnsResolution`. Control-flow decisions (AD-bit gating,
-/// Strict-mode SERVFAIL, cache suppression) compare against `as_str()` rather
-/// than bare string literals, so a typo becomes a compile error instead of a
-/// silently mis-gated security decision.
+/// Canonical DNSSEC validation outcome; `as_str` is the spelling persisted in
+/// the query log's `dnssec_status` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnssecStatus {
     Secure,
@@ -249,6 +243,30 @@ impl FromStr for DnssecStatus {
         .into_iter()
         .find(|status| status.as_str().eq_ignore_ascii_case(s))
         .ok_or_else(|| DomainError::InvalidInput(format!("invalid dnssec status: '{s}'")))
+    }
+}
+
+/// Query-log filter on the DNSSEC validation outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnssecStatusFilter {
+    /// Every row that received a determination (non-NULL status).
+    Any,
+    Is(DnssecStatus),
+}
+
+impl FromStr for DnssecStatusFilter {
+    type Err = DomainError;
+
+    /// `any` or one of the four outcomes, case-insensitively.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("any") {
+            return Ok(Self::Any);
+        }
+        s.parse::<DnssecStatus>().map(Self::Is).map_err(|_| {
+            DomainError::InvalidInput(format!(
+                "invalid dnssec status filter: '{s}' (expected any, secure, insecure, bogus or indeterminate)"
+            ))
+        })
     }
 }
 

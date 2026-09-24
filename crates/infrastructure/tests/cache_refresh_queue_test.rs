@@ -61,10 +61,8 @@ fn create_cache_with(max_entries: usize, refresh_threshold: f64) -> Arc<DnsCache
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -750,5 +748,56 @@ async fn test_absent_period_disables_pacing() {
         3,
         "sem período os 3 devem sair de imediato; count={}",
         resolver.count()
+    );
+}
+
+/// Answers every refresh with a DNSSEC-Bogus resolution.
+struct BogusResolver;
+
+#[async_trait]
+impl DnsResolver for BogusResolver {
+    async fn resolve(&self, _query: &DnsQuery) -> Result<DnsResolution, DomainError> {
+        Ok(DnsResolution {
+            dnssec_status: Some(ferrous_dns_domain::DnssecStatus::Bogus),
+            ..DnsResolution::new(vec!["203.0.113.66".parse().unwrap()], false)
+        })
+    }
+}
+
+/// A refresh that validates as Bogus must not renew the entry with the Bogus
+/// answer: cache hits skip DNSSEC enforcement, so Strict mode would serve it.
+#[tokio::test]
+async fn test_bogus_refresh_drops_the_entry_instead_of_renewing_it() {
+    let cache = create_cache_with(200, 0.0);
+    insert_entries(&cache, 1);
+    let (stale_tx, stale_rx) = mpsc::channel(16);
+    let (_optimistic_tx, optimistic_rx) = mpsc::channel(16);
+    let (_pace_tx, pace_rx) = watch::channel(None);
+    DnsCacheMaintenance::start_refresh_worker(
+        Arc::clone(&cache),
+        Arc::new(BogusResolver),
+        None,
+        stale_rx,
+        optimistic_rx,
+        pace_rx,
+        0,
+    );
+
+    stale_tx
+        .send((Arc::from("queued-0.com"), RecordType::A))
+        .await
+        .expect("send failed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let cached = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || cache.get("queued-0.com", &RecordType::A)
+    })
+    .join()
+    .unwrap();
+    assert!(
+        cached.is_none(),
+        "the Bogus answer must not be cached: {:?}",
+        cached.map(|(data, status, _)| (data.as_ip_addresses().cloned(), status))
     );
 }

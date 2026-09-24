@@ -13,14 +13,6 @@ pub struct DnsCookieGuard {
 }
 
 impl DnsCookieGuard {
-    /// Non-strict guard; its all-zero key only signs response cookies, which are never verified.
-    pub fn disabled() -> Self {
-        Self {
-            strict: false,
-            secret: hmac::Key::new(hmac::HMAC_SHA256, &[0u8; 32]),
-        }
-    }
-
     pub fn from_config(config: &DnsCookiesConfig, secret: [u8; 32]) -> Self {
         Self {
             strict: config.enabled && config.require_valid_cookie,
@@ -169,6 +161,5 @@ mod tests {
         assert!(DnsCookieGuard::from_config(&config(true, true), [0; 32]).is_strict());
         assert!(!DnsCookieGuard::from_config(&config(true, false), [0; 32]).is_strict());
         assert!(!DnsCookieGuard::from_config(&config(false, true), [0; 32]).is_strict());
-        assert!(!DnsCookieGuard::disabled().is_strict());
     }
 }

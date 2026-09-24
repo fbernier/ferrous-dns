@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use ferrous_dns_domain::config::CacheEvictionStrategy;
 use ferrous_dns_domain::Config;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -57,7 +58,9 @@ pub struct DnsConfigResponse {
     /// Deprecated: derived from `dnssec_mode` (`true` when validating). Kept for
     /// backward-compatibility with older API clients.
     pub dnssec_enabled: bool,
-    pub cache_eviction_strategy: String,
+    /// "lru" | "hit_rate" | "lfu" | "lfu-k".
+    #[schema(value_type = String)]
+    pub cache_eviction_strategy: CacheEvictionStrategy,
     pub cache_max_entries: usize,
     pub cache_min_hit_rate: f64,
     pub cache_min_frequency: u64,

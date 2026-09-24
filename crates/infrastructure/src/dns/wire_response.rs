@@ -12,35 +12,34 @@ const OPT_RECORD: [u8; 11] = [
 /// exceed it is rejected (`None`) and handled by the slow path instead.
 pub const RESPONSE_BUF_LEN: usize = 523;
 
-/// Clones the cached wire bytes under the client's query ID and with the
-/// Authenticated Data (AD) bit cleared; `None` if `wire` cannot hold an ID.
+/// Clones the cached wire bytes under the client's query ID and RD bit, with
+/// the Authenticated Data (AD) bit cleared; `None` if `wire` is shorter than
+/// the flags.
 ///
 /// The cached-wire fast path is only taken for clients that did **not** set the
 /// EDNS DO bit, so per RFC 6840 §5.8 we must never assert AD to them — yet the
 /// cached upstream bytes may carry AD=1 from the validating resolver. Clearing
 /// it here keeps the fast path compliant without re-parsing the message.
-pub fn patch_wire_id_clear_ad(wire: &[u8], new_id: u16) -> Option<Vec<u8>> {
-    if wire.len() < 2 {
+pub fn patch_wire_header(wire: &[u8], id: u16, recursion_desired: bool) -> Option<Vec<u8>> {
+    if wire.len() < 4 {
         return None;
     }
     let mut buf = wire.to_vec();
-    buf[..2].copy_from_slice(&new_id.to_be_bytes());
-    set_ad_bit(&mut buf, false);
+    set_relay_header(&mut buf, id, recursion_desired, false);
     Some(buf)
 }
 
-/// Sets or clears the AD (Authenticated Data, RFC 4035) bit directly in a raw
-/// DNS response buffer. The AD bit is bit 5 (`0x20`) of the second flags octet
-/// (byte index 3). Used on the raw-wire echo path where the upstream response
-/// is forwarded verbatim and we must override its AD bit with our own verdict.
-pub fn set_ad_bit(buf: &mut [u8], ad: bool) {
-    if buf.len() >= 4 {
-        if ad {
-            buf[3] |= 0x20;
-        } else {
-            buf[3] &= !0x20;
-        }
-    }
+/// Rewrites a relayed response's header for the client: its ID, its RD bit
+/// (RFC 1035 §4.1.1 copies RD from the query; upstream always saw RD=1) and
+/// our own AD verdict (RFC 4035 bit `0x20` of byte 3). No-op on a buffer
+/// shorter than the flags.
+pub fn set_relay_header(buf: &mut [u8], id: u16, recursion_desired: bool, authentic_data: bool) {
+    let Some([id_hi, id_lo, flags_hi, flags_lo]) = buf.first_chunk_mut::<4>() else {
+        return;
+    };
+    [*id_hi, *id_lo] = id.to_be_bytes();
+    *flags_hi = (*flags_hi & !0x01) | u8::from(recursion_desired);
+    *flags_lo = (*flags_lo & !0x20) | (u8::from(authentic_data) << 5);
 }
 
 /// Over UDP a cached wire answer larger than the client's advertised EDNS
@@ -68,7 +67,11 @@ pub fn build_cache_hit_response(
 
     let answers_size: usize = addresses.iter().map(address_rr_len).sum();
 
-    let opt_size = if query.has_edns { OPT_RECORD.len() } else { 0 };
+    let opt_size = if query.has_edns() {
+        OPT_RECORD.len()
+    } else {
+        0
+    };
     let total_size = 12 + question_len + answers_size + opt_size;
     let max_size = query.client_max_size as usize;
 
@@ -88,7 +91,7 @@ pub fn build_cache_hit_response(
     out[4..6].copy_from_slice(&1u16.to_be_bytes());
     out[6..8].copy_from_slice(&ancount.to_be_bytes());
     out[8..10].copy_from_slice(&0u16.to_be_bytes());
-    out[10..12].copy_from_slice(&u16::from(query.has_edns).to_be_bytes());
+    out[10..12].copy_from_slice(&u16::from(query.has_edns()).to_be_bytes());
 
     out[12..12 + question_len].copy_from_slice(&query_buf[12..query.question_end]);
 
@@ -98,7 +101,7 @@ pub fn build_cache_hit_response(
         pos += write_address_rr(&mut out[pos..], addr, ttl);
     }
 
-    if query.has_edns {
+    if query.has_edns() {
         out[pos..pos + OPT_RECORD.len()].copy_from_slice(&OPT_RECORD);
         pos += OPT_RECORD.len();
     }
@@ -150,6 +153,7 @@ const SOA_RNAME: &[u8] = b"\x0ahostmaster\x0bferrous-dns\x07invalid\x00";
 #[repr(u8)]
 pub enum Rcode {
     NoError = 0,
+    FormErr = 1,
     ServFail = 2,
     NxDomain = 3,
     Refused = 5,
@@ -376,9 +380,7 @@ pub fn relay_with_edns(
         None => {}
     }
 
-    out[0..2].copy_from_slice(&id.to_be_bytes());
-    out[2] = (out[2] & !0x01) | u8::from(recursion_desired);
-    set_ad_bit(&mut out, authentic_data);
+    set_relay_header(&mut out, id, recursion_desired, authentic_data);
     out[10..12].copy_from_slice(&kept_ar.to_be_bytes());
     Some(out)
 }

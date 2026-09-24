@@ -44,6 +44,17 @@ impl BlockFilterEnginePort for BlockingReloadEngine {
     fn compiled_domain_count(&self) -> usize {
         0
     }
+    fn explain(&self, _domain: &str, _group_id: i64) -> ferrous_dns_domain::FilterExplanation {
+        unimplemented!()
+    }
+    fn match_candidate(
+        &self,
+        _domains: &[String],
+        _list_lines: &[String],
+        _regexes: &[String],
+    ) -> Result<Vec<bool>, ferrous_dns_domain::DomainError> {
+        unimplemented!()
+    }
     fn store_cname_decision(&self, _domain: &str, _group_id: i64, _ttl_secs: u64) {}
     fn is_blocking_enabled(&self) -> bool {
         true

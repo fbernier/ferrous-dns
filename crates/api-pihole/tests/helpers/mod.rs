@@ -75,6 +75,17 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
         }
     }
 
+    fn explain(&self, _domain: &str, _group_id: i64) -> ferrous_dns_domain::FilterExplanation {
+        unimplemented!()
+    }
+    fn match_candidate(
+        &self,
+        _domains: &[String],
+        _list_lines: &[String],
+        _regexes: &[String],
+    ) -> Result<Vec<bool>, DomainError> {
+        unimplemented!()
+    }
     fn store_cname_decision(&self, _domain: &str, _group_id: i64, _ttl_secs: u64) {}
 
     async fn reload(&self) -> Result<(), DomainError> {

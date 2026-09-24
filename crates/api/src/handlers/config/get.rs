@@ -70,7 +70,7 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
             cache_ttl: config.dns.cache_ttl,
             dnssec_mode: config.dns.effective_dnssec_mode().as_str().to_string(),
             dnssec_enabled: config.dns.effective_dnssec_mode().validates(),
-            cache_eviction_strategy: config.dns.cache_eviction_strategy.clone(),
+            cache_eviction_strategy: config.dns.cache_eviction_strategy,
             cache_max_entries: config.dns.cache_max_entries,
             cache_min_hit_rate: config.dns.cache_min_hit_rate,
             cache_min_frequency: config.dns.cache_min_frequency,

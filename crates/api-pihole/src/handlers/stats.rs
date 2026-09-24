@@ -142,7 +142,7 @@ pub async fn get_history(
     const BUCKET_MINUTES: i64 = 10;
 
     // Fetch slightly more than 24h to cover all 145 buckets regardless of alignment.
-    let period_hours = params.from.unwrap_or(25.0) as u32;
+    let period_hours = params.from.unwrap_or(25.0);
     let buckets = state
         .query
         .get_timeline

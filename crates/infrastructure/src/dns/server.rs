@@ -1,6 +1,6 @@
 use crate::dns::cache::key::normalize_domain;
 use crate::dns::ede::{self, ExtendedDnsError};
-use crate::dns::fast_path;
+use crate::dns::fast_path::{self, FastPathQuery};
 use crate::dns::forwarding::RecordTypeMapper;
 use crate::dns::wire_response::{
     self, EdnsReply, Rcode, ResponseBody, ResponseHead, COOKIE_OPTION_CODE,
@@ -59,29 +59,30 @@ impl DnsServerHandler {
     }
 
     /// Returns a ready-to-send cached wire response for non-IP record types (NS,
-    /// CNAME, SOA, PTR, MX, TXT): the query ID is patched to `query_id` and the
-    /// AD bit is cleared. Clearing AD here — rather than relying on every caller
-    /// to do it — keeps the cached-wire fast path compliant for non-DO clients
-    /// (RFC 6840 §5.8) by construction.
+    /// CNAME, SOA, PTR, MX, TXT) under the query's ID and RD bit, with AD
+    /// cleared: the fast path serves only non-DO clients (RFC 6840 §5.8).
+    /// `None` defers the query to the slow path.
     pub fn try_fast_path_wire(
         &self,
-        domain: &str,
-        record_type: RecordType,
+        query: &FastPathQuery,
         client_ip: IpAddr,
-        query_id: u16,
-        client_max_size: u16,
         protocol: ClientProtocol,
-    ) -> Option<(Vec<u8>, u32)> {
-        let (wire, ttl) =
-            self.use_case
-                .try_cache_wire_direct(domain, record_type, client_ip, protocol)?;
+    ) -> Option<Vec<u8>> {
+        let wire = self.use_case.try_cache_wire_direct(
+            query.domain(),
+            query.record_type,
+            client_ip,
+            protocol,
+        )?;
         // Oversized-for-UDP hits bail to the slow path (handle_raw_udp_fallback),
         // which sets TC=1 — mirrors build_cache_hit_response for A/AAAA.
-        if !wire_response::wire_fits_udp_buffer(wire.len(), client_max_size) {
-            return None;
+        if query.has_edns() {
+            if !wire_response::wire_fits_udp_buffer(wire.len(), query.client_max_size) {
+                return None;
+            }
+            return wire_response::patch_wire_header(&wire, query.id, query.recursion_desired);
         }
-        let patched = wire_response::patch_wire_id_clear_ad(&wire, query_id)?;
-        Some((patched, ttl))
+        relay_without_opt(&wire, query)
     }
 
     /// The resolution path for every query the inline cache path did not
@@ -96,7 +97,12 @@ impl DnsServerHandler {
         client_ip: IpAddr,
         protocol: ClientProtocol,
     ) -> Option<Vec<u8>> {
-        let (query, request) = parse_client_query(raw, client_ip, protocol)?;
+        let (query, request) = match parse_client_query(raw, client_ip, protocol)? {
+            ParsedQuery::Valid(query, request) => (query, request),
+            ParsedQuery::BadCookie(query) => {
+                return Some(query.respond(Rcode::FormErr, false, ResponseBody::Empty, None, None));
+            }
+        };
 
         // Over UDP, the client-advertised EDNS buffer (or 512 without EDNS) caps
         // the response size; larger answers must be truncated with TC=1 so the
@@ -123,7 +129,7 @@ impl DnsServerHandler {
         // set CD (which signals it wants to do its own validation, not trust ours).
         let set_ad = query.edns.is_some_and(|e| e.dnssec_ok)
             && !query.cd
-            && resolution.dnssec_status == Some(DnssecStatus::Secure.as_str());
+            && resolution.dnssec_status == Some(DnssecStatus::Secure);
         let cookie = self.response_cookie(&request, client_ip);
         let cookie = cookie.as_ref().map(EdnsCookie::as_bytes);
 
@@ -131,31 +137,42 @@ impl DnsServerHandler {
             if let Some(ref wire_data) = resolution.upstream_wire_data {
                 // 0x20 case randomization never reaches this far: responses are
                 // canonicalized at the upstream choke point, before they enter
-                // the cache (see ResponseValidator::canonicalize). Injecting our
-                // server cookie is the only reason to rewrite the upstream OPT.
-                if cookie.is_some() {
+                // the cache (see ResponseValidator::canonicalize). The upstream
+                // OPT is rewritten to inject our server cookie, and dropped for
+                // a client that sent no OPT (RFC 6891 §7).
+                if cookie.is_some() || query.edns.is_none() {
                     let reply = query.edns_reply(cookie, None);
-                    if let Some(bytes) = wire_response::relay_with_edns(
+                    match wire_response::relay_with_edns(
                         wire_data,
                         query.id,
                         query.rd,
                         set_ad,
                         reply.as_ref(),
                     ) {
-                        return Some(maybe_truncate(bytes));
+                        Some(bytes) => return Some(maybe_truncate(bytes)),
+                        // Its extended RCODE, or records behind its OPT, need an
+                        // OPT to be relayed faithfully.
+                        None if query.edns.is_none() => {
+                            return Some(query.respond(
+                                Rcode::ServFail,
+                                false,
+                                ResponseBody::Empty,
+                                None,
+                                None,
+                            ));
+                        }
+                        None => {}
                     }
                 }
-                // No cookie to inject, or an upstream message `relay_with_edns`
-                // cannot re-section safely: relay it with the ID and AD
-                // patched. This hands the upstream's own OPT to the client
-                // verbatim, including the COOKIE echoed back at us. Harmless
-                // (RFC 7873 §5.3 has clients ignore unsolicited cookies; ours
-                // is random per query and the server cookie is bound to our IP).
+                // An EDNS client without a cookie to inject, or an upstream
+                // message `relay_with_edns` cannot re-section safely: relay it
+                // under the client's header. This hands the upstream's own OPT
+                // to the client verbatim, including the COOKIE echoed back at
+                // us. Harmless (RFC 7873 §5.3 has clients ignore unsolicited
+                // cookies; ours is random per query and the server cookie is
+                // bound to our IP).
                 let mut response = wire_data.to_vec();
-                if response.len() >= 2 {
-                    response[0..2].copy_from_slice(&query.id.to_be_bytes());
-                }
-                wire_response::set_ad_bit(&mut response, set_ad);
+                wire_response::set_relay_header(&mut response, query.id, query.rd, set_ad);
                 return Some(maybe_truncate(response));
             }
         }
@@ -202,19 +219,30 @@ impl DnsServerHandler {
     }
 
     /// COOKIE option payload for the reply: the client cookie followed by our
-    /// server cookie for it (RFC 7873 §5.2). `None` without a client cookie.
+    /// server cookie for it (RFC 7873 §5.2). `None` without a client cookie,
+    /// or when DNS Cookies are disabled.
     fn response_cookie(&self, request: &DnsRequest, client_ip: IpAddr) -> Option<EdnsCookie> {
-        let raw = request.edns_cookie.as_ref()?.as_bytes();
-        let client: [u8; 8] = raw.get(..8)?.try_into().ok()?;
-        let server = self
-            .use_case
-            .cookie_guard()
-            .generate_server_cookie(client_ip, &client);
-        let mut payload = [0u8; 8 + 32];
-        payload[..8].copy_from_slice(&client);
-        payload[8..8 + server.len()].copy_from_slice(&server);
-        Some(EdnsCookie::from_bytes(&payload[..8 + server.len()]))
+        let guard = self.use_case.cookie_guard()?;
+        let client = request
+            .edns_cookie
+            .as_ref()?
+            .as_bytes()
+            .first_chunk::<8>()?;
+        let server = guard.generate_server_cookie(client_ip, client);
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(client);
+        payload[8..].copy_from_slice(&server);
+        EdnsCookie::from_bytes(&payload)
     }
+}
+
+/// RFC 6891 §7: the upstream OPT must not reach a client that sent none.
+/// Out of line so the section walk stays off the EDNS clients' hit path.
+#[inline(never)]
+fn relay_without_opt(wire: &[u8], query: &FastPathQuery) -> Option<Vec<u8>> {
+    let reply =
+        wire_response::relay_with_edns(wire, query.id, query.recursion_desired, false, None)?;
+    wire_response::wire_fits_udp_buffer(reply.len(), query.client_max_size).then_some(reply)
 }
 
 /// The OPT fields of a client query that shape its response.
@@ -292,44 +320,52 @@ impl<'a> ClientQuery<'a> {
     }
 }
 
+/// A decoded client query.
+enum ParsedQuery<'a> {
+    /// Resolve the request and answer in the query's shape.
+    Valid(ClientQuery<'a>, DnsRequest),
+    /// RFC 7873 §5.2.2: a COOKIE option of a length it does not allow is
+    /// answered with FORMERR.
+    BadCookie(ClientQuery<'a>),
+}
+
 /// Decodes a client query into its response shape and the resolver request.
 /// `None` drops the query: it is malformed, or of a type we do not resolve.
 fn parse_client_query(
     raw: &[u8],
     client_ip: IpAddr,
     protocol: ClientProtocol,
-) -> Option<(ClientQuery<'_>, DnsRequest)> {
-    if let Some(q) = fast_path::parse_query(raw) {
-        // Options the wire parser cannot walk are left to hickory's decoder.
-        if let Ok(cookie) = q.edns_cookie(raw) {
-            let mut request = DnsRequest::new(q.domain(), q.record_type, client_ip)
-                .with_checking_disabled(q.checking_disabled)
-                .with_protocol(protocol);
-            if let Some(cookie) = cookie {
-                request = request.with_cookie(cookie);
-            }
-            let query = ClientQuery {
-                id: q.id,
-                rd: q.recursion_desired,
-                cd: q.checking_disabled,
-                edns: q.has_edns.then_some(ClientEdns {
-                    dnssec_ok: q.wants_dnssec,
-                    udp_payload: q.client_max_size,
-                }),
-                question: Cow::Borrowed(q.question(raw)),
-                qdcount: 1,
-            };
-            return Some((query, request));
-        }
+) -> Option<ParsedQuery<'_>> {
+    // The wire parser declines options it cannot walk, and bad COOKIEs, so
+    // hickory's decoder has the last word on both.
+    let Some(q) = fast_path::parse_query(raw) else {
+        return parse_client_query_hickory(raw, client_ip, protocol);
+    };
+    let mut request = DnsRequest::new(q.domain(), q.record_type, client_ip)
+        .with_checking_disabled(q.checking_disabled)
+        .with_protocol(protocol);
+    if let Some(cookie) = q.edns_cookie(raw).and_then(EdnsCookie::from_bytes) {
+        request = request.with_cookie(cookie);
     }
-    parse_client_query_hickory(raw, client_ip, protocol)
+    let query = ClientQuery {
+        id: q.id,
+        rd: q.recursion_desired,
+        cd: q.checking_disabled,
+        edns: q.has_edns().then_some(ClientEdns {
+            dnssec_ok: q.wants_dnssec,
+            udp_payload: q.client_max_size,
+        }),
+        question: Cow::Borrowed(q.question(raw)),
+        qdcount: 1,
+    };
+    Some(ParsedQuery::Valid(query, request))
 }
 
 fn parse_client_query_hickory(
     raw: &[u8],
     client_ip: IpAddr,
     protocol: ClientProtocol,
-) -> Option<(ClientQuery<'static>, DnsRequest)> {
+) -> Option<ParsedQuery<'static>> {
     let mut msg = Message::from_vec(raw).ok()?;
     let first = msg.queries.first()?;
     let record_type = RecordTypeMapper::from_hickory(first.query_type())?;
@@ -348,7 +384,8 @@ fn parse_client_query_hickory(
                 _ => None,
             })
     });
-    if let Some(cookie) = cookie {
+    let cookie = cookie.map(EdnsCookie::from_bytes);
+    if let Some(Some(cookie)) = cookie {
         request = request.with_cookie(cookie);
     }
 
@@ -371,7 +408,10 @@ fn parse_client_query_hickory(
         question: Cow::Owned(question),
         qdcount,
     };
-    Some((query, request))
+    Some(match cookie {
+        Some(None) => ParsedQuery::BadCookie(query),
+        Some(Some(_)) | None => ParsedQuery::Valid(query, request),
+    })
 }
 
 /// Builds the response for a domain-verdict block, honouring the configured
@@ -425,6 +465,14 @@ mod tests {
     /// `(flags, name, qtype, OPT as (payload, DO, options))`
     type Case = (u16, &'static str, u16, Option<(u16, bool, &'static [u8])>);
 
+    fn valid(parsed: Option<ParsedQuery<'_>>) -> (ClientQuery<'_>, DnsRequest) {
+        match parsed {
+            Some(ParsedQuery::Valid(query, request)) => (query, request),
+            Some(ParsedQuery::BadCookie(_)) => panic!("COOKIE rejected"),
+            None => panic!("query dropped"),
+        }
+    }
+
     fn encode(id: u16, (flags, name, qtype, opt): Case) -> Vec<u8> {
         let mut buf = id.to_be_bytes().to_vec();
         buf.extend_from_slice(&flags.to_be_bytes());
@@ -470,10 +518,13 @@ mod tests {
         ];
         for (i, &case) in cases.iter().enumerate() {
             let raw = encode(0x4000 + i as u16, case);
-            let wire = fast_path::parse_query(&raw).expect("wire parser accepts the case");
-            assert!(wire.edns_cookie(&raw).is_ok(), "case {i}");
-            let (wq, wr) = parse_client_query(&raw, CLIENT, ClientProtocol::Udp).unwrap();
-            let (hq, hr) = parse_client_query_hickory(&raw, CLIENT, ClientProtocol::Udp).unwrap();
+            assert!(fast_path::parse_query(&raw).is_some(), "case {i}");
+            let (wq, wr) = valid(parse_client_query(&raw, CLIENT, ClientProtocol::Udp));
+            let (hq, hr) = valid(parse_client_query_hickory(
+                &raw,
+                CLIENT,
+                ClientProtocol::Udp,
+            ));
 
             assert_eq!(wr.domain, hr.domain, "case {i}");
             assert_eq!(wr.record_type, hr.record_type, "case {i}");
@@ -497,6 +548,17 @@ mod tests {
         }
     }
 
+    /// What a parse decided, comparable across the two parsers.
+    fn outcome(parsed: Option<ParsedQuery<'_>>) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        parsed.map(|parsed| match parsed {
+            ParsedQuery::Valid(q, r) => (
+                q.question.into_owned(),
+                r.edns_cookie.map(|c| c.as_bytes().to_vec()),
+            ),
+            ParsedQuery::BadCookie(q) => (q.question.into_owned(), None),
+        })
+    }
+
     #[test]
     fn malformed_edns_options_are_decoded_by_hickory() {
         // Option length 8 with 4 bytes present: the wire parser declines, and
@@ -510,22 +572,51 @@ mod tests {
                 Some((1232, false, &[0, 10, 0, 8, 1, 2, 3, 4])),
             ),
         );
-        let wire = fast_path::parse_query(&raw).expect("the fixed header still parses");
-        assert!(wire.edns_cookie(&raw).is_err());
-        let routed = parse_client_query(&raw, CLIENT, ClientProtocol::Udp).map(|(q, r)| {
-            (
-                q.question.into_owned(),
-                r.edns_cookie.map(|c| c.as_bytes().to_vec()),
-            )
-        });
-        let hickory =
-            parse_client_query_hickory(&raw, CLIENT, ClientProtocol::Udp).map(|(q, r)| {
-                (
-                    q.question.into_owned(),
-                    r.edns_cookie.map(|c| c.as_bytes().to_vec()),
-                )
-            });
-        assert_eq!(routed, hickory);
+        assert!(fast_path::parse_query(&raw).is_none());
+        assert_eq!(
+            outcome(parse_client_query(&raw, CLIENT, ClientProtocol::Udp)),
+            outcome(parse_client_query_hickory(
+                &raw,
+                CLIENT,
+                ClientProtocol::Udp
+            ))
+        );
+    }
+
+    /// RFC 7873 §5.2.2: a COOKIE that is not 8 or 16..=40 bytes is a FORMERR,
+    /// never a cookie cut down to fit. The cache fast path must not answer it
+    /// either, so its parser declines the query.
+    #[test]
+    fn cookies_of_a_disallowed_length_are_rejected_by_both_parsers() {
+        for len in [0usize, 7, 9, 15, 41, 64] {
+            let mut option = vec![0, 10];
+            option.extend_from_slice(&(len as u16).to_be_bytes());
+            option.extend(std::iter::repeat_n(0xAB, len));
+            let option: &'static [u8] = option.leak();
+            let raw = encode(1, (0x0100, "example.com", 1, Some((1232, false, option))));
+
+            assert!(fast_path::parse_query(&raw).is_none(), "{len} bytes");
+            assert!(
+                matches!(
+                    parse_client_query(&raw, CLIENT, ClientProtocol::Udp),
+                    Some(ParsedQuery::BadCookie(_))
+                ),
+                "{len} bytes"
+            );
+        }
+        for len in [8usize, 16, 40] {
+            let mut option = vec![0, 10];
+            option.extend_from_slice(&(len as u16).to_be_bytes());
+            option.extend(std::iter::repeat_n(0xAB, len));
+            let option: &'static [u8] = option.leak();
+            let raw = encode(1, (0x0100, "example.com", 1, Some((1232, false, option))));
+            let (_, request) = valid(parse_client_query(&raw, CLIENT, ClientProtocol::Udp));
+            assert_eq!(
+                request.edns_cookie.map(|c| c.as_bytes().len()),
+                Some(len),
+                "{len} bytes"
+            );
+        }
     }
 
     /// RFC 6891 §6.1.1 makes two OPT records a FORMERR. The wire parser must
@@ -538,9 +629,13 @@ mod tests {
         raw[11] = 2;
 
         assert!(fast_path::parse_query(&raw).is_none());
-        let routed = parse_client_query(&raw, CLIENT, ClientProtocol::Udp).map(|(q, _)| q.id);
-        let hickory =
-            parse_client_query_hickory(&raw, CLIENT, ClientProtocol::Udp).map(|(q, _)| q.id);
-        assert_eq!(routed, hickory);
+        assert_eq!(
+            outcome(parse_client_query(&raw, CLIENT, ClientProtocol::Udp)),
+            outcome(parse_client_query_hickory(
+                &raw,
+                CLIENT,
+                ClientProtocol::Udp
+            ))
+        );
     }
 }

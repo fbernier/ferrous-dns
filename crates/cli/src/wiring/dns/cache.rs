@@ -1,39 +1,33 @@
+use ferrous_dns_domain::config::CacheEvictionStrategy;
 use ferrous_dns_domain::Config;
 use ferrous_dns_infrastructure::dns::{
     cache::{DnsCache, DnsCacheConfig, EvictionStrategy},
     CachedAddresses, CachedData,
 };
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
-/// The configured eviction strategy; an unknown name falls back to the
-/// hit-rate default with a warning rather than failing startup.
-fn eviction_strategy(name: &str) -> EvictionStrategy {
-    name.parse().unwrap_or_else(|e| {
-        warn!(error = %e, "Unknown cache_eviction_strategy, using hit_rate");
-        EvictionStrategy::HitRate
-    })
+fn eviction_strategy(strategy: CacheEvictionStrategy) -> EvictionStrategy {
+    match strategy {
+        CacheEvictionStrategy::Lru => EvictionStrategy::LRU,
+        CacheEvictionStrategy::HitRate => EvictionStrategy::HitRate,
+        CacheEvictionStrategy::Lfu => EvictionStrategy::LFU,
+        CacheEvictionStrategy::LfuK => EvictionStrategy::LFUK,
+    }
 }
 
 pub(super) fn build_cache(config: &Config) -> Arc<DnsCache> {
     if config.dns.cache_enabled {
-        let eviction_strategy = eviction_strategy(&config.dns.cache_eviction_strategy);
         info!(
-            strategy = eviction_strategy.as_str(),
+            strategy = %config.dns.cache_eviction_strategy,
             max_entries = config.dns.cache_max_entries,
             "Cache enabled"
         );
         Arc::new(DnsCache::new(DnsCacheConfig {
             max_entries: config.dns.cache_max_entries,
-            eviction_strategy,
-            // Seeded neutral, not from `cache_min_hit_rate`: this feeds the
-            // adaptive EWMA, which blends it with an eviction score bounded by
-            // 1.0, while `cache_min_hit_rate` is a hits-per-minute figure. The
-            // EWMA converges on the observed worst score on its own.
-            min_threshold: 0.0,
+            eviction_strategy: eviction_strategy(config.dns.cache_eviction_strategy),
             refresh_threshold: config.dns.cache_refresh_threshold,
             batch_eviction_percentage: config.dns.cache_batch_eviction_percentage,
-            adaptive_thresholds: config.dns.cache_adaptive_thresholds,
             min_frequency: config.dns.cache_min_frequency,
             min_lfuk_score: config.dns.cache_min_lfuk_score,
             shard_amount: config.dns.cache_shard_amount,
@@ -48,10 +42,8 @@ pub(super) fn build_cache(config: &Config) -> Arc<DnsCache> {
         Arc::new(DnsCache::new(DnsCacheConfig {
             max_entries: 0,
             eviction_strategy: EvictionStrategy::HitRate,
-            min_threshold: 0.0,
             refresh_threshold: 0.0,
             batch_eviction_percentage: 0.0,
-            adaptive_thresholds: false,
             min_frequency: 0,
             min_lfuk_score: 0.0,
             shard_amount: 4,
@@ -81,7 +73,7 @@ pub(super) fn preload_local_records_into_cache(
         });
         let ttl = record.ttl_or_default();
 
-        cache.insert_permanent(&fqdn, record.record_type.into(), data, ttl, None);
+        cache.insert_permanent(&fqdn, record.record_type.into(), data, ttl);
 
         info!(
             fqdn = %fqdn,
@@ -100,23 +92,5 @@ pub(super) fn preload_local_records_into_cache(
             "✓ Preloaded {} local DNS record(s) into permanent cache",
             count
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_documented_eviction_strategy_is_honoured() {
-        assert_eq!(eviction_strategy("lru"), EvictionStrategy::LRU);
-        assert_eq!(eviction_strategy("lfu"), EvictionStrategy::LFU);
-        assert_eq!(eviction_strategy("lfu-k"), EvictionStrategy::LFUK);
-        assert_eq!(eviction_strategy("hit_rate"), EvictionStrategy::HitRate);
-    }
-
-    #[test]
-    fn unknown_eviction_strategy_falls_back_to_hit_rate() {
-        assert_eq!(eviction_strategy("fifo"), EvictionStrategy::HitRate);
     }
 }

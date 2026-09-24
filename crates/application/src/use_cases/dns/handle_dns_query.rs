@@ -52,7 +52,7 @@ pub struct HandleDnsQueryUseCase {
     dga_guard: DgaGuard,
     dga_event_tx: Option<tokio::sync::mpsc::Sender<DgaAnalysisEvent>>,
     dga_flag_store: Option<Arc<dyn DgaFlagStore>>,
-    cookie_guard: DnsCookieGuard,
+    cookie_guard: Option<DnsCookieGuard>,
     dnssec_enforce: bool,
     dns64_prefix: Option<Ipv6Addr>,
     log_queries: bool,
@@ -81,7 +81,7 @@ impl HandleDnsQueryUseCase {
             dga_guard: DgaGuard::disabled(),
             dga_event_tx: None,
             dga_flag_store: None,
-            cookie_guard: DnsCookieGuard::disabled(),
+            cookie_guard: None,
             dnssec_enforce: false,
             dns64_prefix: None,
             log_queries: true,
@@ -144,11 +144,10 @@ impl HandleDnsQueryUseCase {
     /// local DNS server, or is explicitly listed in `allowlist`.
     pub fn with_rebinding_protection(
         mut self,
-        enabled: bool,
         local_domain: Option<&str>,
         allowlist: &[String],
     ) -> Self {
-        self.rebinding_guard = enabled.then(|| RebindingGuard::new(local_domain, allowlist));
+        self.rebinding_guard = Some(RebindingGuard::new(local_domain, allowlist));
         self
     }
 
@@ -222,14 +221,14 @@ impl HandleDnsQueryUseCase {
 
     /// Enables RFC 7873 DNS Cookie validation on the hot path.
     pub fn with_dns_cookies(mut self, guard: DnsCookieGuard) -> Self {
-        self.cookie_guard = guard;
+        self.cookie_guard = Some(guard);
         self
     }
 
-    /// Exposes the cookie guard so the server handler can generate server
-    /// cookies for inclusion in responses.
-    pub fn cookie_guard(&self) -> &DnsCookieGuard {
-        &self.cookie_guard
+    /// The cookie guard the server handler signs response cookies with;
+    /// `None` when DNS Cookies are disabled.
+    pub fn cookie_guard(&self) -> Option<&DnsCookieGuard> {
+        self.cookie_guard.as_ref()
     }
 
     /// Applies the configured tunneling action, returning an error if blocked.
@@ -434,7 +433,7 @@ impl HandleDnsQueryUseCase {
         protocol: ClientProtocol,
         group_id: i64,
         elapsed_us: u64,
-        dnssec_status: Option<&'static str>,
+        dnssec_status: Option<DnssecStatus>,
     ) -> QueryLog {
         QueryLog {
             id: None,
@@ -469,13 +468,12 @@ impl HandleDnsQueryUseCase {
         record_type: RecordType,
         client_ip: IpAddr,
         protocol: ClientProtocol,
-    ) -> Option<(bytes::Bytes, u32)> {
+    ) -> Option<bytes::Bytes> {
         let tsc_start = tsc_timer::now();
         let (group_id, _) = self.cache_gate(domain, client_ip)?;
 
         let resolution = self.resolver.try_cache_str(domain, record_type)?;
         let wire = resolution.upstream_wire_data?;
-        let ttl = resolution.min_ttl.unwrap_or(0);
 
         if self.log_queries {
             self.log(&Self::cache_hit_log(
@@ -489,7 +487,7 @@ impl HandleDnsQueryUseCase {
             ));
         }
 
-        Some((wire, ttl))
+        Some(wire)
     }
 
     pub fn try_cache_direct(
@@ -579,13 +577,13 @@ impl HandleDnsQueryUseCase {
             }
         }
 
-        if self.cookie_guard.is_strict() {
+        if let Some(guard) = self.cookie_guard.as_ref().filter(|g| g.is_strict()) {
             let opt = request
                 .edns_cookie
                 .as_ref()
                 .map(|c| c.as_bytes())
                 .unwrap_or(&[]);
-            if !self.cookie_guard.has_valid_cookie(request.client_ip, opt) {
+            if !guard.has_valid_cookie(request.client_ip, opt) {
                 tracing::debug!(
                     domain = %request.domain,
                     client = %request.client_ip,
@@ -776,7 +774,7 @@ impl HandleDnsQueryUseCase {
                 // is enforced; Insecure/Indeterminate/errors fail open.
                 if self.dnssec_enforce
                     && !request.checking_disabled
-                    && resolution.dnssec_status == Some(DnssecStatus::Bogus.as_str())
+                    && resolution.dnssec_status == Some(DnssecStatus::Bogus)
                 {
                     self.log(&QueryLog {
                         dnssec_status: resolution.dnssec_status,

@@ -85,7 +85,7 @@ pub use nxdomain_hijack_store::NxdomainHijackIpStore;
 pub use password_hasher::PasswordHasher;
 pub use ptr_record_registry::PtrRecordRegistry;
 pub use query_log_repository::{
-    CacheStats, PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
+    CacheStats, PageAt, PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
 };
 pub use regex_filter_repository::{RegexFilterRepository, RegexFilterUpdate};
 pub use response_ip_filter_eviction_target::ResponseIpFilterEvictionTarget;

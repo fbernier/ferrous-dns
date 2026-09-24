@@ -83,7 +83,10 @@ fn test_config_deserialization_with_all_fields() {
     assert_eq!(config.query_timeout, 5);
     assert_eq!(config.cache_ttl, 7200);
     assert_eq!(config.cache_max_entries, 100000);
-    assert_eq!(config.cache_eviction_strategy, "lfu");
+    assert_eq!(
+        config.cache_eviction_strategy,
+        ferrous_dns_domain::config::CacheEvictionStrategy::Lfu
+    );
     assert!(!config.cache_optimistic_refresh);
     assert_eq!(config.cache_min_hit_rate, 3.0);
     assert_eq!(config.cache_min_frequency, 20);

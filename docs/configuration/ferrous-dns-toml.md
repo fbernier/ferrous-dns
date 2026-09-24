@@ -349,7 +349,7 @@ cache_adaptive_thresholds        = false
 | `cache_min_ttl` | `int` | `300` | Minimum TTL; records with lower TTLs are clamped to this value |
 | `cache_max_ttl` | `int` | `86400` | Maximum TTL; records with higher TTLs are clamped |
 | `cache_max_entries` | `int` | `200000` | Maximum number of entries in the L2 cache |
-| `cache_eviction_strategy` | `str` | `"hit_rate"` | Eviction policy: `"hit_rate"`, `"lfu"`, or `"lru"` |
+| `cache_eviction_strategy` | `str` | `"hit_rate"` | Eviction policy: `"hit_rate"`, `"lfu"`, `"lfu-k"` or `"lru"` (case-insensitive). Any other value fails config load |
 | `cache_compaction_interval` | `int` | `600` | Seconds between compaction runs that remove expired entries |
 | `cache_batch_eviction_percentage` | `float` | `0.1` | Fraction of the cache evicted in one pass when full (0.1 = 10%) |
 | `cache_adaptive_thresholds` | `bool` | `false` | Auto-tune eviction thresholds based on observed hit rates |
@@ -678,10 +678,12 @@ require_valid_cookie = false
 
 | Option | Type | Default | Description |
 |:-------|:-----|:--------|:------------|
-| `enabled` | `bool` | `true` | Enable DNS Cookies on UDP responses |
+| `enabled` | `bool` | `true` | Enable DNS Cookies. When `false` no response carries a COOKIE option |
 | `server_secret` | `str` | `""` (ephemeral) | 64-char hex (32 bytes) secret so cookies survive restarts; generate with `openssl rand -hex 32`. Empty uses an ephemeral secret regenerated on each restart |
 | `secret_rotation_secs` | `int` | `3600` | Seconds between server-secret rotations |
 | `require_valid_cookie` | `bool` | `false` | Strict mode: refuse queries without a valid cookie (REFUSED + EDE 25). Only enable when every client supports RFC 7873 |
+
+A COOKIE option whose length RFC 7873 does not allow (anything but 8 or 16–40 bytes) is answered with `FORMERR`, whatever these settings say.
 
 !!! warning "Do not commit a shared `server_secret`"
     Leave `server_secret` empty (ephemeral) or generate a unique value per deployment. A fixed secret baked into an image means every install shares the same cookie key, defeating the anti-spoofing guarantee.

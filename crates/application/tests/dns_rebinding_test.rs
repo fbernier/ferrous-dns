@@ -17,7 +17,7 @@ fn make_use_case(
         Arc::new(MockBlockFilterEngine::new()),
         Arc::new(MockQueryLogRepository::new()),
     )
-    .with_rebinding_protection(true, local_domain, allowlist)
+    .with_rebinding_protection(local_domain, allowlist)
 }
 
 fn resolution_with_ip(ip: IpAddr) -> DnsResolution {
@@ -294,28 +294,6 @@ async fn test_allowlist_match_is_case_insensitive() {
     let allowlist = vec!["myrouter.corp".to_string()];
     let use_case = make_use_case(resolver, None, &allowlist);
     let result = use_case.execute(&dns_request("MyRouter.Corp")).await;
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_protection_disabled_does_not_block() {
-    let resolver = MockDnsResolver::new();
-    resolver
-        .set_response(
-            "evil.com",
-            resolution_with_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
-        )
-        .await;
-
-    let use_case = HandleDnsQueryUseCase::new(
-        Arc::new(resolver),
-        Arc::new(MockBlockFilterEngine::new()),
-        Arc::new(MockQueryLogRepository::new()),
-    )
-    .with_rebinding_protection(false, None, &[]);
-
-    let result = use_case.execute(&dns_request("evil.com")).await;
 
     assert!(result.is_ok());
 }

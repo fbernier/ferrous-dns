@@ -58,7 +58,7 @@ impl Dns64Resolver {
         };
 
         // Never synthesize from a DNSSEC-Bogus A record.
-        if a_res.dnssec_status == Some(DnssecStatus::Bogus.as_str()) {
+        if a_res.dnssec_status == Some(DnssecStatus::Bogus) {
             return Ok(res);
         }
 

@@ -599,10 +599,7 @@ fn try_cache_wire_direct_returns_wire_bytes_on_cache_hit() {
         ClientProtocol::Udp,
     );
 
-    assert!(result.is_some());
-    let (bytes, ttl) = result.unwrap();
-    assert_eq!(bytes, wire_bytes);
-    assert_eq!(ttl, 300);
+    assert_eq!(result, Some(wire_bytes));
 }
 
 #[test]

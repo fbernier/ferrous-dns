@@ -37,7 +37,7 @@ pub async fn get_dashboard(
         if params.include_timeline {
             Some(
                 q.get_timeline
-                    .execute(period_hours as u32, TimeGranularity::QuarterHour)
+                    .execute(period_hours, TimeGranularity::QuarterHour)
                     .await,
             )
         } else {

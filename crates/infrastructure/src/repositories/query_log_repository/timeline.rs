@@ -24,11 +24,11 @@ fn format_bucket(unix_secs: i64) -> String {
 #[instrument(skip(pool))]
 pub(super) async fn get_timeline(
     pool: &SqlitePool,
-    period_hours: u32,
+    period_hours: f32,
     granularity: TimeGranularity,
 ) -> Result<Vec<TimelineBucket>, DomainError> {
     let width = bucket_width_secs(granularity);
-    let since = window_start_bucket(period_hours as f32);
+    let since = window_start_bucket(period_hours);
 
     let rows = sqlx::query(
         "SELECT bucket - (bucket % ?) AS time_bucket,

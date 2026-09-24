@@ -1,4 +1,4 @@
-use ferrous_dns_application::ports::{QueryLogRepository, TimeGranularity};
+use ferrous_dns_application::ports::{PageAt, QueryLogRepository, TimeGranularity};
 use ferrous_dns_domain::config::DatabaseConfig;
 use ferrous_dns_domain::{
     ClientProtocol, QueryCategory, QueryLog, QueryLogFilter, QuerySource, RecordType,
@@ -145,7 +145,7 @@ async fn insert_client(pool: &SqlitePool, ip: &str, hostname: &str) {
 
 async fn page(pool: &SqlitePool, limit: u32, filter: &QueryLogFilter) -> Vec<QueryLog> {
     repo(pool)
-        .get_recent_paged(limit, 0, 24.0, None, filter)
+        .get_recent_paged(limit, PageAt::Offset(0), 24.0, filter)
         .await
         .unwrap()
         .queries
@@ -369,7 +369,7 @@ async fn test_get_timeline_returns_buckets() {
     insert_log(&pool, true, false, None, "internal", None).await;
 
     let buckets = repo(&pool)
-        .get_timeline(24, TimeGranularity::Hour)
+        .get_timeline(24.0, TimeGranularity::Hour)
         .await
         .unwrap();
 
@@ -389,7 +389,7 @@ async fn test_timeline_and_stats_agree_on_malware() {
 
     let repo = repo(&pool);
     let stats = repo.get_stats(24.0).await.unwrap();
-    let timeline = repo.get_timeline(24, TimeGranularity::Day).await.unwrap();
+    let timeline = repo.get_timeline(24.0, TimeGranularity::Day).await.unwrap();
 
     assert_eq!(stats.queries_malware_detected, 2);
     assert_eq!(
@@ -575,7 +575,7 @@ async fn test_category_filter_all_returns_everything() {
     seed_mixed_queries(&pool).await;
 
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &no_filter())
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &no_filter())
         .await
         .unwrap();
     assert_eq!(result.records_filtered, 10);
@@ -589,7 +589,12 @@ async fn test_category_filter_allowed() {
     seed_mixed_queries(&pool).await;
 
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &category_filter(QueryCategory::Allowed))
+        .get_recent_paged(
+            100,
+            PageAt::Offset(0),
+            24.0,
+            &category_filter(QueryCategory::Allowed),
+        )
         .await
         .unwrap();
     // allowed = not blocked: google, github, cached, cached2, rate, local = 6
@@ -604,7 +609,12 @@ async fn test_category_filter_blocked() {
     seed_mixed_queries(&pool).await;
 
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &category_filter(QueryCategory::Blocked))
+        .get_recent_paged(
+            100,
+            PageAt::Offset(0),
+            24.0,
+            &category_filter(QueryCategory::Blocked),
+        )
         .await
         .unwrap();
     // blocked: ads, tracker, tunnel, dga = 4
@@ -619,7 +629,12 @@ async fn test_category_filter_cache() {
     seed_mixed_queries(&pool).await;
 
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &category_filter(QueryCategory::Cache))
+        .get_recent_paged(
+            100,
+            PageAt::Offset(0),
+            24.0,
+            &category_filter(QueryCategory::Cache),
+        )
         .await
         .unwrap();
     assert_eq!(result.records_filtered, 2);
@@ -635,9 +650,8 @@ async fn test_category_filter_upstream() {
     let result = repo(&pool)
         .get_recent_paged(
             100,
-            0,
+            PageAt::Offset(0),
             24.0,
-            None,
             &category_filter(QueryCategory::Upstream),
         )
         .await
@@ -656,9 +670,8 @@ async fn test_category_filter_rate_limited() {
     let result = repo(&pool)
         .get_recent_paged(
             100,
-            0,
+            PageAt::Offset(0),
             24.0,
-            None,
             &category_filter(QueryCategory::RateLimited),
         )
         .await
@@ -673,7 +686,12 @@ async fn test_category_filter_malware() {
     seed_mixed_queries(&pool).await;
 
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &category_filter(QueryCategory::Malware))
+        .get_recent_paged(
+            100,
+            PageAt::Offset(0),
+            24.0,
+            &category_filter(QueryCategory::Malware),
+        )
         .await
         .unwrap();
     // malware: tunnel + dga = 2
@@ -692,7 +710,7 @@ async fn test_category_filter_combined_with_domain_search() {
         ..Default::default()
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
     // blocked + "example": ads.example.com, tracker.example.com, tunnel.example.com = 3
@@ -710,7 +728,7 @@ async fn test_category_filter_respects_pagination() {
     let blocked_filter = category_filter(QueryCategory::Blocked);
 
     let page1 = repo
-        .get_recent_paged(2, 0, 24.0, None, &blocked_filter)
+        .get_recent_paged(2, PageAt::Offset(0), 24.0, &blocked_filter)
         .await
         .unwrap();
     assert_eq!(page1.records_filtered, 4);
@@ -718,7 +736,7 @@ async fn test_category_filter_respects_pagination() {
     assert!(page1.queries.iter().all(|q| q.blocked));
 
     let page2 = repo
-        .get_recent_paged(2, 2, 24.0, None, &blocked_filter)
+        .get_recent_paged(2, PageAt::Offset(2), 24.0, &blocked_filter)
         .await
         .unwrap();
     assert_eq!(page2.records_filtered, 4);
@@ -761,7 +779,7 @@ async fn test_offset_then_cursor_pages_cover_same_second_rows_once() {
 
     let repo = repo(&pool);
     let first = repo
-        .get_recent_paged(2, 0, 24.0, None, &no_filter())
+        .get_recent_paged(2, PageAt::Offset(0), 24.0, &no_filter())
         .await
         .unwrap();
     let mut seen: Vec<&str> = first.queries.iter().map(|q| q.domain.as_ref()).collect();
@@ -771,7 +789,7 @@ async fn test_offset_then_cursor_pages_cover_same_second_rows_once() {
     let mut rest = Vec::new();
     while let Some(c) = cursor {
         let page = repo
-            .get_recent_paged(2, 0, 24.0, Some(c), &no_filter())
+            .get_recent_paged(2, PageAt::Cursor(c), 24.0, &no_filter())
             .await
             .unwrap();
         cursor = page.next_cursor;
@@ -805,7 +823,7 @@ async fn test_client_ip_filter() {
         ..Default::default()
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -842,7 +860,7 @@ async fn test_client_filter_partial_ip() {
         ..Default::default()
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -877,7 +895,7 @@ async fn test_client_filter_hostname() {
         ..Default::default()
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -959,7 +977,7 @@ async fn test_record_type_filter() {
         ..Default::default()
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -1000,7 +1018,7 @@ async fn test_dns64_synthesized_filter() {
 
     // dns64=Some(true): only the synthesized row, and the flag round-trips from SQLite.
     let only_synth = repo
-        .get_recent_paged(100, 0, 24.0, None, &with_dns64(Some(true)))
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &with_dns64(Some(true)))
         .await
         .unwrap();
     assert_eq!(only_synth.records_filtered, 1);
@@ -1009,14 +1027,14 @@ async fn test_dns64_synthesized_filter() {
     assert!(only_synth.queries[0].dns64_synthesized);
 
     let non_synth = repo
-        .get_recent_paged(100, 0, 24.0, None, &with_dns64(Some(false)))
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &with_dns64(Some(false)))
         .await
         .unwrap();
     assert_eq!(non_synth.records_filtered, 2);
     assert!(non_synth.queries.iter().all(|q| !q.dns64_synthesized));
 
     let all = repo
-        .get_recent_paged(100, 0, 24.0, None, &with_dns64(None))
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &with_dns64(None))
         .await
         .unwrap();
     assert_eq!(all.records_filtered, 3);
@@ -1046,7 +1064,7 @@ async fn test_upstream_filter() {
         ..Default::default()
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -1060,7 +1078,12 @@ async fn test_records_total_vs_filtered() {
     seed_mixed_queries(&pool).await;
 
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &category_filter(QueryCategory::Blocked))
+        .get_recent_paged(
+            100,
+            PageAt::Offset(0),
+            24.0,
+            &category_filter(QueryCategory::Blocked),
+        )
         .await
         .unwrap();
 
@@ -1095,7 +1118,7 @@ async fn test_combined_client_and_category() {
         ..Default::default()
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -1157,7 +1180,7 @@ async fn test_combined_all_filters() {
         protocol: None,
     };
     let result = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -1202,7 +1225,7 @@ async fn test_cursor_pagination_with_client_filter() {
     };
 
     let page1 = repo
-        .get_recent_paged(3, 0, 24.0, Some(i64::MAX), &filter)
+        .get_recent_paged(3, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
     assert_eq!(page1.queries.len(), 3);
@@ -1210,7 +1233,7 @@ async fn test_cursor_pagination_with_client_filter() {
     assert!(page1.next_cursor.is_some());
 
     let page2 = repo
-        .get_recent_paged(3, 0, 24.0, page1.next_cursor, &filter)
+        .get_recent_paged(3, PageAt::Cursor(page1.next_cursor.unwrap()), 24.0, &filter)
         .await
         .unwrap();
     assert_eq!(page2.queries.len(), 2);
@@ -1359,7 +1382,7 @@ async fn test_protocol_filter_keeps_only_matching_rows() {
         ..Default::default()
     };
     let page = repo(&pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap();
 
@@ -1452,4 +1475,88 @@ async fn test_delete_older_than_beyond_calendar_range_keeps_everything() {
         .await
         .unwrap();
     assert_eq!(rows, 1);
+}
+
+/// `created_at` of a row `minutes` before now, in the column's format.
+fn minutes_ago(minutes: i64) -> String {
+    (chrono::Utc::now() - chrono::TimeDelta::minutes(minutes))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+/// A backwards clock step gives a newer row (higher id) an older timestamp.
+/// Pages follow the first page's `(created_at, id)` order, so paging from a
+/// cursor visits every row exactly once, in the same order offsets would.
+#[tokio::test]
+async fn cursor_pages_do_not_skip_rows_written_after_a_clock_step() {
+    let pool = migrated_pool().await;
+    let (now, earlier) = (minutes_ago(1), minutes_ago(5));
+    for (domain, created_at) in [("a.com", &now), ("b.com", &now), ("stepped.com", &earlier)] {
+        insert(
+            &pool,
+            Row {
+                domain,
+                created_at: Some(created_at),
+                ..Row::default()
+            },
+        )
+        .await;
+    }
+    let repo = repo(&pool);
+
+    let by_offset = repo
+        .get_recent_paged(10, PageAt::Offset(0), 24.0, &no_filter())
+        .await
+        .unwrap();
+    let expected: Vec<_> = by_offset.queries.iter().map(|q| q.domain.clone()).collect();
+    assert_eq!(expected.len(), 3);
+
+    let mut page = repo
+        .get_recent_paged(1, PageAt::Offset(0), 24.0, &no_filter())
+        .await
+        .unwrap();
+    let mut seen: Vec<_> = page.queries.iter().map(|q| q.domain.clone()).collect();
+    while let Some(cursor) = page.next_cursor {
+        page = repo
+            .get_recent_paged(1, PageAt::Cursor(cursor), 24.0, &no_filter())
+            .await
+            .unwrap();
+        seen.extend(page.queries.iter().map(|q| q.domain.clone()));
+    }
+    assert_eq!(seen, expected);
+}
+
+/// A window shorter than an hour is not rounded down to nothing.
+#[tokio::test]
+async fn timeline_honours_a_sub_hour_period() {
+    let pool = migrated_pool().await;
+    insert_log(&pool, false, false, None, "client", Some(&minutes_ago(10))).await;
+    insert_log(&pool, false, false, None, "client", Some(&minutes_ago(50))).await;
+
+    let buckets = repo(&pool)
+        .get_timeline(0.5, TimeGranularity::Minute)
+        .await
+        .unwrap();
+    assert_eq!(buckets.iter().map(|b| b.total).sum::<u64>(), 1);
+}
+
+#[tokio::test]
+async fn timeline_with_an_unbounded_period_covers_all_history() {
+    let pool = migrated_pool().await;
+    insert_log(&pool, false, false, None, "client", None).await;
+    insert_log(
+        &pool,
+        false,
+        false,
+        None,
+        "client",
+        Some("2000-01-01 00:00:00"),
+    )
+    .await;
+
+    let buckets = repo(&pool)
+        .get_timeline(f32::MAX, TimeGranularity::Day)
+        .await
+        .unwrap();
+    assert_eq!(buckets.iter().map(|b| b.total).sum::<u64>(), 2);
 }

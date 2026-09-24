@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod blocking;
+pub mod cache_eviction;
 pub mod database;
 pub mod dga_detection;
 pub mod dns;
@@ -21,6 +22,7 @@ pub mod web_tls;
 
 pub use auth::{AdminConfig, AuthConfig, WebauthnConfig};
 pub use blocking::{BlockResponseMode, BlockingConfig, DEFAULT_BLOCK_TTL};
+pub use cache_eviction::CacheEvictionStrategy;
 pub use database::DatabaseConfig;
 pub use dga_detection::{DgaDetectionAction, DgaDetectionConfig};
 pub use dns::DnsConfig;

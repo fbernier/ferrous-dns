@@ -14,7 +14,6 @@ pub struct CacheMetrics {
     pub lazy_deletions: AtomicU64,
     pub compactions: AtomicU64,
     pub batch_evictions: AtomicU64,
-    pub adaptive_adjustments: AtomicU64,
 
     /// Upstream failures deliberately not cached as NXDOMAIN (timeouts,
     /// refused/reset connections, no healthy servers, invalid responses).

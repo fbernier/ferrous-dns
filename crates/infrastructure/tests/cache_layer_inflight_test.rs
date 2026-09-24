@@ -38,10 +38,8 @@ fn make_cache() -> Arc<dyn DnsCacheAccess> {
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries: 1000,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 2.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,

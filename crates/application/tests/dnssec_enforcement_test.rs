@@ -6,7 +6,7 @@
 
 use ferrous_dns_application::ports::DnsResolution;
 use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
-use ferrous_dns_domain::{DnsRequest, DomainError, RecordType};
+use ferrous_dns_domain::{DnsRequest, DnssecStatus, DomainError, RecordType};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ fn use_case(resolver: MockDnsResolver, enforce: bool) -> HandleDnsQueryUseCase {
     .with_dnssec_enforcement(enforce)
 }
 
-async fn resolver_returning(status: Option<&'static str>) -> MockDnsResolver {
+async fn resolver_returning(status: Option<DnssecStatus>) -> MockDnsResolver {
     let mut resolution = DnsResolution::new(vec![PUBLIC_IP], false);
     resolution.dnssec_status = status;
     let resolver = MockDnsResolver::new();
@@ -39,7 +39,7 @@ fn request(cd: bool) -> DnsRequest {
 
 #[tokio::test]
 async fn strict_mode_servfails_on_bogus() {
-    let uc = use_case(resolver_returning(Some("Bogus")).await, true);
+    let uc = use_case(resolver_returning(Some(DnssecStatus::Bogus)).await, true);
     let res = uc.execute(&request(false)).await;
     assert!(
         matches!(res, Err(DomainError::DnssecBogus)),
@@ -49,14 +49,14 @@ async fn strict_mode_servfails_on_bogus() {
 
 #[tokio::test]
 async fn strict_mode_honors_cd_bit() {
-    let uc = use_case(resolver_returning(Some("Bogus")).await, true);
+    let uc = use_case(resolver_returning(Some(DnssecStatus::Bogus)).await, true);
     let res = uc.execute(&request(true)).await;
     assert!(res.is_ok(), "CD=1 must bypass enforcement, got {res:?}");
 }
 
 #[tokio::test]
 async fn permissive_mode_serves_bogus() {
-    let uc = use_case(resolver_returning(Some("Bogus")).await, false);
+    let uc = use_case(resolver_returning(Some(DnssecStatus::Bogus)).await, false);
     let res = uc.execute(&request(false)).await;
     assert!(res.is_ok(), "Permissive must serve Bogus, got {res:?}");
 }
@@ -64,7 +64,7 @@ async fn permissive_mode_serves_bogus() {
 #[tokio::test]
 async fn strict_mode_fails_open_on_insecure() {
     // A validation error/timeout degrades to Insecure (fail-open): served, not SERVFAIL.
-    let uc = use_case(resolver_returning(Some("Insecure")).await, true);
+    let uc = use_case(resolver_returning(Some(DnssecStatus::Insecure)).await, true);
     assert!(uc.execute(&request(false)).await.is_ok());
 }
 
@@ -76,6 +76,6 @@ async fn strict_mode_fails_open_on_unknown() {
 
 #[tokio::test]
 async fn strict_mode_serves_secure() {
-    let uc = use_case(resolver_returning(Some("Secure")).await, true);
+    let uc = use_case(resolver_returning(Some(DnssecStatus::Secure)).await, true);
     assert!(uc.execute(&request(false)).await.is_ok());
 }

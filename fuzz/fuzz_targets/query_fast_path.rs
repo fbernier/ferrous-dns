@@ -106,10 +106,12 @@ fuzz_target!(|packet: &[u8]| {
         );
     }
 
-    // The slow path hands queries whose options the walk rejects to hickory.
-    let Ok(cookie) = query.edns_cookie(packet) else {
-        return;
-    };
+    // A parsed query's options are well formed and its COOKIE has an allowed length.
+    let cookie = query.edns_cookie(packet);
+    assert!(
+        cookie.is_none_or(|c| matches!(c.len(), 8 | 16..=40)),
+        "the wire parser admitted a COOKIE RFC 7873 rejects"
+    );
     let question = query.question(packet);
     let head = ResponseHead {
         id: query.id,

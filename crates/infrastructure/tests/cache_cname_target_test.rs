@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
-use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
+use ferrous_dns_domain::{DnsQuery, DnssecStatus, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::{
     CachedAddresses, CachedData, DnsCache, DnsCacheConfig, EvictionStrategy,
@@ -23,7 +23,7 @@ struct CnameChainResolver {
     call_count: Arc<AtomicUsize>,
     addresses: Vec<IpAddr>,
     cname_chain: Vec<Arc<str>>,
-    dnssec_status: Option<&'static str>,
+    dnssec_status: Option<DnssecStatus>,
 }
 
 impl CnameChainResolver {
@@ -47,7 +47,7 @@ impl CnameChainResolver {
         }
     }
 
-    fn with_dnssec(mut self, status: &'static str) -> Self {
+    fn with_dnssec(mut self, status: DnssecStatus) -> Self {
         self.dnssec_status = Some(status);
         self
     }
@@ -81,10 +81,8 @@ fn make_cache() -> Arc<DnsCache> {
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries: 1000,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 2.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -172,7 +170,8 @@ async fn should_not_cache_target_when_chain_is_empty() {
 #[tokio::test]
 async fn should_inherit_dnssec_status_from_qname_entry() {
     let mock = Arc::new(
-        CnameChainResolver::new("9.9.9.9", &["secure-target.example"]).with_dnssec("Secure"),
+        CnameChainResolver::new("9.9.9.9", &["secure-target.example"])
+            .with_dnssec(DnssecStatus::Secure),
     );
     let cache = make_cache();
     let resolver = CachedResolver::new(
@@ -221,7 +220,6 @@ async fn should_not_overwrite_a_local_record_with_a_cname_target() {
             addresses: Arc::new(vec![local]),
         }),
         300,
-        None,
     );
     let mock = Arc::new(CnameChainResolver::new("203.0.113.66", &["nas.home.lan"]));
     let resolver = CachedResolver::new(mock as Arc<dyn DnsResolver>, cache.clone(), 300, 4);

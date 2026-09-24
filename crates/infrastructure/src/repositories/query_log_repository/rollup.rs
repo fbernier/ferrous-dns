@@ -2,7 +2,7 @@
 //! reference definitions live in the `*_query_log_rollups` migrations.
 
 use super::writer::QueryLogEntry;
-use ferrous_dns_domain::{BlockSource, QuerySource, RecordType};
+use ferrous_dns_domain::{BlockSource, DnssecStatus, QuerySource, RecordType};
 use sqlx::query::Query;
 use sqlx::sqlite::{Sqlite, SqliteArguments, SqliteConnection};
 use sqlx::SqlitePool;
@@ -106,11 +106,10 @@ impl MinuteCounters {
         if let Some(status) = e.dnssec_status {
             self.dnssec_validated += 1;
             match status {
-                "Secure" => self.dnssec_secure += 1,
-                "Insecure" => self.dnssec_insecure += 1,
-                "Bogus" => self.dnssec_bogus += 1,
-                "Indeterminate" => self.dnssec_indeterminate += 1,
-                _ => {}
+                DnssecStatus::Secure => self.dnssec_secure += 1,
+                DnssecStatus::Insecure => self.dnssec_insecure += 1,
+                DnssecStatus::Bogus => self.dnssec_bogus += 1,
+                DnssecStatus::Indeterminate => self.dnssec_indeterminate += 1,
             }
         }
         if let Some(us) = e.response_time_us {

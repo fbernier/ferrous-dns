@@ -8,6 +8,7 @@ pub struct QueryParams {
     pub limit: u32,
     #[serde(default)]
     pub offset: u32,
+    /// `next_cursor` of the previous page; takes precedence over `offset`.
     pub cursor: Option<i64>,
     #[serde(default = "crate::utils::default_period")]
     pub period: String,

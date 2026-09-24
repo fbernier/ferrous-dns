@@ -95,7 +95,7 @@ impl DnsResolver for DnssecResolver {
                     "DNSSEC validation complete"
                 );
 
-                resolution.dnssec_status = Some(status.as_str());
+                resolution.dnssec_status = Some(status);
                 Ok(resolution)
             }
             Err(e) => {
@@ -107,7 +107,7 @@ impl DnsResolver for DnssecResolver {
 
                 // A validation error fails open (Insecure, served, AD=0), never
                 // SERVFAIL.
-                resolution.dnssec_status = Some(DnssecStatus::Insecure.as_str());
+                resolution.dnssec_status = Some(DnssecStatus::Insecure);
                 Ok(resolution)
             }
         }

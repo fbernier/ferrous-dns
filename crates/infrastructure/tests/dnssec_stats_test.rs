@@ -1,9 +1,9 @@
 //! Tests for DNSSEC aggregation (`get_dnssec_stats`) and the `dnssec_status`
 //! filter on the paginated query log reader.
 
-use ferrous_dns_application::ports::QueryLogRepository;
+use ferrous_dns_application::ports::{PageAt, QueryLogRepository};
 use ferrous_dns_domain::config::DatabaseConfig;
-use ferrous_dns_domain::QueryLogFilter;
+use ferrous_dns_domain::{DnssecStatus, DnssecStatusFilter, QueryLogFilter};
 use ferrous_dns_infrastructure::repositories::query_log_repository::SqliteQueryLogRepository;
 
 #[path = "support/db.rs"]
@@ -87,13 +87,13 @@ async fn dnssec_stats_empty_is_all_zero() {
     assert_eq!(stats.secure, 0);
 }
 
-async fn count_with_filter(pool: &sqlx::SqlitePool, status: Option<&str>) -> u64 {
+async fn count_with_filter(pool: &sqlx::SqlitePool, status: Option<DnssecStatusFilter>) -> u64 {
     let filter = QueryLogFilter {
-        dnssec_status: status.map(String::from),
+        dnssec_status: status,
         ..Default::default()
     };
     repo(pool)
-        .get_recent_paged(100, 0, 24.0, None, &filter)
+        .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
         .await
         .unwrap()
         .records_filtered
@@ -104,15 +104,25 @@ async fn dnssec_status_filter_any_matches_validated_rows() {
     let pool = migrated_pool().await;
     seed(&pool).await;
     // "any" → every client row with a non-null status.
-    assert_eq!(count_with_filter(&pool, Some("any")).await, 7);
+    assert_eq!(
+        count_with_filter(&pool, Some(DnssecStatusFilter::Any)).await,
+        7
+    );
 }
 
 #[tokio::test]
 async fn dnssec_status_filter_exact_matches_one_status() {
     let pool = migrated_pool().await;
     seed(&pool).await;
-    assert_eq!(count_with_filter(&pool, Some("Secure")).await, 3);
-    assert_eq!(count_with_filter(&pool, Some("Bogus")).await, 1);
+    let exact = |status| Some(DnssecStatusFilter::Is(status));
+    assert_eq!(
+        count_with_filter(&pool, exact(DnssecStatus::Secure)).await,
+        3
+    );
+    assert_eq!(
+        count_with_filter(&pool, exact(DnssecStatus::Bogus)).await,
+        1
+    );
     // No filter → all client rows (validated or not).
     assert_eq!(count_with_filter(&pool, None).await, 9);
 }

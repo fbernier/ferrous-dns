@@ -2,9 +2,9 @@ use super::helpers::{row_to_query_log, window_start_bucket};
 use super::rollup;
 use crate::repositories::{db_err, hours_ago_cutoff, seconds_ago_cutoff, sql_ts};
 use chrono::{TimeDelta, Utc};
-use ferrous_dns_application::ports::PagedQueryResult;
+use ferrous_dns_application::ports::{PageAt, PagedQueryResult};
 use ferrous_dns_domain::entities::query_log::{
-    ClientProtocol, DnssecStats, QueryCategory, QueryLogFilter,
+    ClientProtocol, DnssecStats, DnssecStatusFilter, QueryCategory, QueryLogFilter,
 };
 use ferrous_dns_domain::{DomainError, QueryLog, QueryStats};
 use sqlx::{Row, SqlitePool};
@@ -75,16 +75,14 @@ pub(super) async fn get_recent(
 pub(super) async fn get_recent_paged(
     pool: &SqlitePool,
     limit: u32,
-    offset: u32,
+    page: PageAt,
     period_hours: f32,
-    cursor: Option<i64>,
     filter: &QueryLogFilter,
 ) -> Result<PagedQueryResult, DomainError> {
     debug!(
         limit,
-        offset,
+        ?page,
         period_hours,
-        cursor,
         ?filter,
         "Fetching paginated queries"
     );
@@ -132,10 +130,9 @@ pub(super) async fn get_recent_paged(
     } else {
         ""
     };
-    // `"any"` is the sentinel for "any validated row".
-    let dnssec_clause = match filter.dnssec_status.as_deref() {
-        Some("any") => " AND q.dnssec_status IS NOT NULL",
-        Some(_) => " AND q.dnssec_status = ?",
+    let dnssec_clause = match filter.dnssec_status {
+        Some(DnssecStatusFilter::Any) => " AND q.dnssec_status IS NOT NULL",
+        Some(DnssecStatusFilter::Is(_)) => " AND q.dnssec_status = ?",
         None => "",
     };
     let dns64_clause = match filter.dns64_synthesized {
@@ -179,10 +176,8 @@ pub(super) async fn get_recent_paged(
             if let Some(ref up) = filter.upstream {
                 q = q.bind(up);
             }
-            if let Some(ref status) = filter.dnssec_status {
-                if status != "any" {
-                    q = q.bind(status.as_str());
-                }
+            if let Some(DnssecStatusFilter::Is(status)) = filter.dnssec_status {
+                q = q.bind(status.as_str());
             }
             q
         }};
@@ -190,37 +185,43 @@ pub(super) async fn get_recent_paged(
 
     let (rows_result, filtered_count_result, total_count_result) = tokio::join!(
         async {
-            if let Some(cursor_id) = cursor {
-                let sql = format!(
-                    select_query_log!(
-                        " WHERE q.id < ?
-                            AND q.query_source = 'client'
-                            AND q.created_at >= ?{filters}
-                          ORDER BY q.id DESC
-                          LIMIT ?"
-                    ),
-                    filters = filters
-                );
-                let q = sqlx::query(&sql).bind(cursor_id).bind(&cutoff);
-                bind_filters!(q).bind(fetch_limit).fetch_all(pool).await
-            } else {
-                // `id` breaks `created_at` ties (a flush stamps its whole batch alike) the way
-                // the cursor pages order, so a follow-up cursor page neither repeats nor skips rows.
-                let sql = format!(
-                    select_query_log!(
-                        " WHERE q.created_at >= ?
-                            AND q.query_source = 'client'{filters}
-                          ORDER BY q.created_at DESC, q.id DESC
-                          LIMIT ? OFFSET ?"
-                    ),
-                    filters = filters
-                );
-                let q = sqlx::query(&sql).bind(&cutoff);
-                bind_filters!(q)
-                    .bind(fetch_limit)
-                    .bind(offset as i64)
-                    .fetch_all(pool)
-                    .await
+            // Every page orders by `(created_at, id)`: `id` breaks the ties of a
+            // flush, which stamps its whole batch alike. A cursor page continues
+            // after the cursor row's key, not its id alone, since a backwards
+            // clock step gives newer rows (higher ids) older timestamps.
+            match page {
+                PageAt::Cursor(cursor_id) => {
+                    let sql = format!(
+                        select_query_log!(
+                            " WHERE (q.created_at, q.id) <
+                                    (SELECT c.created_at, c.id FROM query_log c WHERE c.id = ?)
+                                AND q.query_source = 'client'
+                                AND q.created_at >= ?{filters}
+                              ORDER BY q.created_at DESC, q.id DESC
+                              LIMIT ?"
+                        ),
+                        filters = filters
+                    );
+                    let q = sqlx::query(&sql).bind(cursor_id).bind(&cutoff);
+                    bind_filters!(q).bind(fetch_limit).fetch_all(pool).await
+                }
+                PageAt::Offset(offset) => {
+                    let sql = format!(
+                        select_query_log!(
+                            " WHERE q.created_at >= ?
+                                AND q.query_source = 'client'{filters}
+                              ORDER BY q.created_at DESC, q.id DESC
+                              LIMIT ? OFFSET ?"
+                        ),
+                        filters = filters
+                    );
+                    let q = sqlx::query(&sql).bind(&cutoff);
+                    bind_filters!(q)
+                        .bind(fetch_limit)
+                        .bind(i64::from(offset))
+                        .fetch_all(pool)
+                        .await
+                }
             }
         },
         async {
@@ -652,8 +653,8 @@ mod tests {
 
     #[test]
     fn sql_malware_lists_match_block_source_classification() {
-        let expected: BTreeSet<&str> = (0..=u8::MAX)
-            .filter_map(BlockSource::from_u8)
+        let expected: BTreeSet<&str> = BlockSource::ALL
+            .into_iter()
             .filter(|s| s.is_malware())
             .map(|s| s.to_str())
             .collect();

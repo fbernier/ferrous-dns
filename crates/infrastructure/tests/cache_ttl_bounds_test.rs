@@ -9,10 +9,8 @@ fn make_cache() -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.0,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -92,7 +90,6 @@ fn test_permanent_records_ignore_bounds() {
         RecordType::A,
         make_ip_data("1.2.3.4"),
         configured_ttl,
-        None,
     );
     let ttl = cache.get_ttl("example.com", &RecordType::A);
     assert_eq!(

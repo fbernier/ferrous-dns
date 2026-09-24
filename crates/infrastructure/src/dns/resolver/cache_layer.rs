@@ -19,7 +19,7 @@ struct InflightResult {
     addresses: Arc<Vec<IpAddr>>,
     local_dns: bool,
     cname_chain: Arc<[Arc<str>]>,
-    dnssec_status: Option<&'static str>,
+    dnssec_status: Option<DnssecStatus>,
     min_ttl: Option<u32>,
     upstream_wire_data: Option<Bytes>,
 }
@@ -130,7 +130,7 @@ impl CachedResolver {
             addresses,
             cache_hit: true,
             local_dns: local_status != LocalRecordStatus::NotLocal,
-            dnssec_status: dnssec_status.map(|s| s.as_str()),
+            dnssec_status: dnssec_status.and_then(CachedDnssecStatus::to_domain),
             cname_chain,
             upstream_server: None,
             upstream_pool: None,
@@ -158,13 +158,12 @@ impl CachedResolver {
         // Never cache a Bogus result. Under Strict enforcement it must SERVFAIL
         // on every query, so the fast cache path must not be able to serve it;
         // under Permissive, re-validating a broken domain each time is fine.
-        if resolution.dnssec_status == Some(DnssecStatus::Bogus.as_str()) {
+        if resolution.dnssec_status == Some(DnssecStatus::Bogus) {
             return;
         }
         let dnssec_status = resolution
             .dnssec_status
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(CachedDnssecStatus::Insecure);
+            .map_or(CachedDnssecStatus::Unknown, CachedDnssecStatus::from);
 
         if resolution.addresses.is_empty() {
             match &resolution.upstream_wire_data {

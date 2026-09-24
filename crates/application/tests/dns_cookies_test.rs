@@ -3,7 +3,7 @@ mod helpers;
 use ferrous_dns_application::ports::DnsResolution;
 use ferrous_dns_application::use_cases::dns::DnsCookieGuard;
 use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
-use ferrous_dns_domain::{DnsCookiesConfig, DnsRequest, DomainError, RecordType};
+use ferrous_dns_domain::{DnsCookiesConfig, DnsRequest, DomainError, EdnsCookie, RecordType};
 use helpers::{MockBlockFilterEngine, MockDnsResolver, MockQueryLogRepository};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -45,6 +45,10 @@ fn make_use_case(
     (use_case, log)
 }
 
+fn cookie(data: &[u8]) -> EdnsCookie {
+    EdnsCookie::from_bytes(data).expect("a valid COOKIE length")
+}
+
 fn valid_cookie_for(client_ip: IpAddr) -> Vec<u8> {
     let config = cookies_config(true);
     let guard = DnsCookieGuard::from_config(&config, SECRET);
@@ -54,18 +58,6 @@ fn valid_cookie_for(client_ip: IpAddr) -> Vec<u8> {
     data.extend_from_slice(&client_cookie);
     data.extend_from_slice(&server_cookie);
     data
-}
-
-#[tokio::test]
-async fn should_pass_through_when_disabled() {
-    let resolver = resolver_ok().await;
-    let guard = DnsCookieGuard::disabled();
-    let (use_case, _log) = make_use_case(resolver, guard);
-
-    // Even a completely absent cookie is fine when the guard is disabled.
-    let request = DnsRequest::new("example.com", RecordType::A, CLIENT_IP);
-    let result = use_case.execute(&request).await;
-    assert!(result.is_ok());
 }
 
 #[tokio::test]
@@ -93,7 +85,7 @@ async fn should_allow_query_with_only_client_cookie_when_require_valid_cookie_fa
 
     // Only client cookie present (bootstrapping handshake).
     let request =
-        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(&[0xBBu8; 8]);
+        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(cookie(&[0xBBu8; 8]));
     let result = use_case.execute(&request).await;
     assert!(
         result.is_ok(),
@@ -109,7 +101,7 @@ async fn should_allow_query_with_valid_server_cookie() {
     let (use_case, _log) = make_use_case(resolver, guard);
 
     let request = DnsRequest::new("example.com", RecordType::A, CLIENT_IP)
-        .with_cookie(&valid_cookie_for(CLIENT_IP));
+        .with_cookie(cookie(&valid_cookie_for(CLIENT_IP)));
     let result = use_case.execute(&request).await;
     assert!(result.is_ok(), "valid cookie must be accepted");
 }
@@ -126,7 +118,8 @@ async fn should_reject_query_with_invalid_server_cookie() {
     bad_cookie[..8].copy_from_slice(&[0xAAu8; 8]); // client cookie
     bad_cookie[8..].copy_from_slice(&[0xFFu8; 8]); // wrong server cookie
 
-    let request = DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(&bad_cookie);
+    let request =
+        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(cookie(&bad_cookie));
     let result = use_case.execute(&request).await;
     assert!(
         matches!(result, Err(DomainError::DnsCookieInvalid)),
@@ -160,7 +153,7 @@ async fn should_reject_query_with_only_client_cookie_when_require_valid_cookie_t
     // Only the 8-byte client cookie — bootstrapping handshake is not enough in strict mode
     // (RFC 7873 §5.2.3: the client must supply a valid server cookie).
     let request =
-        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(&[0xBBu8; 8]);
+        DnsRequest::new("example.com", RecordType::A, CLIENT_IP).with_cookie(cookie(&[0xBBu8; 8]));
     let result = use_case.execute(&request).await;
     assert!(
         matches!(result, Err(DomainError::DnsCookieInvalid)),

@@ -1,11 +1,9 @@
 use super::coarse_clock::coarse_now_secs;
-use super::data::CachedDnssecStatus;
 use super::record::CachedRecord;
 use super::storage::DnsCache;
 use ferrous_dns_application::ports::{
     CacheEntryOrder, CacheEntryPage, CacheEntryQuery, CacheEntrySnapshot, CacheEntrySort,
 };
-use ferrous_dns_domain::DnssecStatus;
 use std::cmp::Ordering;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
@@ -88,7 +86,7 @@ fn snapshot_from(domain: &str, record: &CachedRecord, now_secs: u64) -> CacheEnt
             .map(|addresses| addresses.as_ref().clone())
             .unwrap_or_default(),
         canonical_name: record.data.as_canonical_name().map(|name| name.to_string()),
-        dnssec_status: map_dnssec_status(record.dnssec_status),
+        dnssec_status: record.dnssec_status.to_domain(),
         ttl: record.ttl,
         remaining_ttl,
         cached_at_secs: record.inserted_at_secs,
@@ -97,18 +95,6 @@ fn snapshot_from(domain: &str, record: &CachedRecord, now_secs: u64) -> CacheEnt
         last_access_secs: record.counters.last_access.load(AtomicOrdering::Relaxed),
         is_permanent,
         is_stale: record.is_stale_usable_at_secs(now_secs),
-    }
-}
-
-/// `CachedDnssecStatus::Unknown` means "no determination was recorded", which
-/// the domain enum expresses as the absence of a status.
-fn map_dnssec_status(status: CachedDnssecStatus) -> Option<DnssecStatus> {
-    match status {
-        CachedDnssecStatus::Unknown => None,
-        CachedDnssecStatus::Secure => Some(DnssecStatus::Secure),
-        CachedDnssecStatus::Insecure => Some(DnssecStatus::Insecure),
-        CachedDnssecStatus::Bogus => Some(DnssecStatus::Bogus),
-        CachedDnssecStatus::Indeterminate => Some(DnssecStatus::Indeterminate),
     }
 }
 

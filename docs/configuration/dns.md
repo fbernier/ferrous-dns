@@ -552,7 +552,7 @@ DNS Cookies (RFC 7873) protect UDP-based DNS against two classes of attack: **so
 
 | Option | Type | Default | Description |
 |:-------|:-----|:--------|:------------|
-| `enabled` | `bool` | `true` | Master switch — enables DNS Cookie processing |
+| `enabled` | `bool` | `true` | Master switch — enables DNS Cookie processing. When `false` the server never sends a COOKIE option |
 | `server_secret` | `str` | `""` | Hex-encoded 32-byte HMAC secret (64 hex chars). Empty = auto-generate an ephemeral secret on startup (not suitable for production) |
 | `secret_rotation_secs` | `int` | `3600` | Seconds between secret rotations. The previous secret is still accepted for one full rotation window to allow in-flight clients to re-negotiate without errors |
 | `require_valid_cookie` | `bool` | `false` | Strict mode — reject queries with an absent or invalid server cookie with `REFUSED` + EDE 25. Default `false` = permissive mode (always respond, but echo a fresh server cookie) |
@@ -562,7 +562,7 @@ DNS Cookies (RFC 7873) protect UDP-based DNS against two classes of attack: **so
 
 ### Permissive mode (default)
 
-All queries are answered regardless of cookie status. The server always echoes a fresh HMAC-SHA256 server cookie in every response, so RFC-7873-capable clients learn and cache the cookie automatically.
+All queries are answered regardless of cookie status. The server always echoes a fresh HMAC-SHA256 server cookie in every response, so RFC-7873-capable clients learn and cache the cookie automatically. A malformed COOKIE option (not 8 or 16–40 bytes long) is answered with `FORMERR` in either mode (RFC 7873 §5.2.2).
 
 ```toml
 [dns.dns_cookies]

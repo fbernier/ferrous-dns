@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
+use ferrous_dns_domain::{DnsQuery, DnssecStatus, DomainError, RecordType};
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
@@ -11,7 +11,7 @@ pub struct DnsResolution {
     pub addresses: Arc<Vec<IpAddr>>,
     pub cache_hit: bool,
     pub local_dns: bool,
-    pub dnssec_status: Option<&'static str>,
+    pub dnssec_status: Option<DnssecStatus>,
     pub cname_chain: Arc<[Arc<str>]>,
     pub upstream_server: Option<Arc<str>>,
     pub upstream_pool: Option<Arc<str>>,

@@ -134,3 +134,20 @@ async fn verdicts_survive_high_cardinality_decision_cache_churn() {
          eviction is scanning the cache instead of evicting in constant time"
     );
 }
+
+/// A CNAME-derived block lives exactly as long as the CNAME's TTL. The
+/// thread-local copy used to keep it for a fixed 60 s regardless, so a chain
+/// that stopped pointing at a blocked name stayed blocked past its TTL.
+#[tokio::test]
+async fn cname_decision_expires_with_its_ttl() {
+    let (engine, _dir) = build_engine(&[BLOCKED]).await;
+    const ALIAS: &str = "alias.allowed-example.test";
+
+    engine.store_cname_decision(ALIAS, DEFAULT_GROUP_ID, 0);
+
+    assert_eq!(
+        engine.check(ALIAS, DEFAULT_GROUP_ID),
+        FilterDecision::Allow,
+        "an expired CNAME decision must not be served from any cache tier"
+    );
+}

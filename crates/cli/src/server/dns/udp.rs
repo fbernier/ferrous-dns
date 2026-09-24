@@ -182,12 +182,9 @@ async fn run_udp_worker_batch(
                             }
                         }
                         FastPathKind::WireData => {
-                            if let Some((patched, _ttl)) = handler.try_fast_path_wire(
-                                fast_query.domain(),
-                                fast_query.record_type,
+                            if let Some(patched) = handler.try_fast_path_wire(
+                                &fast_query,
                                 client_ip,
-                                fast_query.id,
-                                fast_query.client_max_size,
                                 ClientProtocol::Udp,
                             ) {
                                 pending_wire.push(pktinfo::PendingWireResponse {
@@ -295,12 +292,9 @@ async fn run_udp_worker_single(
                                 }
                             }
                             FastPathKind::WireData => {
-                                if let Some((patched, _ttl)) = handler.try_fast_path_wire(
-                                    fast_query.domain(),
-                                    fast_query.record_type,
+                                if let Some(patched) = handler.try_fast_path_wire(
+                                    &fast_query,
                                     client_ip,
-                                    fast_query.id,
-                                    fast_query.client_max_size,
                                     ClientProtocol::Udp,
                                 ) {
                                     let _ = pktinfo::try_send_with_src_ip(

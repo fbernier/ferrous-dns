@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::cache_eviction::CacheEvictionStrategy;
 use super::dga_detection::DgaDetectionConfig;
 use super::dns_cookies::DnsCookiesConfig;
 use super::dnssec::DnssecMode;
@@ -47,7 +48,7 @@ pub struct DnsConfig {
     pub health_check: HealthCheckConfig,
 
     pub cache_max_entries: usize,
-    pub cache_eviction_strategy: String,
+    pub cache_eviction_strategy: CacheEvictionStrategy,
     pub cache_optimistic_refresh: bool,
     pub cache_min_hit_rate: f64,
     pub cache_min_frequency: u64,
@@ -133,7 +134,7 @@ impl Default for DnsConfig {
             pools: vec![],
             health_check: HealthCheckConfig::default(),
             cache_max_entries: 200_000,
-            cache_eviction_strategy: "hit_rate".to_string(),
+            cache_eviction_strategy: CacheEvictionStrategy::HitRate,
             cache_optimistic_refresh: true,
             cache_min_hit_rate: 2.0,
             cache_min_frequency: 10,

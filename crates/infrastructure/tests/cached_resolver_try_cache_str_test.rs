@@ -19,10 +19,8 @@ fn make_cache() -> Arc<dyn DnsCacheAccess> {
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries: 1000,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 2.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -141,4 +139,57 @@ async fn try_cache_str_misses_for_different_record_type() {
             .is_none(),
         "AAAA must not hit A-only cache entry"
     );
+}
+
+/// An entry cached without a DNSSEC determination (DNSSEC off, or a local
+/// record) reads back without one, rather than as `Insecure` or `"Unknown"`.
+#[tokio::test]
+async fn entries_cached_without_a_determination_report_none() {
+    use ferrous_dns_infrastructure::dns::{CachedAddresses, CachedData};
+
+    struct Plain;
+    #[async_trait]
+    impl DnsResolver for Plain {
+        async fn resolve(&self, _query: &DnsQuery) -> Result<DnsResolution, DomainError> {
+            Ok(DnsResolution::new(
+                vec!["192.0.2.1".parse().unwrap()],
+                false,
+            ))
+        }
+    }
+
+    let cache = Arc::new(DnsCache::new(DnsCacheConfig {
+        max_entries: 1000,
+        eviction_strategy: EvictionStrategy::LRU,
+        refresh_threshold: 0.75,
+        batch_eviction_percentage: 0.2,
+        min_frequency: 0,
+        min_lfuk_score: 0.0,
+        shard_amount: 4,
+        access_window_secs: 7200,
+        eviction_sample_size: 8,
+        lfuk_k_value: 0.5,
+        refresh_sample_rate: 1.0,
+        min_ttl: 0,
+        max_ttl: 86_400,
+    }));
+    let local: IpAddr = "10.0.0.5".parse().unwrap();
+    cache.insert_permanent(
+        "nas.home.lan",
+        RecordType::A,
+        CachedData::IpAddresses(CachedAddresses {
+            addresses: Arc::new(vec![local]),
+        }),
+        300,
+    );
+    let resolver = CachedResolver::new(Arc::new(Plain), cache.clone(), 300, 4);
+    resolver
+        .resolve(&DnsQuery::new("plain.example", RecordType::A))
+        .await
+        .unwrap();
+
+    for name in ["nas.home.lan", "plain.example"] {
+        let hit = resolver.try_cache_str(name, RecordType::A).expect("cached");
+        assert_eq!(hit.dnssec_status, None, "{name}");
+    }
 }

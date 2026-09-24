@@ -212,16 +212,16 @@ impl BlockFilterEngine {
                 return cached;
             }
 
-            if let Some(cached) = self.decision_cache.get_by_key(key) {
-                decision_l0_set_by_key(key, cached);
+            if let Some((cached, expires_at)) = self.decision_cache.get_by_key(key) {
+                decision_l0_set_by_key(key, cached, expires_at);
                 return cached;
             }
         }
 
         let verdict = self.index.load().evaluate(domain, group_id);
 
-        self.decision_cache.set_by_key(key, verdict);
-        decision_l0_set_by_key(key, verdict);
+        let expires_at = self.decision_cache.set_by_key(key, verdict);
+        decision_l0_set_by_key(key, verdict, expires_at);
 
         verdict
     }
@@ -377,9 +377,10 @@ impl BlockFilterEnginePort for BlockFilterEngine {
         // Not a manual rule: a CNAME-derived block still yields to the blocking
         // toggle and to schedule overrides.
         let verdict = Verdict::Block(BlockSource::CnameCloaking);
-        self.decision_cache
+        let expires_at = self
+            .decision_cache
             .set_by_key_with_ttl(key, verdict, ttl_secs);
-        decision_l0_set_by_key(key, verdict);
+        decision_l0_set_by_key(key, verdict, expires_at);
     }
 
     async fn reload(&self) -> Result<(), DomainError> {

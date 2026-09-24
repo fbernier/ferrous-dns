@@ -151,7 +151,7 @@ fn test_fast_path_response_includes_opt_when_client_sent_edns() {
         .expect("Minimal EDNS query should be fast-path parseable");
 
     assert!(
-        fast_query.has_edns,
+        fast_query.has_edns(),
         "FastPathQuery.has_edns must be true when query contains OPT record"
     );
 
@@ -247,7 +247,7 @@ fn test_fast_path_response_no_opt_when_client_has_no_edns() {
         fast_path::parse_query(&query_bytes).expect("Minimal query should be fast-path parseable");
 
     assert!(
-        !fast_query.has_edns,
+        !fast_query.has_edns(),
         "FastPathQuery.has_edns must be false when no OPT record is present"
     );
 

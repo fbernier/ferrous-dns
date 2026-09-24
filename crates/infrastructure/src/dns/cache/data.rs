@@ -1,6 +1,6 @@
 use bytes::Bytes;
+use ferrous_dns_domain::DnssecStatus;
 use std::net::IpAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 
 #[repr(u8)]
@@ -13,28 +13,26 @@ pub enum CachedDnssecStatus {
     Indeterminate = 4,
 }
 
-impl FromStr for CachedDnssecStatus {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "Secure" => Self::Secure,
-            "Insecure" => Self::Insecure,
-            "Bogus" => Self::Bogus,
-            "Indeterminate" => Self::Indeterminate,
-            _ => Self::Unknown,
-        })
+impl From<DnssecStatus> for CachedDnssecStatus {
+    fn from(status: DnssecStatus) -> Self {
+        match status {
+            DnssecStatus::Secure => Self::Secure,
+            DnssecStatus::Insecure => Self::Insecure,
+            DnssecStatus::Bogus => Self::Bogus,
+            DnssecStatus::Indeterminate => Self::Indeterminate,
+        }
     }
 }
 
 impl CachedDnssecStatus {
-    pub fn as_str(&self) -> &'static str {
+    /// `Unknown` is an entry cached without a DNSSEC determination.
+    pub fn to_domain(self) -> Option<DnssecStatus> {
         match self {
-            Self::Unknown => "Unknown",
-            Self::Secure => "Secure",
-            Self::Insecure => "Insecure",
-            Self::Bogus => "Bogus",
-            Self::Indeterminate => "Indeterminate",
+            Self::Unknown => None,
+            Self::Secure => Some(DnssecStatus::Secure),
+            Self::Insecure => Some(DnssecStatus::Insecure),
+            Self::Bogus => Some(DnssecStatus::Bogus),
+            Self::Indeterminate => Some(DnssecStatus::Indeterminate),
         }
     }
 }

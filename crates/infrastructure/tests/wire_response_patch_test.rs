@@ -1,64 +1,48 @@
-use ferrous_dns_infrastructure::dns::wire_response::{patch_wire_id_clear_ad, set_ad_bit};
+use ferrous_dns_infrastructure::dns::wire_response::{patch_wire_header, set_relay_header};
 
-// --- patch_wire_id_clear_ad: a non-DO client must NEVER receive AD=1 ---
+// --- patch_wire_header: a non-DO client must NEVER receive AD=1 ---
 
 #[test]
-fn patch_wire_id_clear_ad_clears_set_ad_bit() {
-    // Byte 3 = 0xA0 has the AD bit (0x20) set; it must come back cleared, and
-    // the query ID must still be patched.
-    let wire = vec![0x00, 0x00, 0x81, 0xA0, 0xCC];
-    let patched = patch_wire_id_clear_ad(&wire, 0x1234).expect("should return Some");
-    assert_eq!(patched[0], 0x12);
-    assert_eq!(patched[1], 0x34);
-    assert_eq!(patched[3] & 0x20, 0x00, "AD bit must be cleared");
-    // Other flag bits in byte 3 are untouched (0xA0 & !0x20 == 0x80).
-    assert_eq!(patched[3], 0x80);
+fn patch_wire_header_clears_ad_and_writes_the_query_id() {
+    // Byte 3 = 0xA3 has AD (0x20) set beside RA and an RCODE; only AD may move.
+    let wire = vec![0x00, 0x00, 0x81, 0xA3, 0xCC];
+    let patched = patch_wire_header(&wire, 0x1234, true).expect("holds a header");
+    assert_eq!(patched[..2], [0x12, 0x34]);
+    assert_eq!(patched[3], 0x83, "AD cleared, RA and RCODE untouched");
     assert_eq!(patched[4], 0xCC);
 }
 
+/// RFC 1035 §4.1.1: RD is copied from the query. The upstream exchange always
+/// set it, so a cached answer carries RD=1 whatever the client asked.
 #[test]
-fn patch_wire_id_clear_ad_leaves_already_clear_ad() {
-    let wire = vec![0x00, 0x00, 0x81, 0x80, 0xCC];
-    let patched = patch_wire_id_clear_ad(&wire, 0xBEEF).expect("should return Some");
-    assert_eq!(patched[3], 0x80);
+fn patch_wire_header_copies_rd_from_the_query() {
+    let wire = vec![0x00, 0x00, 0x85, 0x80];
+    assert_eq!(patch_wire_header(&wire, 1, false).unwrap()[2], 0x84);
+    assert_eq!(
+        patch_wire_header(&[0, 0, 0x84, 0x80], 1, true).unwrap()[2],
+        0x85
+    );
 }
 
 #[test]
-fn patch_wire_id_clear_ad_returns_none_for_short_slice() {
-    assert!(patch_wire_id_clear_ad(&[0xFF], 0x1234).is_none());
+fn patch_wire_header_declines_a_message_without_flags() {
+    assert!(patch_wire_header(&[0xFF, 0xFF, 0x81], 0x1234, true).is_none());
 }
 
-#[test]
-fn patch_wire_id_clear_ad_patches_a_two_byte_message() {
-    // Too short to hold flags: only the ID is rewritten.
-    let patched = patch_wire_id_clear_ad(&[0x00, 0x00], 0xABCD).expect("two bytes hold an ID");
-    assert_eq!(patched, vec![0xAB, 0xCD]);
-}
-
-// --- set_ad_bit: raw-wire AD override on the slow path ---
+// --- set_relay_header: raw-wire header override on the slow path ---
 
 #[test]
-fn set_ad_bit_sets_and_clears() {
-    let mut buf = vec![0x00, 0x00, 0x81, 0x80];
-    set_ad_bit(&mut buf, true);
-    assert_eq!(buf[3] & 0x20, 0x20, "AD bit must be set");
-    set_ad_bit(&mut buf, false);
-    assert_eq!(buf[3] & 0x20, 0x00, "AD bit must be cleared");
-}
-
-#[test]
-fn set_ad_bit_preserves_other_flag_bits() {
-    // 0x83 keeps RA + RCODE bits; setting/clearing AD must not disturb them.
+fn set_relay_header_writes_id_rd_and_our_ad_verdict() {
     let mut buf = vec![0x00, 0x00, 0x81, 0x83];
-    set_ad_bit(&mut buf, true);
-    assert_eq!(buf[3], 0xA3);
-    set_ad_bit(&mut buf, false);
-    assert_eq!(buf[3], 0x83);
+    set_relay_header(&mut buf, 0xBEEF, false, true);
+    assert_eq!(buf, vec![0xBE, 0xEF, 0x80, 0xA3]);
+    set_relay_header(&mut buf, 0xBEEF, true, false);
+    assert_eq!(buf, vec![0xBE, 0xEF, 0x81, 0x83]);
 }
 
 #[test]
-fn set_ad_bit_noop_on_short_buffer() {
+fn set_relay_header_is_a_noop_on_a_buffer_without_flags() {
     let mut buf = vec![0x00, 0x00, 0x81];
-    set_ad_bit(&mut buf, true);
+    set_relay_header(&mut buf, 0xBEEF, false, true);
     assert_eq!(buf, vec![0x00, 0x00, 0x81]);
 }

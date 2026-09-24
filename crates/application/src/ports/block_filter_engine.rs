@@ -24,18 +24,7 @@ pub trait BlockFilterEnginePort: Send + Sync {
     /// Read-only, exhaustive attribution of how the static filter index evaluates
     /// `domain` for `group_id` (all matching allow/block rules, named). Does not
     /// touch any decision cache.
-    ///
-    /// The default returns an empty "not blocked" explanation; the real engine
-    /// overrides it. Mock/no-op implementations can rely on the default.
-    fn explain(&self, domain: &str, group_id: i64) -> FilterExplanation {
-        FilterExplanation {
-            domain: domain.to_string(),
-            group_id,
-            blocked: false,
-            allow_reasons: Vec::new(),
-            block_matches: Vec::new(),
-        }
-    }
+    fn explain(&self, domain: &str, group_id: i64) -> FilterExplanation;
     /// Batch variant of [`BlockFilterEnginePort::explain`]. Implementations may
     /// load the index snapshot once for the whole batch.
     fn explain_batch(&self, domains: &[String], group_id: i64) -> Vec<FilterExplanation> {
@@ -47,19 +36,13 @@ pub trait BlockFilterEnginePort: Send + Sync {
     /// `list_lines` are raw blocklist-style lines (hosts/adblock/wildcard/plain,
     /// comments skipped) parsed exactly as real lists are; `regexes` are raw
     /// regex patterns. Returns one `bool` per input domain (`true` = matched).
-    ///
-    /// The default matches nothing (mocks rely on it); the real engine — which
-    /// owns the list parser and regex compiler — overrides it. Errors only on an
-    /// invalid regex pattern.
+    /// Errors only on an invalid regex pattern.
     fn match_candidate(
         &self,
         domains: &[String],
         list_lines: &[String],
         regexes: &[String],
-    ) -> Result<Vec<bool>, DomainError> {
-        let _ = (list_lines, regexes);
-        Ok(vec![false; domains.len()])
-    }
+    ) -> Result<Vec<bool>, DomainError>;
     fn store_cname_decision(&self, domain: &str, group_id: i64, ttl_secs: u64);
     async fn reload(&self) -> Result<(), DomainError>;
     async fn load_client_groups(&self) -> Result<(), DomainError>;

@@ -212,14 +212,16 @@ impl DnsServices {
             repos.client.clone(),
             config.database.client_tracking_interval,
         )
-        .with_rebinding_protection(
-            config.dns.rebinding_protection_enabled,
-            config.dns.local_domain.as_deref(),
-            &config.dns.rebinding_allowlist,
-        )
         .with_rate_limiter(rate_limiter)
         .with_dnssec_enforcement(config.dns.effective_dnssec_mode().enforces())
         .with_query_logging(config.database.log_queries);
+
+        if config.dns.rebinding_protection_enabled {
+            handler = handler.with_rebinding_protection(
+                config.dns.local_domain.as_deref(),
+                &config.dns.rebinding_allowlist,
+            );
+        }
 
         if config.dns64.enabled {
             if let Some(prefix) = config.dns64.parsed_prefix() {

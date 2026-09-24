@@ -163,10 +163,8 @@ impl TestAppBuilder {
         let cache = Arc::new(DnsCache::new(DnsCacheConfig {
             max_entries: self.cache_max_entries,
             eviction_strategy: EvictionStrategy::LRU,
-            min_threshold: 0.0,
             refresh_threshold: 0.0,
             batch_eviction_percentage: 0.0,
-            adaptive_thresholds: false,
             min_frequency: 0,
             min_lfuk_score: 0.0,
             shard_amount: 4,

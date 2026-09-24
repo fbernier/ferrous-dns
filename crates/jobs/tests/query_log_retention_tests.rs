@@ -71,6 +71,10 @@ impl QueryLogRepository for MockQueryLogRepository {
         Ok(())
     }
 
+    fn log_query_sync(&self, _query: &QueryLog) -> Result<(), DomainError> {
+        unimplemented!()
+    }
+
     async fn get_recent(
         &self,
         limit: u32,
@@ -84,11 +88,13 @@ impl QueryLogRepository for MockQueryLogRepository {
     async fn get_recent_paged(
         &self,
         limit: u32,
-        offset: u32,
+        page: ferrous_dns_application::ports::PageAt,
         period_hours: f32,
-        _cursor: Option<i64>,
         _filter: &QueryLogFilter,
     ) -> Result<PagedQueryResult, DomainError> {
+        let ferrous_dns_application::ports::PageAt::Offset(offset) = page else {
+            unimplemented!()
+        };
         let all = self.get_recent(limit + offset, period_hours).await?;
         let total = all.len() as u64;
         let queries: Vec<QueryLog> = all
@@ -132,7 +138,7 @@ impl QueryLogRepository for MockQueryLogRepository {
 
     async fn get_timeline(
         &self,
-        _period_hours: u32,
+        _period_hours: f32,
         _granularity: TimeGranularity,
     ) -> Result<Vec<TimelineBucket>, DomainError> {
         Ok(Vec::new())

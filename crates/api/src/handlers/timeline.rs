@@ -42,7 +42,7 @@ pub async fn get_timeline(
         "Fetching query timeline"
     );
 
-    let period_hours = period_hours(&params.period) as u32;
+    let period_hours = period_hours(&params.period);
     let granularity = parse_granularity(&params.granularity);
 
     let buckets = state

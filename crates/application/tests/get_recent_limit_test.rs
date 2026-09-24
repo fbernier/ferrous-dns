@@ -18,6 +18,10 @@ impl QueryLogRepository for CaptureLimitRepository {
         Ok(())
     }
 
+    fn log_query_sync(&self, _: &QueryLog) -> Result<(), DomainError> {
+        Ok(())
+    }
+
     async fn get_recent(&self, limit: u32, _: f32) -> Result<Vec<QueryLog>, DomainError> {
         *self.last_limit.lock().unwrap() = limit;
         Ok(vec![])
@@ -26,9 +30,8 @@ impl QueryLogRepository for CaptureLimitRepository {
     async fn get_recent_paged(
         &self,
         limit: u32,
-        _: u32,
+        _: ferrous_dns_application::ports::PageAt,
         _: f32,
-        _: Option<i64>,
         _: &QueryLogFilter,
     ) -> Result<PagedQueryResult, DomainError> {
         *self.last_limit.lock().unwrap() = limit;
@@ -50,7 +53,7 @@ impl QueryLogRepository for CaptureLimitRepository {
 
     async fn get_timeline(
         &self,
-        _: u32,
+        _: f32,
         _: TimeGranularity,
     ) -> Result<Vec<TimelineBucket>, DomainError> {
         unimplemented!()

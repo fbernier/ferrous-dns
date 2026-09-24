@@ -59,6 +59,17 @@ impl BlockFilterEnginePort for AllowAllFilter {
     fn check(&self, _domain: &str, _group_id: i64) -> FilterDecision {
         FilterDecision::Allow
     }
+    fn explain(&self, _domain: &str, _group_id: i64) -> ferrous_dns_domain::FilterExplanation {
+        unimplemented!()
+    }
+    fn match_candidate(
+        &self,
+        _domains: &[String],
+        _list_lines: &[String],
+        _regexes: &[String],
+    ) -> Result<Vec<bool>, DomainError> {
+        unimplemented!()
+    }
     fn store_cname_decision(&self, _domain: &str, _group_id: i64, _ttl_secs: u64) {}
     async fn reload(&self) -> Result<(), DomainError> {
         Ok(())
@@ -83,6 +94,9 @@ impl QueryLogRepository for NoopQueryLog {
     async fn log_query(&self, _query: &QueryLog) -> Result<(), DomainError> {
         Ok(())
     }
+    fn log_query_sync(&self, _query: &QueryLog) -> Result<(), DomainError> {
+        Ok(())
+    }
     async fn get_recent(
         &self,
         _limit: u32,
@@ -93,9 +107,8 @@ impl QueryLogRepository for NoopQueryLog {
     async fn get_recent_paged(
         &self,
         _limit: u32,
-        _offset: u32,
+        _page: ferrous_dns_application::ports::PageAt,
         _period_hours: f32,
-        _cursor: Option<i64>,
         _filter: &QueryLogFilter,
     ) -> Result<PagedQueryResult, DomainError> {
         unimplemented!()
@@ -108,7 +121,7 @@ impl QueryLogRepository for NoopQueryLog {
     }
     async fn get_timeline(
         &self,
-        _period_hours: u32,
+        _period_hours: f32,
         _granularity: TimeGranularity,
     ) -> Result<Vec<TimelineBucket>, DomainError> {
         unimplemented!()

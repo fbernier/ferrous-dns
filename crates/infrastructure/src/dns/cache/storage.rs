@@ -13,7 +13,7 @@ use ferrous_dns_domain::RecordType;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -69,10 +69,8 @@ pub struct RefreshSenders {
 pub struct DnsCacheConfig {
     pub max_entries: usize,
     pub eviction_strategy: EvictionStrategy,
-    pub min_threshold: f64,
     pub refresh_threshold: f64,
     pub batch_eviction_percentage: f64,
-    pub adaptive_thresholds: bool,
     pub min_frequency: u64,
     pub min_lfuk_score: f64,
     pub shard_amount: usize,
@@ -88,10 +86,8 @@ pub struct DnsCache {
     pub(super) cache: DashMap<CacheKey, CachedRecord, FxBuildHasher>,
     pub(super) max_entries: usize,
     pub(super) eviction_policy: ActiveEvictionPolicy,
-    pub(super) min_threshold_bits: AtomicU64,
     pub(super) refresh_threshold: f64,
     pub(super) batch_eviction_percentage: f64,
-    pub(super) adaptive_thresholds: bool,
     pub(super) metrics: CacheMetrics,
     pub(super) bloom: AtomicBloom,
     pub(super) access_window_secs: u64,
@@ -116,9 +112,7 @@ impl DnsCache {
         info!(
             max_entries = config.max_entries,
             eviction_strategy = config.eviction_strategy.as_str(),
-            config.min_threshold,
             config.refresh_threshold,
-            config.adaptive_thresholds,
             "Initializing DNS cache"
         );
 
@@ -133,10 +127,8 @@ impl DnsCache {
             cache,
             max_entries: config.max_entries,
             eviction_policy,
-            min_threshold_bits: AtomicU64::new(config.min_threshold.to_bits()),
             refresh_threshold: config.refresh_threshold,
             batch_eviction_percentage: config.batch_eviction_percentage,
-            adaptive_thresholds: config.adaptive_thresholds,
             metrics: CacheMetrics::default(),
             bloom,
             access_window_secs: config.access_window_secs,
@@ -156,16 +148,6 @@ impl DnsCache {
     #[inline(always)]
     fn clamp_ttl(&self, ttl: u32) -> u32 {
         ttl.clamp(self.min_ttl, self.max_ttl)
-    }
-
-    pub(super) fn get_threshold(&self) -> f64 {
-        let bits = self.min_threshold_bits.load(AtomicOrdering::Relaxed);
-        f64::from_bits(bits)
-    }
-
-    fn set_threshold(&self, value: f64) {
-        self.min_threshold_bits
-            .store(value.to_bits(), AtomicOrdering::Relaxed);
     }
 
     pub fn len(&self) -> usize {
@@ -343,7 +325,6 @@ impl DnsCache {
         record_type: RecordType,
         data: CachedData,
         ttl: u32,
-        _dnssec_status: Option<CachedDnssecStatus>,
     ) {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
@@ -794,10 +775,7 @@ impl DnsCache {
         candidates.sort_unstable_by(|a, b| a.score.total_cmp(&b.score));
 
         let mut scored_evicted = 0usize;
-        let mut last_worst_score = f64::MAX;
-
         for candidate in candidates.into_iter().take(evict_count) {
-            last_worst_score = candidate.score;
             self.cache.remove(&candidate.key);
             scored_evicted += 1;
         }
@@ -818,14 +796,6 @@ impl DnsCache {
         self.metrics
             .batch_evictions
             .fetch_add(1, AtomicOrdering::Relaxed);
-
-        if self.adaptive_thresholds && last_worst_score < f64::MAX {
-            let current = self.get_threshold();
-            self.set_threshold((current * 0.9) + (last_worst_score * 0.1));
-            self.metrics
-                .adaptive_adjustments
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        }
     }
 }
 
@@ -870,7 +840,7 @@ impl ferrous_dns_application::ports::DnsCachePort for DnsCache {
         let data = CachedData::IpAddresses(super::data::CachedAddresses {
             addresses: Arc::new(addresses),
         });
-        self.insert_permanent(domain, record_type, data, ttl, None);
+        self.insert_permanent(domain, record_type, data, ttl);
     }
 
     fn remove_record(&self, domain: &str, record_type: &ferrous_dns_domain::RecordType) -> bool {

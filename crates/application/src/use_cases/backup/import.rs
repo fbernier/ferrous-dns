@@ -139,7 +139,7 @@ impl ImportConfigUseCase {
                 ferrous_dns_domain::DnssecMode::Off
             });
         }
-        new_config.dns.cache_eviction_strategy = sc.dns.cache_eviction_strategy.clone();
+        new_config.dns.cache_eviction_strategy = sc.dns.cache_eviction_strategy;
         new_config.dns.cache_max_entries = sc.dns.cache_max_entries;
         new_config.dns.cache_min_hit_rate = sc.dns.cache_min_hit_rate;
         new_config.dns.cache_min_frequency = sc.dns.cache_min_frequency;

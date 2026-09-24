@@ -27,10 +27,8 @@ fn create_refresh_cache(access_window_secs: u64) -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.0, // toda entrada qualifica pelo tempo imediatamente
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -65,10 +63,8 @@ fn create_cache(
     DnsCache::new(DnsCacheConfig {
         max_entries,
         eviction_strategy: strategy,
-        min_threshold: 2.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency,
         min_lfuk_score,
         shard_amount: 4,
@@ -85,10 +81,8 @@ fn create_cache_with_ttl_limits(min_ttl: u32, max_ttl: u32) -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -581,13 +575,7 @@ fn test_refresh_candidates_skips_permanent_entries() {
     // passaria em todos os outros filtros.
     let cache = create_refresh_cache(u64::MAX);
 
-    cache.insert_permanent(
-        "forever.com",
-        RecordType::A,
-        make_ip_data("10.0.0.1"),
-        300,
-        None,
-    );
+    cache.insert_permanent("forever.com", RecordType::A, make_ip_data("10.0.0.1"), 300);
     cache.insert(
         "ephemeral.com",
         RecordType::A,
@@ -816,10 +804,8 @@ fn test_lru_eviction_protects_recently_accessed_entry() {
     let cache = DnsCache::new(DnsCacheConfig {
         max_entries: 4,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.25, // evicta 1 de 4 por vez
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -864,10 +850,8 @@ fn test_hit_rate_eviction_protects_high_hit_entries() {
     let cache = DnsCache::new(DnsCacheConfig {
         max_entries: 4,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.5,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -945,10 +929,8 @@ fn test_lfu_negative_score_below_min_frequency_leads_to_eviction() {
     let cache = DnsCache::new(DnsCacheConfig {
         max_entries: 4,
         eviction_strategy: EvictionStrategy::LFU,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.5,
-        adaptive_thresholds: false,
         min_frequency: 5, // mínimo de 5 hits
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -1033,10 +1015,8 @@ fn test_single_scan_evicts_exact_count() {
     let cache = DnsCache::new(DnsCacheConfig {
         max_entries: 5,
         eviction_strategy: EvictionStrategy::LFU,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -1311,10 +1291,8 @@ fn test_lru_evicts_least_recently_used() {
     let cache = DnsCache::new(DnsCacheConfig {
         max_entries: 3,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 1.0,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,

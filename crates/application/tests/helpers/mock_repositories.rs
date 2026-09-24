@@ -205,11 +205,13 @@ impl QueryLogRepository for MockQueryLogRepository {
     async fn get_recent_paged(
         &self,
         limit: u32,
-        offset: u32,
+        page: ferrous_dns_application::ports::PageAt,
         period_hours: f32,
-        _cursor: Option<i64>,
         _filter: &ferrous_dns_domain::QueryLogFilter,
     ) -> Result<ferrous_dns_application::ports::PagedQueryResult, DomainError> {
+        let ferrous_dns_application::ports::PageAt::Offset(offset) = page else {
+            unimplemented!()
+        };
         let all = self.get_recent(limit + offset, period_hours).await?;
         let total = all.len() as u64;
         let start = (offset as usize).min(all.len());
@@ -287,7 +289,7 @@ impl QueryLogRepository for MockQueryLogRepository {
 
     async fn get_timeline(
         &self,
-        _period_hours: u32,
+        _period_hours: f32,
         _granularity: TimeGranularity,
     ) -> Result<Vec<ferrous_dns_application::ports::TimelineBucket>, DomainError> {
         Ok(Vec::new())
@@ -1093,7 +1095,7 @@ impl WhitelistSourceRepository for MockWhitelistSourceRepository {
 pub struct DnsResolutionBuilder {
     addresses: Vec<IpAddr>,
     cache_hit: bool,
-    dnssec_status: Option<&'static str>,
+    dnssec_status: Option<ferrous_dns_domain::DnssecStatus>,
     cname_chain: Arc<[Arc<str>]>,
     upstream_server: Option<Arc<str>>,
 }
@@ -1124,7 +1126,7 @@ impl DnsResolutionBuilder {
         self
     }
 
-    pub fn with_dnssec(mut self, status: &'static str) -> Self {
+    pub fn with_dnssec(mut self, status: ferrous_dns_domain::DnssecStatus) -> Self {
         self.dnssec_status = Some(status);
         self
     }
@@ -1427,6 +1429,17 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
         FilterDecision::Allow
     }
 
+    fn explain(&self, _domain: &str, _group_id: i64) -> ferrous_dns_domain::FilterExplanation {
+        unimplemented!()
+    }
+    fn match_candidate(
+        &self,
+        _domains: &[String],
+        _list_lines: &[String],
+        _regexes: &[String],
+    ) -> Result<Vec<bool>, DomainError> {
+        unimplemented!()
+    }
     fn store_cname_decision(&self, domain: &str, _group_id: i64, _ttl_secs: u64) {
         self.cname_blocked_domains
             .write()
