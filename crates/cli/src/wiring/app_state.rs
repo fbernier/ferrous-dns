@@ -54,8 +54,8 @@ pub async fn build_app_state(
     let create_local_record = Arc::new(
         CreateLocalRecordUseCase::new(config.clone(), config_repo.clone())
             .with_ptr_registry(dns_services.ptr_registry.clone())
-            .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-            .with_dns_cache(Some(dns_cache.clone())),
+            .with_wildcard_registry(dns_services.wildcard_registry.clone())
+            .with_dns_cache(dns_cache.clone()),
     );
 
     let backup = {
@@ -99,14 +99,14 @@ pub async fn build_app_state(
             update_local_record: Arc::new(
                 UpdateLocalRecordUseCase::new(config.clone(), config_repo.clone())
                     .with_ptr_registry(dns_services.ptr_registry.clone())
-                    .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_cache.clone())),
+                    .with_wildcard_registry(dns_services.wildcard_registry.clone())
+                    .with_dns_cache(dns_cache.clone()),
             ),
             delete_local_record: Arc::new(
                 DeleteLocalRecordUseCase::new(config.clone(), config_repo)
                     .with_ptr_registry(dns_services.ptr_registry.clone())
-                    .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_cache)),
+                    .with_wildcard_registry(dns_services.wildcard_registry.clone())
+                    .with_dns_cache(dns_cache),
             ),
             upstream_health: Arc::new(UpstreamHealthAdapter::new(
                 dns_services.pool_manager.clone(),

@@ -69,8 +69,8 @@ impl ExportConfigUseCase {
             .map(|r| LocalRecordSnapshot {
                 hostname: r.hostname.clone(),
                 domain: r.domain.clone(),
-                ip: r.ip.clone(),
-                record_type: r.record_type.clone(),
+                ip: r.ip.to_string(),
+                record_type: r.record_type.as_str().to_string(),
                 ttl: r.ttl,
             })
             .collect();

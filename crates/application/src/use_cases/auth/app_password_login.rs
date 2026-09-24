@@ -63,7 +63,7 @@ impl AppPasswordLoginUseCase {
 
         let session = build_session(
             user.username.clone(),
-            user.role.clone(),
+            user.role,
             false,
             ip_address,
             user_agent,

@@ -1,3 +1,4 @@
+use super::domain_heuristics::{char_ratios, extract_apex, shannon_entropy};
 use super::guard_whitelist::GuardWhitelist;
 use ferrous_dns_domain::{DgaDetectionAction, DgaDetectionConfig};
 use std::net::IpAddr;
@@ -181,105 +182,6 @@ pub struct DgaAnalysisEvent {
     pub client_ip: IpAddr,
 }
 
-/// Computes Shannon entropy in bits per character.
-///
-/// Uses a stack-allocated histogram `[u32; 256]` (~1 KB) — zero heap allocation.
-#[inline]
-fn shannon_entropy(data: &[u8]) -> f32 {
-    if data.is_empty() {
-        return 0.0;
-    }
-    let mut counts = [0u32; 256];
-    for &b in data {
-        counts[b as usize] += 1;
-    }
-    let len = data.len() as f32;
-    let mut entropy: f32 = 0.0;
-    for &count in &counts {
-        if count > 0 {
-            let p = count as f32 / len;
-            entropy -= p * p.log2();
-        }
-    }
-    entropy
-}
-
-/// Computes character class counts for DGA detection.
-///
-/// Returns (consonants, vowels, digits, total_chars).
-#[inline]
-fn char_ratios(sld: &str) -> (u32, u32, u32, u32) {
-    let mut consonants = 0u32;
-    let mut vowels = 0u32;
-    let mut digits = 0u32;
-    let mut total = 0u32;
-
-    for &b in sld.as_bytes() {
-        total += 1;
-        let lower = b.to_ascii_lowercase();
-        match lower {
-            b'a' | b'e' | b'i' | b'o' | b'u' => vowels += 1,
-            b'b'..=b'd' | b'f'..=b'h' | b'j'..=b'n' | b'p'..=b't' | b'v'..=b'z' => {
-                consonants += 1;
-            }
-            b'0'..=b'9' => digits += 1,
-            _ => {} // hyphens and other chars don't count
-        }
-    }
-
-    (consonants, vowels, digits, total)
-}
-
-/// Common two-level TLDs where the apex requires 3 labels.
-const COMPOUND_TLDS: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "net.uk", "me.uk", "co.jp", "or.jp", "ne.jp", "ac.jp",
-    "go.jp", "com.br", "org.br", "net.br", "gov.br", "edu.br", "com.au", "org.au", "net.au",
-    "edu.au", "gov.au", "co.nz", "org.nz", "net.nz", "co.za", "org.za", "co.in", "org.in",
-    "net.in", "gen.in", "com.cn", "org.cn", "net.cn", "gov.cn", "edu.cn", "com.tw", "org.tw",
-    "com.hk", "org.hk", "com.sg", "org.sg", "com.my", "org.my", "co.kr", "or.kr", "co.il",
-    "org.il", "com.ar", "org.ar", "com.mx", "org.mx", "com.co", "org.co", "com.ve", "com.pe",
-    "com.tr", "org.tr", "co.th", "or.th", "com.ph", "org.ph", "com.ng", "org.ng", "co.ke", "or.ke",
-    "com.eg", "org.eg", "com.pk", "org.pk", "com.bd", "org.bd",
-];
-
-fn is_compound_tld(domain: &str) -> bool {
-    let bytes = domain.as_bytes();
-    let mut dot_count = 0;
-    for (i, &b) in bytes.iter().enumerate().rev() {
-        if b == b'.' {
-            dot_count += 1;
-            if dot_count == 2 {
-                let last_two = &domain[i + 1..];
-                return COMPOUND_TLDS
-                    .iter()
-                    .any(|tld| last_two.eq_ignore_ascii_case(tld));
-            }
-        }
-    }
-    if dot_count == 1 {
-        return COMPOUND_TLDS
-            .iter()
-            .any(|tld| domain.eq_ignore_ascii_case(tld));
-    }
-    false
-}
-
-/// Extracts the apex domain from a domain name.
-fn extract_apex(domain: &str) -> &str {
-    let target_dots = if is_compound_tld(domain) { 3 } else { 2 };
-    let bytes = domain.as_bytes();
-    let mut dot_count = 0;
-    for (i, &b) in bytes.iter().enumerate().rev() {
-        if b == b'.' {
-            dot_count += 1;
-            if dot_count == target_dots {
-                return &domain[i + 1..];
-            }
-        }
-    }
-    domain
-}
-
 /// Extracts the second-level domain (SLD) from a domain name.
 ///
 /// E.g., `xjk4f9a2h.com` → `xjk4f9a2h`, `sub.example.co.uk` → `example`.
@@ -459,17 +361,5 @@ mod tests {
         assert_eq!(extract_sld("sub.example.com"), Some("example"));
         assert_eq!(extract_sld("example.co.uk"), Some("example"));
         assert_eq!(extract_sld("xjk4f9a2h.com"), Some("xjk4f9a2h"));
-    }
-
-    #[test]
-    fn shannon_entropy_low_for_repetitive() {
-        let e = shannon_entropy(b"aaaa");
-        assert!(e < 1.0);
-    }
-
-    #[test]
-    fn shannon_entropy_high_for_random() {
-        let e = shannon_entropy(b"xjk4f9a2h3b5c7d");
-        assert!(e > 3.0);
     }
 }

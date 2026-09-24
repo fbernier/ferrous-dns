@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use ferrous_dns_application::ports::{ApiTokenRepository, SessionRepository, UserProvider};
+use ferrous_dns_application::ports::{
+    ApiKeyMaterial, ApiTokenRepository, SessionRepository, UserProvider,
+};
 use ferrous_dns_application::use_cases::{
     AppPasswordLoginUseCase, CreateApiTokenUseCase, LoginRateLimiter, UpdateApiTokenUseCase,
     ValidateApiTokenUseCase,
@@ -83,9 +85,7 @@ impl ApiTokenRepository for MockApiTokenRepo {
         &self,
         id: i64,
         name: &str,
-        key_prefix: Option<&str>,
-        key_hash: Option<&str>,
-        key_raw: Option<&str>,
+        new_key: Option<ApiKeyMaterial<'_>>,
     ) -> Result<ApiToken, DomainError> {
         let mut tokens = self.tokens.write().await;
         // Check name uniqueness (excluding self)
@@ -100,14 +100,10 @@ impl ApiTokenRepository for MockApiTokenRepo {
             .find(|t| t.id == Some(id))
             .ok_or(DomainError::ApiTokenNotFound(id))?;
         token.name = Arc::from(name);
-        if let Some(p) = key_prefix {
-            token.key_prefix = Arc::from(p);
-        }
-        if let Some(h) = key_hash {
-            token.key_hash = Arc::from(h);
-        }
-        if let Some(r) = key_raw {
-            token.key_raw = Some(Arc::from(r));
+        if let Some(key) = new_key {
+            token.key_prefix = Arc::from(key.prefix);
+            token.key_hash = Arc::from(key.hash);
+            token.key_raw = Some(Arc::from(key.raw));
         }
         Ok(token.clone())
     }
@@ -128,16 +124,6 @@ impl ApiTokenRepository for MockApiTokenRepo {
             t.last_used_at = Some("2026-01-01 12:00:00".to_string());
         }
         Ok(())
-    }
-
-    async fn get_all_hashes(&self) -> Result<Vec<(i64, String)>, DomainError> {
-        Ok(self
-            .tokens
-            .read()
-            .await
-            .iter()
-            .map(|t| (t.id.unwrap(), t.key_hash.to_string()))
-            .collect())
     }
 
     async fn get_id_by_hash(&self, key_hash: &str) -> Result<Option<i64>, DomainError> {

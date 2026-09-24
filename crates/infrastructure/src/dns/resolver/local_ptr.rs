@@ -25,7 +25,7 @@ pub type PtrMap = DashMap<IpAddr, (Arc<str>, u32), FxBuildHasher>;
 pub struct LocalPtrResolver {
     inner: Arc<dyn DnsResolver>,
     /// Live mapping of IP address → (FQDN, TTL).
-    pub map: Arc<PtrMap>,
+    map: Arc<PtrMap>,
 }
 
 impl LocalPtrResolver {
@@ -34,52 +34,45 @@ impl LocalPtrResolver {
         Self { inner, map }
     }
 
-    /// Builds a resolver pre-populated from local DNS records declared in config.
-    pub fn from_local_records(
+    /// Builds a PTR map from the exact records among the configured local
+    /// records. When several share an address, the last one wins.
+    pub fn map_from_local_records(
         records: &[LocalDnsRecord],
-        default_domain: &Option<String>,
-        inner: Arc<dyn DnsResolver>,
-    ) -> Self {
+        default_domain: Option<&str>,
+    ) -> Arc<PtrMap> {
         let map: PtrMap = DashMap::with_hasher(FxBuildHasher);
 
-        let mut count = 0usize;
-
-        for record in records {
-            // A wildcard covers a whole subtree, so there is no single name an
-            // address could reverse to. Skip it rather than inventing one.
-            if record.is_wildcard() {
-                continue;
-            }
-
-            match record.ip.parse::<IpAddr>() {
-                Ok(ip) => {
-                    let fqdn = record.fqdn(default_domain);
-                    map.insert(ip, (Arc::from(fqdn.as_str()), record.ttl_or_default()));
-                    count += 1;
-                }
-                Err(_) => {
-                    warn!(
-                        hostname = %record.hostname,
-                        ip = %record.ip,
-                        "PTR auto-generation: invalid IP address, skipping record"
-                    );
-                }
-            }
+        // A wildcard covers a whole subtree, so there is no single name an
+        // address could reverse to. Skip it rather than inventing one.
+        for record in records.iter().filter(|r| !r.is_wildcard()) {
+            let fqdn = record.fqdn(default_domain);
+            map.insert(record.ip, (Arc::from(fqdn), record.ttl_or_default()));
         }
 
         info!(
-            count,
+            count = map.len(),
             "PTR auto-generation: preloaded local records at startup"
         );
 
-        Self {
-            inner,
-            map: Arc::new(map),
-        }
+        Arc::new(map)
     }
 }
 
-impl PtrRecordRegistry for LocalPtrResolver {
+/// Mutating handle on the live PTR map, held by the CRUD use cases.
+///
+/// Separate from the resolver for the same reason as `WildcardRegistry`: the
+/// use cases only add and remove entries and have no inner resolver to give.
+pub struct PtrRegistry {
+    map: Arc<PtrMap>,
+}
+
+impl PtrRegistry {
+    pub fn new(map: Arc<PtrMap>) -> Self {
+        Self { map }
+    }
+}
+
+impl PtrRecordRegistry for PtrRegistry {
     fn register(&self, ip: IpAddr, fqdn: Arc<str>, ttl: u32) {
         self.map.insert(ip, (fqdn, ttl));
     }

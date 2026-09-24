@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -61,7 +61,9 @@ pub enum DnsProtocol {
     },
     Https {
         url: Arc<str>,
+        /// URL host without brackets or port: the name the certificate is checked against.
         hostname: Arc<str>,
+        port: u16,
         resolved_addrs: Vec<SocketAddr>,
     },
     Quic {
@@ -70,7 +72,9 @@ pub enum DnsProtocol {
     },
     H3 {
         url: Arc<str>,
+        /// URL host without brackets or port: the name the certificate is checked against.
         hostname: Arc<str>,
+        port: u16,
         resolved_addrs: Vec<SocketAddr>,
     },
 }
@@ -112,7 +116,7 @@ impl DnsProtocol {
                 hostname,
                 resolved_addrs,
                 ..
-            } => hostname.parse::<std::net::IpAddr>().is_err() && resolved_addrs.is_empty(),
+            } => hostname.parse::<IpAddr>().is_err() && resolved_addrs.is_empty(),
         }
     }
 
@@ -140,14 +144,26 @@ impl DnsProtocol {
 
     pub fn with_resolved_addrs(&self, addrs: Vec<SocketAddr>) -> Self {
         match self {
-            DnsProtocol::Https { url, hostname, .. } => DnsProtocol::Https {
+            DnsProtocol::Https {
+                url,
+                hostname,
+                port,
+                ..
+            } => DnsProtocol::Https {
                 url: url.clone(),
                 hostname: hostname.clone(),
+                port: *port,
                 resolved_addrs: addrs,
             },
-            DnsProtocol::H3 { url, hostname, .. } => DnsProtocol::H3 {
+            DnsProtocol::H3 {
+                url,
+                hostname,
+                port,
+                ..
+            } => DnsProtocol::H3 {
                 url: url.clone(),
                 hostname: hostname.clone(),
+                port: *port,
                 resolved_addrs: addrs,
             },
             DnsProtocol::Udp { .. }
@@ -192,10 +208,43 @@ fn parse_named_addr(rest: &str) -> Result<(UpstreamAddr, Arc<str>), String> {
     ))
 }
 
-/// Keeps any `:port` suffix; the pool strips it before resolving.
-fn url_authority(rest: &str) -> &str {
-    rest.split_once('/')
-        .map_or(rest, |(authority, _)| authority)
+/// Splits the authority of `rest` (a URL after its scheme) into the bare host,
+/// IPv6 unbracketed, and the port, 443 when absent.
+fn parse_url_authority(rest: &str) -> Result<(Arc<str>, u16), String> {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, after) = bracketed
+                .split_once(']')
+                .ok_or("unterminated IPv6 literal")?;
+            host.parse::<Ipv6Addr>()
+                .map_err(|e| format!("invalid IPv6 literal '{host}': {e}"))?;
+            let port = match after {
+                "" => None,
+                _ => Some(
+                    after
+                        .strip_prefix(':')
+                        .ok_or("unexpected characters after IPv6 literal")?,
+                ),
+            };
+            (host, port)
+        }
+        // An unbracketed IPv6 address lands here and fails the port parse.
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if host.is_empty() {
+        return Err("missing host".into());
+    }
+    let port = match port {
+        Some(port) => port
+            .parse::<u16>()
+            .map_err(|e| format!("invalid port '{port}': {e}"))?,
+        None => 443,
+    };
+    Ok((host.into(), port))
 }
 
 fn parse_upstream_addr(addr_str: &str) -> Result<UpstreamAddr, String> {
@@ -236,16 +285,22 @@ impl FromStr for DnsProtocol {
             return Ok(DnsProtocol::Quic { addr, hostname });
         }
         if let Some(rest) = s.strip_prefix("h3://") {
+            let (hostname, port) =
+                parse_url_authority(rest).map_err(|e| format!("Invalid H3 URL '{s}': {e}"))?;
             return Ok(DnsProtocol::H3 {
                 url: s.into(),
-                hostname: url_authority(rest).into(),
+                hostname,
+                port,
                 resolved_addrs: vec![],
             });
         }
         if let Some(rest) = s.strip_prefix("https://") {
+            let (hostname, port) =
+                parse_url_authority(rest).map_err(|e| format!("Invalid HTTPS URL '{s}': {e}"))?;
             return Ok(DnsProtocol::Https {
                 url: s.into(),
-                hostname: url_authority(rest).into(),
+                hostname,
+                port,
                 resolved_addrs: vec![],
             });
         }

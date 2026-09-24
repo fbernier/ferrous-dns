@@ -1,11 +1,12 @@
 use super::client_stats::{
     fx_hash_str, subnet_key_from_ip, ClientApexStats, StatsMap, TrackingKey,
 };
-use super::entropy::{extract_apex, extract_subdomain, shannon_entropy};
+use super::entropy::extract_subdomain;
 use super::signal::SignalScore;
 use dashmap::DashMap;
 use ferrous_dns_application::ports::{TunnelingEvictionTarget, TunnelingFlagStore};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
+use ferrous_dns_application::use_cases::dns::domain_heuristics::{extract_apex, shannon_entropy};
 use ferrous_dns_application::use_cases::dns::TunnelingAnalysisEvent;
 use ferrous_dns_domain::{RecordType, TunnelingDetectionConfig};
 use rustc_hash::FxBuildHasher;

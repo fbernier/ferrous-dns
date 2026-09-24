@@ -26,9 +26,7 @@ async fn failed_admin_password_save_leaves_config_and_login_hash_unchanged() {
     let config = Arc::new(RwLock::new(config));
     let provider = CompositeUserProvider::new(
         admin,
-        Arc::new(SqliteUserRepository::new(Arc::new(
-            db::migrated_pool().await,
-        ))),
+        Arc::new(SqliteUserRepository::new(db::migrated_pool().await)),
         config.clone(),
         Some("/nonexistent/config.toml".into()),
         Arc::new(FailingPersistence),

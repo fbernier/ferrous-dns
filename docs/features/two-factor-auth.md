@@ -27,6 +27,8 @@ Under **Settings → Security → Two-Factor Authentication**, choose **Set up a
 
 On successful confirmation you receive a set of **one-time recovery codes** — store them somewhere safe. Each code lets you sign in once if you lose access to your authenticator. TOTP works on any deployment, including servers reached by bare IP over plain HTTP.
 
+Each code is accepted **once** (RFC 6238 §5.2). Codes stay valid for about 30 seconds on either side of the current one to tolerate clock drift, but once a code has been accepted, neither it nor any earlier code works again — someone who sees you type it cannot reuse it. Signing in twice within the same 30 seconds therefore needs the next code; the code that confirmed enrollment cannot also complete a login.
+
 The issuer label shown by the authenticator app is configurable via `totp_issuer` in `[auth]` (default `"Ferrous DNS"`).
 
 ---
@@ -36,6 +38,8 @@ The issuer label shown by the authenticator app is configurable via `totp_issuer
 Passkeys use public-key cryptography bound to your device or security key. From the same Security panel, choose **Register a passkey** and follow your browser/OS prompt. Registered passkeys are listed and can be removed individually.
 
 ![Passkey management — a registered passkey and the register button](../assets/auth/auth-passkey.png)
+
+Every passkey login stores the authenticator's signature counter with the passkey. A later login whose counter does not increase is refused as a possibly cloned key; authenticators that never count (they always report `0`, as most synced passkeys do) are unaffected.
 
 ### Requirements
 

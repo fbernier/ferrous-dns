@@ -84,7 +84,7 @@ async fn manager(addr: SocketAddr) -> Arc<PoolManager> {
 async fn resolver_with_local_server(addr: SocketAddr) -> CoreResolver {
     CoreResolver::new(manager(addr).await, 2000, false)
         .with_local_domain(Some("lan".to_string()))
-        .with_local_dns_server(Some(addr.to_string()))
+        .with_local_dns_server(Some(addr))
 }
 
 #[tokio::test]

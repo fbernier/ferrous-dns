@@ -6,61 +6,23 @@ pub use create::CreateLocalRecordUseCase;
 pub use delete::DeleteLocalRecordUseCase;
 pub use update::UpdateLocalRecordUseCase;
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
-use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord, RecordType};
-use tracing::warn;
+use ferrous_dns_domain::{DomainError, LocalDnsRecord, RecordType};
 
 use crate::ports::{DnsCachePort, PtrRecordRegistry, WildcardRecordRegistry};
 
-/// A validated A/AAAA record with its address and type already parsed.
-struct ParsedRecord {
-    record: LocalDnsRecord,
-    ip: IpAddr,
-    record_type: RecordType,
-}
-
-fn parse_record(
-    hostname: String,
-    domain: Option<String>,
-    ip: String,
-    record_type: String,
-    ttl: Option<u32>,
-) -> Result<ParsedRecord, DomainError> {
-    LocalDnsRecord::validate_hostname(&hostname).map_err(DomainError::InvalidDomainName)?;
-    if let Some(ref domain) = domain {
+/// Rejects a record the resolver could not serve as written. Needs the
+/// configured `local_domain`, which is what anchors a domain-less wildcard.
+fn validate(record: &LocalDnsRecord, local_domain: Option<&str>) -> Result<(), DomainError> {
+    LocalDnsRecord::validate_hostname(&record.hostname).map_err(DomainError::InvalidDomainName)?;
+    if let Some(domain) = &record.domain {
         LocalDnsRecord::validate_domain(domain).map_err(DomainError::InvalidDomainName)?;
     }
+    LocalDnsRecord::validate_address(record.record_type, record.ip)
+        .map_err(DomainError::InvalidIpAddress)?;
 
-    let parsed_ip = ip
-        .parse::<IpAddr>()
-        .map_err(|_| DomainError::InvalidIpAddress("Invalid IP address".to_string()))?;
-
-    let record_type = record_type.to_uppercase();
-    let parsed_record_type = record_type
-        .parse::<RecordType>()
-        .ok()
-        .filter(|rt| matches!(rt, RecordType::A | RecordType::AAAA))
-        .ok_or_else(|| {
-            DomainError::InvalidDomainName("Invalid record type (must be A or AAAA)".to_string())
-        })?;
-
-    Ok(ParsedRecord {
-        record: LocalDnsRecord {
-            hostname,
-            domain,
-            ip,
-            record_type,
-            ttl,
-        },
-        ip: parsed_ip,
-        record_type: parsed_record_type,
-    })
-}
-
-fn ensure_wildcard_anchored(record: &LocalDnsRecord, config: &Config) -> Result<(), DomainError> {
-    if record.is_wildcard() && record.wildcard_suffix(&config.dns.local_domain).is_none() {
+    if record.is_wildcard() && record.wildcard_suffix(local_domain).is_none() {
         return Err(DomainError::InvalidDomainName(
             "A wildcard record needs a domain to anchor it: set the domain field or dns.local_domain".to_string(),
         ));
@@ -89,56 +51,67 @@ struct LiveRecordSinks {
 }
 
 impl LiveRecordSinks {
-    fn install(&self, parsed: &ParsedRecord, local_domain: &Option<String>) {
-        let record = &parsed.record;
-        let ttl = record.ttl_or_default();
-        if let Some(suffix) = record.wildcard_suffix(local_domain) {
-            if let Some(ref registry) = self.wildcard {
-                registry.register(&suffix, parsed.record_type, parsed.ip, ttl);
-            }
-            return;
-        }
+    /// Points every live entry keyed by `changed` — its address for PTR, its
+    /// name and type for the cache and the wildcard index — at whichever of
+    /// `records` now holds that key, or drops the entry when none does.
+    ///
+    /// Records may share a key, so a deleted or edited record cannot simply
+    /// take its entries with it. The last holder wins, as at startup.
+    fn refresh(
+        &self,
+        changed: &LocalDnsRecord,
+        records: &[LocalDnsRecord],
+        local_domain: Option<&str>,
+    ) {
+        let fqdn = changed.fqdn(local_domain);
+        let same_name = |r: &&LocalDnsRecord| {
+            r.record_type == changed.record_type && r.has_fqdn(&fqdn, local_domain)
+        };
 
-        let fqdn = record.fqdn(local_domain);
-        if let Some(ref registry) = self.ptr {
-            registry.register(parsed.ip, Arc::from(fqdn.as_str()), ttl);
-        }
-        if let Some(ref cache) = self.cache {
-            cache.insert_permanent_record(&fqdn, parsed.record_type, vec![parsed.ip], ttl);
-        }
-    }
-
-    /// Stored records were validated on write; unparseable fields are logged and skipped.
-    fn retire(&self, record: &LocalDnsRecord, local_domain: &Option<String>) {
-        let record_type = record.record_type.parse::<RecordType>();
-        if let Some(suffix) = record.wildcard_suffix(local_domain) {
-            if let Some(ref registry) = self.wildcard {
-                match record_type {
-                    Ok(rt) => registry.unregister(&suffix, rt),
-                    Err(_) => warn!(
-                        record_type = %record.record_type,
-                        "Wildcard registry: unrecognised record type, skipping removal"
+        if changed.is_wildcard() {
+            // An unanchored wildcard is never indexed, so it has no entry to refresh.
+            if let (Some(registry), Some(suffix)) =
+                (&self.wildcard, changed.wildcard_suffix(local_domain))
+            {
+                match records.iter().rev().find(same_name) {
+                    Some(owner) => registry.register(
+                        &suffix,
+                        owner.record_type,
+                        owner.ip,
+                        owner.ttl_or_default(),
                     ),
+                    None => registry.unregister(&suffix, changed.record_type),
                 }
             }
             return;
         }
 
-        if let Some(ref registry) = self.ptr {
-            match record.ip.parse() {
-                Ok(ip) => registry.unregister(ip),
-                Err(_) => warn!(ip = %record.ip, "PTR registry: unparseable IP, skipping removal"),
+        if let Some(registry) = &self.ptr {
+            match records
+                .iter()
+                .rev()
+                .find(|r| !r.is_wildcard() && r.ip == changed.ip)
+            {
+                Some(owner) => registry.register(
+                    changed.ip,
+                    Arc::from(owner.fqdn(local_domain)),
+                    owner.ttl_or_default(),
+                ),
+                None => registry.unregister(changed.ip),
             }
         }
-        if let Some(ref cache) = self.cache {
-            match record_type {
-                Ok(rt) => {
-                    cache.remove_record(&record.fqdn(local_domain), &rt);
-                }
-                Err(_) => warn!(
-                    record_type = %record.record_type,
-                    "DNS cache: unrecognised record type, skipping eviction"
-                ),
+
+        if let Some(cache) = &self.cache {
+            let record_type = RecordType::from(changed.record_type);
+            // Removing first also retires the old answer from every thread's L1.
+            cache.remove_record(&fqdn, &record_type);
+            if let Some(owner) = records.iter().rev().find(same_name) {
+                cache.insert_permanent_record(
+                    &fqdn,
+                    record_type,
+                    vec![owner.ip],
+                    owner.ttl_or_default(),
+                );
             }
         }
     }

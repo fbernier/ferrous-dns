@@ -13,7 +13,7 @@ pub use entities::whitelist;
 pub use config::{
     AdminConfig, AuthConfig, BlockResponseMode, CliOverrides, Config, ConfigError,
     DgaDetectionAction, DgaDetectionConfig, Dns64Config, DnsConfig, DnsCookiesConfig, DnssecMode,
-    EncryptedDnsConfig, HealthCheckConfig, LocalDnsRecord, NxdomainHijackAction,
+    EncryptedDnsConfig, HealthCheckConfig, LocalDnsRecord, LocalRecordType, NxdomainHijackAction,
     NxdomainHijackConfig, RateLimitConfig, ResponseIpFilterAction, ResponseIpFilterConfig,
     ServerConfig, TunnelingAction, TunnelingDetectionConfig, UpstreamPool, UpstreamStrategy,
     WebauthnConfig, DEFAULT_BLOCK_TTL, DEFAULT_DNS64_PREFIX,

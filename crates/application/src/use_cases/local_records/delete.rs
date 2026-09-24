@@ -23,25 +23,22 @@ impl DeleteLocalRecordUseCase {
 
     /// Attaches a live PTR registry so that a successful record deletion immediately
     /// removes the IP → FQDN mapping without requiring a server restart.
-    pub fn with_ptr_registry(mut self, registry: Option<Arc<dyn PtrRecordRegistry>>) -> Self {
-        self.sinks.ptr = registry;
+    pub fn with_ptr_registry(mut self, registry: Arc<dyn PtrRecordRegistry>) -> Self {
+        self.sinks.ptr = Some(registry);
         self
     }
 
     /// Attaches a live DNS cache so that a successful record deletion immediately
     /// removes the forward record (A/AAAA) from the cache without requiring a server restart.
-    pub fn with_dns_cache(mut self, cache: Option<Arc<dyn DnsCachePort>>) -> Self {
-        self.sinks.cache = cache;
+    pub fn with_dns_cache(mut self, cache: Arc<dyn DnsCachePort>) -> Self {
+        self.sinks.cache = Some(cache);
         self
     }
 
     /// Attaches the live wildcard index so that deleting a wildcard record stops
     /// it answering on the next query, without a server restart.
-    pub fn with_wildcard_registry(
-        mut self,
-        registry: Option<Arc<dyn WildcardRecordRegistry>>,
-    ) -> Self {
-        self.sinks.wildcard = registry;
+    pub fn with_wildcard_registry(mut self, registry: Arc<dyn WildcardRecordRegistry>) -> Self {
+        self.sinks.wildcard = Some(registry);
         self
     }
 
@@ -60,7 +57,12 @@ impl DeleteLocalRecordUseCase {
             return Err(save_failed(e));
         }
 
-        self.sinks.retire(&removed_record, &config.dns.local_domain);
+        let dns = &config.dns;
+        self.sinks.refresh(
+            &removed_record,
+            &dns.local_records,
+            dns.local_domain.as_deref(),
+        );
         Ok(removed_record)
     }
 }

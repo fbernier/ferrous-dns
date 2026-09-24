@@ -19,40 +19,24 @@ pub struct DnsForwarder {
     hardening: HardeningOpts,
 }
 
-impl Default for DnsForwarder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DnsForwarder {
-    pub fn new() -> Self {
-        Self {
-            hardening: HardeningOpts::default(),
-        }
-    }
-
-    /// Applies the upstream pools' hardening, so `qname_case_randomization`
+    /// `hardening` should be the upstream pools', so `qname_case_randomization`
     /// covers the local server too.
-    pub fn with_hardening(mut self, hardening: HardeningOpts) -> Self {
-        self.hardening = hardening;
-        self
+    pub fn new(hardening: HardeningOpts) -> Self {
+        Self { hardening }
     }
 
     pub async fn query(
         &self,
-        server: &str,
+        server: SocketAddr,
         domain: &str,
         record_type: &RecordType,
         timeout_ms: u64,
     ) -> Result<DnsResponse, DomainError> {
-        let server_addr: SocketAddr = server
-            .parse()
-            .map_err(|e| DomainError::IoError(format!("Invalid server address: {}", e)))?;
         let (query_bytes, validator) =
             MessageBuilder::build_query_hardened(domain, record_type, false, self.hardening)?;
         let udp = DnsProtocol::Udp {
-            addr: UpstreamAddr::Resolved(server_addr),
+            addr: UpstreamAddr::Resolved(server),
         };
         let (response, _) = exchange_with_tc_retry(
             &udp,
@@ -102,7 +86,7 @@ async fn exchange(
     let reply = transport::get_or_create_transport(protocol)?
         .send(query_bytes, timeout)
         .await?;
-    let mut response = ResponseParser::parse_bytes(reply.bytes)?;
+    let mut response = ResponseParser::parse_bytes(reply)?;
     validator.validate(&response, protocol)?;
     validator.canonicalize(&mut response);
     Ok(response)

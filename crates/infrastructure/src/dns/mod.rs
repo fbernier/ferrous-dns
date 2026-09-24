@@ -32,7 +32,6 @@ pub use load_balancer::{
     UpstreamReloadAdapter,
 };
 pub use nxdomain_hijack::NxdomainHijackDetector;
-pub use resolver::HickoryDnsResolver;
 pub use response_ip_filter::ResponseIpFilterDetector;
 pub use safe_search::SafeSearchEnforcer;
 pub use tunneling::TunnelingDetector;

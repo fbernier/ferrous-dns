@@ -467,7 +467,7 @@ fn write_local_records(
             if let Some(ref domain) = record.domain {
                 table.insert("domain", toml_edit::value(domain.as_str()));
             }
-            table.insert("ip", toml_edit::value(record.ip.as_str()));
+            table.insert("ip", toml_edit::value(record.ip.to_string()));
             table.insert("record_type", toml_edit::value(record.record_type.as_str()));
             if let Some(ttl) = record.ttl {
                 table.insert("ttl", toml_edit::value(ttl as i64));

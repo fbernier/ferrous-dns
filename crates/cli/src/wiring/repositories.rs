@@ -137,10 +137,10 @@ impl Repositories {
             safe_search_engine,
             schedule_profile: Arc::new(SqliteScheduleProfileRepository::new(write_pool.clone())),
             schedule_state,
-            session: Arc::new(SqliteSessionRepository::new(Arc::new(write_pool.clone()))),
-            user: Arc::new(SqliteUserRepository::new(Arc::new(write_pool.clone()))),
-            mfa: Arc::new(SqliteMfaRepository::new(Arc::new(write_pool.clone()))),
-            api_token: Arc::new(SqliteApiTokenRepository::new(Arc::new(write_pool))),
+            session: Arc::new(SqliteSessionRepository::new(write_pool.clone())),
+            user: Arc::new(SqliteUserRepository::new(write_pool.clone())),
+            mfa: Arc::new(SqliteMfaRepository::new(write_pool.clone())),
+            api_token: Arc::new(SqliteApiTokenRepository::new(write_pool)),
         })
     }
 }

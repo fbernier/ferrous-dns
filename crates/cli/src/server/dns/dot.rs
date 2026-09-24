@@ -1,10 +1,8 @@
 use super::connection_limiter::{ConnectionGuard, ConnectionLimiter};
 use super::pktinfo;
 use super::tcp::bind_tcp_listener;
-use ferrous_dns_domain::ClientProtocol;
-use ferrous_dns_infrastructure::dns::proxy_protocol::{
-    read_proxy_v2_client_ip, ProxyProtocolError,
-};
+use ferrous_dns_domain::{ClientProtocol, DomainError};
+use ferrous_dns_infrastructure::dns::proxy_protocol::read_proxy_v2_client_ip;
 use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -130,7 +128,7 @@ async fn handle_dot_connection(
         .await
         {
             Ok(Ok(ip)) => ip,
-            Ok(Err(ProxyProtocolError::Io(e))) => {
+            Ok(Err(DomainError::IoError(e))) => {
                 warn!(client = %peer_addr, error = %e, "DoT PROXY Protocol I/O error");
                 return;
             }

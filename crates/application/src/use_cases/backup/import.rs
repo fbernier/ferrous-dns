@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ferrous_dns_domain::{Config, DomainError};
+use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord};
 use tokio::sync::RwLock;
 use tracing::{error, info, instrument, warn};
 
@@ -301,18 +301,19 @@ impl ImportConfigUseCase {
                 }
             }
 
-            match self
-                .local_record_creator
-                .create_local_record(
-                    record.hostname.clone(),
-                    record.domain.clone(),
-                    record.ip.clone(),
-                    record.record_type.clone(),
-                    record.ttl,
-                )
-                .await
-            {
-                Ok(_) => imported += 1,
+            let parsed = LocalDnsRecord::parse(
+                record.hostname.clone(),
+                record.domain.clone(),
+                &record.ip,
+                &record.record_type,
+                record.ttl,
+            );
+            let created = match parsed {
+                Ok(parsed) => self.local_record_creator.create_local_record(parsed).await,
+                Err(e) => Err(e),
+            };
+            match created {
+                Ok(()) => imported += 1,
                 Err(e) => {
                     warn!(hostname = %record.hostname, error = %e, "Skipping local record during import");
                     skipped += 1;

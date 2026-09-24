@@ -1,11 +1,11 @@
 use super::record_type_map::RecordTypeMapper;
 use super::response_validator::ResponseValidator;
+use crate::dns::wire_response::COOKIE_OPTION_CODE;
 use ferrous_dns_domain::{DomainError, RecordType};
 use hickory_proto::rr::Name;
 use std::str::FromStr;
 
 pub(super) const CLIENT_COOKIE_LEN: usize = 8;
-pub(super) const COOKIE_OPTION_CODE: u16 = 10;
 /// RFC 1035 §3.1: a wire-format name is at most 255 octets.
 const MAX_QNAME_LEN: usize = 255;
 

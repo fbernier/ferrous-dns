@@ -10,7 +10,7 @@ use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use ferrous_dns_application::use_cases::LoginOutcome;
-use ferrous_dns_domain::{AuthSession, DomainError};
+use ferrous_dns_domain::{AuthSession, DomainError, MfaMethod};
 
 use crate::dto::auth::{
     AuthStatusResponse, ChangePasswordRequest, ConfirmTotpRequest, DisableMfaRequest,
@@ -191,7 +191,7 @@ pub async fn login_public(
             Ok(Json(LoginResponse {
                 mfa_required: true,
                 challenge_token: Some(challenge_token),
-                methods: methods.into_iter().map(String::from).collect(),
+                methods: methods.iter().map(MfaMethod::as_str).collect(),
                 ..Default::default()
             })
             .into_response())

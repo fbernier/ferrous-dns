@@ -3,7 +3,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use ferrous_dns_domain::LocalDnsRecord;
+use ferrous_dns_domain::{LocalDnsRecord, LocalRecordType};
 use helpers::TestApp;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -146,15 +146,15 @@ async fn test_export_includes_local_records_from_config() {
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "nas".to_string(),
             domain: Some("home".to_string()),
-            ip: "192.168.1.100".to_string(),
-            record_type: "A".to_string(),
+            ip: "192.168.1.100".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(300),
         });
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "pi".to_string(),
             domain: Some("home".to_string()),
-            ip: "192.168.1.5".to_string(),
-            record_type: "A".to_string(),
+            ip: "192.168.1.5".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(60),
         });
     }
@@ -345,8 +345,8 @@ async fn test_import_existing_local_record_is_skipped() {
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "server".to_string(),
             domain: Some("local".to_string()),
-            ip: "10.0.0.1".to_string(),
-            record_type: "A".to_string(),
+            ip: "10.0.0.1".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(300),
         });
     }
@@ -521,15 +521,15 @@ async fn test_import_partial_overlap_counts_each_correctly() {
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "existing-a".to_string(),
             domain: Some("lan".to_string()),
-            ip: "10.0.0.1".to_string(),
-            record_type: "A".to_string(),
+            ip: "10.0.0.1".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(300),
         });
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "existing-b".to_string(),
             domain: Some("lan".to_string()),
-            ip: "10.0.0.2".to_string(),
-            record_type: "A".to_string(),
+            ip: "10.0.0.2".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(300),
         });
     }
@@ -583,7 +583,7 @@ async fn test_import_ipv6_aaaa_records() {
         .dns
         .local_records
         .iter()
-        .any(|r| r.hostname == "v6host" && r.record_type == "AAAA"));
+        .any(|r| r.hostname == "v6host" && r.record_type == LocalRecordType::AAAA));
 }
 
 #[tokio::test]
@@ -599,8 +599,8 @@ async fn test_import_record_without_domain_is_distinct_from_record_with_domain()
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "server".to_string(),
             domain: None,
-            ip: "10.0.0.1".to_string(),
-            record_type: "A".to_string(),
+            ip: "10.0.0.1".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(300),
         });
     }
@@ -795,8 +795,8 @@ async fn test_export_then_import_is_a_complete_round_trip() {
             cfg.dns.local_records.push(LocalDnsRecord {
                 hostname: format!("node-{i}"),
                 domain: Some("cluster".to_string()),
-                ip: format!("192.168.10.{i}"),
-                record_type: "A".to_string(),
+                ip: format!("192.168.10.{i}").parse().unwrap(),
+                record_type: LocalRecordType::A,
                 ttl: Some(120),
             });
         }
@@ -879,13 +879,13 @@ async fn test_import_mixed_ipv4_and_ipv6_records() {
         .dns
         .local_records
         .iter()
-        .filter(|r| r.record_type == "A")
+        .filter(|r| r.record_type == LocalRecordType::A)
         .count();
     let aaaa_count = cfg
         .dns
         .local_records
         .iter()
-        .filter(|r| r.record_type == "AAAA")
+        .filter(|r| r.record_type == LocalRecordType::AAAA)
         .count();
     assert_eq!(a_count, 2);
     assert_eq!(aaaa_count, 2);

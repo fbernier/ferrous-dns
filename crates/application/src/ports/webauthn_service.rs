@@ -15,6 +15,8 @@ pub struct AuthenticatedCredential {
     pub credential_id: String,
     /// Updated signature counter (for clone detection).
     pub sign_count: i64,
+    /// The stored `Passkey` (JSON) with the assertion's counter and backup state applied.
+    pub passkey_json: String,
 }
 
 /// Port abstracting the WebAuthn ceremonies (register/authenticate).
@@ -49,11 +51,13 @@ pub trait WebauthnService: Send + Sync {
         passkeys_json: &[String],
     ) -> Result<(serde_json::Value, String), DomainError>;
 
-    /// Complete authentication from the browser response and stored state.
+    /// Complete authentication from the browser response and stored state;
+    /// `passkeys_json` are the user's stored `Passkey`s the assertion is matched against.
     fn finish_authentication(
         &self,
         response: serde_json::Value,
         state_json: &str,
+        passkeys_json: &[String],
     ) -> Result<AuthenticatedCredential, DomainError>;
 
     /// Begin a usernameless (discoverable-credential) authentication. No user is

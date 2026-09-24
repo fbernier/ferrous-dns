@@ -5,7 +5,8 @@
 use async_trait::async_trait;
 use ferrous_dns_api_pihole::state::PiholeAuthState;
 use ferrous_dns_application::ports::{
-    ApiTokenRepository, MfaRepository, PasswordHasher, SessionRepository, TotpService, UserProvider,
+    ApiKeyMaterial, ApiTokenRepository, MfaRepository, PasswordHasher, SessionRepository,
+    TotpService, UserProvider,
 };
 use ferrous_dns_application::use_cases::{
     AppPasswordLoginUseCase, CreateApiTokenUseCase, LoginRateLimiter, LoginUseCase, LogoutUseCase,
@@ -181,6 +182,9 @@ impl MfaRepository for InMemoryMfaRepository {
     async fn enable(&self, _: &str) -> Result<(), DomainError> {
         Ok(())
     }
+    async fn advance_totp_step(&self, _: &str, _: u64) -> Result<bool, DomainError> {
+        Ok(true)
+    }
     async fn delete_all(&self, _: &str) -> Result<(), DomainError> {
         Ok(())
     }
@@ -222,7 +226,7 @@ impl MfaRepository for InMemoryMfaRepository {
     ) -> Result<Option<WebauthnCredential>, DomainError> {
         Ok(None)
     }
-    async fn update_credential_counter(&self, _: &str, _: i64) -> Result<(), DomainError> {
+    async fn update_credential(&self, _: &str, _: i64, _: &str) -> Result<(), DomainError> {
         Ok(())
     }
     async fn delete_credential(&self, _: i64, _: &str) -> Result<(), DomainError> {
@@ -245,8 +249,8 @@ impl TotpService for FixedTotpService {
     fn qr_svg(&self, _: &str) -> Result<String, DomainError> {
         Ok("<svg/>".to_string())
     }
-    fn verify(&self, _: &str, code: &str) -> Result<bool, DomainError> {
-        Ok(code == TOTP_CODE)
+    fn verify(&self, _: &str, code: &str) -> Result<Option<u64>, DomainError> {
+        Ok((code == TOTP_CODE).then_some(1))
     }
 }
 
@@ -290,9 +294,7 @@ impl ApiTokenRepository for InMemoryApiTokenRepository {
         &self,
         id: i64,
         _: &str,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
+        _: Option<ApiKeyMaterial<'_>>,
     ) -> Result<ApiToken, DomainError> {
         Err(DomainError::ApiTokenNotFound(id))
     }
@@ -301,9 +303,6 @@ impl ApiTokenRepository for InMemoryApiTokenRepository {
     }
     async fn update_last_used(&self, _: i64) -> Result<(), DomainError> {
         Ok(())
-    }
-    async fn get_all_hashes(&self) -> Result<Vec<(i64, String)>, DomainError> {
-        Ok(Vec::new())
     }
     async fn get_id_by_hash(&self, key_hash: &str) -> Result<Option<i64>, DomainError> {
         let hashes = self.hashes.lock().unwrap();

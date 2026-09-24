@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ferrous_dns_domain::DomainError;
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::{RData, Record};
+use hickory_proto::rr::RData;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::debug;
@@ -17,8 +17,6 @@ pub struct DnsResponse {
     pub truncated: bool,
 
     pub min_ttl: Option<u32>,
-
-    pub raw_answers: Vec<Record>,
 
     pub negative_soa_ttl: Option<u32>,
 
@@ -56,7 +54,6 @@ impl ResponseParser {
         let mut addresses = Vec::with_capacity(message.answers.len().min(8));
         let mut cname_chain: Vec<Arc<str>> = Vec::new();
         let mut min_ttl: Option<u32> = None;
-        let mut raw_answers = Vec::new();
 
         for record in &message.answers {
             let record_ttl = record.ttl;
@@ -74,9 +71,7 @@ impl ResponseParser {
                     debug!(cname = %name, "CNAME record found");
                     cname_chain.push(Arc::from(name.as_str()));
                 }
-                _ => {
-                    raw_answers.push(record.clone());
-                }
+                _ => {}
             }
         }
 
@@ -102,7 +97,6 @@ impl ResponseParser {
             rcode,
             truncated,
             min_ttl,
-            raw_answers,
             negative_soa_ttl,
             message,
             raw_bytes: response_bytes,

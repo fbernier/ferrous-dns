@@ -12,6 +12,6 @@ pub trait TotpService: Send + Sync {
     /// Render an SVG QR code for a provisioning URI.
     fn qr_svg(&self, otpauth_uri: &str) -> Result<String, DomainError>;
 
-    /// Verify a 6-digit code against the secret, tolerating small clock drift.
-    fn verify(&self, secret: &str, code: &str) -> Result<bool, DomainError>;
+    /// The RFC 6238 time step `code` matches within the clock-drift window (the newest on a tie), or `None`.
+    fn verify(&self, secret: &str, code: &str) -> Result<Option<u64>, DomainError>;
 }

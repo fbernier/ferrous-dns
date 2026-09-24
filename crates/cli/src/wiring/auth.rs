@@ -101,6 +101,7 @@ pub async fn build_auth_services(
             repos.user.clone(),
             user_provider.clone(),
             password_hasher.clone(),
+            auth_config.admin.username.clone(),
         )),
         get_users: Arc::new(GetUsersUseCase::new(user_provider.clone())),
         delete_user: Arc::new(DeleteUserUseCase::new(repos.user.clone())),

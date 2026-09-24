@@ -47,11 +47,13 @@ fn test_parse_https_with_hostname() {
     if let DnsProtocol::Https {
         url,
         hostname,
+        port,
         resolved_addrs,
     } = protocol
     {
         assert_eq!(&*url, "https://dns.google/dns-query");
         assert_eq!(&*hostname, "dns.google");
+        assert_eq!(port, 443);
         assert!(resolved_addrs.is_empty());
     } else {
         panic!("Expected Https variant");
@@ -150,11 +152,13 @@ fn test_parse_h3_with_hostname() {
     if let DnsProtocol::H3 {
         url,
         hostname,
+        port,
         resolved_addrs,
     } = protocol
     {
         assert_eq!(&*url, "h3://dns.google/dns-query");
         assert_eq!(&*hostname, "dns.google");
+        assert_eq!(port, 443);
         assert!(resolved_addrs.is_empty());
     } else {
         panic!("Expected H3 variant");
@@ -513,6 +517,63 @@ fn test_h3_ip_url_needs_no_resolution() {
         !protocol.needs_resolution(),
         "H3 with IP literal should not need resolution"
     );
+}
+
+#[test]
+fn https_and_h3_urls_split_into_bare_host_and_port() {
+    let cases = [
+        (
+            "https://[2606:4700::1111]/dns-query",
+            "2606:4700::1111",
+            443,
+        ),
+        ("https://[::1]:8443/dns-query", "::1", 8443),
+        ("h3://[::1]:8443/dns-query", "::1", 8443),
+        ("https://dns.example:8443/dns-query", "dns.example", 8443),
+        ("h3://dns.example?dns=AAAB", "dns.example", 443),
+    ];
+    for (url, expected_host, expected_port) in cases {
+        let protocol: DnsProtocol = url.parse().unwrap();
+        let (DnsProtocol::Https { hostname, port, .. } | DnsProtocol::H3 { hostname, port, .. }) =
+            &protocol
+        else {
+            panic!("{url}: expected an HTTPS or H3 variant");
+        };
+        assert_eq!(
+            (&**hostname, *port),
+            (expected_host, expected_port),
+            "{url}"
+        );
+        assert_eq!(protocol.to_string(), url);
+    }
+}
+
+#[test]
+fn https_and_h3_ipv6_literals_need_no_resolution() {
+    for url in [
+        "https://[2606:4700::1111]/dns-query",
+        "https://[::1]:8443/dns-query",
+        "h3://[::1]:8443/dns-query",
+    ] {
+        let protocol: DnsProtocol = url.parse().unwrap();
+        assert!(!protocol.needs_resolution(), "{url}");
+    }
+}
+
+#[test]
+fn malformed_https_and_h3_authorities_are_rejected() {
+    for url in [
+        "https://2606:4700::1111/dns-query",
+        "https://[2606:4700::1111/dns-query",
+        "https://[dns.example]/dns-query",
+        "https://[::1]x/dns-query",
+        "https://dns.example:notaport/dns-query",
+        "https://dns.example:70000/dns-query",
+        "https:///dns-query",
+        "h3://:443/dns-query",
+    ] {
+        assert!(url.parse::<DnsProtocol>().is_err(), "{url}");
+    }
 }
 
 #[test]

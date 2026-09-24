@@ -1,7 +1,7 @@
 use super::health::HealthChecker;
 use super::strategy::{QueryContext, ServerDisplays, Strategy, UpstreamResult};
 use crate::dns::forwarding::{HardeningOpts, MessageBuilder, ResponseParser};
-use crate::dns::transport::{resolver, split_authority};
+use crate::dns::transport::resolver;
 use arc_swap::ArcSwap;
 use ferrous_dns_domain::{DnsProtocol, DomainError, RecordType, UpstreamPool, UpstreamStrategy};
 use smallvec::SmallVec;
@@ -197,13 +197,12 @@ impl PoolManager {
                             }
                         }
                     }
-                    DnsProtocol::Https { hostname, .. } | DnsProtocol::H3 { hostname, .. } => {
-                        let (clean_host, port) = split_authority(hostname, 443);
-                        match resolver::resolve_all(clean_host, port, Duration::from_secs(5)).await
-                        {
+                    DnsProtocol::Https { hostname, port, .. }
+                    | DnsProtocol::H3 { hostname, port, .. } => {
+                        match resolver::resolve_all(hostname, *port, Duration::from_secs(5)).await {
                             Ok(addrs) => {
                                 let limited = Self::limit_resolved_addrs(addrs);
-                                info!("{} pre-resolved to {} addresses", clean_host, limited.len());
+                                info!("{} pre-resolved to {} addresses", hostname, limited.len());
                                 for addr in &limited {
                                     info!("  → {}", addr);
                                 }
@@ -216,7 +215,7 @@ impl PoolManager {
                             }
                             Err(e) => {
                                 warn!(
-                                    hostname = %clean_host,
+                                    hostname = %hostname,
                                     error = %e,
                                     "Failed to pre-resolve, transport will resolve at runtime"
                                 );
@@ -303,7 +302,7 @@ impl PoolManager {
 
             match pool.strategy.query_refs(&ctx).await {
                 Ok(result) => {
-                    debug!(pool = %pool.config.name, server = %result.server, "Pool query successful");
+                    debug!(pool = %pool.config.name, server = %result.server_display, "Pool query successful");
                     return Ok(result);
                 }
                 Err(e) => {

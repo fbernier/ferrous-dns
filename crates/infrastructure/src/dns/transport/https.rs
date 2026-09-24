@@ -1,4 +1,4 @@
-use super::{doh_response_too_large, split_authority, MAX_DOH_MESSAGE_SIZE};
+use super::{doh_response_too_large, MAX_DOH_MESSAGE_SIZE};
 use bytes::{Bytes, BytesMut};
 use ferrous_dns_domain::DomainError;
 use std::net::SocketAddr;
@@ -31,9 +31,8 @@ pub struct HttpsTransport {
 }
 
 impl HttpsTransport {
-    /// `authority` is the URL's `host[:port]`.
-    pub fn new(url: String, authority: &str, resolved_addrs: Vec<SocketAddr>) -> Self {
-        let (host, _) = split_authority(authority, 443);
+    /// `host` is the URL host without port or brackets.
+    pub fn new(url: String, host: &str, resolved_addrs: Vec<SocketAddr>) -> Self {
         Self {
             url,
             host: host.to_owned(),
@@ -155,7 +154,7 @@ impl HttpsTransport {
 mod tests {
     use super::HttpsTransport;
     use bytes::Bytes;
-    use ferrous_dns_domain::DomainError;
+    use ferrous_dns_domain::{DnsProtocol, DomainError};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -228,12 +227,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // `.invalid` never resolves, so reaching the listener proves the override was used.
-        let authority = format!("ferrous-doh-test.invalid:{}", addr.port());
-        let transport = HttpsTransport::new(
-            format!("http://{authority}/dns-query"),
-            &authority,
-            vec![addr],
-        );
+        let upstream: DnsProtocol =
+            format!("https://ferrous-doh-test.invalid:{}/dns-query", addr.port())
+                .parse()
+                .unwrap();
+        let DnsProtocol::Https { url, hostname, .. } = upstream.with_resolved_addrs(vec![addr])
+        else {
+            panic!("expected an HTTPS upstream");
+        };
+        let transport = HttpsTransport::new(url.to_string(), &hostname, vec![addr]);
 
         let accepted = tokio::select! {
             accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept()) => accepted,

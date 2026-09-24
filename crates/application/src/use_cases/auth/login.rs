@@ -17,9 +17,8 @@ pub enum LoginOutcome {
     MfaRequired {
         /// Opaque challenge token the client echoes back to `/auth/2fa/verify`.
         challenge_token: String,
-        /// Which second-factor methods this account has enrolled
-        /// (`"totp"` and/or `"webauthn"`).
-        methods: Vec<&'static str>,
+        /// Second-factor methods this account has enrolled.
+        methods: Vec<MfaMethod>,
     },
 }
 
@@ -129,10 +128,10 @@ impl LoginUseCase {
 
             let mut methods = Vec::new();
             if totp_enabled {
-                methods.push("totp");
+                methods.push(MfaMethod::Totp);
             }
             if has_passkeys {
-                methods.push("webauthn");
+                methods.push(MfaMethod::Webauthn);
             }
 
             info!(username = username, "Password OK, second factor required");
@@ -144,7 +143,7 @@ impl LoginUseCase {
 
         let session = build_session(
             user.username.clone(),
-            user.role.clone(),
+            user.role,
             remember_me,
             ip_address,
             user_agent,

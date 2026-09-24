@@ -1,12 +1,11 @@
-use ferrous_dns_application::ports::ApiTokenRepository;
+use ferrous_dns_application::ports::{ApiKeyMaterial, ApiTokenRepository};
 use ferrous_dns_infrastructure::repositories::SqliteApiTokenRepository;
-use std::sync::Arc;
 
 #[path = "support/db.rs"]
 mod db;
 
 fn make_repo(pool: sqlx::SqlitePool) -> SqliteApiTokenRepository {
-    SqliteApiTokenRepository::new(Arc::new(pool))
+    SqliteApiTokenRepository::new(pool)
 }
 
 #[tokio::test]
@@ -115,7 +114,7 @@ async fn update_name_only() {
     let created = repo.create("old-name", "pre", "hash", "raw").await.unwrap();
     let id = created.id.unwrap();
 
-    let updated = repo.update(id, "new-name", None, None, None).await.unwrap();
+    let updated = repo.update(id, "new-name", None).await.unwrap();
     assert_eq!(updated.name.as_ref(), "new-name");
     assert_eq!(updated.key_hash.as_ref(), "hash");
 }
@@ -129,7 +128,15 @@ async fn update_name_and_key() {
     let id = created.id.unwrap();
 
     let updated = repo
-        .update(id, "token", Some("newpre"), Some("newhash"), Some("newraw"))
+        .update(
+            id,
+            "token",
+            Some(ApiKeyMaterial {
+                prefix: "newpre",
+                hash: "newhash",
+                raw: "newraw",
+            }),
+        )
         .await
         .unwrap();
 
@@ -143,10 +150,7 @@ async fn update_nonexistent_returns_not_found() {
     let pool = db::migrated_pool().await;
     let repo = make_repo(pool);
 
-    let err = repo
-        .update(999, "name", None, None, None)
-        .await
-        .unwrap_err();
+    let err = repo.update(999, "name", None).await.unwrap_err();
     assert!(matches!(
         err,
         ferrous_dns_domain::DomainError::ApiTokenNotFound(999)
@@ -162,10 +166,7 @@ async fn update_duplicate_name_returns_error() {
     let second = repo.create("other", "pre2", "hash2", "raw2").await.unwrap();
     let id2 = second.id.unwrap();
 
-    let err = repo
-        .update(id2, "taken", None, None, None)
-        .await
-        .unwrap_err();
+    let err = repo.update(id2, "taken", None).await.unwrap_err();
     assert!(matches!(
         err,
         ferrous_dns_domain::DomainError::DuplicateApiTokenName(_)
@@ -209,22 +210,6 @@ async fn update_last_used_sets_timestamp() {
 
     let token = repo.get_by_id(id).await.unwrap().unwrap();
     assert!(token.last_used_at.is_some());
-}
-
-#[tokio::test]
-async fn get_all_hashes_returns_pairs() {
-    let pool = db::migrated_pool().await;
-    let repo = make_repo(pool);
-
-    repo.create("a", "pre1", "hash_a", "raw1").await.unwrap();
-    repo.create("b", "pre2", "hash_b", "raw2").await.unwrap();
-
-    let hashes = repo.get_all_hashes().await.unwrap();
-    assert_eq!(hashes.len(), 2);
-
-    let hash_strings: Vec<&str> = hashes.iter().map(|(_, h)| h.as_str()).collect();
-    assert!(hash_strings.contains(&"hash_a"));
-    assert!(hash_strings.contains(&"hash_b"));
 }
 
 #[tokio::test]

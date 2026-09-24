@@ -27,8 +27,9 @@ pub struct LoginResponse {
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub methods: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<String>)]
+    pub methods: Vec<&'static str>,
 }
 
 /// Second step of MFA login: verify a TOTP or recovery code against a challenge.

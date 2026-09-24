@@ -1,4 +1,4 @@
-use std::fmt;
+use ferrous_dns_domain::DomainError;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -13,52 +13,30 @@ const COMMAND_PROXY: u8 = 0x01;
 const FAMILY_TCP4: u8 = 0x11;
 const FAMILY_TCP6: u8 = 0x21;
 
-#[derive(Debug)]
-pub enum ProxyProtocolError {
-    Io(io::Error),
-    InvalidSignature,
-    InvalidVersion,
-    UnknownCommand,
-    AdditionalLenTooLarge,
+fn read_error(e: io::Error) -> DomainError {
+    DomainError::IoError(format!("reading PROXY Protocol v2 header: {e}"))
 }
 
-impl fmt::Display for ProxyProtocolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "I/O error reading PROXY Protocol v2 header: {e}"),
-            Self::InvalidSignature => write!(f, "invalid PROXY Protocol v2 signature"),
-            Self::InvalidVersion => write!(f, "unsupported PROXY Protocol version (expected 2)"),
-            Self::UnknownCommand => write!(f, "unknown PROXY Protocol v2 command nibble"),
-            Self::AdditionalLenTooLarge => {
-                write!(
-                    f,
-                    "PROXY Protocol v2 additional length exceeds {MAX_ADDITIONAL_LEN}"
-                )
-            }
-        }
-    }
+fn invalid_header(reason: &str) -> DomainError {
+    DomainError::InvalidInput(format!("PROXY Protocol v2 header: {reason}"))
 }
 
-impl From<io::Error> for ProxyProtocolError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
+/// The client address behind a PROXY Protocol v2 header. Read failures are
+/// `IoError`; a malformed header is `InvalidInput`.
 pub async fn read_proxy_v2_client_ip<R: AsyncRead + Unpin>(
     stream: &mut R,
     peer_addr: IpAddr,
-) -> Result<IpAddr, ProxyProtocolError> {
+) -> Result<IpAddr, DomainError> {
     let mut header = [0u8; FIXED_HEADER_LEN];
-    stream.read_exact(&mut header).await?;
+    stream.read_exact(&mut header).await.map_err(read_error)?;
 
     if header[0..12] != PROXY_V2_SIGNATURE {
-        return Err(ProxyProtocolError::InvalidSignature);
+        return Err(invalid_header("invalid signature"));
     }
 
     let version = header[12] >> 4;
     if version != 2 {
-        return Err(ProxyProtocolError::InvalidVersion);
+        return Err(invalid_header("unsupported version (expected 2)"));
     }
 
     let command = header[12] & 0x0F;
@@ -66,12 +44,17 @@ pub async fn read_proxy_v2_client_ip<R: AsyncRead + Unpin>(
     let additional_len = u16::from_be_bytes([header[14], header[15]]) as usize;
 
     if additional_len > MAX_ADDITIONAL_LEN {
-        return Err(ProxyProtocolError::AdditionalLenTooLarge);
+        return Err(DomainError::InvalidInput(format!(
+            "PROXY Protocol v2 header: additional length exceeds {MAX_ADDITIONAL_LEN} bytes"
+        )));
     }
 
     let mut additional = [0u8; MAX_ADDITIONAL_LEN];
     if additional_len > 0 {
-        stream.read_exact(&mut additional[..additional_len]).await?;
+        stream
+            .read_exact(&mut additional[..additional_len])
+            .await
+            .map_err(read_error)?;
     }
 
     match command {
@@ -81,7 +64,7 @@ pub async fn read_proxy_v2_client_ip<R: AsyncRead + Unpin>(
             &additional[..additional_len],
             peer_addr,
         )),
-        _ => Err(ProxyProtocolError::UnknownCommand),
+        _ => Err(invalid_header("unknown command")),
     }
 }
 

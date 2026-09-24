@@ -7,7 +7,7 @@ use ferrous_dns_application::ports::{ConfigRepository, PtrRecordRegistry, Wildca
 use ferrous_dns_application::use_cases::{
     CreateLocalRecordUseCase, DeleteLocalRecordUseCase, UpdateLocalRecordUseCase,
 };
-use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord, RecordType};
+use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord, LocalRecordType};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
@@ -39,8 +39,8 @@ impl ConfigRepository for MockConfigRepository {
 
 #[derive(Default)]
 struct MockWildcardRegistry {
-    registered: Mutex<Vec<(String, RecordType, IpAddr, u32)>>,
-    unregistered: Mutex<Vec<(String, RecordType)>>,
+    registered: Mutex<Vec<(String, LocalRecordType, IpAddr, u32)>>,
+    unregistered: Mutex<Vec<(String, LocalRecordType)>>,
 }
 
 impl MockWildcardRegistry {
@@ -50,14 +50,14 @@ impl MockWildcardRegistry {
 }
 
 impl WildcardRecordRegistry for MockWildcardRegistry {
-    fn register(&self, suffix: &str, record_type: RecordType, address: IpAddr, ttl: u32) {
+    fn register(&self, suffix: &str, record_type: LocalRecordType, address: IpAddr, ttl: u32) {
         self.registered
             .lock()
             .unwrap()
             .push((suffix.to_string(), record_type, address, ttl));
     }
 
-    fn unregister(&self, suffix: &str, record_type: RecordType) {
+    fn unregister(&self, suffix: &str, record_type: LocalRecordType) {
         self.unregistered
             .lock()
             .unwrap()
@@ -100,47 +100,40 @@ fn config_with(record: LocalDnsRecord) -> Arc<RwLock<Config>> {
     Arc::new(RwLock::new(config))
 }
 
-fn wildcard_record() -> LocalDnsRecord {
+/// A record as the API edge hands it over: address and type already parsed.
+fn new_record(hostname: &str, domain: Option<&str>, ip: &str, ttl: Option<u32>) -> LocalDnsRecord {
     LocalDnsRecord {
-        hostname: "*".to_string(),
-        domain: Some("home.lan".to_string()),
-        ip: "192.168.1.10".to_string(),
-        record_type: "A".to_string(),
-        ttl: Some(300),
+        hostname: hostname.to_string(),
+        domain: domain.map(str::to_string),
+        ip: ip.parse().unwrap(),
+        record_type: LocalRecordType::A,
+        ttl,
     }
 }
 
+fn wildcard_record() -> LocalDnsRecord {
+    new_record("*", Some("home.lan"), "192.168.1.10", Some(300))
+}
+
 fn exact_record() -> LocalDnsRecord {
-    LocalDnsRecord {
-        hostname: "nas".to_string(),
-        domain: Some("home.lan".to_string()),
-        ip: "192.168.1.50".to_string(),
-        record_type: "A".to_string(),
-        ttl: Some(300),
-    }
+    new_record("nas", Some("home.lan"), "192.168.1.50", Some(300))
 }
 
 #[tokio::test]
 async fn test_create_wildcard_registers_in_the_wildcard_index() {
     let wildcards = MockWildcardRegistry::new_arc();
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok())
-        .with_wildcard_registry(Some(wildcards.clone() as Arc<dyn WildcardRecordRegistry>));
+        .with_wildcard_registry(wildcards.clone());
 
     let result = use_case
-        .execute(
-            "*".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            Some(300),
-        )
+        .execute(new_record("*", Some("home.lan"), "192.168.1.10", Some(300)))
         .await;
 
     assert!(result.is_ok());
     let registered = wildcards.registered.lock().unwrap();
     assert_eq!(registered.len(), 1);
     assert_eq!(registered[0].0, "home.lan");
-    assert_eq!(registered[0].1, RecordType::A);
+    assert_eq!(registered[0].1, LocalRecordType::A);
     assert_eq!(registered[0].2, "192.168.1.10".parse::<IpAddr>().unwrap());
     assert_eq!(registered[0].3, 300);
 }
@@ -149,16 +142,10 @@ async fn test_create_wildcard_registers_in_the_wildcard_index() {
 async fn test_create_wildcard_skips_the_ptr_registry() {
     let ptr = MockPtrRegistry::new_arc();
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok())
-        .with_ptr_registry(Some(ptr.clone() as Arc<dyn PtrRecordRegistry>));
+        .with_ptr_registry(ptr.clone());
 
     let result = use_case
-        .execute(
-            "*".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(new_record("*", Some("home.lan"), "192.168.1.10", None))
         .await;
 
     assert!(result.is_ok());
@@ -172,16 +159,10 @@ async fn test_create_wildcard_skips_the_ptr_registry() {
 async fn test_create_exact_record_leaves_the_wildcard_index_alone() {
     let wildcards = MockWildcardRegistry::new_arc();
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok())
-        .with_wildcard_registry(Some(wildcards.clone() as Arc<dyn WildcardRecordRegistry>));
+        .with_wildcard_registry(wildcards.clone());
 
     let result = use_case
-        .execute(
-            "nas".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.50".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(new_record("nas", Some("home.lan"), "192.168.1.50", None))
         .await;
 
     assert!(result.is_ok());
@@ -193,13 +174,7 @@ async fn test_create_rejects_a_misplaced_wildcard() {
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok());
 
     let result = use_case
-        .execute(
-            "a.*.b".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(new_record("a.*.b", Some("home.lan"), "192.168.1.10", None))
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidDomainName(_))));
@@ -210,13 +185,7 @@ async fn test_create_rejects_an_invalid_hostname() {
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok());
 
     let result = use_case
-        .execute(
-            "my host".to_string(),
-            None,
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(new_record("my host", None, "192.168.1.10", None))
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidDomainName(_))));
@@ -227,13 +196,7 @@ async fn test_create_rejects_a_wildcard_in_the_domain_field() {
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok());
 
     let result = use_case
-        .execute(
-            "nas".to_string(),
-            Some("*.home.lan".to_string()),
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(new_record("nas", Some("*.home.lan"), "192.168.1.10", None))
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidDomainName(_))));
@@ -246,13 +209,7 @@ async fn test_create_rejects_a_wildcard_with_nothing_to_anchor_it() {
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok());
 
     let result = use_case
-        .execute(
-            "*".to_string(),
-            None,
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(new_record("*", None, "192.168.1.10", None))
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidDomainName(_))));
@@ -262,16 +219,10 @@ async fn test_create_rejects_a_wildcard_with_nothing_to_anchor_it() {
 async fn test_create_wildcard_does_not_register_on_save_failure() {
     let wildcards = MockWildcardRegistry::new_arc();
     let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::failing())
-        .with_wildcard_registry(Some(wildcards.clone() as Arc<dyn WildcardRecordRegistry>));
+        .with_wildcard_registry(wildcards.clone());
 
     let result = use_case
-        .execute(
-            "*".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(new_record("*", Some("home.lan"), "192.168.1.10", None))
         .await;
 
     assert!(result.is_err());
@@ -284,15 +235,18 @@ async fn test_delete_wildcard_unregisters_it() {
     let ptr = MockPtrRegistry::new_arc();
     let use_case =
         DeleteLocalRecordUseCase::new(config_with(wildcard_record()), MockConfigRepository::ok())
-            .with_wildcard_registry(Some(wildcards.clone() as Arc<dyn WildcardRecordRegistry>))
-            .with_ptr_registry(Some(ptr.clone() as Arc<dyn PtrRecordRegistry>));
+            .with_wildcard_registry(wildcards.clone())
+            .with_ptr_registry(ptr.clone());
 
     let result = use_case.execute(0).await;
 
     assert!(result.is_ok());
     let unregistered = wildcards.unregistered.lock().unwrap();
     assert_eq!(unregistered.len(), 1);
-    assert_eq!(unregistered[0], ("home.lan".to_string(), RecordType::A));
+    assert_eq!(
+        unregistered[0],
+        ("home.lan".to_string(), LocalRecordType::A)
+    );
     assert!(ptr.unregistered.lock().unwrap().is_empty());
 }
 
@@ -301,7 +255,7 @@ async fn test_delete_exact_record_leaves_the_wildcard_index_alone() {
     let wildcards = MockWildcardRegistry::new_arc();
     let use_case =
         DeleteLocalRecordUseCase::new(config_with(exact_record()), MockConfigRepository::ok())
-            .with_wildcard_registry(Some(wildcards.clone() as Arc<dyn WildcardRecordRegistry>));
+            .with_wildcard_registry(wildcards.clone());
 
     let result = use_case.execute(0).await;
 
@@ -315,17 +269,13 @@ async fn test_update_from_exact_to_wildcard_moves_the_record() {
     let ptr = MockPtrRegistry::new_arc();
     let use_case =
         UpdateLocalRecordUseCase::new(config_with(exact_record()), MockConfigRepository::ok())
-            .with_wildcard_registry(Some(wildcards.clone() as Arc<dyn WildcardRecordRegistry>))
-            .with_ptr_registry(Some(ptr.clone() as Arc<dyn PtrRecordRegistry>));
+            .with_wildcard_registry(wildcards.clone())
+            .with_ptr_registry(ptr.clone());
 
     let result = use_case
         .execute(
             0,
-            "*".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            Some(120),
+            new_record("*", Some("home.lan"), "192.168.1.10", Some(120)),
         )
         .await;
 
@@ -347,24 +297,20 @@ async fn test_update_from_wildcard_to_exact_moves_it_back() {
     let ptr = MockPtrRegistry::new_arc();
     let use_case =
         UpdateLocalRecordUseCase::new(config_with(wildcard_record()), MockConfigRepository::ok())
-            .with_wildcard_registry(Some(wildcards.clone() as Arc<dyn WildcardRecordRegistry>))
-            .with_ptr_registry(Some(ptr.clone() as Arc<dyn PtrRecordRegistry>));
+            .with_wildcard_registry(wildcards.clone())
+            .with_ptr_registry(ptr.clone());
 
     let result = use_case
         .execute(
             0,
-            "nas".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.50".to_string(),
-            "A".to_string(),
-            Some(300),
+            new_record("nas", Some("home.lan"), "192.168.1.50", Some(300)),
         )
         .await;
 
     assert!(result.is_ok());
     assert_eq!(
         wildcards.unregistered.lock().unwrap()[0],
-        ("home.lan".to_string(), RecordType::A)
+        ("home.lan".to_string(), LocalRecordType::A)
     );
     assert!(wildcards.registered.lock().unwrap().is_empty());
     let registered = ptr.registered.lock().unwrap();
@@ -377,14 +323,7 @@ async fn test_update_rejects_a_misplaced_wildcard() {
         UpdateLocalRecordUseCase::new(config_with(exact_record()), MockConfigRepository::ok());
 
     let result = use_case
-        .execute(
-            0,
-            "*x".to_string(),
-            Some("home.lan".to_string()),
-            "192.168.1.10".to_string(),
-            "A".to_string(),
-            None,
-        )
+        .execute(0, new_record("*x", Some("home.lan"), "192.168.1.10", None))
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidDomainName(_))));

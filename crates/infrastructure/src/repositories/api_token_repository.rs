@@ -4,17 +4,17 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use tracing::{info, instrument};
 
-use ferrous_dns_application::ports::ApiTokenRepository;
+use ferrous_dns_application::ports::{ApiKeyMaterial, ApiTokenRepository};
 use ferrous_dns_domain::{ApiToken, DomainError};
 
 use crate::repositories::{db_err, is_unique_violation, sql_now};
 
 pub struct SqliteApiTokenRepository {
-    pool: Arc<SqlitePool>,
+    pool: SqlitePool,
 }
 
 impl SqliteApiTokenRepository {
-    pub fn new(pool: Arc<SqlitePool>) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
@@ -52,7 +52,7 @@ impl ApiTokenRepository for SqliteApiTokenRepository {
         .bind(key_hash)
         .bind(key_raw)
         .bind(&now)
-        .fetch_one(self.pool.as_ref())
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
@@ -72,7 +72,7 @@ impl ApiTokenRepository for SqliteApiTokenRepository {
             "SELECT id, name, key_prefix, key_hash, key_raw, created_at, last_used_at
              FROM api_tokens ORDER BY id",
         )
-        .fetch_all(self.pool.as_ref())
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err("Failed to get all API tokens"))?;
 
@@ -86,7 +86,7 @@ impl ApiTokenRepository for SqliteApiTokenRepository {
              FROM api_tokens WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err("Failed to get API token by id"))?;
 
@@ -100,37 +100,36 @@ impl ApiTokenRepository for SqliteApiTokenRepository {
              FROM api_tokens WHERE name = ?",
         )
         .bind(name)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err("Failed to get API token by name"))?;
 
         Ok(row.map(row_to_token))
     }
 
-    #[instrument(skip(self, key_hash, key_raw))]
+    #[instrument(skip(self, new_key))]
     async fn update(
         &self,
         id: i64,
         name: &str,
-        key_prefix: Option<&str>,
-        key_hash: Option<&str>,
-        key_raw: Option<&str>,
+        new_key: Option<ApiKeyMaterial<'_>>,
     ) -> Result<ApiToken, DomainError> {
-        let row: Option<TokenRow> =
-            if let (Some(prefix), Some(hash), Some(raw)) = (key_prefix, key_hash, key_raw) {
+        let row: Option<TokenRow> = match new_key {
+            Some(key) => {
                 sqlx::query_as(
                     "UPDATE api_tokens SET name = ?, key_prefix = ?, key_hash = ?, key_raw = ?
                  WHERE id = ?
                  RETURNING id, name, key_prefix, key_hash, key_raw, created_at, last_used_at",
                 )
                 .bind(name)
-                .bind(prefix)
-                .bind(hash)
-                .bind(raw)
+                .bind(key.prefix)
+                .bind(key.hash)
+                .bind(key.raw)
                 .bind(id)
-                .fetch_optional(self.pool.as_ref())
+                .fetch_optional(&self.pool)
                 .await
-            } else {
+            }
+            None => {
                 sqlx::query_as(
                     "UPDATE api_tokens SET name = ?
                  WHERE id = ?
@@ -138,16 +137,17 @@ impl ApiTokenRepository for SqliteApiTokenRepository {
                 )
                 .bind(name)
                 .bind(id)
-                .fetch_optional(self.pool.as_ref())
+                .fetch_optional(&self.pool)
                 .await
             }
-            .map_err(|e| {
-                if is_unique_violation(&e) {
-                    DomainError::DuplicateApiTokenName(name.to_string())
-                } else {
-                    db_err("Failed to update API token")(e)
-                }
-            })?;
+        }
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                DomainError::DuplicateApiTokenName(name.to_string())
+            } else {
+                db_err("Failed to update API token")(e)
+            }
+        })?;
 
         row.map(row_to_token)
             .ok_or(DomainError::ApiTokenNotFound(id))
@@ -157,7 +157,7 @@ impl ApiTokenRepository for SqliteApiTokenRepository {
     async fn delete(&self, id: i64) -> Result<(), DomainError> {
         let result = sqlx::query("DELETE FROM api_tokens WHERE id = ?")
             .bind(id)
-            .execute(self.pool.as_ref())
+            .execute(&self.pool)
             .await
             .map_err(db_err("Failed to delete API token"))?;
 
@@ -173,28 +173,18 @@ impl ApiTokenRepository for SqliteApiTokenRepository {
         sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
             .bind(sql_now())
             .bind(id)
-            .execute(self.pool.as_ref())
+            .execute(&self.pool)
             .await
             .map_err(db_err("Failed to update API token last_used"))?;
 
         Ok(())
     }
 
-    #[instrument(skip(self))]
-    async fn get_all_hashes(&self) -> Result<Vec<(i64, String)>, DomainError> {
-        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, key_hash FROM api_tokens")
-            .fetch_all(self.pool.as_ref())
-            .await
-            .map_err(db_err("Failed to get API token hashes"))?;
-
-        Ok(rows)
-    }
-
     #[instrument(skip(self, key_hash))]
     async fn get_id_by_hash(&self, key_hash: &str) -> Result<Option<i64>, DomainError> {
         let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM api_tokens WHERE key_hash = ?")
             .bind(key_hash)
-            .fetch_optional(self.pool.as_ref())
+            .fetch_optional(&self.pool)
             .await
             .map_err(db_err("Failed to get API token by hash"))?;
 

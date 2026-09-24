@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ferrous_dns_domain::{DomainError, User};
+use ferrous_dns_domain::{DomainError, User, UserRole};
 
 /// Port for managing database-stored user accounts.
 ///
@@ -12,7 +12,7 @@ pub trait UserRepository: Send + Sync {
         username: &str,
         display_name: Option<&str>,
         password_hash: &str,
-        role: &str,
+        role: UserRole,
     ) -> Result<User, DomainError>;
 
     async fn get_by_username(&self, username: &str) -> Result<Option<User>, DomainError>;

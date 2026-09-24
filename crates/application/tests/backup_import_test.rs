@@ -42,14 +42,7 @@ struct StubLocalRecordCreator;
 
 #[async_trait::async_trait]
 impl LocalRecordCreator for StubLocalRecordCreator {
-    async fn create_local_record(
-        &self,
-        _hostname: String,
-        _domain: Option<String>,
-        _ip: String,
-        _record_type: String,
-        _ttl: Option<u32>,
-    ) -> Result<LocalDnsRecord, DomainError> {
+    async fn create_local_record(&self, _record: LocalDnsRecord) -> Result<(), DomainError> {
         Err(DomainError::IoError("test stub".to_string()))
     }
 }

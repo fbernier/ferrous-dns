@@ -3,7 +3,6 @@ use crate::dns::forwarding::{DnsResponse, ResponseValidator};
 use ferrous_dns_domain::{DnsProtocol, DomainError, UpstreamStrategy};
 use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -14,7 +13,6 @@ pub type ServerDisplays = HashMap<Arc<DnsProtocol>, Arc<str>, FxBuildHasher>;
 #[derive(Debug, Clone)]
 pub struct UpstreamResult {
     pub response: DnsResponse,
-    pub server: SocketAddr,
     pub latency_ms: u64,
     pub pool_name: Arc<str>,
     pub server_display: Arc<str>,

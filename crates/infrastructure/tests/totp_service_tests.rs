@@ -28,12 +28,21 @@ fn generated_secret_verifies_current_code() {
     assert!(!secret.is_empty());
 
     let code = current_code(&secret);
+    let now_step = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 30;
+    let step = svc
+        .verify(&secret, &code)
+        .unwrap()
+        .expect("current code must verify");
     assert!(
-        svc.verify(&secret, &code).unwrap(),
-        "current code must verify"
+        step.abs_diff(now_step) <= 1,
+        "matched step {step} is not the current one ({now_step})"
     );
     assert!(
-        !svc.verify(&secret, "000000").unwrap() || code == "000000",
+        svc.verify(&secret, "000000").unwrap().is_none() || code == "000000",
         "an unrelated code must fail"
     );
 }

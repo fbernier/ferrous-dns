@@ -8,7 +8,7 @@ use ferrous_dns_infrastructure::auth::SqliteMfaRepository;
 mod db;
 
 fn repo(pool: sqlx::SqlitePool) -> SqliteMfaRepository {
-    SqliteMfaRepository::new(Arc::new(pool))
+    SqliteMfaRepository::new(pool)
 }
 
 fn future_ts(secs: i64) -> String {
@@ -145,11 +145,12 @@ async fn webauthn_credentials_crud() {
     assert_eq!(creds.len(), 1);
     assert_eq!(creds[0].credential_id.as_ref(), "cred-abc");
 
-    repo.update_credential_counter("cred-abc", 5).await.unwrap();
-    assert_eq!(
-        repo.list_credentials("admin").await.unwrap()[0].sign_count,
-        5
-    );
+    repo.update_credential("cred-abc", 5, "{\"k\":2}")
+        .await
+        .unwrap();
+    let stored = &repo.list_credentials("admin").await.unwrap()[0];
+    assert_eq!(stored.sign_count, 5);
+    assert_eq!(stored.passkey, "{\"k\":2}");
 
     let id = creds[0].id.unwrap();
     repo.delete_credential(id, "admin").await.unwrap();
@@ -281,11 +282,14 @@ async fn credential_counter_must_increase_unless_authenticator_has_none() {
         .await
         .unwrap();
 
-    repo.update_credential_counter("counted", 7).await.unwrap();
+    repo.update_credential("counted", 7, "{\"counter\":7}")
+        .await
+        .unwrap();
     for replayed in [7, 3, 0] {
         assert!(
             matches!(
-                repo.update_credential_counter("counted", replayed).await,
+                repo.update_credential("counted", replayed, "{\"counter\":0}")
+                    .await,
                 Err(DomainError::WebauthnError(_))
             ),
             "counter {replayed} after 7 must be rejected"
@@ -297,11 +301,27 @@ async fn credential_counter_must_increase_unless_authenticator_has_none() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.sign_count, 7);
+    assert_eq!(stored.passkey, "{\"counter\":7}");
 
-    repo.update_credential_counter("counterless", 0)
+    repo.update_credential("counterless", 0, "{}")
         .await
         .unwrap();
-    repo.update_credential_counter("counterless", 0)
+    repo.update_credential("counterless", 0, "{}")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn totp_step_must_advance_and_restarts_with_a_new_secret() {
+    let repo = repo(db::migrated_pool().await);
+    repo.upsert_secret("admin", "SECRET").await.unwrap();
+
+    assert!(repo.advance_totp_step("admin", 100).await.unwrap());
+    assert!(!repo.advance_totp_step("admin", 100).await.unwrap());
+    assert!(!repo.advance_totp_step("admin", 99).await.unwrap());
+    assert!(repo.advance_totp_step("admin", 101).await.unwrap());
+    assert!(!repo.advance_totp_step("nobody", 200).await.unwrap());
+
+    repo.upsert_secret("admin", "NEWSECRET").await.unwrap();
+    assert!(repo.advance_totp_step("admin", 50).await.unwrap());
 }

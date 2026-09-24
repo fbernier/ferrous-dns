@@ -3,6 +3,7 @@ mod pool;
 mod resolver;
 
 use crate::server::dns::connection_limiter::ConnectionLimiter;
+use anyhow::Context;
 use ferrous_dns_application::ports::{
     CacheMaintenancePort, DgaEvictionTarget, DgaFlagStore, DnssecStatsPort, NxdomainHijackIpStore,
     NxdomainHijackProbeTarget, PtrRecordRegistry, ResponseIpFilterEvictionTarget,
@@ -17,14 +18,15 @@ use ferrous_dns_infrastructure::dns::{
     cache::DnsCache,
     cache_maintenance::DnsCacheMaintenance,
     dnssec::DnssecStatsAdapter,
-    resolver::{LocalPtrResolver, LocalWildcardResolver, WildcardRegistry},
-    DgaDetector, HealthChecker, HickoryDnsResolver, NxdomainHijackDetector, PoolManager,
-    RefreshScanOptions, RefreshSenders, ResponseIpFilterDetector, TunnelingDetector,
+    resolver::{LocalPtrResolver, LocalWildcardResolver, PtrRegistry, WildcardRegistry},
+    DgaDetector, HealthChecker, NxdomainHijackDetector, PoolManager, RefreshScanOptions,
+    RefreshSenders, ResponseIpFilterDetector, TunnelingDetector,
 };
 use ferrous_dns_jobs::{
     DgaEvictionJob, NxdomainHijackEvictionJob, ResponseIpFilterEvictionJob, TunnelingEvictionJob,
     DEFAULT_REFRESH_INTERVAL_SECS,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -45,10 +47,14 @@ pub struct DnsServices {
     pub maintenance_pool_manager: Option<Arc<PoolManager>>,
     pub health_checker: Arc<HealthChecker>,
     pub cache_maintenance: Option<Arc<dyn CacheMaintenancePort>>,
-    pub ptr_registry: Option<Arc<dyn PtrRecordRegistry>>,
+    /// Live PTR map for local records. Always present, so a record added from
+    /// the admin UI reverse-resolves without a restart.
+    pub ptr_registry: Arc<dyn PtrRecordRegistry>,
     /// Live wildcard index. Always present, even with no wildcard configured,
     /// so the first one added from the admin UI answers without a restart.
     pub wildcard_registry: Arc<dyn WildcardRecordRegistry>,
+    /// `dns.local_dns_server`, parsed once for every consumer.
+    pub local_dns_server: Option<SocketAddr>,
     pub tcp_conn_limiter: ConnectionLimiter,
     pub dot_conn_limiter: ConnectionLimiter,
     pub doq_conn_limiter: ConnectionLimiter,
@@ -78,72 +84,67 @@ impl DnsServices {
             None
         };
 
-        let (mut dns_resolver, dnssec_cache) = resolver::build_resolver(
-            Arc::clone(&pool_manager),
-            dnssec_pool_manager.clone(),
+        let local_dns_server = config
+            .dns
+            .local_dns_server
+            .as_deref()
+            .map(str::parse::<SocketAddr>)
+            .transpose()
+            .context("dns.local_dns_server must be an IP:port address such as 192.168.1.1:53")?;
+
+        let upstream_layers = resolver::UpstreamLayers::from_config(
             config,
-            repos,
+            dnssec_pool_manager.clone(),
+            local_dns_server,
             timeout_ms,
         )?;
-        let dnssec_stats: Arc<dyn DnssecStatsPort> = Arc::new(match dnssec_cache {
-            Some(cache) => DnssecStatsAdapter::new(cache),
-            None => DnssecStatsAdapter::disabled(),
-        });
+        let dnssec_stats: Arc<dyn DnssecStatsPort> =
+            Arc::new(match upstream_layers.dnssec_cache() {
+                Some(cache) => DnssecStatsAdapter::new(cache),
+                None => DnssecStatsAdapter::disabled(),
+            });
         let dns_cache = cache::build_cache(config);
 
+        let mut resolver_builder = upstream_layers
+            .builder(Arc::clone(&pool_manager))
+            .with_filters(resolver::query_filters(config, local_dns_server));
         if config.dns.cache_enabled {
-            dns_resolver = dns_resolver
-                .with_inflight_shards(config.dns.cache_inflight_shards)
-                .with_cache(dns_cache.clone(), config.dns.cache_ttl);
+            resolver_builder = resolver_builder.with_cache(
+                dns_cache.clone(),
+                config.dns.cache_ttl,
+                config.dns.cache_inflight_shards,
+            );
         }
 
-        let (cache_maintenance, maintenance_pool_manager) =
-            Self::setup_cache_maintenance(config, &dns_cache, &health_checker, timeout_ms, repos)
-                .await?;
+        let (cache_maintenance, maintenance_pool_manager) = Self::setup_cache_maintenance(
+            config,
+            &dns_cache,
+            &health_checker,
+            &upstream_layers,
+            repos,
+        )
+        .await?;
 
-        let ptr_registry: Option<Arc<dyn PtrRecordRegistry>> =
-            if !config.dns.local_records.is_empty() {
-                info!(
-                    count = config.dns.local_records.len(),
-                    "Preloading local DNS records into permanent cache..."
-                );
-                cache::preload_local_records_into_cache(
-                    &dns_cache,
-                    &config.dns.local_records,
-                    &config.dns.local_domain,
-                );
-                info!("✓ Local DNS records preloaded (cached permanently, <0.1ms resolution)");
-
-                let dummy_inner: Arc<dyn ferrous_dns_application::ports::DnsResolver> =
-                    Arc::new(HickoryDnsResolver::new_with_pools(
-                        Arc::clone(&pool_manager),
-                        timeout_ms,
-                        false,
-                        None,
-                    )?);
-                let local_ptr = Arc::new(LocalPtrResolver::from_local_records(
-                    &config.dns.local_records,
-                    &config.dns.local_domain,
-                    dummy_inner,
-                ));
-                dns_resolver = dns_resolver.with_local_ptr_map(Arc::clone(&local_ptr.map));
-                Some(local_ptr as Arc<dyn PtrRecordRegistry>)
-            } else {
-                None
-            };
-
-        // Unconditional, unlike the PTR map above: an empty index costs one
-        // `is_empty()` check per query, and it is what lets a wildcard created
-        // from the admin UI take effect on the next query.
-        let wildcard_map = LocalWildcardResolver::map_from_local_records(
+        // Exact local records live in the permanent cache; PTRs and wildcards
+        // in live maps, always attached (even empty) so that records added from
+        // the admin UI take effect on the next query.
+        let local_domain = config.dns.local_domain.as_deref();
+        cache::preload_local_records_into_cache(
+            &dns_cache,
             &config.dns.local_records,
-            &config.dns.local_domain,
+            local_domain,
         );
-        dns_resolver = dns_resolver.with_local_wildcards(Arc::clone(&wildcard_map));
+        let ptr_map =
+            LocalPtrResolver::map_from_local_records(&config.dns.local_records, local_domain);
+        let wildcard_map =
+            LocalWildcardResolver::map_from_local_records(&config.dns.local_records, local_domain);
+        let resolver = resolver_builder
+            .with_local_ptr_map(Arc::clone(&ptr_map))
+            .with_local_wildcards(Arc::clone(&wildcard_map))
+            .build();
+        let ptr_registry: Arc<dyn PtrRecordRegistry> = Arc::new(PtrRegistry::new(ptr_map));
         let wildcard_registry: Arc<dyn WildcardRecordRegistry> =
             Arc::new(WildcardRegistry::new(wildcard_map));
-
-        let resolver = Arc::new(dns_resolver);
 
         let rate_limiter = Arc::new(DnsRateLimiter::new(&config.dns.rate_limit));
         if config.dns.rate_limit.enabled {
@@ -346,6 +347,7 @@ impl DnsServices {
             cache_maintenance,
             ptr_registry,
             wildcard_registry,
+            local_dns_server,
             tcp_conn_limiter,
             dot_conn_limiter,
             doq_conn_limiter,
@@ -356,7 +358,7 @@ impl DnsServices {
         config: &Config,
         cache: &Arc<DnsCache>,
         health_checker: &Arc<HealthChecker>,
-        timeout_ms: u64,
+        upstream_layers: &resolver::UpstreamLayers,
         repos: &Repositories,
     ) -> anyhow::Result<(
         Option<Arc<dyn CacheMaintenancePort>>,
@@ -396,13 +398,9 @@ impl DnsServices {
 
         // Returned too, so hot upstream reloads also reach this resolver.
         let maintenance_pool_manager = pool::setup_pool_manager(config, health_checker).await?;
-        let resolver_for_maintenance: Arc<dyn ferrous_dns_application::ports::DnsResolver> =
-            Arc::new(HickoryDnsResolver::new_with_pools(
-                Arc::clone(&maintenance_pool_manager),
-                timeout_ms,
-                false,
-                None,
-            )?);
+        let resolver_for_maintenance = upstream_layers
+            .builder(Arc::clone(&maintenance_pool_manager))
+            .build();
 
         DnsCacheMaintenance::start_refresh_worker(
             cache.clone(),
@@ -493,5 +491,52 @@ mod tests {
                 "{bad:?} was accepted"
             );
         }
+    }
+
+    /// With no local record at startup, a PTR registered later — what the
+    /// create use case does — must still be answered by the running resolver.
+    #[tokio::test]
+    async fn ptr_registered_at_runtime_is_answered_without_startup_records() {
+        use ferrous_dns_domain::{DnsRequest, RecordType, UpstreamPool, UpstreamStrategy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.database.path = dir.path().join("ferrous.db").display().to_string();
+        config.dns.pools = vec![UpstreamPool {
+            name: "unreachable".to_string(),
+            strategy: UpstreamStrategy::Parallel,
+            priority: 1,
+            servers: vec!["127.0.0.1:9".to_string()],
+            weight: None,
+        }];
+        assert!(config.dns.local_records.is_empty());
+
+        let database_url = format!("sqlite:{}", config.database.path);
+        let (write, query_log, read) =
+            crate::bootstrap::database::init_database(&database_url, &config.database)
+                .await
+                .unwrap();
+        let repos = Repositories::new(write, query_log, read, &config.database, false)
+            .await
+            .unwrap();
+        let services = DnsServices::new(&config, &repos).await.unwrap();
+
+        services
+            .ptr_registry
+            .register("10.0.0.5".parse().unwrap(), Arc::from("nas.lan"), 300);
+        let resolution = services
+            .handler_use_case
+            .execute(&DnsRequest::new(
+                "5.0.0.10.in-addr.arpa",
+                RecordType::PTR,
+                "127.0.0.1".parse().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            resolution.local_dns,
+            "PTR was not answered from the local map"
+        );
     }
 }

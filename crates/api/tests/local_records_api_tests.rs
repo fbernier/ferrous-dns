@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use ferrous_dns_domain::LocalDnsRecord;
+use ferrous_dns_domain::{LocalDnsRecord, LocalRecordType};
 use helpers::TestApp;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -50,15 +50,15 @@ async fn test_list_local_records_returns_preloaded_records() {
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "server".to_string(),
             domain: Some("local".to_string()),
-            ip: "192.168.1.10".to_string(),
-            record_type: "A".to_string(),
+            ip: "192.168.1.10".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(300),
         });
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "ipv6host".to_string(),
             domain: None,
-            ip: "::1".to_string(),
-            record_type: "AAAA".to_string(),
+            ip: "::1".parse().unwrap(),
+            record_type: LocalRecordType::AAAA,
             ttl: None,
         });
     }
@@ -246,8 +246,8 @@ async fn test_list_local_records_fqdn_without_domain_uses_hostname() {
         cfg.dns.local_records.push(LocalDnsRecord {
             hostname: "standalone".to_string(),
             domain: None,
-            ip: "10.10.10.1".to_string(),
-            record_type: "A".to_string(),
+            ip: "10.10.10.1".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(60),
         });
     }

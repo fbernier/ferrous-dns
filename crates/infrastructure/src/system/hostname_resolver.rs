@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ferrous_dns_application::ports::HostnameResolver;
 use ferrous_dns_domain::{DomainError, RecordType};
 use hickory_proto::rr::{RData, Record};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -12,7 +12,7 @@ use crate::dns::load_balancer::PoolManager;
 pub struct PtrHostnameResolver {
     pool_manager: Arc<PoolManager>,
     timeout_secs: u64,
-    local_dns_server: Option<String>,
+    local_dns_server: Option<SocketAddr>,
 }
 
 impl PtrHostnameResolver {
@@ -24,7 +24,7 @@ impl PtrHostnameResolver {
         }
     }
 
-    pub fn with_local_dns_server(mut self, server: Option<String>) -> Self {
+    pub fn with_local_dns_server(mut self, server: Option<SocketAddr>) -> Self {
         self.local_dns_server = server;
         self
     }
@@ -90,15 +90,15 @@ impl HostnameResolver for PtrHostnameResolver {
             "Performing PTR lookup"
         );
 
-        if let Some(ref server) = self.local_dns_server {
+        if let Some(server) = self.local_dns_server {
             if Self::is_private_or_local(&ip) {
-                let forwarder = DnsForwarder::new().with_hardening(self.pool_manager.hardening());
+                let forwarder = DnsForwarder::new(self.pool_manager.hardening());
                 match forwarder
                     .query(server, &reverse_domain, &RecordType::PTR, timeout_ms)
                     .await
                 {
                     Ok(result) => {
-                        let hostname = first_ptr(&result.raw_answers);
+                        let hostname = first_ptr(&result.message.answers);
                         match &hostname {
                             Some(h) => {
                                 debug!(ip = %ip, hostname = %h, server = %server, "PTR lookup via local DNS server successful")
@@ -123,7 +123,7 @@ impl HostnameResolver for PtrHostnameResolver {
             .await
         {
             Ok(result) => {
-                let hostname = first_ptr(&result.response.raw_answers);
+                let hostname = first_ptr(&result.response.message.answers);
                 match &hostname {
                     Some(h) => debug!(ip = %ip, hostname = %h, "PTR lookup successful"),
                     None => debug!(ip = %ip, "PTR lookup returned no records"),

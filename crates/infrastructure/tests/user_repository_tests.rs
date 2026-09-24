@@ -27,18 +27,21 @@ fn session(id: &str, username: &str) -> AuthSession {
 
 #[tokio::test]
 async fn create_duplicate_username_is_rejected() {
-    let users = SqliteUserRepository::new(Arc::new(db::migrated_pool().await));
-    users.create("bob", None, "hash", "viewer").await.unwrap();
+    let users = SqliteUserRepository::new(db::migrated_pool().await);
+    users
+        .create("bob", None, "hash", UserRole::Viewer)
+        .await
+        .unwrap();
 
     assert!(matches!(
-        users.create("bob", None, "hash", "viewer").await,
+        users.create("bob", None, "hash", UserRole::Viewer).await,
         Err(DomainError::DuplicateUsername(name)) if name == "bob"
     ));
 }
 
 #[tokio::test]
 async fn update_password_of_missing_user_is_not_found() {
-    let users = SqliteUserRepository::new(Arc::new(db::migrated_pool().await));
+    let users = SqliteUserRepository::new(db::migrated_pool().await);
 
     assert!(matches!(
         users.update_password(42, "hash").await,
@@ -48,13 +51,19 @@ async fn update_password_of_missing_user_is_not_found() {
 
 #[tokio::test]
 async fn delete_revokes_sessions_and_second_factors_of_that_user_only() {
-    let pool = Arc::new(db::migrated_pool().await);
+    let pool = db::migrated_pool().await;
     let users = SqliteUserRepository::new(pool.clone());
     let sessions = SqliteSessionRepository::new(pool.clone());
     let mfa = SqliteMfaRepository::new(pool);
 
-    let bob = users.create("bob", None, "hash", "viewer").await.unwrap();
-    users.create("carol", None, "hash", "viewer").await.unwrap();
+    let bob = users
+        .create("bob", None, "hash", UserRole::Viewer)
+        .await
+        .unwrap();
+    users
+        .create("carol", None, "hash", UserRole::Viewer)
+        .await
+        .unwrap();
     for name in ["bob", "carol"] {
         sessions
             .create(&session(&format!("{name}-session"), name))
@@ -96,7 +105,7 @@ async fn delete_revokes_sessions_and_second_factors_of_that_user_only() {
 
 #[tokio::test]
 async fn delete_missing_user_is_not_found() {
-    let users = SqliteUserRepository::new(Arc::new(db::migrated_pool().await));
+    let users = SqliteUserRepository::new(db::migrated_pool().await);
 
     assert!(matches!(
         users.delete(42).await,

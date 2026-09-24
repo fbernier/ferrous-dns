@@ -10,11 +10,11 @@ use ferrous_dns_domain::{DomainError, User, UserRole, UserSource};
 use crate::repositories::{db_err, is_unique_violation, sql_now};
 
 pub struct SqliteUserRepository {
-    pool: Arc<SqlitePool>,
+    pool: SqlitePool,
 }
 
 impl SqliteUserRepository {
-    pub fn new(pool: Arc<SqlitePool>) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
@@ -38,7 +38,7 @@ impl UserRepository for SqliteUserRepository {
         username: &str,
         display_name: Option<&str>,
         password_hash: &str,
-        role: &str,
+        role: UserRole,
     ) -> Result<User, DomainError> {
         let now = sql_now();
 
@@ -50,10 +50,10 @@ impl UserRepository for SqliteUserRepository {
         .bind(username)
         .bind(display_name)
         .bind(password_hash)
-        .bind(role)
+        .bind(role.as_str())
         .bind(&now)
         .bind(&now)
-        .fetch_one(self.pool.as_ref())
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
@@ -74,7 +74,7 @@ impl UserRepository for SqliteUserRepository {
              FROM users WHERE username = ?",
         )
         .bind(username)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err("Failed to get user by username"))?;
 
@@ -88,7 +88,7 @@ impl UserRepository for SqliteUserRepository {
              FROM users WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err("Failed to get user by id"))?;
 
@@ -101,7 +101,7 @@ impl UserRepository for SqliteUserRepository {
             "SELECT id, username, display_name, password_hash, role, enabled, created_at, updated_at
              FROM users ORDER BY id",
         )
-        .fetch_all(self.pool.as_ref())
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err("Failed to get all users"))?;
 
@@ -114,7 +114,7 @@ impl UserRepository for SqliteUserRepository {
             .bind(password_hash)
             .bind(sql_now())
             .bind(id)
-            .execute(self.pool.as_ref())
+            .execute(&self.pool)
             .await
             .map_err(db_err("Failed to update user password"))?;
 
@@ -170,8 +170,8 @@ impl UserRepository for SqliteUserRepository {
 fn row_to_user(
     (id, username, display_name, password_hash, role, enabled, created_at, updated_at): UserRow,
 ) -> User {
-    let role = UserRole::parse(&role).unwrap_or_else(|_| {
-        error!(role, "Invalid user role in database, defaulting to Viewer");
+    let role = role.parse::<UserRole>().unwrap_or_else(|e| {
+        error!(error = %e, "Invalid user role in database, defaulting to Viewer");
         UserRole::Viewer
     });
     User {

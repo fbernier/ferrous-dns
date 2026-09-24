@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::RecordType::{A, AAAA, CNAME, TXT};
-use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, RecordType};
+use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, LocalRecordType, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::{CachedResolver, LocalWildcardResolver};
 use ferrous_dns_infrastructure::dns::{
     CachedAddresses, CachedData, DnsCache, DnsCacheConfig, EvictionStrategy,
@@ -186,11 +186,11 @@ async fn test_exact_local_nodata_beats_covering_wildcard_until_last_record_remov
         &[LocalDnsRecord {
             hostname: "*".to_string(),
             domain: Some("wildcard.test".to_string()),
-            ip: "2001:db8::99".to_string(),
-            record_type: "AAAA".to_string(),
+            ip: "2001:db8::99".parse().unwrap(),
+            record_type: LocalRecordType::AAAA,
             ttl: Some(120),
         }],
-        &None,
+        None,
     );
     let resolver = LocalWildcardResolver::new(cached_resolver, map);
     let a = DnsQuery::new(name, A);

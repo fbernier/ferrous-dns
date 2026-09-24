@@ -31,7 +31,7 @@ pub use dnssec::DnssecMode;
 pub use encrypted_dns::EncryptedDnsConfig;
 pub use errors::ConfigError;
 pub use health::HealthCheckConfig;
-pub use local_records::LocalDnsRecord;
+pub use local_records::{LocalDnsRecord, LocalRecordType};
 pub use logging::LoggingConfig;
 pub use nxdomain_hijack::{NxdomainHijackAction, NxdomainHijackConfig};
 pub use rate_limit::RateLimitConfig;

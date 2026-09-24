@@ -1,5 +1,6 @@
-use super::message_builder::{CLIENT_COOKIE_LEN, COOKIE_OPTION_CODE};
+use super::message_builder::CLIENT_COOKIE_LEN;
 use super::response_parser::DnsResponse;
+use crate::dns::wire_response::COOKIE_OPTION_CODE;
 use bytes::Bytes;
 use ferrous_dns_domain::{DnsProtocol, DomainError};
 use hickory_proto::op::Message;
@@ -178,7 +179,6 @@ impl ResponseValidator {
             .iter_mut()
             .chain(resp.message.authorities.iter_mut())
             .chain(resp.message.additionals.iter_mut())
-            .chain(resp.raw_answers.iter_mut())
         {
             record.name = record.name.to_lowercase();
         }

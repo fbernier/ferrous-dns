@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver, PtrRecordRegistry};
 use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, RecordType};
-use ferrous_dns_infrastructure::dns::resolver::local_ptr::PtrMap;
-use ferrous_dns_infrastructure::dns::resolver::LocalPtrResolver;
+use ferrous_dns_infrastructure::dns::resolver::{LocalPtrResolver, PtrMap, PtrRegistry};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,10 +19,17 @@ fn make_record(hostname: &str, domain: &str, ip: &str, record_type: &str) -> Loc
     LocalDnsRecord {
         hostname: hostname.to_string(),
         domain: Some(domain.to_string()),
-        ip: ip.to_string(),
-        record_type: record_type.to_string(),
+        ip: ip.parse().unwrap(),
+        record_type: record_type.parse().unwrap(),
         ttl: Some(300),
     }
+}
+
+fn resolver_with(records: &[LocalDnsRecord], inner: Arc<dyn DnsResolver>) -> LocalPtrResolver {
+    LocalPtrResolver::new(
+        inner,
+        LocalPtrResolver::map_from_local_records(records, Some("local")),
+    )
 }
 
 fn ptr_query(reverse_name: &str) -> DnsQuery {
@@ -38,8 +44,7 @@ fn a_query(domain: &str) -> DnsQuery {
 async fn test_ptr_query_for_local_record_returns_wire_data() {
     let records = vec![make_record("server", "local", "10.0.10.1", "A")];
     let inner: Arc<dyn DnsResolver> = Arc::new(MockInner);
-    let resolver =
-        LocalPtrResolver::from_local_records(&records, &Some("local".to_string()), inner);
+    let resolver = resolver_with(&records, inner);
 
     let query = ptr_query("1.10.0.10.in-addr.arpa");
     let result = resolver.resolve(&query).await;
@@ -58,8 +63,7 @@ async fn test_ptr_query_for_local_record_returns_wire_data() {
 async fn test_ptr_query_unknown_ip_passes_through() {
     let records = vec![make_record("server", "local", "10.0.10.1", "A")];
     let inner: Arc<dyn DnsResolver> = Arc::new(MockInner);
-    let resolver =
-        LocalPtrResolver::from_local_records(&records, &Some("local".to_string()), inner);
+    let resolver = resolver_with(&records, inner);
 
     let query = ptr_query("99.10.0.10.in-addr.arpa");
     let result = resolver.resolve(&query).await;
@@ -71,8 +75,7 @@ async fn test_ptr_query_unknown_ip_passes_through() {
 async fn test_a_query_passes_through_without_touching_map() {
     let records = vec![make_record("server", "local", "10.0.10.1", "A")];
     let inner: Arc<dyn DnsResolver> = Arc::new(MockInner);
-    let resolver =
-        LocalPtrResolver::from_local_records(&records, &Some("local".to_string()), inner);
+    let resolver = resolver_with(&records, inner);
 
     let query = a_query("server.local");
     let result = resolver.resolve(&query).await;
@@ -81,16 +84,14 @@ async fn test_a_query_passes_through_without_touching_map() {
 }
 
 #[tokio::test]
-async fn test_from_local_records_answers_every_valid_entry() {
+async fn test_map_from_local_records_answers_every_entry() {
     let records = vec![
         make_record("host1", "local", "10.0.0.1", "A"),
-        make_record("bad", "local", "not-an-ip", "A"),
         make_record("host2", "local", "10.0.0.2", "A"),
         make_record("host3", "local", "10.0.0.3", "A"),
     ];
     let inner: Arc<dyn DnsResolver> = Arc::new(MockInner);
-    let resolver =
-        LocalPtrResolver::from_local_records(&records, &Some("local".to_string()), inner);
+    let resolver = resolver_with(&records, inner);
 
     for reverse in [
         "1.0.0.10.in-addr.arpa",
@@ -146,11 +147,12 @@ fn test_upstream_fallback_does_not_hold_the_map_lock() {
 
 #[tokio::test]
 async fn test_register_adds_entry_to_map() {
-    let inner: Arc<dyn DnsResolver> = Arc::new(MockInner);
-    let resolver = LocalPtrResolver::from_local_records(&[], &None, inner);
+    let map = LocalPtrResolver::map_from_local_records(&[], None);
+    let resolver = LocalPtrResolver::new(Arc::new(MockInner), Arc::clone(&map));
+    let registry = PtrRegistry::new(map);
 
     let ip: IpAddr = "10.0.0.5".parse().unwrap();
-    resolver.register(ip, Arc::from("nas.local"), 300);
+    registry.register(ip, Arc::from("nas.local"), 300);
 
     let query = ptr_query("5.0.0.10.in-addr.arpa");
     let result = resolver.resolve(&query).await;
@@ -162,12 +164,12 @@ async fn test_register_adds_entry_to_map() {
 #[tokio::test]
 async fn test_unregister_removes_entry_from_map() {
     let records = vec![make_record("server", "local", "10.0.10.1", "A")];
-    let inner: Arc<dyn DnsResolver> = Arc::new(MockInner);
-    let resolver =
-        LocalPtrResolver::from_local_records(&records, &Some("local".to_string()), inner);
+    let map = LocalPtrResolver::map_from_local_records(&records, None);
+    let resolver = LocalPtrResolver::new(Arc::new(MockInner), Arc::clone(&map));
+    let registry = PtrRegistry::new(map);
 
     let ip: IpAddr = "10.0.10.1".parse().unwrap();
-    resolver.unregister(ip);
+    registry.unregister(ip);
 
     let query = ptr_query("1.10.0.10.in-addr.arpa");
     let result = resolver.resolve(&query).await;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tracing::{info, instrument};
 
-use crate::ports::ApiTokenRepository;
+use crate::ports::{ApiKeyMaterial, ApiTokenRepository};
 use ferrous_dns_domain::{ApiToken, DomainError};
 
 /// Updates an existing API token's name and optionally replaces its key
@@ -33,15 +33,15 @@ impl UpdateApiTokenUseCase {
         // An empty key keeps the current one, matching create's "empty means not provided".
         let new_key = custom_token
             .filter(|token| !token.is_empty())
-            .map(|token| (token, super::key_material(token)));
+            .map(|raw| (raw, super::key_material(raw)));
         let updated = self
             .repo
             .update(
                 id,
                 name,
-                new_key.as_ref().map(|(_, (prefix, _))| *prefix),
-                new_key.as_ref().map(|(_, (_, hash))| hash.as_str()),
-                new_key.as_ref().map(|(raw, _)| *raw),
+                new_key
+                    .as_ref()
+                    .map(|(raw, (prefix, hash))| ApiKeyMaterial { prefix, hash, raw }),
             )
             .await?;
 

@@ -220,7 +220,7 @@ hijack_ip_ttl_secs = 3600              # Eviction TTL for unconfirmed hijack IPs
 [dns.response_ip_filter]
 enabled = false                                              # opt-in
 action = "block"                                             # "alert" | "block"
-ip_list_urls = []                                            # add C2 feed URLs
+ip_list_urls = []                                            # add C2 feed URLs (each at most 64 MiB)
 # Example feeds:
 # ip_list_urls = [
 #   "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
@@ -247,6 +247,9 @@ success_threshold = 2                   # Consecutive successes to mark a server
 # never for the domain itself, and an exact record always beats it. A query type
 # the wildcard does not carry — AAAA when only an A is defined — is answered as
 # an empty NOERROR rather than being forwarded upstream.
+#
+# `ip` must be an address literal of the family `record_type` names (IPv4 for A,
+# IPv6 for AAAA); a record that is not fails startup with an error naming it.
 
 [[dns.local_records]]
 hostname = "viudes"

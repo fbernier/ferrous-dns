@@ -1,6 +1,5 @@
 use super::{
-    doh_response_too_large, endpoint_for, quic_client_endpoint, resolver, split_authority,
-    MAX_DOH_MESSAGE_SIZE,
+    doh_response_too_large, endpoint_for, quic_client_endpoint, resolver, MAX_DOH_MESSAGE_SIZE,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -41,16 +40,13 @@ pub struct H3Transport {
 }
 
 impl H3Transport {
-    pub fn new(h3_url: String, resolved_addrs: Vec<SocketAddr>) -> Self {
-        let without_scheme = h3_url.strip_prefix("h3://").unwrap_or(&h3_url);
-        let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
-        let (hostname, port) = split_authority(authority, 443);
-        let hostname = hostname.to_owned();
+    /// `hostname` is the URL host without port or brackets.
+    pub fn new(h3_url: &str, hostname: &str, port: u16, resolved_addrs: Vec<SocketAddr>) -> Self {
         let https_url = h3_url.replacen("h3://", "https://", 1);
-        let pool_key: Arc<str> = Arc::from(format!("{}:{}", hostname, port));
+        let pool_key: Arc<str> = Arc::from(format!("{hostname}:{port}"));
         Self {
             https_url,
-            hostname,
+            hostname: hostname.to_owned(),
             port,
             pool_key,
             resolved_addrs,
@@ -325,7 +321,9 @@ mod tests {
             )));
             let addr = server.local_addr().unwrap();
             let transport = H3Transport::new(
-                format!("h3://localhost:{}/dns-query", addr.port()),
+                &format!("h3://localhost:{}/dns-query", addr.port()),
+                "localhost",
+                addr.port(),
                 vec![addr],
             );
             Self {
@@ -506,14 +504,5 @@ mod tests {
             tokio::join!(server, client);
         })
         .await;
-    }
-
-    #[test]
-    fn test_h3_url_with_ipv6_literal_targets_the_address() {
-        let transport = H3Transport::new("h3://[2606:4700::1111]:8443/dns-query".into(), vec![]);
-        assert_eq!(
-            (transport.hostname.as_str(), transport.port),
-            ("2606:4700::1111", 8443)
-        );
     }
 }

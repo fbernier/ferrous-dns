@@ -66,6 +66,28 @@ fn ceremony<C: serde::Serialize, S: serde::Serialize>(
     Ok((challenge, state))
 }
 
+fn parse_passkeys(passkeys_json: &[String]) -> Result<Vec<Passkey>, DomainError> {
+    passkeys_json
+        .iter()
+        .map(|j| serde_json::from_str::<Passkey>(j))
+        .collect::<Result<_, _>>()
+        .map_err(|e| json_err("parse stored passkey", e))
+}
+
+/// Folds the assertion into the passkey so webauthn-rs checks the next counter against it.
+fn authenticated(
+    mut passkey: Passkey,
+    result: &AuthenticationResult,
+) -> Result<AuthenticatedCredential, DomainError> {
+    passkey.update_credential(result);
+    Ok(AuthenticatedCredential {
+        credential_id: credential_id_b64(result.cred_id().as_ref()),
+        sign_count: i64::from(result.counter()),
+        passkey_json: serde_json::to_string(&passkey)
+            .map_err(|e| json_err("serialize passkey", e))?,
+    })
+}
+
 impl WebauthnService for WebauthnRsService {
     fn is_configured(&self) -> bool {
         self.webauthn.is_some()
@@ -130,11 +152,7 @@ impl WebauthnService for WebauthnRsService {
     ) -> Result<(serde_json::Value, String), DomainError> {
         let wa = self.wa()?;
 
-        let passkeys: Vec<Passkey> = passkeys_json
-            .iter()
-            .map(|j| serde_json::from_str::<Passkey>(j))
-            .collect::<Result<_, _>>()
-            .map_err(|e| json_err("parse stored passkey", e))?;
+        let passkeys = parse_passkeys(passkeys_json)?;
 
         let (rcr, state) = wa
             .start_passkey_authentication(&passkeys)
@@ -147,6 +165,7 @@ impl WebauthnService for WebauthnRsService {
         &self,
         response: serde_json::Value,
         state_json: &str,
+        passkeys_json: &[String],
     ) -> Result<AuthenticatedCredential, DomainError> {
         let wa = self.wa()?;
 
@@ -159,10 +178,13 @@ impl WebauthnService for WebauthnRsService {
             .finish_passkey_authentication(&cred, &state)
             .map_err(|e| wa_err("finish_authentication", e))?;
 
-        Ok(AuthenticatedCredential {
-            credential_id: credential_id_b64(result.cred_id().as_ref()),
-            sign_count: i64::from(result.counter()),
-        })
+        let passkey = parse_passkeys(passkeys_json)?
+            .into_iter()
+            .find(|pk| pk.cred_id() == result.cred_id())
+            .ok_or_else(|| {
+                DomainError::WebauthnError("authenticated credential is no longer stored".into())
+            })?;
+        authenticated(passkey, &result)
     }
 
     fn start_discoverable(&self) -> Result<(serde_json::Value, String), DomainError> {
@@ -205,9 +227,6 @@ impl WebauthnService for WebauthnRsService {
             .finish_discoverable_authentication(&cred, state, &[DiscoverableKey::from(&passkey)])
             .map_err(|e| wa_err("finish_discoverable", e))?;
 
-        Ok(AuthenticatedCredential {
-            credential_id: credential_id_b64(result.cred_id().as_ref()),
-            sign_count: i64::from(result.counter()),
-        })
+        authenticated(passkey, &result)
     }
 }

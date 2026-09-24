@@ -86,7 +86,7 @@ fn insert<T>(
     items: Vec<T>,
     ttl_seconds: u32,
 ) {
-    evict_if_full(map, CacheEntry::is_expired);
+    map.evict_if_full::<EVICTION_BATCH_SIZE>(MAX_ENTRIES, CacheEntry::is_expired);
     map.insert(Arc::from(domain), CacheEntry::new(items, ttl_seconds));
 }
 
@@ -105,62 +105,5 @@ fn lookup<T>(map: &CountedDashMap<Arc<str>, CacheEntry<T>>, domain: &str) -> Opt
 impl Default for DnssecCache {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Makes room in a full `map` before an insert. Inspects at most
-/// [`EVICTION_BATCH_SIZE`] entries for expiration first;
-/// if the map is still full it drops one arbitrary entry so the
-/// insert cannot grow the map past the ceiling. Hot zones (root, common TLDs)
-/// re-populate on the next miss, so worst case is extra churn, never unbounded
-/// growth.
-fn evict_if_full<V, F>(map: &CountedDashMap<Arc<str>, V>, is_expired: F)
-where
-    F: Fn(&V) -> bool,
-{
-    if map.len() < MAX_ENTRIES {
-        return;
-    }
-
-    let expired: Vec<Arc<str>> = map
-        .iter()
-        .take(EVICTION_BATCH_SIZE)
-        .filter(|e| is_expired(e.value()))
-        .map(|e| e.key().clone())
-        .collect();
-    for k in &expired {
-        map.remove(k);
-    }
-
-    if map.len() >= MAX_ENTRIES {
-        let fallback = map.iter().next().map(|e| e.key().clone());
-        if let Some(k) = fallback {
-            map.remove(&k);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::Cell;
-
-    #[test]
-    fn eviction_bounds_inspections_and_makes_room() {
-        for expired in [false, true] {
-            let map: CountedDashMap<Arc<str>, bool> = (0..MAX_ENTRIES)
-                .map(|i| (Arc::from(format!("zone{i}.example")), expired))
-                .collect();
-            let inspected = Cell::new(0);
-
-            evict_if_full(&map, |expired| {
-                inspected.set(inspected.get() + 1);
-                *expired
-            });
-
-            assert_eq!(inspected.get(), EVICTION_BATCH_SIZE);
-            let removed = if expired { EVICTION_BATCH_SIZE } else { 1 };
-            assert_eq!(map.len(), MAX_ENTRIES - removed);
-        }
     }
 }

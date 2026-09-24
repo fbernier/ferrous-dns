@@ -50,7 +50,7 @@ mod whitelist_repository;
 mod whitelist_source_repository;
 mod wildcard_record_registry;
 
-pub use api_token_repository::ApiTokenRepository;
+pub use api_token_repository::{ApiKeyMaterial, ApiTokenRepository};
 pub use arp_reader::{ArpReader, ArpTable};
 pub use block_filter_engine::{BlockFilterEnginePort, FilterDecision};
 pub use blocked_service_repository::BlockedServiceRepository;

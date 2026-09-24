@@ -1,6 +1,5 @@
 use ferrous_dns_domain::{DnsProtocol, UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
-use std::net::SocketAddr;
 
 #[tokio::test]
 #[ignore = "live network: resolves dns.google; run with --ignored"]
@@ -219,49 +218,29 @@ async fn test_pool_manager_preresolves_h3_hostnames() {
 
 #[tokio::test]
 async fn test_pool_manager_https_ip_no_resolution() {
-    let pool = UpstreamPool {
-        name: "test-https-ip".into(),
-        strategy: UpstreamStrategy::Parallel,
-        priority: 1,
-        servers: vec!["https://1.1.1.1/dns-query".into()],
-        weight: None,
-    };
+    for server in ["https://1.1.1.1/dns-query", "https://[::1]:8443/dns-query"] {
+        let pool = UpstreamPool {
+            name: "test-https-ip".into(),
+            strategy: UpstreamStrategy::Parallel,
+            priority: 1,
+            servers: vec![server.into()],
+            weight: None,
+        };
 
-    let pm = PoolManager::new(vec![pool], None)
-        .await
-        .expect("PoolManager should create successfully");
+        let pm = PoolManager::new(vec![pool], None)
+            .await
+            .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_arc_protocols();
-    assert_eq!(protocols.len(), 1);
+        let protocols = pm.get_all_arc_protocols();
+        assert_eq!(protocols.len(), 1);
 
-    if let DnsProtocol::Https { resolved_addrs, .. } = protocols[0].as_ref() {
-        assert!(
-            resolved_addrs.is_empty(),
-            "HTTPS with IP literal should have empty resolved_addrs"
-        );
-    } else {
-        panic!("Expected Https variant, got: {}", protocols[0]);
+        if let DnsProtocol::Https { resolved_addrs, .. } = protocols[0].as_ref() {
+            assert!(
+                resolved_addrs.is_empty(),
+                "{server}: HTTPS with IP literal should have empty resolved_addrs"
+            );
+        } else {
+            panic!("Expected Https variant, got: {}", protocols[0]);
+        }
     }
-}
-
-#[tokio::test]
-async fn test_pool_manager_preresolves_bracketed_ipv6_https_host() {
-    let pool = UpstreamPool {
-        name: "test-https-v6".into(),
-        strategy: UpstreamStrategy::Parallel,
-        priority: 1,
-        servers: vec!["https://[::1]/dns-query".into()],
-        weight: None,
-    };
-
-    let pm = PoolManager::new(vec![pool], None)
-        .await
-        .expect("PoolManager should create successfully");
-
-    let protocols = pm.get_all_arc_protocols();
-    let DnsProtocol::Https { resolved_addrs, .. } = protocols[0].as_ref() else {
-        panic!("Expected Https variant, got: {}", protocols[0]);
-    };
-    let expected: SocketAddr = "[::1]:443".parse().unwrap();
-    assert_eq!(resolved_addrs, &[expected]);
 }

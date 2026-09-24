@@ -15,8 +15,7 @@ pub struct DnssecValidatorPool {
 
 impl DnssecValidatorPool {
     /// Builds the pool over a caller-owned cache, so the wiring can keep a
-    /// handle for stats reporting and so the counters survive the resolver-stack
-    /// rebuilds that `HickoryDnsResolver` performs on every `with_*` call.
+    /// handle for stats reporting.
     pub fn new(
         pool_manager: Arc<PoolManager>,
         timeout_ms: u64,

@@ -1,6 +1,5 @@
 //! A `DashMap` whose size is an O(1) read.
 
-use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use smallvec::SmallVec;
@@ -143,10 +142,6 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> CountedDashMap<K, V, S> {
                 self.remove(&key);
             }
         }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = RefMulti<'_, K, V>> {
-        self.map.iter()
     }
 
     #[cfg(test)]

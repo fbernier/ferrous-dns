@@ -68,7 +68,7 @@ async fn async_main() -> anyhow::Result<()> {
     let use_cases = wiring::UseCases::new(
         &repos,
         dns_services.pool_manager.clone(),
-        config.dns.local_dns_server.clone(),
+        dns_services.local_dns_server,
     );
 
     bootstrap::spawn_jobs(

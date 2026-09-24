@@ -111,7 +111,11 @@ impl DiscoverablePasskeyLoginUseCase {
                 .finish_discoverable(response, state, &credential.passkey)?;
 
         self.mfa_repo
-            .update_credential_counter(&authenticated.credential_id, authenticated.sign_count)
+            .update_credential(
+                &authenticated.credential_id,
+                authenticated.sign_count,
+                &authenticated.passkey_json,
+            )
             .await?;
 
         let user = self
@@ -130,7 +134,7 @@ impl DiscoverablePasskeyLoginUseCase {
 
         let session = build_session(
             user.username.clone(),
-            user.role.clone(),
+            user.role,
             remember_me,
             ip_address,
             user_agent,

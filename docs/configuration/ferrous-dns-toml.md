@@ -557,7 +557,7 @@ ip_ttl_secs             = 604800
 |:-------|:-----|:--------|:------------|
 | `enabled` | `bool` | `false` | Enable response IP filtering (opt-in) |
 | `action` | `str` | `"block"` | `"alert"` to log only; `"block"` to return NXDOMAIN |
-| `ip_list_urls` | `list` | `[]` | Feed URLs; one IP per line, `#` comments are supported |
+| `ip_list_urls` | `list` | `[]` | Feed URLs; one IP per line, `#` comments are supported. A feed over 64 MiB is skipped with a warning |
 | `refresh_interval_secs` | `int` | `86400` | Seconds between feed refreshes (24 hours) |
 | `ip_ttl_secs` | `int` | `604800` | Seconds before an IP entry expires if not re-confirmed by a feed refresh (7 days) |
 
@@ -573,7 +573,7 @@ See [Malware Detection](../features/malware-detection.md#response-ip-filtering).
 
 ## `[[dns.local_records]]` {#local-records}
 
-Static A or AAAA records served directly from the cache, bypassing upstream entirely. An automatic PTR record is generated for every A record.
+Static A or AAAA records served directly from the cache, bypassing upstream entirely. An automatic PTR record is generated for every non-wildcard record.
 
 ```toml title="ferrous-dns.toml"
 [[dns.local_records]]
@@ -595,9 +595,11 @@ ttl         = 300
 |:-------|:-----|:--------|:------------|
 | `hostname` | `str` | — | Hostname without the domain suffix |
 | `domain` | `str` | — | Domain suffix (e.g. `"local"`, `"lan"`) |
-| `ip` | `str` | — | IP address for this record |
-| `record_type` | `str` | `"A"` | Record type: `"A"` or `"AAAA"` |
+| `ip` | `str` | — | IP address literal: IPv4 for `A`, IPv6 for `AAAA` |
+| `record_type` | `str` | — | Record type: `"A"` or `"AAAA"` (case-insensitive) |
 | `ttl` | `int` | `300` | TTL in seconds |
+
+A record with an unparseable `ip`, an unknown `record_type`, or an address of the wrong family for its type fails the config load with an error naming it.
 
 See [DNS & Upstreams](dns.md#local-records).
 

@@ -8,6 +8,8 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 const NS_PER_SEC: u64 = 1_000_000_000;
+/// Largest feed body accepted; a feed past it is skipped rather than buffered.
+const MAX_FEED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Downloads C2 IP threat feeds and provides O(1) hot-path lookup.
 ///
@@ -53,7 +55,7 @@ impl ResponseIpFilterDetector {
         let mut fetch_errors = 0usize;
 
         for url in &self.config.ip_list_urls {
-            match fetch_ip_list(url, http_client).await {
+            match fetch_ip_list(url, http_client, MAX_FEED_BYTES).await {
                 Ok(ips) => {
                     for ip in ips {
                         if self.blocked_ips.insert(ip, now_ns).is_none() {
@@ -106,8 +108,12 @@ impl ResponseIpFilterEvictionTarget for ResponseIpFilterDetector {
     }
 }
 
-async fn fetch_ip_list(url: &str, client: &reqwest::Client) -> Result<Vec<IpAddr>, DomainError> {
-    let response = client
+async fn fetch_ip_list(
+    url: &str,
+    client: &reqwest::Client,
+    max_bytes: usize,
+) -> Result<Vec<IpAddr>, DomainError> {
+    let mut response = client
         .get(url)
         .timeout(Duration::from_secs(30))
         .send()
@@ -121,12 +127,26 @@ async fn fetch_ip_list(url: &str, client: &reqwest::Client) -> Result<Vec<IpAddr
         )));
     }
 
-    let text = response
-        .text()
+    let too_large = || DomainError::IoError(format!("feed {url} exceeds {max_bytes} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| DomainError::IoError(format!("read error for {url}: {e}")))?;
+        .map_err(|e| DomainError::IoError(format!("read error for {url}: {e}")))?
+    {
+        if chunk.len() > max_bytes - body.len() {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
 
-    Ok(parse_ip_list(&text))
+    Ok(parse_ip_list(&String::from_utf8_lossy(&body)))
 }
 
 /// Parses an IP list in standard format: one IP per line, `#` comments, blank lines ignored.
@@ -141,6 +161,69 @@ fn parse_ip_list(text: &str) -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `response` to one request and keeps the connection open, so a
+    /// reader that waits for EOF hangs.
+    async fn serve_once(response: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        format!("http://{addr}/feed")
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_feeds_are_rejected_while_streaming() {
+        let body = "192.0.2.1\n".repeat(20);
+        let advertised = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let streamed = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+            body.len()
+        );
+        for response in [advertised, streamed] {
+            let url = serve_once(response).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_ip_list(&url, &client(), body.len() - 1),
+            )
+            .await
+            .expect("an oversized feed must be rejected without waiting for EOF");
+            assert!(matches!(result, Err(DomainError::IoError(_))), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_of_exactly_the_cap_is_parsed() {
+        let body = "192.0.2.1\n2001:db8::1\n";
+        let url = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let ips = fetch_ip_list(&url, &client(), body.len()).await.unwrap();
+        assert_eq!(
+            ips,
+            [
+                "192.0.2.1".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+    }
 
     #[test]
     fn parse_ip_list_handles_comments_and_blanks() {

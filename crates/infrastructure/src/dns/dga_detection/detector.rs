@@ -1,10 +1,12 @@
 use super::ngram::bigram_deviation_score;
 use crate::dns::tunneling::client_stats::subnet_key_from_ip;
-use crate::dns::tunneling::entropy::{extract_apex, shannon_entropy};
 use crate::dns::tunneling::signal::SignalScore;
 use dashmap::DashMap;
 use ferrous_dns_application::ports::{DgaEvictionTarget, DgaFlagStore};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
+use ferrous_dns_application::use_cases::dns::domain_heuristics::{
+    char_ratios, extract_apex, shannon_entropy,
+};
 use ferrous_dns_application::use_cases::dns::DgaAnalysisEvent;
 use ferrous_dns_domain::DgaDetectionConfig;
 use rustc_hash::FxBuildHasher;
@@ -258,29 +260,6 @@ impl DgaEvictionTarget for DgaDetector {
     fn flagged_count(&self) -> usize {
         self.flagged_domains.len()
     }
-}
-
-/// (consonants, vowels, digits, total bytes) of an SLD.
-fn char_ratios(sld: &str) -> (u32, u32, u32, u32) {
-    let mut consonants = 0u32;
-    let mut vowels = 0u32;
-    let mut digits = 0u32;
-    let mut total = 0u32;
-
-    for &b in sld.as_bytes() {
-        total += 1;
-        let lower = b.to_ascii_lowercase();
-        match lower {
-            b'a' | b'e' | b'i' | b'o' | b'u' => vowels += 1,
-            b'b'..=b'd' | b'f'..=b'h' | b'j'..=b'n' | b'p'..=b't' | b'v'..=b'z' => {
-                consonants += 1;
-            }
-            b'0'..=b'9' => digits += 1,
-            _ => {}
-        }
-    }
-
-    (consonants, vowels, digits, total)
 }
 
 #[cfg(test)]

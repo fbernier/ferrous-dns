@@ -127,7 +127,7 @@ impl HealthChecker {
                 warn!(server = %protocol, error = %e, "Health check: FAILED");
                 self.mark_failed(protocol, Some(latency_ms), e.to_string());
             }
-            Ok(Ok(resp)) => match ResponseParser::parse_bytes(resp.bytes) {
+            Ok(Ok(resp)) => match ResponseParser::parse_bytes(resp) {
                 Ok(dns) if dns.is_server_error() => {
                     self.mark_failed(
                         protocol,

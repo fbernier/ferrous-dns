@@ -13,7 +13,7 @@ pub(super) async fn query(ctx: &QueryContext<'_>) -> Result<UpstreamResult, Doma
     for (index, protocol) in ctx.servers.iter().enumerate() {
         match query_server(ctx, protocol).await {
             Ok(r) => {
-                debug!(server = %r.server, latency_ms = r.latency_ms, position = index, "Server responded");
+                debug!(server = %r.server_display, latency_ms = r.latency_ms, position = index, "Server responded");
                 return Ok(r);
             }
             Err(e) => {

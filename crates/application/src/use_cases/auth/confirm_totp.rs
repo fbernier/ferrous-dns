@@ -49,7 +49,12 @@ impl ConfirmTotpUseCase {
             return Err(DomainError::MfaAlreadyEnabled);
         }
 
-        if !self.totp.verify(&mfa.totp_secret, code)? {
+        // Spending the step keeps the enrollment code from also completing a login.
+        let accepted = match self.totp.verify(&mfa.totp_secret, code)? {
+            Some(step) => self.mfa_repo.advance_totp_step(username, step).await?,
+            None => false,
+        };
+        if !accepted {
             return Err(DomainError::InvalidMfaCode);
         }
 

@@ -12,7 +12,7 @@ use crate::dto::user::{CreateUserRequest, UserResponse};
 use crate::errors::ApiError;
 use crate::state::AppState;
 use ferrous_dns_application::ports::CreateUserInput;
-use ferrous_dns_domain::{DomainError, User, UserRole, UserSource};
+use ferrous_dns_domain::{User, UserRole};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -51,13 +51,12 @@ async fn create_user(
     State(state): State<AppState>,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserResponse>), ApiError> {
-    // Rejected here because the repository stores the role string as given.
-    let role = UserRole::parse(&req.role).map_err(DomainError::InvalidInput)?;
+    let role: UserRole = req.role.parse()?;
     let input = CreateUserInput {
         username: Arc::from(req.username.as_str()),
         display_name: req.display_name.map(|s| Arc::from(s.as_str())),
         password: req.password,
-        role: role.as_str().to_string(),
+        role,
     };
 
     let user = state.auth.create_user.execute(input).await?;
@@ -92,10 +91,7 @@ fn user_to_response(user: User) -> UserResponse {
         username: user.username.to_string(),
         display_name: user.display_name.map(|s| s.to_string()),
         role: user.role.as_str(),
-        source: match user.source {
-            UserSource::Toml => "toml",
-            UserSource::Database => "database",
-        },
+        source: user.source.as_str(),
         enabled: user.enabled,
         created_at: user.created_at,
         updated_at: user.updated_at,

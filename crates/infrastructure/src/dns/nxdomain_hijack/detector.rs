@@ -97,7 +97,7 @@ impl NxdomainHijackDetector {
                     Err(e) => {
                         debug!(server = %protocol, error = %e, "Hijack probe failed");
                     }
-                    Ok(resp) => match ResponseParser::parse_bytes(resp.bytes) {
+                    Ok(resp) => match ResponseParser::parse_bytes(resp) {
                         Ok(dns) if dns.is_nxdomain() => {}
                         Ok(dns) if !dns.addresses.is_empty() => {
                             found_hijack = true;

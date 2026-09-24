@@ -9,6 +9,7 @@ pub mod tls;
 pub mod udp;
 pub mod udp_pool;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use ferrous_dns_domain::{DnsProtocol, DomainError, UpstreamAddr};
 use rustc_hash::FxBuildHasher;
@@ -23,11 +24,6 @@ fn doh_response_too_large(url: &str) -> DomainError {
     DomainError::IoError(format!(
         "DoH response from {url} exceeds {MAX_DOH_MESSAGE_SIZE} bytes"
     ))
-}
-
-#[derive(Debug)]
-pub struct TransportResponse {
-    pub bytes: bytes::Bytes,
 }
 
 pub enum Transport {
@@ -48,8 +44,8 @@ impl Transport {
         &self,
         message_bytes: &[u8],
         timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
-        let bytes = match self {
+    ) -> Result<Bytes, DomainError> {
+        match self {
             Self::Udp(t) => t.send(message_bytes, timeout).await,
             Self::Tcp(t) => t.send(message_bytes, timeout).await,
             #[cfg(feature = "dns-over-rustls")]
@@ -60,8 +56,7 @@ impl Transport {
             Self::H3(t) => t.send(message_bytes, timeout).await,
             #[cfg(feature = "dns-over-quic")]
             Self::Quic(t) => t.send(message_bytes, timeout).await,
-        }?;
-        Ok(TransportResponse { bytes })
+        }
     }
 }
 
@@ -97,6 +92,7 @@ fn create_transport(protocol: &DnsProtocol) -> Result<Transport, DomainError> {
             url,
             hostname,
             resolved_addrs,
+            ..
         } => Ok(Transport::Https(https::HttpsTransport::new(
             url.to_string(),
             hostname,
@@ -118,10 +114,13 @@ fn create_transport(protocol: &DnsProtocol) -> Result<Transport, DomainError> {
         #[cfg(feature = "dns-over-h3")]
         DnsProtocol::H3 {
             url,
+            hostname,
+            port,
             resolved_addrs,
-            ..
         } => Ok(Transport::H3(h3::H3Transport::new(
-            url.to_string(),
+            url,
+            hostname,
+            *port,
             resolved_addrs.clone(),
         ))),
 
@@ -152,24 +151,6 @@ fn require_resolved(addr: &UpstreamAddr, label: &str) -> Result<SocketAddr, Doma
             "{label} transport requires resolved address, got: {addr}"
         ))
     })
-}
-
-/// Splits a URL authority into host and port, unwrapping a bracketed IPv6
-/// literal. A missing or unparsable port yields `default_port`.
-pub(crate) fn split_authority(authority: &str, default_port: u16) -> (&str, u16) {
-    let (host, port) = match authority.strip_prefix('[') {
-        Some(rest) => match rest.split_once(']') {
-            Some((host, after)) => (host, after.strip_prefix(':')),
-            None => (authority, None),
-        },
-        None => match authority.rsplit_once(':') {
-            // More than one colon without brackets is a bare IPv6 address, not host:port.
-            Some((host, port)) if !host.contains(':') => (host, Some(port)),
-            _ => (authority, None),
-        },
-    };
-    let port = port.and_then(|p| p.parse().ok()).unwrap_or(default_port);
-    (host, port)
 }
 
 /// Client TLS for encrypted upstreams: webpki roots and session resumption.
@@ -213,25 +194,4 @@ fn endpoint_for<'a>(
     endpoint
         .as_ref()
         .map_err(|e| DomainError::IoError(e.clone()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::split_authority;
-
-    #[test]
-    fn split_authority_handles_ipv6_literals_and_ports() {
-        let cases = [
-            ("dns.example", ("dns.example", 443)),
-            ("dns.example:8443", ("dns.example", 8443)),
-            ("1.1.1.1:853", ("1.1.1.1", 853)),
-            ("[2606:4700::1111]", ("2606:4700::1111", 443)),
-            ("[2606:4700::1111]:8443", ("2606:4700::1111", 8443)),
-            ("2606:4700::1111", ("2606:4700::1111", 443)),
-            ("dns.example:notaport", ("dns.example", 443)),
-        ];
-        for (authority, expected) in cases {
-            assert_eq!(split_authority(authority, 443), expected, "{authority}");
-        }
-    }
 }

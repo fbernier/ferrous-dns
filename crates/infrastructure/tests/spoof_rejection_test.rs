@@ -113,13 +113,13 @@ async fn manager_hardened(addr: SocketAddr) -> Arc<PoolManager> {
     )
 }
 
-async fn resolve(mode: Mode) -> Result<SocketAddr, ferrous_dns_domain::DomainError> {
+async fn resolve(mode: Mode) -> Result<Arc<str>, ferrous_dns_domain::DomainError> {
     let addr = spawn_responder(mode).await;
     let pm = manager(addr).await;
     let domain: Arc<str> = Arc::from("example.com");
     pm.query(&domain, &RecordType::A, 2000, false)
         .await
-        .map(|r| r.server)
+        .map(|r| r.server_display)
 }
 
 #[tokio::test]

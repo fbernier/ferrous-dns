@@ -51,6 +51,12 @@ All API endpoints are protected by the auth guard middleware, except:
 - `POST /api/auth/logout` — logout
 - `GET /api/health` — health check
 
+### Users and Roles
+
+Besides the `[auth.admin]` account from the config file, users can be created under **Settings > Users** or via `POST /api/users`. The admin username is reserved: no database user can take it, even before the admin's password is set.
+
+Each user has a role, `admin` or `viewer`. **Roles are informational only**: they are stored and displayed, but no endpoint checks them, so a `viewer` has the same access as an `admin`. Only create accounts for people you would trust with full control.
+
 ### Session Management
 
 View and revoke active sessions from **Settings > Security** or via the API:
@@ -59,6 +65,8 @@ View and revoke active sessions from **Settings > Security** or via the API:
 GET /api/auth/sessions
 DELETE /api/auth/sessions/{id}
 ```
+
+Like every other protected endpoint, these are not restricted by role or owner: any signed-in user or API token can list every session and revoke any of them, the admin's included.
 
 ### Password Change
 

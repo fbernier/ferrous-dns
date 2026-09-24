@@ -1,3 +1,5 @@
+use crate::DomainError;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// TOTP enrollment state for a single user, keyed by username.
@@ -38,12 +40,18 @@ impl MfaMethod {
             Self::Webauthn => "webauthn",
         }
     }
+}
 
-    pub fn parse(s: &str) -> Option<Self> {
+impl FromStr for MfaMethod {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "totp" => Some(Self::Totp),
-            "webauthn" => Some(Self::Webauthn),
-            _ => None,
+            "totp" => Ok(Self::Totp),
+            "webauthn" => Ok(Self::Webauthn),
+            other => Err(DomainError::InvalidInput(format!(
+                "Invalid MFA method: {other}"
+            ))),
         }
     }
 }

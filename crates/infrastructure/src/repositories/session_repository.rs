@@ -10,11 +10,11 @@ use ferrous_dns_domain::{AuthSession, DomainError, UserRole};
 use crate::repositories::{db_err, sql_now};
 
 pub struct SqliteSessionRepository {
-    pool: Arc<SqlitePool>,
+    pool: SqlitePool,
 }
 
 impl SqliteSessionRepository {
-    pub fn new(pool: Arc<SqlitePool>) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
@@ -48,7 +48,7 @@ impl SessionRepository for SqliteSessionRepository {
         .bind(&session.created_at)
         .bind(&session.last_seen_at)
         .bind(&session.expires_at)
-        .execute(self.pool.as_ref())
+        .execute(&self.pool)
         .await
         .map_err(db_err("Failed to create session"))?;
 
@@ -62,7 +62,7 @@ impl SessionRepository for SqliteSessionRepository {
              FROM auth_sessions WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err("Failed to get session"))?;
 
@@ -74,7 +74,7 @@ impl SessionRepository for SqliteSessionRepository {
         sqlx::query("UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?")
             .bind(sql_now())
             .bind(id)
-            .execute(self.pool.as_ref())
+            .execute(&self.pool)
             .await
             .map_err(db_err("Failed to update session last_seen"))?;
 
@@ -85,7 +85,7 @@ impl SessionRepository for SqliteSessionRepository {
     async fn delete(&self, id: &str) -> Result<(), DomainError> {
         sqlx::query("DELETE FROM auth_sessions WHERE id = ?")
             .bind(id)
-            .execute(self.pool.as_ref())
+            .execute(&self.pool)
             .await
             .map_err(db_err("Failed to delete session"))?;
 
@@ -96,7 +96,7 @@ impl SessionRepository for SqliteSessionRepository {
     async fn delete_expired(&self) -> Result<u64, DomainError> {
         let result = sqlx::query("DELETE FROM auth_sessions WHERE expires_at < ?")
             .bind(sql_now())
-            .execute(self.pool.as_ref())
+            .execute(&self.pool)
             .await
             .map_err(db_err("Failed to delete expired sessions"))?;
 
@@ -110,7 +110,7 @@ impl SessionRepository for SqliteSessionRepository {
              FROM auth_sessions WHERE expires_at >= ? ORDER BY last_seen_at DESC",
         )
         .bind(sql_now())
-        .fetch_all(self.pool.as_ref())
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err("Failed to get active sessions"))?;
 
@@ -131,11 +131,8 @@ fn row_to_session(
         expires_at,
     ): SessionRow,
 ) -> AuthSession {
-    let role = UserRole::parse(&role).unwrap_or_else(|_| {
-        error!(
-            role,
-            "Invalid session role in database, defaulting to Viewer"
-        );
+    let role = role.parse::<UserRole>().unwrap_or_else(|e| {
+        error!(error = %e, "Invalid session role in database, defaulting to Viewer");
         UserRole::Viewer
     });
     AuthSession {

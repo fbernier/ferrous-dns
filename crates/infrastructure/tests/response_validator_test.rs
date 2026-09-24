@@ -19,6 +19,7 @@ fn https() -> DnsProtocol {
     DnsProtocol::Https {
         url: Arc::from("https://dns.google/dns-query"),
         hostname: Arc::from("dns.google"),
+        port: 443,
         resolved_addrs: vec![],
     }
 }

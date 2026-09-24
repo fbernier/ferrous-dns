@@ -1,7 +1,6 @@
 use super::strategy::{QueryContext, ServerDisplays, UpstreamResult};
 use crate::dns::forwarding::forwarder::exchange_with_tc_retry;
 use ferrous_dns_domain::{DnsProtocol, DomainError};
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,9 +27,6 @@ pub(super) async fn query_server(
 
     Ok(UpstreamResult {
         response,
-        server: protocol
-            .socket_addr()
-            .unwrap_or(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
         latency_ms: start.elapsed().as_millis() as u64,
         pool_name: Arc::clone(ctx.pool_name),
         server_display: get_display(&answered_by, ctx.server_displays),

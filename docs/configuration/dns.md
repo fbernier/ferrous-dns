@@ -45,10 +45,12 @@ Ferrous DNS supports all major DNS transport protocols:
 |:---------|:-----------|:--------|
 | Plain UDP | `udp://host:port` | `udp://8.8.8.8:53` |
 | Plain TCP | `tcp://host:port` | `tcp://8.8.8.8:53` |
-| DNS-over-HTTPS | `https://host/path` | `https://cloudflare-dns.com/dns-query` |
+| DNS-over-HTTPS | `https://host[:port]/path` | `https://cloudflare-dns.com/dns-query` |
 | DNS-over-TLS | `tls://host:port` | `tls://1.1.1.1:853` |
 | DNS-over-QUIC | `doq://host:port` | `doq://dns.adguard-dns.com:853` |
-| HTTP/3 | `h3://host/path` | `h3://dns.google/dns-query` |
+| HTTP/3 | `h3://host[:port]/path` | `h3://dns.google/dns-query` |
+
+DoH and HTTP/3 URLs default to port 443; write an IPv6 literal in brackets (`https://[2606:4700:4700::1111]/dns-query`).
 
 You can also use DNS names directly (resolved at startup):
 
@@ -154,9 +156,19 @@ ttl = 300
 |:------|:------------|
 | `hostname` | Short hostname (without domain) |
 | `domain` | Domain suffix — full name is `hostname.domain` |
-| `ip` | IPv4 or IPv6 address |
-| `record_type` | `"A"` for IPv4, `"AAAA"` for IPv6 |
-| `ttl` | Time-to-live in seconds |
+| `ip` | IPv4 or IPv6 address literal |
+| `record_type` | `"A"` for IPv4, `"AAAA"` for IPv6 (case-insensitive) |
+| `ttl` | Time-to-live in seconds (default `300`) |
+
+Each record is checked when the file is loaded: an `ip` that is not an address
+literal, a `record_type` other than `A`/`AAAA`, or an address of the wrong
+family (`A` with an IPv6 address, `AAAA` with an IPv4 one) stops startup with an
+error naming the record, instead of being skipped. The API rejects the same
+mistakes with a `400`.
+
+Several records may share a name and type, or an address. The last one in the
+list answers, and deleting or editing one of them hands the name (or the PTR)
+to the next remaining record rather than dropping it.
 
 An exact local name stays local even when the requested record type is not
 configured. For example, an `AAAA` query for the A-only `router.local` above
@@ -206,9 +218,9 @@ record that would cover every query.
 
 ### Auto PTR Generation
 
-When you define a local A record, Ferrous DNS automatically creates a PTR record. For example, `server.local → 192.168.1.100` also creates `100.1.168.192.in-addr.arpa → server.local`.
+When you define a local A or AAAA record, Ferrous DNS automatically creates a PTR record. For example, `server.local → 192.168.1.100` also creates `100.1.168.192.in-addr.arpa → server.local`.
 
-This means reverse DNS lookups work without any extra configuration.
+This means reverse DNS lookups work without any extra configuration, including for records added from the dashboard while the server runs — even when none were configured at startup.
 
 ---
 

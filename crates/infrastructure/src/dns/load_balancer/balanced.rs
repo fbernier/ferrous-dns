@@ -19,7 +19,7 @@ pub(super) async fn query(
         let protocol = ctx.servers[(start_index + i) % ctx.servers.len()];
         match query_server(ctx, protocol).await {
             Ok(r) => {
-                debug!(server = %r.server, latency_ms = r.latency_ms, "Server responded");
+                debug!(server = %r.server_display, latency_ms = r.latency_ms, "Server responded");
                 return Ok(r);
             }
             Err(e) => {

@@ -12,10 +12,12 @@ All upstream servers are specified as URLs. Every major DNS transport protocol i
 |:---------|:-------|:--------|
 | Plain UDP | `udp://host:port` | `udp://8.8.8.8:53` |
 | Plain TCP | `tcp://host:port` | `tcp://8.8.8.8:53` |
-| DNS-over-HTTPS (DoH) | `https://host/path` | `https://cloudflare-dns.com/dns-query` |
+| DNS-over-HTTPS (DoH) | `https://host[:port]/path` | `https://cloudflare-dns.com/dns-query` |
 | DNS-over-TLS (DoT) | `tls://host:port` | `tls://1.1.1.1:853` |
 | DNS-over-QUIC (DoQ) | `doq://host:port` | `doq://dns.adguard-dns.com:853` |
-| HTTP/3 | `h3://host/path` | `h3://dns.google/dns-query` |
+| HTTP/3 | `h3://host[:port]/path` | `h3://dns.google/dns-query` |
+
+DoH and HTTP/3 URLs default to port 443. An IPv6 literal goes in brackets, as in any URL: `https://[2606:4700:4700::1111]/dns-query`. A URL with an unbracketed IPv6 address or a port that is not a number from 0 to 65535 is rejected at startup and by the configuration API.
 
 Hostnames in upstream URLs are resolved once at startup — you never need to use bare IP addresses:
 

@@ -24,6 +24,7 @@ use ferrous_dns_application::use_cases::{
 };
 use ferrous_dns_infrastructure::dns::PoolManager;
 use ferrous_dns_infrastructure::system::{LinuxArpReader, PtrHostnameResolver};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub struct UseCases {
@@ -97,7 +98,7 @@ impl UseCases {
     pub fn new(
         repos: &Repositories,
         pool_manager: Arc<PoolManager>,
-        local_dns_server: Option<String>,
+        local_dns_server: Option<SocketAddr>,
     ) -> Self {
         let arp_reader = Arc::new(LinuxArpReader::new());
         let hostname_resolver = Arc::new(

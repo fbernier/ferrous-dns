@@ -68,7 +68,7 @@ impl DnssecValidator {
 
         debug!(
             domain = %domain,
-            server = %upstream_result.server,
+            server = %upstream_result.server_display,
             latency_ms = upstream_result.latency_ms,
             "DNS query completed"
         );

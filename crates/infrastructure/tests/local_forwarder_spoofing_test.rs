@@ -151,13 +151,13 @@ async fn resolve_with(
 ) -> Result<Vec<IpAddr>, ferrous_dns_domain::DomainError> {
     let addr = spawn_responder(mode).await;
     forwarder
-        .query(&addr.to_string(), "nas.lan", &RecordType::A, 2000)
+        .query(addr, "nas.lan", &RecordType::A, 2000)
         .await
         .map(|response| response.addresses)
 }
 
 async fn resolve(mode: Responder) -> Result<Vec<IpAddr>, ferrous_dns_domain::DomainError> {
-    resolve_with(mode, DnsForwarder::new()).await
+    resolve_with(mode, DnsForwarder::new(HardeningOpts::default())).await
 }
 
 #[tokio::test]
@@ -200,7 +200,7 @@ async fn forged_cookie_is_rejected() {
 
 #[tokio::test]
 async fn case_flipped_answer_is_rejected_with_0x20() {
-    let forwarder = DnsForwarder::new().with_hardening(WITH_0X20);
+    let forwarder = DnsForwarder::new(WITH_0X20);
 
     let result = resolve_with(Responder::FlipQnameCase, forwarder).await;
 
@@ -216,9 +216,8 @@ async fn case_flipped_answer_is_rejected_with_0x20() {
 async fn answer_under_0x20_is_relayed_lowercased() {
     let addr = spawn_responder(Responder::Faithful).await;
 
-    let response = DnsForwarder::new()
-        .with_hardening(WITH_0X20)
-        .query(&addr.to_string(), "nas.lan", &RecordType::A, 2000)
+    let response = DnsForwarder::new(WITH_0X20)
+        .query(addr, "nas.lan", &RecordType::A, 2000)
         .await
         .unwrap();
 

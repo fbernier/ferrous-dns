@@ -435,7 +435,7 @@ Returns all active sessions. **Protected**.
 DELETE /api/auth/sessions/{id}
 ```
 
-Revokes a specific session by ID. **Protected**.
+Revokes a specific session by ID. **Protected**. Any authenticated caller — any user's session or any API token — can revoke any user's session, including the admin's; there is no ownership or role check.
 
 ---
 
@@ -501,6 +501,9 @@ DELETE /api/api-tokens/{id}
 
 ## User Management
 
+!!! warning "Roles are informational"
+    Every user has a `role` (`admin` or `viewer`), stored on the account and its sessions and shown in the UI and API responses. **Nothing enforces it**: a `viewer` can call every protected endpoint, including configuration changes, user management and API tokens. Give accounts only to people you would trust with full access.
+
 ### List Users
 
 ```http
@@ -518,9 +521,19 @@ POST /api/users
 ```json
 {
   "username": "operator",
-  "password": "secure-password"
+  "password": "secure-password",
+  "role": "viewer"
 }
 ```
+
+| Field | Type | Default | Description |
+|:------|:-----|:--------|:------------|
+| `username` | `str` | — | 1–64 alphanumeric characters, `-`, `_` or `.` |
+| `display_name` | `str` | — | Optional, up to 100 characters |
+| `password` | `str` | — | 8–256 characters |
+| `role` | `str` | `viewer` | `admin` or `viewer` (informational, see above); any other value is `400` |
+
+A username that is already taken returns `409`. The `[auth.admin]` username is always taken, even before its password is set in the setup wizard.
 
 ### Delete User
 
