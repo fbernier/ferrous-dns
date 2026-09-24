@@ -229,7 +229,4 @@ pub enum DomainError {
 
     #[error("Already exists: {0}")]
     AlreadyExists(String),
-
-    #[error("Group is in use: {0}")]
-    GroupInUse(String),
 }

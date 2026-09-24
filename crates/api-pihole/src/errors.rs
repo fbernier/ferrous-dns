@@ -87,8 +87,7 @@ fn pihole_status_and_key(err: &DomainError) -> (StatusCode, &'static str) {
         | DomainError::DuplicateUsername(_)
         | DomainError::PasswordAlreadyConfigured
         | DomainError::MfaAlreadyEnabled
-        | DomainError::AlreadyExists(_)
-        | DomainError::GroupInUse(_) => (StatusCode::CONFLICT, "already_exists"),
+        | DomainError::AlreadyExists(_) => (StatusCode::CONFLICT, "already_exists"),
 
         DomainError::AuthRequired
         | DomainError::SessionNotFound

@@ -1,5 +1,5 @@
 use super::client_row_mapper::{row_to_client, ClientRow, CLIENT_SELECT_BY_GROUP};
-use crate::repositories::{db_err, is_fk_violation, is_unique_violation, sql_now};
+use crate::repositories::{db_err, is_unique_violation, sql_now};
 use async_trait::async_trait;
 use ferrous_dns_application::ports::GroupRepository;
 use ferrous_dns_domain::{Client, DomainError, Group};
@@ -183,15 +183,7 @@ impl GroupRepository for SqliteGroupRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                if is_fk_violation(&e) {
-                    DomainError::GroupInUse(format!(
-                        "group {id} is still referenced by regex filters"
-                    ))
-                } else {
-                    db_err("Failed to delete group")(e)
-                }
-            })?;
+            .map_err(db_err("Failed to delete group"))?;
 
         if result.rows_affected() == 0 {
             return Err(DomainError::GroupNotFound(id));

@@ -56,8 +56,7 @@ fn status_code(err: &DomainError) -> StatusCode {
         | DomainError::CustomServiceAlreadyExists(_)
         | DomainError::SubnetConflict(_)
         | DomainError::GroupHasAssignedClients(_)
-        | DomainError::AlreadyExists(_)
-        | DomainError::GroupInUse(_) => StatusCode::CONFLICT,
+        | DomainError::AlreadyExists(_) => StatusCode::CONFLICT,
 
         DomainError::MfaNotConfigured
         | DomainError::WebauthnNotConfigured

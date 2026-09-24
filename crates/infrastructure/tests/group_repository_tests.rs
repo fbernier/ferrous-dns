@@ -213,33 +213,6 @@ async fn test_delete_group_unassigns_its_clients() {
 }
 
 #[tokio::test]
-async fn test_delete_group_referenced_by_rule_is_refused() {
-    let (repo, pool) = repo().await;
-    let id = repo
-        .create("Rules".to_string(), None, true)
-        .await
-        .unwrap()
-        .id
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO regex_filters (name, pattern, action, group_id, created_at, updated_at)
-         VALUES ('r', 'x', 'deny', ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
-    )
-    .bind(id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let result = repo.delete(id).await;
-
-    assert!(
-        matches!(result, Err(DomainError::GroupInUse(_))),
-        "got {result:?}"
-    );
-    assert!(repo.get_by_id(id).await.unwrap().is_some());
-}
-
-#[tokio::test]
 async fn test_count_clients_in_group() {
     let (repo, pool) = repo().await;
     insert_client(&pool, "192.168.1.1", 1).await;
