@@ -257,24 +257,20 @@ async fn ad_bit_needs_a_secure_answer_to_a_do_client_without_cd() {
 #[tokio::test]
 async fn relayed_answers_keep_upstream_records_under_our_id_and_cookie() {
     let (handler, our_cookie) = server(Ok(relayed(None)));
-    let upstream = relayed(None).upstream_wire_data.unwrap();
+    let upstream = Message::from_vec(&relayed(None).upstream_wire_data.unwrap()).unwrap();
 
-    let plain = ask_raw(&handler, &query(RecordType::TXT, Some(false), false, false)).await;
-    assert_eq!(plain[..2], ID.to_be_bytes());
-    assert_eq!(
-        plain[2..],
-        upstream[2..],
-        "no cookie to add: relayed verbatim"
-    );
-
-    let q = query(RecordType::TXT, Some(false), true, false);
-    let reply = ask(&handler, &q).await;
-    assert_eq!(reply.answers, Message::from_vec(&upstream).unwrap().answers);
-    assert_eq!(
-        option(&reply, 10),
-        Some(our_cookie),
-        "upstream cookie swapped for ours"
-    );
+    for (cookie, expected) in [(false, None), (true, Some(our_cookie))] {
+        let q = query(RecordType::TXT, Some(true), cookie, false);
+        let reply = ask(&handler, &q).await;
+        assert_eq!(reply.answers, upstream.answers);
+        let opt = reply.edns.as_ref().expect("OPT echoed");
+        assert!(opt.flags().dnssec_ok, "DO copied (RFC 3225 §3)");
+        assert_eq!(
+            option(&reply, 10),
+            expected,
+            "the upstream's cookie echo never reaches the client"
+        );
+    }
 }
 
 /// RFC 6891 §7: a query without OPT gets a reply without one, even when the
@@ -307,18 +303,8 @@ async fn disabled_cookies_are_never_echoed() {
         let label = format!("{outcome:?}");
         let reply = ask(&server_without_cookies(outcome), &q).await;
         assert!(reply.edns.is_some(), "{label}: OPT echoed");
-        let echoed = option(&reply, 10);
-        assert!(
-            echoed.is_none() || relayed_echo(&echoed),
-            "{label}: server cookie {echoed:?}"
-        );
+        assert_eq!(option(&reply, 10), None, "{label}");
     }
-}
-
-/// The relayed fixture's own upstream COOKIE echo, which the verbatim relay
-/// hands through untouched; anything else would be a server cookie of ours.
-fn relayed_echo(echoed: &Option<Vec<u8>>) -> bool {
-    echoed.as_deref() == Some(&[9u8; 24][..])
 }
 
 /// RFC 7873 §5.2.2: a COOKIE option that is not 8 or 16..=40 bytes long is a

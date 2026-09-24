@@ -460,43 +460,54 @@ impl HandleDnsQueryUseCase {
     }
 
     /// Checks the cache for a non-IP record type (NS, CNAME, SOA, PTR, MX, TXT,
-    /// HTTPS, SRV, SVCB) and returns the raw wire bytes if there is a hit.
-    /// The caller is responsible for patching the query ID before sending.
-    pub fn try_cache_wire_direct(
+    /// HTTPS, SRV, SVCB) and hands a hit's wire bytes to `respond`, which
+    /// builds the reply or declines it (`None`) for the slow path. Only a hit
+    /// `respond` answers is logged here; [`Self::execute`] logs a declined one.
+    pub fn try_cache_wire_direct<R>(
         &self,
         domain: &str,
         record_type: RecordType,
         client_ip: IpAddr,
         protocol: ClientProtocol,
-    ) -> Option<bytes::Bytes> {
+        respond: impl FnOnce(&[u8]) -> Option<R>,
+    ) -> Option<R> {
         let tsc_start = tsc_timer::now();
         let (group_id, _) = self.cache_gate(domain, client_ip)?;
 
         let resolution = self.resolver.try_cache_str(domain, record_type)?;
-        let wire = resolution.upstream_wire_data?;
+        let wire = resolution.upstream_wire_data.as_deref()?;
+        // The logged time is the cache probe's, read before `respond` allocates.
+        let elapsed_us = self
+            .log_queries
+            .then(|| tsc_timer::elapsed_us_since(tsc_start));
+        let reply = respond(wire)?;
 
-        if self.log_queries {
+        if let Some(elapsed_us) = elapsed_us {
             self.log(&Self::cache_hit_log(
                 domain,
                 record_type,
                 client_ip,
                 protocol,
                 group_id,
-                tsc_timer::elapsed_us_since(tsc_start),
+                elapsed_us,
                 resolution.dnssec_status,
             ));
         }
 
-        Some(wire)
+        Some(reply)
     }
 
-    pub fn try_cache_direct(
+    /// Checks the cache for an A/AAAA answer and hands its addresses and TTL
+    /// to `respond`, logging the hit only if `respond` answers it; see
+    /// [`Self::try_cache_wire_direct`].
+    pub fn try_cache_direct<R>(
         &self,
         domain: &str,
         record_type: RecordType,
         client_ip: IpAddr,
         protocol: ClientProtocol,
-    ) -> Option<(Arc<Vec<IpAddr>>, u32)> {
+        respond: impl FnOnce(&[IpAddr], u32) -> Option<R>,
+    ) -> Option<R> {
         let tsc_start = tsc_timer::now();
         let (group_id, explicitly_allowed) = self.cache_gate(domain, client_ip)?;
 
@@ -508,8 +519,12 @@ impl HandleDnsQueryUseCase {
         if !explicitly_allowed && self.is_suspicious_cached_answer(domain, &resolution) {
             return None;
         }
+        let elapsed_us = self
+            .log_queries
+            .then(|| tsc_timer::elapsed_us_since(tsc_start));
+        let reply = respond(&resolution.addresses, resolution.min_ttl.unwrap_or(60))?;
 
-        if self.log_queries {
+        if let Some(elapsed_us) = elapsed_us {
             self.log(&QueryLog {
                 dns64_synthesized: self.is_dns64_synthesized(record_type, &resolution.addresses),
                 answers: Some(Arc::clone(&resolution.addresses)),
@@ -519,13 +534,13 @@ impl HandleDnsQueryUseCase {
                     client_ip,
                     protocol,
                     group_id,
-                    tsc_timer::elapsed_us_since(tsc_start),
+                    elapsed_us,
                     resolution.dnssec_status,
                 )
             });
         }
 
-        Some((resolution.addresses, resolution.min_ttl.unwrap_or(60)))
+        Some(reply)
     }
 
     /// Cached answers are admitted before the response guards run, so re-check the

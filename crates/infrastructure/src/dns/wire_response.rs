@@ -141,6 +141,10 @@ fn write_address_rr(out: &mut [u8], addr: &IpAddr, ttl: u32) -> usize {
 const CLASS_IN: u16 = 1;
 const TYPE_SOA: u16 = 6;
 const TYPE_OPT: u16 = 41;
+const TYPE_RRSIG: u16 = 46;
+const TYPE_NSEC: u16 = 47;
+const TYPE_NSEC3: u16 = 50;
+const TYPE_ANY: u16 = 255;
 /// EDNS option code of the DNS Cookie (RFC 7873 §4).
 pub(crate) const COOKIE_OPTION_CODE: u16 = 10;
 /// UDP payload size advertised in every OPT this server writes.
@@ -319,13 +323,14 @@ fn write_header(out: &mut Vec<u8>, id: u16, flags: [u8; 2], qd: u16, an: u16, ns
     }
 }
 
-/// Re-issues a cached upstream response under the client's header and OPT:
-/// ID and RD from the client, AD as given, the upstream OPT dropped and
-/// `edns` appended in its place, carrying the upstream's extended RCODE bits.
-/// `None` if `upstream` is not a well-formed sequence of sections, holds two
-/// OPTs, has records after its OPT (their compression pointers may target
-/// bytes that move once the OPT is cut out), or has an extended RCODE that
-/// `edns: None` cannot carry.
+/// Re-issues an upstream response under the client's header and OPT: ID and
+/// RD from the client, AD as given, the upstream OPT dropped and `edns`
+/// appended in its place, carrying the upstream's extended RCODE bits. A
+/// client without DO (no `edns`, or `dnssec_ok` clear) gets no authenticating
+/// DNSSEC RRs it did not ask for (RFC 4035 §3.2.1). `None` if `upstream` is
+/// not a well-formed sequence of sections, holds two OPTs or an OPT outside
+/// the additional section, or has an extended RCODE that `edns: None` cannot
+/// carry.
 pub fn relay_with_edns(
     upstream: &[u8],
     id: u16,
@@ -333,56 +338,374 @@ pub fn relay_with_edns(
     authentic_data: bool,
     edns: Option<&EdnsReply<'_>>,
 ) -> Option<Vec<u8>> {
-    let header = upstream.get(..12)?;
-    let count = |i: usize| u16::from_be_bytes([header[i], header[i + 1]]);
-    let (qd, an, ns, ar) = (count(4), count(6), count(8), count(10));
+    let strip = !edns.is_some_and(|e| e.dnssec_ok);
+    let sections = resection(upstream, strip)?;
+    let mut out = append_opt(sections.out, sections.extended_rcode, edns)?;
+    set_relay_header(&mut out, id, recursion_desired, authentic_data);
+    Some(out)
+}
 
-    let mut pos = 12;
-    for _ in 0..qd {
-        pos = skip_name(upstream, pos)?.checked_add(4)?;
-    }
-    for _ in 0..usize::from(an) + usize::from(ns) {
-        pos = skip_rr(upstream, pos)?.1;
-    }
-    let sections_end = pos;
-    upstream.get(..sections_end)?;
+/// Re-sections an upstream response into the form the cache stores: every
+/// record but the OPT, then an option-less OPT holding the upstream's
+/// extended RCODE, whose DO bit records whether the message carries
+/// authenticating DNSSEC RRs. That last record is what lets [`relay_cached`]
+/// answer a client without walking the message. The upstream's options,
+/// among them the COOKIE it echoed back to us, are not kept. The header is
+/// the upstream's but for ARCOUNT. `None` where [`relay_with_edns`] would be.
+pub fn cache_form(upstream: &[u8]) -> Option<Vec<u8>> {
+    let sections = resection(upstream, false)?;
+    let opt = EdnsReply {
+        dnssec_ok: sections.authenticating,
+        cookie: None,
+        ede: None,
+    };
+    append_opt(sections.out, sections.extended_rcode, Some(&opt))
+}
 
-    let mut out = Vec::with_capacity(upstream.len() + 64);
-    out.extend_from_slice(&upstream[..sections_end]);
-    let mut kept_ar = 0u16;
-    let mut extended_rcode: Option<u8> = None;
-    for _ in 0..ar {
-        let (rtype, end) = skip_rr(upstream, pos)?;
-        if rtype == TYPE_OPT {
-            if extended_rcode.is_some() {
-                return None;
-            }
-            // The upper eight RCODE bits open the OPT's TTL field (RFC 6891 §6.1.3).
-            extended_rcode = Some(upstream[skip_name(upstream, pos)? + 4]);
-        } else if extended_rcode.is_some() {
-            return None;
-        } else {
-            out.extend_from_slice(&upstream[pos..end]);
-            kept_ar += 1;
-        }
-        pos = end;
-    }
-    let extended_rcode = extended_rcode.unwrap_or(0);
+/// Whether the cached answer `wire` (see [`cache_form`]) can go as is to an
+/// EDNS client that set neither DO nor a COOKIE: it ends in the plain OPT
+/// that client gets, and holds no DNSSEC RRs it must not see.
+#[inline]
+pub fn is_plain_cached(wire: &[u8]) -> bool {
+    cached_opt(wire).is_some_and(|(_, opt)| !opt.authenticating)
+}
+
+/// Relays the cached answer `wire` (see [`cache_form`]) to a client that did
+/// not set DO, under its ID and RD with AD clear, and with `edns` as its OPT.
+/// Without authenticating DNSSEC RRs to strip, the cached OPT is swapped for
+/// `edns` without walking the message; otherwise, or for bytes not in cache
+/// form, this is [`relay_with_edns`].
+pub fn relay_cached(
+    wire: &[u8],
+    id: u16,
+    recursion_desired: bool,
+    edns: Option<&EdnsReply<'_>>,
+) -> Option<Vec<u8>> {
+    let Some((body, opt)) = cached_opt(wire).filter(|(_, opt)| !opt.authenticating) else {
+        return relay_with_edns(wire, id, recursion_desired, false, edns);
+    };
+    let mut out = Vec::with_capacity(wire.len() + 64);
+    out.extend_from_slice(body);
+    let arcount = u16::from_be_bytes([out[10], out[11]]).checked_sub(1)?;
+    out[10..12].copy_from_slice(&arcount.to_be_bytes());
+    let mut out = append_opt(out, opt.extended_rcode, edns)?;
+    set_relay_header(&mut out, id, recursion_desired, false);
+    Some(out)
+}
+
+/// The last record of a cached answer, as [`cache_form`] wrote it.
+#[derive(Clone, Copy)]
+struct CachedOpt {
+    extended_rcode: u8,
+    /// The DO bit: the message carries authenticating DNSSEC RRs.
+    authenticating: bool,
+}
+
+/// Splits the option-less OPT that ends `wire` from the header and records
+/// before it.
+#[inline]
+fn cached_opt(wire: &[u8]) -> Option<(&[u8], CachedOpt)> {
+    let (body, opt) = wire.split_last_chunk::<{ OPT_RECORD.len() }>()?;
+    // Root owner, TYPE 41, any CLASS, TTL (extended RCODE, version 0, flags), RDLENGTH 0.
+    let [0, 0, 41, _, _, extended_rcode, 0, flags, _, 0, 0] = *opt else {
+        return None;
+    };
+    let opt = CachedOpt {
+        extended_rcode,
+        authenticating: flags & 0x80 != 0,
+    };
+    (body.len() >= 12).then_some((body, opt))
+}
+
+/// Appends `edns` to the re-sectioned records in `out`, carrying the dropped
+/// OPT's extended RCODE; `None` if that RCODE is set and there is no `edns`
+/// to carry it.
+fn append_opt(
+    mut out: Vec<u8>,
+    extended_rcode: u8,
+    edns: Option<&EdnsReply<'_>>,
+) -> Option<Vec<u8>> {
     match edns {
         Some(edns) => {
             let opt = out.len();
             edns.write(&mut out);
             // Root owner (1), TYPE (2), CLASS (2), then the TTL's first byte.
             out[opt + 5] = extended_rcode;
-            kept_ar += 1;
+            let arcount = u16::from_be_bytes([out[10], out[11]]).checked_add(1)?;
+            out[10..12].copy_from_slice(&arcount.to_be_bytes());
         }
         None if extended_rcode != 0 => return None,
         None => {}
     }
-
-    set_relay_header(&mut out, id, recursion_desired, authentic_data);
-    out[10..12].copy_from_slice(&kept_ar.to_be_bytes());
     Some(out)
+}
+
+/// Whether a client that did not set DO must not see a record of `rtype`:
+/// RFC 4035 §3.2.1 strips the authenticating DNSSEC RRs, but not a type the
+/// query asked for (RFC 3225 §3 counts ANY as asking).
+fn is_authenticating(rtype: u16, qtype: Option<u16>) -> bool {
+    matches!(rtype, TYPE_RRSIG | TYPE_NSEC | TYPE_NSEC3)
+        && !qtype.is_some_and(|q| q == rtype || q == TYPE_ANY)
+}
+
+/// A message re-sectioned without its OPT.
+struct Sections {
+    /// Header and every kept record; the header's counts match them.
+    out: Vec<u8>,
+    /// The upper eight RCODE bits from the dropped OPT (RFC 6891 §6.1.3).
+    extended_rcode: u8,
+    /// The message carried authenticating DNSSEC RRs, kept or not.
+    authenticating: bool,
+}
+
+/// Copies `upstream` without its OPT and, when `strip`, without its
+/// authenticating DNSSEC RRs. See [`relay_with_edns`] for `None`.
+fn resection(upstream: &[u8], strip: bool) -> Option<Sections> {
+    let header = upstream.get(..12)?;
+    let count = |i: usize| u16::from_be_bytes([header[i], header[i + 1]]);
+
+    let mut pos = 12;
+    let mut qtype = None;
+    for _ in 0..count(4) {
+        pos = skip_name(upstream, pos)?;
+        let fixed = upstream.get(pos..pos + 4)?;
+        qtype.get_or_insert(u16::from_be_bytes([fixed[0], fixed[1]]));
+        pos += 4;
+    }
+
+    let mut copy = Rewriter::new(upstream);
+    let mut kept = [0u16; 3];
+    let mut extended_rcode = None;
+    let mut authenticating = false;
+    for (section, total) in [count(6), count(8), count(10)].into_iter().enumerate() {
+        for _ in 0..total {
+            let (rtype, end) = skip_rr(upstream, pos)?;
+            let dropped = if rtype == TYPE_OPT {
+                if section != 2 || extended_rcode.is_some() {
+                    return None;
+                }
+                // The upper eight RCODE bits open the OPT's TTL field.
+                extended_rcode = Some(*upstream.get(skip_name(upstream, pos)? + 4)?);
+                true
+            } else if is_authenticating(rtype, qtype) {
+                authenticating = true;
+                strip
+            } else {
+                false
+            };
+            if dropped {
+                copy.drop_from(pos);
+            } else {
+                copy.keep(pos, end, rtype)?;
+                kept[section] += 1;
+            }
+            pos = end;
+        }
+    }
+
+    let mut out = copy.finish(pos);
+    for (at, n) in [6, 8, 10].into_iter().zip(kept) {
+        out[at..at + 2].copy_from_slice(&n.to_be_bytes());
+    }
+    Some(Sections {
+        out,
+        extended_rcode: extended_rcode.unwrap_or(0),
+        authenticating,
+    })
+}
+
+/// Copies the records of a message being re-sectioned. Nothing is copied
+/// until the first record is dropped: the bytes before it go over in one
+/// piece, at their own offsets. Past that point the records move, so each
+/// kept one is copied field by field, logging every byte copied as is in
+/// `spans` for the compression pointers that follow to find it.
+struct Rewriter<'a> {
+    src: &'a [u8],
+    out: Vec<u8>,
+    /// Source offset of the first dropped record.
+    cut: Option<usize>,
+    /// `(source start, source end, output start)` of each run copied as is
+    /// past `cut`, in source order.
+    spans: Vec<(usize, usize, usize)>,
+}
+
+/// A run of RDATA fields that [`Rewriter::keep`] copies.
+#[derive(Clone, Copy)]
+enum Field {
+    Fixed(usize),
+    /// A length-prefixed character string.
+    Text,
+    Name,
+}
+
+/// The leading RDATA fields of `rtype` up to its last domain name: the types
+/// whose names a compressor may point at or into (RFC 3597 §4), with the
+/// DNSSEC and SVCB names that must not be compressed but might be. The rest
+/// of the RDATA, and every other type's, is copied as is.
+fn rdata_fields(rtype: u16) -> &'static [Field] {
+    use Field::{Fixed, Name, Text};
+    match rtype {
+        // NS, MD, MF, CNAME, MB, MG, MR, PTR, NXT, DNAME, NSEC
+        2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 | 30 | 39 | 47 => &[Name],
+        // SOA, MINFO, RP
+        6 | 14 | 17 => &[Name, Name],
+        // MX, AFSDB, RT, SVCB, HTTPS
+        15 | 18 | 21 | 64 | 65 => &[Fixed(2), Name],
+        // PX
+        26 => &[Fixed(2), Name, Name],
+        // SRV
+        33 => &[Fixed(6), Name],
+        // NAPTR
+        35 => &[Fixed(4), Text, Text, Text, Name],
+        // SIG, RRSIG: the signer
+        24 | 46 => &[Fixed(18), Name],
+        _ => &[],
+    }
+}
+
+impl<'a> Rewriter<'a> {
+    fn new(src: &'a [u8]) -> Self {
+        Self {
+            src,
+            out: Vec::with_capacity(src.len() + 64),
+            cut: None,
+            spans: Vec::new(),
+        }
+    }
+
+    /// Drops the record at `pos`.
+    fn drop_from(&mut self, pos: usize) {
+        if self.cut.is_none() {
+            self.out.extend_from_slice(&self.src[..pos]);
+            self.cut = Some(pos);
+        }
+    }
+
+    /// Keeps the record at `pos..end`, of type `rtype`.
+    fn keep(&mut self, pos: usize, end: usize, rtype: u16) -> Option<()> {
+        if self.cut.is_none() {
+            return Some(());
+        }
+        let fixed = self.name(pos)?;
+        // TYPE, CLASS, TTL, then an RDLENGTH set once the RDATA is written.
+        self.copy(fixed, fixed + 10)?;
+        let rdata_at = self.out.len();
+        let mut at = fixed + 10;
+        for field in rdata_fields(rtype) {
+            at = match *field {
+                Field::Fixed(len) => self.copy(at, at + len)?,
+                Field::Text => self.copy(at, at + 1 + usize::from(*self.src.get(at)?))?,
+                Field::Name => self.name(at)?,
+            };
+        }
+        if at > end {
+            return None;
+        }
+        self.copy(at, end)?;
+        let rdlength = u16::try_from(self.out.len() - rdata_at).ok()?;
+        self.out[rdata_at - 2..rdata_at].copy_from_slice(&rdlength.to_be_bytes());
+        Some(())
+    }
+
+    fn finish(mut self, end: usize) -> Vec<u8> {
+        if self.cut.is_none() {
+            self.out.extend_from_slice(&self.src[..end]);
+        }
+        self.out
+    }
+
+    /// Copies the name at `pos` and returns the source offset past it. A
+    /// pointer is aimed at its target's new offset; one into dropped bytes
+    /// is replaced by the labels it named.
+    fn name(&mut self, mut pos: usize) -> Option<usize> {
+        // Source offset past the name where it is written, once a pointer ends it.
+        let mut end = None;
+        // RFC 1035 §2.3.4 caps a name at 255 bytes, which also ends pointer loops.
+        let mut len = 0usize;
+        loop {
+            let byte = *self.src.get(pos)?;
+            match byte & 0xC0 {
+                0x00 => {
+                    let next = pos + 1 + usize::from(byte);
+                    len += 1 + usize::from(byte);
+                    if len > 255 {
+                        return None;
+                    }
+                    self.copy_from(pos, next, end.is_none())?;
+                    if byte == 0 {
+                        return Some(end.unwrap_or(next));
+                    }
+                    pos = next;
+                }
+                0xC0 => {
+                    let target =
+                        usize::from(u16::from_be_bytes([byte & 0x3F, *self.src.get(pos + 1)?]));
+                    // A pointer names an earlier occurrence (RFC 1035 §4.1.4).
+                    if target >= pos {
+                        return None;
+                    }
+                    let in_place = end.is_none();
+                    let past = *end.get_or_insert(pos + 2);
+                    if let Some(moved) = self.moved(target) {
+                        if in_place {
+                            self.span(pos, pos + 2);
+                        }
+                        self.out.extend_from_slice(&(0xC000 | moved).to_be_bytes());
+                        return Some(past);
+                    }
+                    pos = target;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Where the source byte at `at` sits in `out`, if it was copied as is
+    /// and a pointer can still reach it.
+    fn moved(&self, at: usize) -> Option<u16> {
+        let moved = match self.cut {
+            Some(cut) if at >= cut => {
+                let i = self
+                    .spans
+                    .partition_point(|&(start, _, _)| start <= at)
+                    .checked_sub(1)?;
+                let (start, end, out) = self.spans[i];
+                if at >= end {
+                    return None;
+                }
+                out + (at - start)
+            }
+            _ => at,
+        };
+        u16::try_from(moved).ok().filter(|&m| m < 0x4000)
+    }
+
+    /// Copies `src[from..to]` as is and returns `to`.
+    fn copy(&mut self, from: usize, to: usize) -> Option<usize> {
+        self.copy_from(from, to, true)?;
+        Some(to)
+    }
+
+    /// Copies `src[from..to]`, logging it for pointers when it is `in_place`
+    /// rather than labels inlined from elsewhere.
+    fn copy_from(&mut self, from: usize, to: usize, in_place: bool) -> Option<()> {
+        let src = self.src;
+        let bytes = src.get(from..to)?;
+        if in_place {
+            self.span(from, to);
+        }
+        self.out.extend_from_slice(bytes);
+        Some(())
+    }
+
+    /// Logs that `src[from..to]` lands at the end of `out`.
+    fn span(&mut self, from: usize, to: usize) {
+        let at = self.out.len();
+        match self.spans.last_mut() {
+            Some(last) if last.1 == from && last.2 + (last.1 - last.0) == at => last.1 = to,
+            _ => self.spans.push((from, to, at)),
+        }
+    }
 }
 
 /// Offset just past the (possibly compressed) name at `pos`.
@@ -648,7 +971,7 @@ mod tests {
     /// record after it may compress its owner against another post-OPT name,
     /// and those offsets move when the OPT is cut out.
     #[test]
-    fn relay_never_breaks_compression_behind_a_dropped_opt() {
+    fn relay_re_aims_compression_behind_a_dropped_opt() {
         let mut wire = vec![0x11, 0x11, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 3];
         wire.extend_from_slice(b"\x07example\x03com\x00\x00\x10\x00\x01"); // question @12
         wire.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]); // OPT first
@@ -660,21 +983,178 @@ mod tests {
             0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x35,
         ]);
         let upstream = Message::from_vec(&wire).expect("hickory accepts the upstream message");
-        let owners = |m: &Message| {
-            m.additionals
-                .iter()
-                .map(|r| r.name.clone())
-                .collect::<Vec<_>>()
-        };
 
         let ours = EdnsReply {
             dnssec_ok: false,
             cookie: Some(&[0x55; 16]),
             ede: None,
         };
-        if let Some(relayed) = relay_with_edns(&wire, 1, true, false, Some(&ours)) {
+        let relayed = relay_with_edns(&wire, 1, true, false, Some(&ours)).expect("re-sectioned");
+        let relayed = Message::from_vec(&relayed).expect("relayed message decodes");
+        assert_eq!(relayed.additionals, upstream.additionals);
+    }
+
+    /// RDATA of an RRSIG over `covered`, signed by `example.com.`.
+    fn rrsig_rdata(covered: u16) -> Vec<u8> {
+        let mut rdata = covered.to_be_bytes().to_vec();
+        rdata.extend_from_slice(&[
+            13, 3, 0, 0, 0x0E, 0x10, 0x70, 0, 0, 0, 0x60, 0, 0, 0, 0x12, 0x34,
+        ]);
+        rdata.extend_from_slice(b"\x07example\x03com\x00");
+        rdata.extend_from_slice(&[0xAB; 64]);
+        rdata
+    }
+
+    fn rr(out: &mut Vec<u8>, owner: &[u8], rtype: u16, rdata: &[u8]) {
+        out.extend_from_slice(owner);
+        out.extend_from_slice(&rtype.to_be_bytes());
+        out.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        out.extend_from_slice(rdata);
+    }
+
+    /// A signed MX answer from a DO=1 upstream whose later records compress
+    /// against the RRSIG's signer name and against each other, so cutting the
+    /// RRSIG out moves or orphans their pointer targets.
+    fn signed_mx_with_tangled_glue() -> Vec<u8> {
+        let mut wire = vec![0x11, 0x11, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 4];
+        wire.extend_from_slice(b"\x04mail\x07example\x03com\x00\x00\x0F\x00\x01"); // @12
+        let exchange = wire.len() + 12 + 2;
+        rr(&mut wire, &[0xC0, 12], 15, b"\x00\x0A\x03mx1\xC0\x11");
+        let signer = wire.len() + 12 + 18;
+        rr(&mut wire, &[0xC0, 12], TYPE_RRSIG, &rrsig_rdata(15));
+        rr(&mut wire, &[0xC0, exchange as u8], 1, &[192, 0, 2, 25]);
+        let mx2 = wire.len();
+        // mx2.example.com, its suffix pointing into the RRSIG's signer name.
+        let owner = [b"\x03mx2".as_slice(), &[0xC0, signer as u8]].concat();
+        rr(
+            &mut wire,
+            &owner,
+            28,
+            &[
+                0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x25,
+            ],
+        );
+        rr(&mut wire, &[0xC0, mx2 as u8], 16, b"\x02hi");
+        wire.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0x80, 0, 0, 0]);
+        wire
+    }
+
+    fn types(records: &[Record]) -> Vec<RecordType> {
+        records.iter().map(Record::record_type).collect()
+    }
+
+    /// RFC 4035 §3.2.1: without DO the authenticating DNSSEC RRs go, and
+    /// every pointer behind them still names what it named.
+    #[test]
+    fn relay_strips_dnssec_records_for_a_client_without_do() {
+        let wire = signed_mx_with_tangled_glue();
+        let upstream = Message::from_vec(&wire).expect("hickory accepts the upstream message");
+        assert_eq!(
+            types(&upstream.answers),
+            [RecordType::MX, RecordType::RRSIG]
+        );
+        let plain = EdnsReply {
+            dnssec_ok: false,
+            cookie: None,
+            ede: None,
+        };
+
+        for edns in [Some(&plain), None] {
+            let relayed = relay_with_edns(&wire, 7, true, false, edns).expect("re-sectioned");
             let relayed = Message::from_vec(&relayed).expect("relayed message decodes");
-            assert_eq!(owners(&relayed), owners(&upstream));
+            assert_eq!(relayed.answers, upstream.answers[..1], "{edns:?}");
+            assert_eq!(relayed.additionals, upstream.additionals, "{edns:?}");
+            assert_eq!(
+                relayed.edns.map(|e| e.flags().dnssec_ok),
+                edns.map(|_| false)
+            );
+        }
+
+        let validating = EdnsReply {
+            dnssec_ok: true,
+            ..plain
+        };
+        let relayed = relay_with_edns(&wire, 7, true, false, Some(&validating)).unwrap();
+        let relayed = Message::from_vec(&relayed).unwrap();
+        assert_eq!(relayed.answers, upstream.answers, "a DO client keeps them");
+    }
+
+    #[test]
+    fn relay_keeps_dnssec_records_the_query_asked_for() {
+        let mut wire = vec![0x11, 0x11, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        wire.extend_from_slice(b"\x07example\x03com\x00\x00\x2E\x00\x01"); // RRSIG query
+        rr(&mut wire, &[0xC0, 12], TYPE_RRSIG, &rrsig_rdata(1));
+        let relayed = relay_with_edns(&wire, 7, true, false, None).unwrap();
+        assert_eq!(
+            types(&Message::from_vec(&relayed).unwrap().answers),
+            [RecordType::RRSIG]
+        );
+    }
+
+    /// The cached OPT's DO bit says whether the answer carries DNSSEC RRs a
+    /// client without DO must not see, whatever DO the upstream echoed.
+    #[test]
+    fn cache_form_records_dnssec_records_in_its_do_bit_and_drops_upstream_options() {
+        let signed = cache_form(&signed_mx_with_tangled_glue()).unwrap();
+        let msg = Message::from_vec(&signed).unwrap();
+        assert!(msg.edns.as_ref().unwrap().flags().dnssec_ok);
+        assert_eq!(types(&msg.answers), [RecordType::MX, RecordType::RRSIG]);
+
+        let mut upstream = Message::new(0x1111, MessageType::Response, OpCode::Query);
+        upstream.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::TXT,
+        ));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![0xAA; 16]));
+        upstream.set_edns(edns);
+        let unsigned = cache_form(&upstream.to_vec().unwrap()).unwrap();
+        assert_eq!(unsigned[unsigned.len() - OPT_RECORD.len()..], OPT_RECORD);
+        assert!(is_plain_cached(&unsigned));
+        assert!(!is_plain_cached(&signed));
+    }
+
+    /// Serving from the cache form, with or without a walk, gives the bytes
+    /// relaying the upstream answer itself would.
+    #[test]
+    fn relay_cached_matches_relaying_the_upstream_answer() {
+        let mut upstream = Message::new(0x1111, MessageType::Response, OpCode::Query);
+        upstream.metadata.recursion_desired = true;
+        let owner = Name::from_str("mail.example.com.").unwrap();
+        upstream.add_query(Query::query(owner.clone(), RecordType::MX));
+        upstream.add_answer(Record::from_rdata(
+            owner,
+            60,
+            RData::MX(hickory_proto::rr::rdata::MX::new(
+                10,
+                Name::from_str("mx.example.com.").unwrap(),
+            )),
+        ));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![0xAA; 16]));
+        upstream.set_edns(edns);
+        let unsigned = upstream.to_vec().unwrap();
+
+        let cookie = [0x55; 16];
+        let with_cookie = EdnsReply {
+            dnssec_ok: false,
+            cookie: Some(&cookie),
+            ede: None,
+        };
+        for wire in [unsigned, signed_mx_with_tangled_glue()] {
+            let cached = cache_form(&wire).unwrap();
+            for edns in [None, Some(&with_cookie)] {
+                assert_eq!(
+                    relay_cached(&cached, 9, false, edns),
+                    relay_with_edns(&wire, 9, false, false, edns),
+                    "{edns:?}"
+                );
+            }
         }
     }
 }

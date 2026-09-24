@@ -161,29 +161,34 @@ async fn run_udp_worker_batch(
                 {
                     match fast_query.kind {
                         FastPathKind::IpAddress => {
-                            if let Some((addresses, ttl)) = handler.try_fast_path(
+                            // Encoded straight into the sendmmsg buffer.
+                            let staged = handler.try_fast_path(
                                 fast_query.domain(),
                                 fast_query.record_type,
                                 client_ip,
                                 ClientProtocol::Udp,
-                            ) {
-                                // Encoded straight into the sendmmsg buffer.
-                                if send_batch.stage(msg.src, msg.dst_ip, |out| {
-                                    wire_response::build_cache_hit_response(
-                                        &fast_query,
-                                        msg.data,
-                                        &addresses,
-                                        ttl,
-                                        out,
-                                    )
-                                }) {
-                                    continue;
-                                }
+                                |addresses, ttl| {
+                                    send_batch
+                                        .stage(msg.src, msg.dst_ip, |out| {
+                                            wire_response::build_cache_hit_response(
+                                                &fast_query,
+                                                msg.data,
+                                                addresses,
+                                                ttl,
+                                                out,
+                                            )
+                                        })
+                                        .then_some(())
+                                },
+                            );
+                            if staged.is_some() {
+                                continue;
                             }
                         }
                         FastPathKind::WireData => {
                             if let Some(patched) = handler.try_fast_path_wire(
                                 &fast_query,
+                                msg.data,
                                 client_ip,
                                 ClientProtocol::Udp,
                             ) {
@@ -267,33 +272,37 @@ async fn run_udp_worker_single(
                     {
                         match fast_query.kind {
                             FastPathKind::IpAddress => {
-                                if let Some((addresses, ttl)) = handler.try_fast_path(
+                                let sent = handler.try_fast_path(
                                     fast_query.domain(),
                                     fast_query.record_type,
                                     client_ip,
                                     ClientProtocol::Udp,
-                                ) {
-                                    let mut wire = [0u8; wire_response::RESPONSE_BUF_LEN];
-                                    if let Some(wire_len) = wire_response::build_cache_hit_response(
-                                        &fast_query,
-                                        query_buf,
-                                        &addresses,
-                                        ttl,
-                                        &mut wire,
-                                    ) {
+                                    |addresses, ttl| {
+                                        let mut wire = [0u8; wire_response::RESPONSE_BUF_LEN];
+                                        let wire_len = wire_response::build_cache_hit_response(
+                                            &fast_query,
+                                            query_buf,
+                                            addresses,
+                                            ttl,
+                                            &mut wire,
+                                        )?;
                                         let _ = pktinfo::try_send_with_src_ip(
                                             socket.get_ref(),
                                             &wire[..wire_len],
                                             from,
                                             dst_ip,
                                         );
-                                        continue;
-                                    }
+                                        Some(())
+                                    },
+                                );
+                                if sent.is_some() {
+                                    continue;
                                 }
                             }
                             FastPathKind::WireData => {
                                 if let Some(patched) = handler.try_fast_path_wire(
                                     &fast_query,
+                                    query_buf,
                                     client_ip,
                                     ClientProtocol::Udp,
                                 ) {

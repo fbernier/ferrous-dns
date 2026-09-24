@@ -1,3 +1,4 @@
+use crate::dns::wire_response;
 use bytes::Bytes;
 use ferrous_dns_domain::DnssecStatus;
 use std::net::IpAddr;
@@ -48,13 +49,28 @@ pub enum CachedData {
 
     CanonicalName(Arc<str>),
 
-    /// Raw upstream DNS wire bytes for non-A/AAAA record types (HTTPS, MX, TXT, etc.).
+    /// An upstream DNS response for a non-A/AAAA record type (HTTPS, MX, TXT,
+    /// etc.), in [`wire_response::cache_form`].
     WireData(Bytes),
 
     NegativeResponse,
 }
 
 impl CachedData {
+    /// The form the cache stores: a wire answer re-sectioned by
+    /// [`wire_response::cache_form`], anything else as is. `None` for a wire
+    /// answer that does not re-section.
+    pub(super) fn into_stored(self) -> Option<Self> {
+        match self {
+            Self::WireData(wire) => {
+                wire_response::cache_form(&wire).map(|wire| Self::WireData(Bytes::from(wire)))
+            }
+            data @ (Self::IpAddresses(_) | Self::CanonicalName(_) | Self::NegativeResponse) => {
+                Some(data)
+            }
+        }
+    }
+
     pub fn is_negative(&self) -> bool {
         matches!(self, CachedData::NegativeResponse)
     }

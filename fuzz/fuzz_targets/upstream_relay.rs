@@ -1,13 +1,16 @@
 //! `wire_response::relay_with_edns` re-sections a cached upstream answer to
-//! swap its OPT for ours (`server.rs`, when a client sends a cookie). The bytes
-//! come from the upstream, or from an off-path spoofer that won the race.
+//! swap its OPT for ours and, for a client without DO, drop the DNSSEC RRs
+//! it did not ask for (`server.rs`). `cache_form` stores an upstream answer
+//! for `relay_cached`, the fast path's relay. The bytes come from the
+//! upstream, or from an off-path spoofer that won the race.
 //!
 //! Beyond not panicking: relaying our own output again is a no-op, and when
 //! hickory decodes the upstream message it decodes the relayed one to the same
-//! RCODE and records under our header and OPT. Messages with a compression
-//! pointer into the header are skipped for that check: RFC 1035 forbids them,
-//! hickory follows them, and their target moves under the ID rewrite every
-//! cached answer gets, relayed or not.
+//! RCODE and records (less the stripped ones) under our header and OPT, and
+//! serving the cache form decodes to the same message as relaying directly.
+//! Messages with a compression pointer into the header are skipped for those
+//! checks: RFC 1035 forbids them, hickory follows them, and their target
+//! moves under the ID rewrite every cached answer gets, relayed or not.
 //!
 //! The relay knobs come from the upstream ID, which the relay overwrites
 //! anyway, so corpus entries stay plain DNS packets.
@@ -15,9 +18,28 @@
 
 use ferrous_dns_infrastructure::dns::wire_response::{self, EdnsReply};
 use hickory_proto::op::Message;
+use hickory_proto::rr::{Record, RecordType};
 use libfuzzer_sys::fuzz_target;
 
 const ID: u16 = 0xABCD;
+
+/// The records a client with DO as given gets from `records`, answering a
+/// `qtype` query (RFC 4035 §3.2.1, RFC 3225 §3).
+fn kept(records: &[Record], dnssec_ok: bool, qtype: Option<RecordType>) -> Vec<Record> {
+    records
+        .iter()
+        .filter(|r| {
+            let rtype = r.record_type();
+            dnssec_ok
+                || !matches!(
+                    rtype,
+                    RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3
+                )
+                || qtype.is_some_and(|q| q == rtype || q == RecordType::ANY)
+        })
+        .cloned()
+        .collect()
+}
 
 fuzz_target!(|upstream: &[u8]| {
     let Some(&[hi, lo]) = upstream.get(..2) else {
@@ -31,12 +53,17 @@ fuzz_target!(|upstream: &[u8]| {
         ede: None,
     };
     let edns = (knobs & 16 == 0).then_some(&reply);
+    let dnssec_ok = edns.is_some_and(|e| e.dnssec_ok);
 
     let Some(relayed) = wire_response::relay_with_edns(upstream, ID, rd, ad, edns) else {
         return;
     };
     let again = wire_response::relay_with_edns(&relayed, ID, rd, ad, edns);
-    assert_eq!(again.as_deref(), Some(&relayed[..]), "relay is not idempotent");
+    assert_eq!(
+        again.as_deref(),
+        Some(&relayed[..]),
+        "relay is not idempotent"
+    );
 
     let points_into_header = upstream
         .windows(2)
@@ -47,13 +74,27 @@ fuzz_target!(|upstream: &[u8]| {
     if points_into_header {
         return;
     }
+    let qtype = source.queries.first().map(|q| q.query_type());
     let got = Message::from_vec(&relayed).expect("relay made a valid message invalid");
     assert_eq!((got.metadata.id, got.metadata.recursion_desired), (ID, rd));
     assert_eq!(got.metadata.authentic_data, ad);
     assert_eq!(got.metadata.response_code, source.metadata.response_code);
     assert_eq!(got.queries, source.queries);
-    assert_eq!(got.answers, source.answers);
-    assert_eq!(got.authorities, source.authorities);
-    assert_eq!(got.additionals, source.additionals);
-    assert_eq!(got.edns.map(|e| e.flags().dnssec_ok), edns.map(|e| e.dnssec_ok));
+    assert_eq!(got.answers, kept(&source.answers, dnssec_ok, qtype));
+    assert_eq!(got.authorities, kept(&source.authorities, dnssec_ok, qtype));
+    assert_eq!(got.additionals, kept(&source.additionals, dnssec_ok, qtype));
+    assert_eq!(
+        got.edns.as_ref().map(|e| e.flags().dnssec_ok),
+        edns.map(|e| e.dnssec_ok)
+    );
+
+    // The fast path serves clients without DO, from the cache form.
+    if dnssec_ok || ad {
+        return;
+    }
+    let cached = wire_response::cache_form(upstream).expect("relayed but not cacheable");
+    let served = wire_response::relay_cached(&cached, ID, rd, edns)
+        .expect("relayed but not served from the cache");
+    let served = Message::from_vec(&served).expect("the cache form served an invalid message");
+    assert_eq!(served, got, "the cache form serves another message");
 });

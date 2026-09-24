@@ -47,42 +47,73 @@ impl DnsServerHandler {
         }
     }
 
-    pub fn try_fast_path(
+    /// Serves an A/AAAA cache hit through `respond`, which encodes the reply
+    /// or declines it (`None`) for the slow path.
+    pub fn try_fast_path<R>(
         &self,
         domain: &str,
         record_type: RecordType,
         client_ip: IpAddr,
         protocol: ClientProtocol,
-    ) -> Option<(Arc<Vec<IpAddr>>, u32)> {
+        respond: impl FnOnce(&[IpAddr], u32) -> Option<R>,
+    ) -> Option<R> {
         self.use_case
-            .try_cache_direct(domain, record_type, client_ip, protocol)
+            .try_cache_direct(domain, record_type, client_ip, protocol, respond)
     }
 
     /// Returns a ready-to-send cached wire response for non-IP record types (NS,
-    /// CNAME, SOA, PTR, MX, TXT) under the query's ID and RD bit, with AD
-    /// cleared: the fast path serves only non-DO clients (RFC 6840 §5.8).
-    /// `None` defers the query to the slow path.
+    /// CNAME, SOA, PTR, MX, TXT, SRV, SVCB, HTTPS) under the query's ID and RD
+    /// bit, with AD cleared: the fast path serves only non-DO clients (RFC 6840
+    /// §5.8). `raw` is the query packet. `None` defers the query to the slow
+    /// path, which then logs it instead.
     pub fn try_fast_path_wire(
         &self,
         query: &FastPathQuery,
+        raw: &[u8],
         client_ip: IpAddr,
         protocol: ClientProtocol,
     ) -> Option<Vec<u8>> {
-        let wire = self.use_case.try_cache_wire_direct(
+        self.use_case.try_cache_wire_direct(
             query.domain(),
             query.record_type,
             client_ip,
             protocol,
-        )?;
-        // Oversized-for-UDP hits bail to the slow path (handle_raw_udp_fallback),
-        // which sets TC=1 — mirrors build_cache_hit_response for A/AAAA.
-        if query.has_edns() {
-            if !wire_response::wire_fits_udp_buffer(wire.len(), query.client_max_size) {
-                return None;
-            }
-            return wire_response::patch_wire_header(&wire, query.id, query.recursion_desired);
-        }
-        relay_without_opt(&wire, query)
+            |wire| {
+                let reply = if query.has_edns()
+                    && query.edns_cookie(raw).is_none()
+                    && wire_response::is_plain_cached(wire)
+                {
+                    wire_response::patch_wire_header(wire, query.id, query.recursion_desired)
+                } else {
+                    self.relay_cached(wire, query, raw, client_ip)
+                }?;
+                // Oversized-for-UDP hits bail to the slow path, which sets TC=1,
+                // as build_cache_hit_response does for A/AAAA.
+                wire_response::wire_fits_udp_buffer(reply.len(), query.client_max_size)
+                    .then_some(reply)
+            },
+        )
+    }
+
+    /// The cached answer for a client without OPT or with a COOKIE, or one
+    /// holding DNSSEC RRs the client did not ask for. Out of line to keep the
+    /// plain EDNS hit small.
+    #[inline(never)]
+    fn relay_cached(
+        &self,
+        wire: &[u8],
+        query: &FastPathQuery,
+        raw: &[u8],
+        client_ip: IpAddr,
+    ) -> Option<Vec<u8>> {
+        // RFC 7873 §5.3: a client drops a reply that does not echo its cookie.
+        let cookie = self.response_cookie(query.edns_cookie(raw), client_ip);
+        let reply = query.has_edns().then(|| EdnsReply {
+            dnssec_ok: false,
+            cookie: cookie.as_ref().map(EdnsCookie::as_bytes),
+            ede: None,
+        });
+        wire_response::relay_cached(wire, query.id, query.recursion_desired, reply.as_ref())
     }
 
     /// The resolution path for every query the inline cache path did not
@@ -130,47 +161,44 @@ impl DnsServerHandler {
         let set_ad = query.edns.is_some_and(|e| e.dnssec_ok)
             && !query.cd
             && resolution.dnssec_status == Some(DnssecStatus::Secure);
-        let cookie = self.response_cookie(&request, client_ip);
+        let cookie = self.response_cookie(
+            request.edns_cookie.as_ref().map(EdnsCookie::as_bytes),
+            client_ip,
+        );
         let cookie = cookie.as_ref().map(EdnsCookie::as_bytes);
 
         if resolution.addresses.is_empty() {
-            if let Some(ref wire_data) = resolution.upstream_wire_data {
+            if let Some(wire_data) = &resolution.upstream_wire_data {
                 // 0x20 case randomization never reaches this far: responses are
                 // canonicalized at the upstream choke point, before they enter
-                // the cache (see ResponseValidator::canonicalize). The upstream
-                // OPT is rewritten to inject our server cookie, and dropped for
-                // a client that sent no OPT (RFC 6891 §7).
-                if cookie.is_some() || query.edns.is_none() {
-                    let reply = query.edns_reply(cookie, None);
-                    match wire_response::relay_with_edns(
-                        wire_data,
-                        query.id,
-                        query.rd,
-                        set_ad,
-                        reply.as_ref(),
-                    ) {
-                        Some(bytes) => return Some(maybe_truncate(bytes)),
-                        // Its extended RCODE, or records behind its OPT, need an
-                        // OPT to be relayed faithfully.
-                        None if query.edns.is_none() => {
-                            return Some(query.respond(
-                                Rcode::ServFail,
-                                false,
-                                ResponseBody::Empty,
-                                None,
-                                None,
-                            ));
-                        }
-                        None => {}
-                    }
+                // the cache (see ResponseValidator::canonicalize). Our OPT
+                // replaces the upstream's or the cache's: DO copied from the
+                // query (RFC 3225 §3), our server cookie, and none for a client
+                // that sent none (RFC 6891 §7). A client without DO loses the
+                // DNSSEC RRs it did not ask for (RFC 4035 §3.2.1).
+                let reply = query.edns_reply(cookie, None);
+                if let Some(bytes) = wire_response::relay_with_edns(
+                    wire_data,
+                    query.id,
+                    query.rd,
+                    set_ad,
+                    reply.as_ref(),
+                ) {
+                    return Some(maybe_truncate(bytes));
                 }
-                // An EDNS client without a cookie to inject, or an upstream
-                // message `relay_with_edns` cannot re-section safely: relay it
-                // under the client's header. This hands the upstream's own OPT
-                // to the client verbatim, including the COOKIE echoed back at
-                // us. Harmless (RFC 7873 §5.3 has clients ignore unsolicited
-                // cookies; ours is random per query and the server cookie is
-                // bound to our IP).
+                // Its extended RCODE needs an OPT to be relayed faithfully.
+                if query.edns.is_none() {
+                    return Some(query.respond(
+                        Rcode::ServFail,
+                        false,
+                        ResponseBody::Empty,
+                        None,
+                        None,
+                    ));
+                }
+                // An upstream message `relay_with_edns` cannot re-section (two
+                // OPTs, or one outside the additional section): relay it under
+                // the client's header, its OPT as it came.
                 let mut response = wire_data.to_vec();
                 wire_response::set_relay_header(&mut response, query.id, query.rd, set_ad);
                 return Some(maybe_truncate(response));
@@ -218,31 +246,23 @@ impl DnsServerHandler {
         query.respond(rcode, false, ResponseBody::Empty, None, ede.as_ref())
     }
 
-    /// COOKIE option payload for the reply: the client cookie followed by our
-    /// server cookie for it (RFC 7873 §5.2). `None` without a client cookie,
-    /// or when DNS Cookies are disabled.
-    fn response_cookie(&self, request: &DnsRequest, client_ip: IpAddr) -> Option<EdnsCookie> {
+    /// COOKIE option payload for the reply to `client_cookie`, the query's
+    /// COOKIE option: the client cookie followed by our server cookie for it
+    /// (RFC 7873 §5.2). `None` without a client cookie, or when DNS Cookies
+    /// are disabled.
+    fn response_cookie(
+        &self,
+        client_cookie: Option<&[u8]>,
+        client_ip: IpAddr,
+    ) -> Option<EdnsCookie> {
         let guard = self.use_case.cookie_guard()?;
-        let client = request
-            .edns_cookie
-            .as_ref()?
-            .as_bytes()
-            .first_chunk::<8>()?;
+        let client = client_cookie?.first_chunk::<8>()?;
         let server = guard.generate_server_cookie(client_ip, client);
         let mut payload = [0u8; 16];
         payload[..8].copy_from_slice(client);
         payload[8..].copy_from_slice(&server);
         EdnsCookie::from_bytes(&payload)
     }
-}
-
-/// RFC 6891 §7: the upstream OPT must not reach a client that sent none.
-/// Out of line so the section walk stays off the EDNS clients' hit path.
-#[inline(never)]
-fn relay_without_opt(wire: &[u8], query: &FastPathQuery) -> Option<Vec<u8>> {
-    let reply =
-        wire_response::relay_with_edns(wire, query.id, query.recursion_desired, false, None)?;
-    wire_response::wire_fits_udp_buffer(reply.len(), query.client_max_size).then_some(reply)
 }
 
 /// The OPT fields of a client query that shape its response.

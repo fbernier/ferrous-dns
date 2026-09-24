@@ -482,7 +482,7 @@ This gives RFC-aware clients a precise machine-readable reason for the rejection
 
 ### Fast Path Behaviour
 
-Cache hits bypass the DNS Cookie guard entirely — a query served from L1 or L2 cache does not incur any cookie verification overhead. Cookie validation runs only on cache misses, keeping the hot path at zero additional cost.
+Cache hits skip cookie validation: a query served from L1 or L2 cache is answered even in strict mode, and validation runs only on cache misses. A cache hit still answers a client cookie the way RFC 7873 §5.3 requires. The reply echoes that cookie beside a fresh server cookie, so a validating client does not discard the answer. Only queries that carry a cookie pay for the HMAC.
 
 ### Configuration
 

@@ -18,7 +18,7 @@ use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
 use ferrous_dns_domain::{BlockResponseMode, ClientProtocol, DnsQuery, DomainError};
 use ferrous_dns_infrastructure::dns::fast_path::parse_query;
 use ferrous_dns_infrastructure::dns::server::{BlockPolicy, DnsServerHandler};
-use ferrous_dns_infrastructure::dns::wire_response::wire_fits_udp_buffer;
+use ferrous_dns_infrastructure::dns::wire_response::{cache_form, wire_fits_udp_buffer};
 use ports::{AllowAllFilter, NoopQueryLog};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -144,15 +144,25 @@ fn mx_query(udp_payload: Option<u16>) -> Vec<u8> {
 }
 
 fn serve_wire(handler: &DnsServerHandler, query: &[u8]) -> Option<Vec<u8>> {
-    let query = parse_query(query).expect("valid MX query");
-    handler.try_fast_path_wire(&query, IpAddr::V4(Ipv4Addr::LOCALHOST), ClientProtocol::Udp)
+    let parsed = parse_query(query).expect("valid MX query");
+    handler.try_fast_path_wire(
+        &parsed,
+        query,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ClientProtocol::Udp,
+    )
+}
+
+/// [`large_answer`] as the cache stores it.
+fn cached_large_answer() -> Vec<u8> {
+    cache_form(&large_answer()).expect("a well-formed answer")
 }
 
 #[test]
 fn wire_fast_path_defers_when_answer_exceeds_client_buffer() {
-    let handler = handler_with_cached_wire(vec![0u8; 600]);
-    // 600-byte cached answer vs a 512 buffer → must defer (None) so the slow
-    // path can truncate it with TC=1 instead of serving oversized wire.
+    let handler = handler_with_cached_wire(cached_large_answer());
+    // A cached answer past 512 bytes vs a 512 buffer → must defer (None) so
+    // the slow path can truncate it with TC=1 instead of serving it oversized.
     assert!(
         serve_wire(&handler, &mx_query(Some(512))).is_none(),
         "oversized wire-data hit must defer to the slow path"
@@ -161,12 +171,13 @@ fn wire_fast_path_defers_when_answer_exceeds_client_buffer() {
 
 #[test]
 fn wire_fast_path_serves_when_answer_fits_client_buffer() {
-    let handler = handler_with_cached_wire(vec![0u8; 600]);
-    // Same 600-byte answer, but the client advertised 4096 → it fits, so the
-    // fast path serves it verbatim with the query id patched in.
+    let cached = cached_large_answer();
+    let handler = handler_with_cached_wire(cached.clone());
+    // Same answer, but the client advertised 4096 → it fits, so the fast path
+    // serves it verbatim with the query id patched in.
     let bytes = serve_wire(&handler, &mx_query(Some(4096)))
         .expect("answer within the client buffer must be served on the fast path");
-    assert_eq!(bytes.len(), 600);
+    assert_eq!(bytes.len(), cached.len());
     assert_eq!(&bytes[0..2], &[0x12, 0x34], "query id must be patched");
 }
 

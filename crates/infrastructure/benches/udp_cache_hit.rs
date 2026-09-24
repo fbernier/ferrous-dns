@@ -1,7 +1,9 @@
 //! The UDP worker's cache-hit fast path, end to end on one thread: parse the
 //! query, admit it through the use case (block filter, rate limiter, cache
 //! probe, query-log entry) and encode the reply. Run with and without an OPT
-//! record, for an address answer and for a cached upstream wire answer.
+//! record, for an address answer and for a cached upstream wire answer, plus
+//! the wire answer to a client sending a DNS Cookie and a signed wire answer
+//! (fetched with DO=1) to clients that did not set DO.
 
 #[path = "../tests/support/ports.rs"]
 mod ports;
@@ -10,9 +12,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use ferrous_dns_application::ports::{BlockFilterEnginePort, DnsResolution, DnsResolver};
+use ferrous_dns_application::use_cases::dns::DnsCookieGuard;
 use ferrous_dns_application::use_cases::HandleDnsQueryUseCase;
 use ferrous_dns_domain::config::DatabaseConfig;
-use ferrous_dns_domain::{BlockResponseMode, ClientProtocol, DnsQuery, DomainError, RecordType};
+use ferrous_dns_domain::{
+    BlockResponseMode, ClientProtocol, DnsCookiesConfig, DnsQuery, DomainError, RecordType,
+};
 use ferrous_dns_infrastructure::database::create_write_pool;
 use ferrous_dns_infrastructure::dns::cache::coarse_clock;
 use ferrous_dns_infrastructure::dns::fast_path::{self, FastPathKind};
@@ -35,6 +40,7 @@ use std::sync::Arc;
 const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
 const A_NAME: &str = "www.example.com";
 const MX_NAME: &str = "mail.example.com";
+const SIGNED_NAME: &str = "signed.example.com";
 
 /// Every probe is served from the cache; an upstream call means a broken setup.
 struct NoUpstream;
@@ -85,8 +91,40 @@ fn upstream_mx() -> Bytes {
     Bytes::from(msg.to_bytes().unwrap())
 }
 
-/// A recursion-desired query, with a DO-clear 1232-byte OPT when `edns`.
-fn query(name: &str, qtype: u16, edns: bool) -> Vec<u8> {
+/// An MX answer from a signed zone as a DO=1 upstream sends it: an RRSIG
+/// beside the MX and DO set in the OPT.
+fn upstream_signed_mx() -> Bytes {
+    let name = Name::from_ascii("signed.example.com.").unwrap();
+    let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.metadata.recursion_available = true;
+    msg.add_query(Query::query(
+        name.clone(),
+        hickory_proto::rr::RecordType::MX,
+    ));
+    msg.add_answer(Record::from_rdata(
+        name,
+        3600,
+        RData::MX(MX::new(10, Name::from_ascii("mx1.example.com.").unwrap())),
+    ));
+    let mut wire = msg.to_bytes().unwrap();
+    // RRSIG MX, algorithm 13, 3 labels, then the signer and a P-256 signature.
+    let mut rdata = vec![0, 15, 13, 3, 0, 0, 0x0E, 0x10];
+    rdata.extend_from_slice(&[0x70, 0, 0, 0, 0x60, 0, 0, 0, 0x12, 0x34]);
+    rdata.extend_from_slice(b"\x07example\x03com\x00");
+    rdata.extend_from_slice(&[0xAB; 64]);
+    wire.extend_from_slice(&[0xC0, 0x0C, 0, 46, 0, 1, 0, 0, 0x0E, 0x10]);
+    wire.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    wire.extend_from_slice(&rdata);
+    wire[7] += 1;
+    wire.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0x80, 0, 0, 0]);
+    wire[11] = 1;
+    Bytes::from(wire)
+}
+
+/// A recursion-desired query, with a DO-clear 1232-byte OPT carrying
+/// `options` when `edns`.
+fn query_with_options(name: &str, qtype: u16, edns: bool, options: &[u8]) -> Vec<u8> {
     let mut buf = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, u8::from(edns)];
     for label in name.split('.') {
         buf.push(label.len() as u8);
@@ -96,9 +134,15 @@ fn query(name: &str, qtype: u16, edns: bool) -> Vec<u8> {
     buf.extend_from_slice(&qtype.to_be_bytes());
     buf.extend_from_slice(&[0, 1]);
     if edns {
-        buf.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&(options.len() as u16).to_be_bytes());
+        buf.extend_from_slice(options);
     }
     buf
+}
+
+fn query(name: &str, qtype: u16, edns: bool) -> Vec<u8> {
+    query_with_options(name, qtype, edns, &[])
 }
 
 fn handler(
@@ -139,6 +183,13 @@ fn handler(
         3600,
         None,
     );
+    cache.insert(
+        SIGNED_NAME,
+        RecordType::MX,
+        CachedData::WireData(upstream_signed_mx()),
+        3600,
+        None,
+    );
     let resolver: Arc<CachedResolver> =
         Arc::new(CachedResolver::new(Arc::new(NoUpstream), cache, 300, 4));
     let policy = BlockPolicy {
@@ -147,7 +198,12 @@ fn handler(
         sinkhole_ipv4: None,
         sinkhole_ipv6: None,
     };
-    let filtered = HandleDnsQueryUseCase::new(resolver.clone(), engine, Arc::new(NoopQueryLog));
+    let cookies = DnsCookiesConfig {
+        require_valid_cookie: false,
+        ..DnsCookiesConfig::default()
+    };
+    let filtered = HandleDnsQueryUseCase::new(resolver.clone(), engine, Arc::new(NoopQueryLog))
+        .with_dns_cookies(DnsCookieGuard::from_config(&cookies, [7; 32]));
     // The same path minus the block filter, to tell its cost from the rest.
     let unfiltered =
         HandleDnsQueryUseCase::new(resolver, Arc::new(AllowAllFilter), Arc::new(NoopQueryLog));
@@ -169,13 +225,13 @@ fn serve(handler: &DnsServerHandler, raw: &[u8], out: &mut [u8; RESPONSE_BUF_LEN
                 query.record_type,
                 CLIENT,
                 ClientProtocol::Udp,
+                |addresses, ttl| {
+                    wire_response::build_cache_hit_response(&query, raw, addresses, ttl, out)
+                },
             )
-            .and_then(|(addresses, ttl)| {
-                wire_response::build_cache_hit_response(&query, raw, &addresses, ttl, out)
-            })
             .unwrap_or(0),
         FastPathKind::WireData => handler
-            .try_fast_path_wire(&query, CLIENT, ClientProtocol::Udp)
+            .try_fast_path_wire(&query, raw, CLIENT, ClientProtocol::Udp)
             .map_or(0, |wire| wire.len()),
     }
 }
@@ -194,6 +250,12 @@ fn udp_cache_hit(c: &mut Criterion) {
         ("a_plain", query(A_NAME, 1, false)),
         ("mx_edns", query(MX_NAME, 15, true)),
         ("mx_plain", query(MX_NAME, 15, false)),
+        (
+            "mx_edns_cookie",
+            query_with_options(MX_NAME, 15, true, &[0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]),
+        ),
+        ("mx_edns_signed", query(SIGNED_NAME, 15, true)),
+        ("mx_plain_signed", query(SIGNED_NAME, 15, false)),
     ] {
         assert_ne!(serve(&handler, &raw, &mut out), 0, "{label} must hit");
         group.bench_function(label, |b| {

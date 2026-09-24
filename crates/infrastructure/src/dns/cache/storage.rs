@@ -281,6 +281,10 @@ impl DnsCache {
             return;
         }
 
+        let Some(data) = data.into_stored() else {
+            debug!(domain = %domain, record_type = %record_type, "Answer does not re-section; not cached");
+            return;
+        };
         let ttl = self.clamp_ttl(ttl);
         let key = CacheKey::from_lowercase(domain, record_type);
         let maybe_l1_addresses = data.as_ip_addresses().cloned();
@@ -296,6 +300,9 @@ impl DnsCache {
                     .insertions
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
+            // A local record is configuration: an upstream answer that raced
+            // its creation must not replace it, here or in L1.
+            dashmap::Entry::Occupied(e) if e.get().is_permanent() => return,
             dashmap::Entry::Occupied(mut e) => {
                 e.insert(record);
             }
@@ -328,6 +335,9 @@ impl DnsCache {
     ) {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
+        let Some(data) = data.into_stored() else {
+            return;
+        };
         let key = CacheKey::from_lowercase(domain, record_type);
         self.bloom.set(&key);
 
@@ -572,6 +582,9 @@ impl DnsCache {
         let domain = domain.as_ref();
         let key = CacheKey::from_lowercase(domain, *record_type);
         let now = coarse_now_secs();
+        let Some(new_data) = new_data.into_stored() else {
+            return false;
+        };
 
         if let Some(mut entry) = self.cache.get_mut(&key) {
             let record = entry.value_mut();

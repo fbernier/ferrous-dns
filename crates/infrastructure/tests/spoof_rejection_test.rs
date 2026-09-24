@@ -216,9 +216,14 @@ async fn forged_cookie_is_rejected_for_non_address_types() {
 /// the TCP side replies per `tcp_mode`, letting us assert the validator also runs
 /// on the post-truncation TCP path.
 async fn spawn_truncating_pair(tcp_mode: Mode) -> SocketAddr {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = udp.local_addr().unwrap();
-    let listener = TcpListener::bind(addr).await.unwrap();
+    // An ephemeral UDP port may already be taken on TCP; retry until both bind.
+    let (udp, addr, listener) = loop {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp.local_addr().unwrap();
+        if let Ok(listener) = TcpListener::bind(addr).await {
+            break (udp, addr, listener);
+        }
+    };
 
     // UDP side: faithful echo but TC=1, so the response passes the first validate
     // and then triggers the TCP retry.

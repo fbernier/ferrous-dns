@@ -153,3 +153,29 @@ fn test_removed_permanent_entry_is_no_longer_permanent() {
         "a removed entry must not come back through clear()"
     );
 }
+
+/// A local record added while an upstream answer for the same name was in
+/// flight: that answer then reaches `insert`, and must not replace the local
+/// record in the shared map or in the thread-local L1.
+#[test]
+fn test_upstream_insert_does_not_replace_a_permanent_entry() {
+    let cache = make_cache();
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
+    cache.insert(
+        "nas.home.lan",
+        RecordType::A,
+        make_ip_data("203.0.113.9"),
+        60,
+        None,
+    );
+
+    let (data, _, _) = cache
+        .get("nas.home.lan", &RecordType::A)
+        .expect("the local record is still readable");
+    assert_eq!(
+        addresses_of(&data),
+        vec!["10.0.0.5".parse::<IpAddr>().unwrap()]
+    );
+    assert_eq!(cache.get_ttl("nas.home.lan", &RecordType::A), Some(300));
+    assert!(cache.is_permanent("nas.home.lan", &RecordType::A));
+}
