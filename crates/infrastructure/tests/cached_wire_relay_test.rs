@@ -18,6 +18,7 @@ use ferrous_dns_domain::{
     BlockResponseMode, ClientProtocol, DnsCookiesConfig, DnsQuery, DnssecStats, DomainError,
     QueryLog, QueryLogFilter, QueryStats, RecordType,
 };
+use ferrous_dns_infrastructure::dns::cache::coarse_clock;
 use ferrous_dns_infrastructure::dns::fast_path::parse_query;
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::server::{BlockPolicy, DnsServerHandler};
@@ -405,4 +406,65 @@ async fn a_hit_the_fast_path_declines_is_logged_once() {
     let reply = server.slow(&q).await;
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
     assert_eq!(logged(), 2);
+}
+
+/// RFC 1035 §3.2.1, RFC 2181 §8: a cached answer's TTLs count down its
+/// time in the cache, on every record and on either path, never past what
+/// the entry has left.
+#[tokio::test]
+async fn cached_answers_count_down_every_ttl() {
+    let exchange = name("mx1.example.com.");
+    let mut msg = Message::new(0xBEEF, MessageType::Response, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::query(name("mail.example.com."), WireType::MX));
+    msg.add_answer(Record::from_rdata(name("mail.example.com."), 300, mx()));
+    msg.add_authority(Record::from_rdata(
+        name("example.com."),
+        3600,
+        RData::NS(hickory_proto::rr::rdata::NS(exchange.clone())),
+    ));
+    msg.add_additional(Record::from_rdata(
+        exchange,
+        120,
+        RData::A(Ipv4Addr::new(192, 0, 2, 25).into()),
+    ));
+    msg.set_edns(Edns::new());
+    coarse_clock::tick();
+    let server = Server::caching(
+        &[("mail.example.com", RecordType::MX, msg.to_bytes().unwrap())],
+        Arc::new(NoopQueryLog),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    coarse_clock::tick();
+
+    let ttls = |reply: &Message| -> Vec<u32> {
+        [&reply.answers, &reply.authorities, &reply.additionals]
+            .into_iter()
+            .flatten()
+            .map(|r| r.ttl)
+            .collect()
+    };
+    let replies = [
+        server.fast(&query("mail.example.com", WireType::MX, Some(false), None)),
+        server.fast(&query("mail.example.com", WireType::MX, None, None)),
+        server.fast(&query(
+            "mail.example.com",
+            WireType::MX,
+            Some(false),
+            Some(&CLIENT_COOKIE),
+        )),
+        Some(
+            server
+                .slow(&query("mail.example.com", WireType::MX, Some(true), None))
+                .await,
+        ),
+    ];
+    for reply in replies {
+        let reply = reply.expect("served on the fast path");
+        let got = ttls(&reply);
+        let age = 300 - got[0];
+        assert!(age >= 1, "counted down: {got:?}");
+        // The NS may not outlive the entry; the glue has its own countdown.
+        assert_eq!(got, [300 - age, 300 - age, 120 - age]);
+    }
 }

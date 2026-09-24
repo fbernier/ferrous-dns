@@ -1,6 +1,8 @@
+use super::cache::storage::STALE_SERVE_TTL;
 use super::ede::{self, ExtendedDnsError};
 use super::fast_path::FastPathQuery;
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 
 /// The fast path's fixed OPT: `EdnsReply` with DO clear and no options, as a
 /// constant so a cache hit copies it instead of encoding it.
@@ -11,23 +13,6 @@ const OPT_RECORD: [u8; 11] = [
 /// Capacity of the fixed fast-path cache-hit response buffer. A hit that would
 /// exceed it is rejected (`None`) and handled by the slow path instead.
 pub const RESPONSE_BUF_LEN: usize = 523;
-
-/// Clones the cached wire bytes under the client's query ID and RD bit, with
-/// the Authenticated Data (AD) bit cleared; `None` if `wire` is shorter than
-/// the flags.
-///
-/// The cached-wire fast path is only taken for clients that did **not** set the
-/// EDNS DO bit, so per RFC 6840 §5.8 we must never assert AD to them — yet the
-/// cached upstream bytes may carry AD=1 from the validating resolver. Clearing
-/// it here keeps the fast path compliant without re-parsing the message.
-pub fn patch_wire_header(wire: &[u8], id: u16, recursion_desired: bool) -> Option<Vec<u8>> {
-    if wire.len() < 4 {
-        return None;
-    }
-    let mut buf = wire.to_vec();
-    set_relay_header(&mut buf, id, recursion_desired, false);
-    Some(buf)
-}
 
 /// Rewrites a relayed response's header for the client: its ID, its RD bit
 /// (RFC 1035 §4.1.1 copies RD from the query; upstream always saw RD=1) and
@@ -196,16 +181,23 @@ pub struct EdnsReply<'a> {
 }
 
 impl EdnsReply<'_> {
-    fn write(&self, out: &mut Vec<u8>) {
-        let cookie_len = self.cookie.map_or(0, |c| 4 + c.len());
-        let ede_len = self.ede.map_or(0, |e| 6 + e.extra_text.len());
-        let rdlen = (cookie_len + ede_len) as u16;
-        out.push(0);
-        out.extend_from_slice(&TYPE_OPT.to_be_bytes());
-        out.extend_from_slice(&EDNS_UDP_PAYLOAD.to_be_bytes());
-        // Extended RCODE 0, version 0, then the flags word with DO in the top bit.
-        out.extend_from_slice(&[0, 0, u8::from(self.dnssec_ok) << 7, 0]);
-        out.extend_from_slice(&rdlen.to_be_bytes());
+    /// Bytes [`Self::write`] appends.
+    fn len(&self) -> usize {
+        OPT_RECORD.len() + self.rdata_len()
+    }
+
+    fn rdata_len(&self) -> usize {
+        self.cookie.map_or(0, |c| 4 + c.len()) + self.ede.map_or(0, |e| 6 + e.extra_text.len())
+    }
+
+    /// Appends the OPT, whose TTL opens with `extended_rcode`, the upper
+    /// eight RCODE bits (RFC 6891 §6.1.3).
+    fn write(&self, out: &mut Vec<u8>, extended_rcode: u8) {
+        out.extend_from_slice(&opt_head(
+            extended_rcode,
+            self.dnssec_ok,
+            self.rdata_len() as u16,
+        ));
         if let Some(cookie) = self.cookie {
             out.extend_from_slice(&COOKIE_OPTION_CODE.to_be_bytes());
             out.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
@@ -291,7 +283,7 @@ pub fn encode_response(
         }
     }
     if let Some(edns) = edns {
-        edns.write(&mut out);
+        edns.write(&mut out, 0);
     }
     out
 }
@@ -345,76 +337,234 @@ pub fn relay_with_edns(
     Some(out)
 }
 
-/// Re-sections an upstream response into the form the cache stores: every
-/// record but the OPT, then an option-less OPT holding the upstream's
-/// extended RCODE, whose DO bit records whether the message carries
-/// authenticating DNSSEC RRs. That last record is what lets [`relay_cached`]
-/// answer a client without walking the message. The upstream's options,
-/// among them the COOKIE it echoed back to us, are not kept. The header is
-/// the upstream's but for ARCOUNT. `None` where [`relay_with_edns`] would be.
-pub fn cache_form(upstream: &[u8]) -> Option<Vec<u8>> {
-    let sections = resection(upstream, false)?;
-    let opt = EdnsReply {
-        dnssec_ok: sections.authenticating,
-        cookie: None,
-        ede: None,
-    };
-    append_opt(sections.out, sections.extended_rcode, Some(&opt))
+/// EDNS option code, from the local and experimental range (RFC 6891 §9), of
+/// the option in the OPT of the cache form.
+const CACHE_OPTION_CODE: u16 = 65_001;
+/// Bytes of the cache form's OPT before its TTL offsets: the record's fixed
+/// part, then the option's code, its length and the entry TTL.
+const CACHE_OPT_HEAD: usize = OPT_RECORD.len() + 4 + 4;
+
+/// Re-sections an upstream response into the form the cache stores for an
+/// entry of `entry_ttl` seconds: every record but the OPT, its TTL clamped
+/// into `ttls`, then an OPT of ours holding the upstream's extended RCODE,
+/// with DO set iff the message carries authenticating DNSSEC RRs. That OPT's
+/// one option carries `entry_ttl`, then the offset of every record's TTL
+/// field and, last, their count. It is what lets [`relay_cached`] answer a
+/// client without walking the message. The upstream's options, among them
+/// the COOKIE it echoed back to us, are not kept. The header is the
+/// upstream's but for ARCOUNT. `None` where [`relay_with_edns`] would be, or
+/// for a message too long to address its TTLs in 16 bits.
+pub fn cache_form(upstream: &[u8], entry_ttl: u32, ttls: RangeInclusive<u32>) -> Option<Vec<u8>> {
+    let Sections {
+        mut out,
+        extended_rcode,
+        authenticating,
+    } = resection(upstream, false)?;
+    let mut offsets = Vec::new();
+    for_each_ttl(&mut out, |ttl, at| {
+        *ttl = u32::from_be_bytes(*ttl)
+            .clamp(*ttls.start(), *ttls.end())
+            .to_be_bytes();
+        offsets.push(at);
+    })?;
+    let count = u16::try_from(offsets.len()).ok()?;
+    let option_len = u16::try_from(4 + 2 * offsets.len() + 2).ok()?;
+    out.extend_from_slice(&opt_head(
+        extended_rcode,
+        authenticating,
+        option_len.checked_add(4)?,
+    ));
+    out.extend_from_slice(&CACHE_OPTION_CODE.to_be_bytes());
+    out.extend_from_slice(&option_len.to_be_bytes());
+    out.extend_from_slice(&entry_ttl.to_be_bytes());
+    for at in offsets {
+        out.extend_from_slice(&u16::try_from(at).ok()?.to_be_bytes());
+    }
+    out.extend_from_slice(&count.to_be_bytes());
+    let arcount = u16::from_be_bytes([out[10], out[11]]).checked_add(1)?;
+    out[10..12].copy_from_slice(&arcount.to_be_bytes());
+    Some(out)
 }
 
-/// Whether the cached answer `wire` (see [`cache_form`]) can go as is to an
-/// EDNS client that set neither DO nor a COOKIE: it ends in the plain OPT
-/// that client gets, and holds no DNSSEC RRs it must not see.
-#[inline]
-pub fn is_plain_cached(wire: &[u8]) -> bool {
-    cached_opt(wire).is_some_and(|(_, opt)| !opt.authenticating)
-}
-
-/// Relays the cached answer `wire` (see [`cache_form`]) to a client that did
-/// not set DO, under its ID and RD with AD clear, and with `edns` as its OPT.
-/// Without authenticating DNSSEC RRs to strip, the cached OPT is swapped for
-/// `edns` without walking the message; otherwise, or for bytes not in cache
-/// form, this is [`relay_with_edns`].
+/// Relays the cached answer `wire` (see [`cache_form`]) to a client, under
+/// its ID and RD and `edns` as its OPT, every TTL counted down by
+/// [`aged_ttl`] for an entry with `remaining` seconds left. AD is clear: the
+/// fast path serves clients without DO, which must not see the validating
+/// upstream's AD (RFC 6840 §5.8). The records are copied as they sit, and
+/// re-sectioned only for a client without DO that must not see the
+/// authenticating DNSSEC RRs among them. `None` for bytes not in cache form,
+/// or an extended RCODE `edns: None` cannot carry.
 pub fn relay_cached(
     wire: &[u8],
     id: u16,
     recursion_desired: bool,
     edns: Option<&EdnsReply<'_>>,
+    remaining: u32,
 ) -> Option<Vec<u8>> {
-    let Some((body, opt)) = cached_opt(wire).filter(|(_, opt)| !opt.authenticating) else {
-        return relay_with_edns(wire, id, recursion_desired, false, edns);
+    let (body, opt) = cached_opt(wire)?;
+    if opt.authenticating && !edns.is_some_and(|e| e.dnssec_ok) {
+        return relay_aged(wire, id, recursion_desired, false, edns, remaining);
+    }
+    let mut out = match edns {
+        // The cache's OPT but for its option and DO, which is the query's.
+        Some(&EdnsReply {
+            dnssec_ok,
+            cookie: None,
+            ede: None,
+        }) => {
+            let mut out = wire.get(..body.len() + OPT_RECORD.len())?.to_vec();
+            let [.., flags, _, rdlen_hi, rdlen_lo] = &mut out[..] else {
+                return None;
+            };
+            *flags = u8::from(dnssec_ok) << 7;
+            [*rdlen_hi, *rdlen_lo] = [0, 0];
+            out
+        }
+        // In place of the cache's OPT, so ARCOUNT stands.
+        Some(edns) => {
+            let mut out = Vec::with_capacity(body.len() + edns.len());
+            out.extend_from_slice(body);
+            edns.write(&mut out, opt.extended_rcode);
+            out
+        }
+        None if opt.extended_rcode != 0 => return None,
+        None => {
+            let mut out = body.to_vec();
+            let arcount = u16::from_be_bytes([out[10], out[11]]).checked_sub(1)?;
+            out[10..12].copy_from_slice(&arcount.to_be_bytes());
+            out
+        }
     };
-    let mut out = Vec::with_capacity(wire.len() + 64);
-    out.extend_from_slice(body);
-    let arcount = u16::from_be_bytes([out[10], out[11]]).checked_sub(1)?;
-    out[10..12].copy_from_slice(&arcount.to_be_bytes());
-    let mut out = append_opt(out, opt.extended_rcode, edns)?;
+    age_ttls(&mut out, opt.ttls, opt.entry_ttl, remaining)?;
     set_relay_header(&mut out, id, recursion_desired, false);
     Some(out)
 }
 
-/// The last record of a cached answer, as [`cache_form`] wrote it.
+/// [`relay_with_edns`] for an answer from the cache, which has `remaining`
+/// seconds left: when `wire` is in cache form, [`aged_ttl`] counts down every
+/// TTL of the reply.
+pub fn relay_aged(
+    wire: &[u8],
+    id: u16,
+    recursion_desired: bool,
+    authentic_data: bool,
+    edns: Option<&EdnsReply<'_>>,
+    remaining: u32,
+) -> Option<Vec<u8>> {
+    let mut out = relay_with_edns(wire, id, recursion_desired, authentic_data, edns)?;
+    if let Some((_, opt)) = cached_opt(wire) {
+        for_each_ttl(&mut out, |ttl, _| {
+            *ttl = aged_ttl(u32::from_be_bytes(*ttl), opt.entry_ttl, remaining).to_be_bytes();
+        })?;
+    }
+    Some(out)
+}
+/// Counts down, by [`aged_ttl`], the TTL fields of `msg` at the big-endian
+/// 16-bit offsets in `offsets`. `None` if one lies outside `msg`.
+#[inline]
+fn age_ttls(msg: &mut [u8], offsets: &[u8], entry_ttl: u32, remaining: u32) -> Option<()> {
+    for at in offsets.chunks_exact(2) {
+        let at = usize::from(u16::from_be_bytes([at[0], at[1]]));
+        let ttl: &mut [u8; 4] = msg.get_mut(at..at + 4)?.try_into().ok()?;
+        *ttl = aged_ttl(u32::from_be_bytes(*ttl), entry_ttl, remaining).to_be_bytes();
+    }
+    Some(())
+}
+
+/// The TTL a hit gives a record stored with `ttl` in an entry cached for
+/// `entry_ttl` seconds, `remaining` of which are left: `ttl` less the entry's
+/// age, and no more than the entry has left, as the A/AAAA hits answer. A
+/// record past its own TTL is served stale, which RFC 8767 §4 answers with a
+/// TTL above 0: [`STALE_SERVE_TTL`], the one a stale entry reports, or
+/// `remaining` if lower.
+#[inline]
+fn aged_ttl(ttl: u32, entry_ttl: u32, remaining: u32) -> u32 {
+    remaining
+        .saturating_sub(entry_ttl.saturating_sub(ttl))
+        .max(remaining.min(STALE_SERVE_TTL))
+}
+
+/// The OPT that ends a cached answer, as [`cache_form`] wrote it.
 #[derive(Clone, Copy)]
-struct CachedOpt {
+struct CachedOpt<'a> {
     extended_rcode: u8,
     /// The DO bit: the message carries authenticating DNSSEC RRs.
     authenticating: bool,
+    entry_ttl: u32,
+    /// The big-endian 16-bit offset of every record's TTL field.
+    ttls: &'a [u8],
 }
 
-/// Splits the option-less OPT that ends `wire` from the header and records
+/// Splits the OPT that ends the cache form `wire` from the header and records
 /// before it.
 #[inline]
-fn cached_opt(wire: &[u8]) -> Option<(&[u8], CachedOpt)> {
-    let (body, opt) = wire.split_last_chunk::<{ OPT_RECORD.len() }>()?;
-    // Root owner, TYPE 41, any CLASS, TTL (extended RCODE, version 0, flags), RDLENGTH 0.
-    let [0, 0, 41, _, _, extended_rcode, 0, flags, _, 0, 0] = *opt else {
+fn cached_opt(wire: &[u8]) -> Option<(&[u8], CachedOpt<'_>)> {
+    let (rest, &count) = wire.split_last_chunk::<2>()?;
+    let ttls_len = 2 * usize::from(u16::from_be_bytes(count));
+    let (body, opt) = rest.split_at(rest.len().checked_sub(CACHE_OPT_HEAD + ttls_len)?);
+    let (&head, ttls) = opt.split_first_chunk::<CACHE_OPT_HEAD>()?;
+    // Root owner, TYPE 41, CLASS, TTL (extended RCODE, version 0, flags),
+    // RDLENGTH, then our option's code, its length and the entry TTL.
+    let [0, 0, 41, _, _, extended_rcode, 0, flags, _, rd0, rd1, c0, c1, l0, l1, t0, t1, t2, t3] =
+        head
+    else {
         return None;
     };
+    let option_len = 4 + ttls_len + 2;
+    let well_formed = u16::from_be_bytes([c0, c1]) == CACHE_OPTION_CODE
+        && usize::from(u16::from_be_bytes([l0, l1])) == option_len
+        && usize::from(u16::from_be_bytes([rd0, rd1])) == 4 + option_len
+        && body.len() >= 12;
     let opt = CachedOpt {
         extended_rcode,
         authenticating: flags & 0x80 != 0,
+        entry_ttl: u32::from_be_bytes([t0, t1, t2, t3]),
+        ttls,
     };
-    (body.len() >= 12).then_some((body, opt))
+    well_formed.then_some((body, opt))
+}
+
+/// Calls `f` with the TTL field, and its offset, of every record of `msg`
+/// but OPT. `None` if its sections do not walk.
+fn for_each_ttl(msg: &mut [u8], mut f: impl FnMut(&mut [u8; 4], usize)) -> Option<()> {
+    let header = msg.get(..12)?;
+    let count = |i: usize| usize::from(u16::from_be_bytes([header[i], header[i + 1]]));
+    let (questions, records) = (count(4), count(6) + count(8) + count(10));
+    let mut pos = 12;
+    for _ in 0..questions {
+        pos = skip_name(msg, pos)? + 4;
+    }
+    for _ in 0..records {
+        let fixed = skip_name(msg, pos)?;
+        let [t0, t1, _, _, ttl @ .., l0, l1] = msg.get_mut(fixed..)?.first_chunk_mut::<10>()?;
+        if u16::from_be_bytes([*t0, *t1]) != TYPE_OPT {
+            f(ttl, fixed + 4);
+        }
+        pos = fixed + 10 + usize::from(u16::from_be_bytes([*l0, *l1]));
+    }
+    (pos <= msg.len()).then_some(())
+}
+
+/// The fixed part of an OPT record: root owner, TYPE, our UDP payload size as
+/// CLASS, the TTL (extended RCODE, version 0, the flags word with DO in its
+/// top bit), then RDLENGTH.
+fn opt_head(extended_rcode: u8, dnssec_ok: bool, rdlen: u16) -> [u8; 11] {
+    let [type_hi, type_lo] = TYPE_OPT.to_be_bytes();
+    let [payload_hi, payload_lo] = EDNS_UDP_PAYLOAD.to_be_bytes();
+    let [rdlen_hi, rdlen_lo] = rdlen.to_be_bytes();
+    [
+        0,
+        type_hi,
+        type_lo,
+        payload_hi,
+        payload_lo,
+        extended_rcode,
+        0,
+        u8::from(dnssec_ok) << 7,
+        0,
+        rdlen_hi,
+        rdlen_lo,
+    ]
 }
 
 /// Appends `edns` to the re-sectioned records in `out`, carrying the dropped
@@ -427,10 +577,7 @@ fn append_opt(
 ) -> Option<Vec<u8>> {
     match edns {
         Some(edns) => {
-            let opt = out.len();
-            edns.write(&mut out);
-            // Root owner (1), TYPE (2), CLASS (2), then the TTL's first byte.
-            out[opt + 5] = extended_rcode;
+            edns.write(&mut out, extended_rcode);
             let arcount = u16::from_be_bytes([out[10], out[11]]).checked_add(1)?;
             out[10..12].copy_from_slice(&arcount.to_be_bytes());
         }
@@ -762,7 +909,7 @@ mod tests {
             cookie: None,
             ede: None,
         }
-        .write(&mut written);
+        .write(&mut written, 0);
         assert_eq!(written, OPT_RECORD);
     }
 
@@ -1092,14 +1239,26 @@ mod tests {
         );
     }
 
+    /// The options of `msg`'s OPT, by code.
+    fn option_codes(msg: &Message) -> Vec<u16> {
+        let opt = msg.edns.as_ref().expect("an OPT");
+        opt.options()
+            .as_ref()
+            .iter()
+            .map(|(code, _)| u16::from(*code))
+            .collect()
+    }
+
     /// The cached OPT's DO bit says whether the answer carries DNSSEC RRs a
-    /// client without DO must not see, whatever DO the upstream echoed.
+    /// client without DO must not see, whatever DO the upstream echoed, and
+    /// none of the upstream's options survive.
     #[test]
     fn cache_form_records_dnssec_records_in_its_do_bit_and_drops_upstream_options() {
-        let signed = cache_form(&signed_mx_with_tangled_glue()).unwrap();
+        let signed = cache_form(&signed_mx_with_tangled_glue(), 60, 0..=u32::MAX).unwrap();
         let msg = Message::from_vec(&signed).unwrap();
         assert!(msg.edns.as_ref().unwrap().flags().dnssec_ok);
         assert_eq!(types(&msg.answers), [RecordType::MX, RecordType::RRSIG]);
+        assert_eq!(option_codes(&msg), [CACHE_OPTION_CODE]);
 
         let mut upstream = Message::new(0x1111, MessageType::Response, OpCode::Query);
         upstream.add_query(Query::query(
@@ -1111,14 +1270,14 @@ mod tests {
         edns.options_mut()
             .insert(EdnsOption::Unknown(10, vec![0xAA; 16]));
         upstream.set_edns(edns);
-        let unsigned = cache_form(&upstream.to_vec().unwrap()).unwrap();
-        assert_eq!(unsigned[unsigned.len() - OPT_RECORD.len()..], OPT_RECORD);
-        assert!(is_plain_cached(&unsigned));
-        assert!(!is_plain_cached(&signed));
+        let unsigned = cache_form(&upstream.to_vec().unwrap(), 60, 0..=u32::MAX).unwrap();
+        let msg = Message::from_vec(&unsigned).unwrap();
+        assert!(!msg.edns.as_ref().unwrap().flags().dnssec_ok);
+        assert_eq!(option_codes(&msg), [CACHE_OPTION_CODE]);
     }
 
-    /// Serving from the cache form, with or without a walk, gives the bytes
-    /// relaying the upstream answer itself would.
+    /// Serving from the cache form before any time has passed, with or
+    /// without a walk, gives the bytes relaying the upstream answer would.
     #[test]
     fn relay_cached_matches_relaying_the_upstream_answer() {
         let mut upstream = Message::new(0x1111, MessageType::Response, OpCode::Query);
@@ -1141,20 +1300,177 @@ mod tests {
         let unsigned = upstream.to_vec().unwrap();
 
         let cookie = [0x55; 16];
-        let with_cookie = EdnsReply {
+        let plain = EdnsReply {
             dnssec_ok: false,
-            cookie: Some(&cookie),
+            cookie: None,
             ede: None,
         };
+        let with_cookie = EdnsReply {
+            cookie: Some(&cookie),
+            ..plain
+        };
         for wire in [unsigned, signed_mx_with_tangled_glue()] {
-            let cached = cache_form(&wire).unwrap();
-            for edns in [None, Some(&with_cookie)] {
+            let cached = cache_form(&wire, 60, 0..=u32::MAX).unwrap();
+            for edns in [None, Some(&plain), Some(&with_cookie)] {
                 assert_eq!(
-                    relay_cached(&cached, 9, false, edns),
+                    relay_cached(&cached, 9, false, edns, 60),
                     relay_with_edns(&wire, 9, false, false, edns),
                     "{edns:?}"
                 );
             }
+        }
+    }
+
+    /// An MX answer cached for 300 s: the MX at 300, an NS in authority at
+    /// 3600 and A glue at 120, behind an upstream OPT.
+    fn mx_with_authority_and_glue(signed: bool) -> Vec<u8> {
+        let owner = Name::from_str("mail.example.com.").unwrap();
+        let exchange = Name::from_str("mx.example.com.").unwrap();
+        let mut upstream = Message::new(0x1111, MessageType::Response, OpCode::Query);
+        upstream.add_query(Query::query(owner.clone(), RecordType::MX));
+        upstream.add_answer(Record::from_rdata(
+            owner.clone(),
+            300,
+            RData::MX(hickory_proto::rr::rdata::MX::new(10, exchange.clone())),
+        ));
+        upstream.add_authority(Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            3600,
+            RData::NS(hickory_proto::rr::rdata::NS(exchange.clone())),
+        ));
+        upstream.add_additional(Record::from_rdata(
+            exchange,
+            120,
+            RData::A("192.0.2.25".parse::<std::net::Ipv4Addr>().unwrap().into()),
+        ));
+        upstream.set_edns(Edns::new());
+        let mut wire = upstream.to_vec().unwrap();
+        if signed {
+            // An RRSIG over the MX closes the answer section.
+            let mut signature = vec![];
+            rr(&mut signature, &[0xC0, 12], TYPE_RRSIG, &rrsig_rdata(15));
+            // The MX's TTL, after the owner, TYPE and CLASS.
+            signature[6..10].copy_from_slice(&300u32.to_be_bytes());
+            let at = 12 + question("mail.example.com.", RecordType::MX).len();
+            let mx_end = at + skip_rr(&wire, at).unwrap().1 - at;
+            wire.splice(mx_end..mx_end, signature);
+            wire[7] += 1;
+        }
+        wire
+    }
+
+    /// `(type, TTL)` of every record of `msg` but OPT, section by section.
+    fn ttls(msg: &[u8]) -> Vec<(RecordType, u32)> {
+        let msg = Message::from_vec(msg).expect("the reply decodes");
+        [&msg.answers, &msg.authorities, &msg.additionals]
+            .into_iter()
+            .flatten()
+            .map(|r| (r.record_type(), r.ttl))
+            .collect()
+    }
+
+    /// RFC 1035 §3.2.1, RFC 2181 §8: a cached record's TTL counts down its
+    /// time in the cache, and no record outlives the entry, as an A/AAAA hit
+    /// reports it. 100 s after caching, the entry has 200 s left.
+    #[test]
+    fn cached_answers_count_down_every_ttl() {
+        let plain = EdnsReply {
+            dnssec_ok: false,
+            cookie: None,
+            ede: None,
+        };
+        let cookie = [0x55; 16];
+        let with_cookie = EdnsReply {
+            cookie: Some(&cookie),
+            ..plain
+        };
+        let aged = [
+            (RecordType::MX, 200),
+            (RecordType::NS, 200),
+            (RecordType::A, 20),
+        ];
+        for signed in [false, true] {
+            let cached =
+                cache_form(&mx_with_authority_and_glue(signed), 300, 0..=u32::MAX).unwrap();
+            for edns in [None, Some(&plain), Some(&with_cookie)] {
+                let reply = relay_cached(&cached, 9, false, edns, 200).unwrap();
+                assert_eq!(ttls(&reply), aged, "signed {signed}, {edns:?}");
+            }
+            // The slow path, for a client that keeps the RRSIG.
+            let validating = EdnsReply {
+                dnssec_ok: true,
+                ..plain
+            };
+            let reply = relay_aged(&cached, 9, false, false, Some(&validating), 200).unwrap();
+            let mut kept = aged.to_vec();
+            if signed {
+                kept.insert(1, (RecordType::RRSIG, 200));
+            }
+            assert_eq!(ttls(&reply), kept, "signed {signed}, DO");
+        }
+    }
+
+    /// RFC 8767 §4: a stale entry, and a record past its own TTL, is served
+    /// with a TTL above 0: the one a stale A/AAAA hit reports.
+    #[test]
+    fn records_past_their_ttl_are_served_with_the_stale_ttl() {
+        let cached = cache_form(&mx_with_authority_and_glue(false), 300, 0..=u32::MAX).unwrap();
+        let stale = relay_cached(&cached, 9, false, None, STALE_SERVE_TTL).unwrap();
+        assert!(ttls(&stale).iter().all(|&(_, ttl)| ttl == STALE_SERVE_TTL));
+
+        // 250 s in, the glue ran out 130 s ago.
+        let late = relay_cached(&cached, 9, false, None, 50).unwrap();
+        assert_eq!(
+            ttls(&late),
+            [
+                (RecordType::MX, 50),
+                (RecordType::NS, 50),
+                (RecordType::A, STALE_SERVE_TTL)
+            ]
+        );
+    }
+
+    /// The cache's TTL bounds apply to every record it stores, so an answer
+    /// raised to the minimum reports what the entry has left, as A/AAAA hits
+    /// do.
+    #[test]
+    fn cache_form_clamps_every_ttl_into_the_cache_bounds() {
+        let cached = cache_form(&mx_with_authority_and_glue(false), 600, 600..=1800).unwrap();
+        assert_eq!(
+            ttls(&cached),
+            [
+                (RecordType::MX, 600),
+                (RecordType::NS, 1800),
+                (RecordType::A, 600)
+            ]
+        );
+        let reply = relay_cached(&cached, 9, false, None, 500).unwrap();
+        assert!(ttls(&reply).iter().all(|&(_, ttl)| ttl == 500));
+    }
+
+    /// The fast path relays nothing it cannot age: bytes that are not in
+    /// cache form are left to the slow path.
+    #[test]
+    fn relay_cached_declines_bytes_not_in_cache_form() {
+        let upstream = mx_with_authority_and_glue(false);
+        assert!(relay_cached(&upstream, 9, false, None, 60).is_none());
+    }
+
+    /// RFC 6840 §5.8: the cached bytes may carry the validating upstream's
+    /// AD bit, which a client without DO must not see; RD is the query's.
+    #[test]
+    fn relay_cached_clears_ad_and_copies_rd() {
+        let mut wire = mx_with_authority_and_glue(false);
+        wire[2] |= 0x01;
+        wire[3] |= 0x20;
+        let cached = cache_form(&wire, 300, 0..=u32::MAX).unwrap();
+        for rd in [false, true] {
+            let reply = relay_cached(&cached, 0x4242, rd, None, 300).unwrap();
+            let msg = Message::from_vec(&reply).unwrap();
+            assert_eq!(
+                (msg.id, msg.recursion_desired, msg.authentic_data),
+                (0x4242, rd, false)
+            );
         }
     }
 }

@@ -324,3 +324,29 @@ async fn malformed_cookie_lengths_are_formerr() {
         assert!(reply.answers.is_empty(), "{len} bytes");
     }
 }
+
+/// RFC 6891 §7: the OPT a client gets is ours. An upstream message that
+/// does not re-section (here, a second OPT) cannot be relayed without the
+/// upstream's, so the client gets SERVFAIL under our OPT and cookie.
+#[tokio::test]
+async fn unresectionable_upstream_answers_are_servfail_under_our_opt() {
+    let mut resolution = relayed(None);
+    let mut wire = resolution.upstream_wire_data.take().unwrap().to_vec();
+    wire.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+    wire[11] += 1;
+    resolution.upstream_wire_data = Some(Bytes::from(wire));
+    let (handler, cookie) = server(Ok(resolution));
+
+    let reply = ask(&handler, &query(RecordType::TXT, Some(false), true, false)).await;
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert!(reply.answers.is_empty());
+    assert_eq!(
+        option(&reply, 10),
+        Some(cookie),
+        "our cookie, not the upstream's echo"
+    );
+
+    let reply = ask(&handler, &query(RecordType::TXT, None, false, false)).await;
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert!(reply.edns.is_none());
+}

@@ -155,7 +155,7 @@ fn serve_wire(handler: &DnsServerHandler, query: &[u8]) -> Option<Vec<u8>> {
 
 /// [`large_answer`] as the cache stores it.
 fn cached_large_answer() -> Vec<u8> {
-    cache_form(&large_answer()).expect("a well-formed answer")
+    cache_form(&large_answer(), 300, 0..=u32::MAX).expect("a well-formed answer")
 }
 
 #[test]
@@ -174,10 +174,12 @@ fn wire_fast_path_serves_when_answer_fits_client_buffer() {
     let cached = cached_large_answer();
     let handler = handler_with_cached_wire(cached.clone());
     // Same answer, but the client advertised 4096 → it fits, so the fast path
-    // serves it verbatim with the query id patched in.
+    // serves it with the query id patched in.
     let bytes = serve_wire(&handler, &mx_query(Some(4096)))
         .expect("answer within the client buffer must be served on the fast path");
-    assert_eq!(bytes.len(), cached.len());
+    let served = hickory_proto::op::Message::from_vec(&bytes).expect("the reply decodes");
+    let cached = hickory_proto::op::Message::from_vec(&cached).expect("the cache form decodes");
+    assert_eq!(served.answers.len(), cached.answers.len());
     assert_eq!(&bytes[0..2], &[0x12, 0x34], "query id must be patched");
 }
 
@@ -236,7 +238,8 @@ fn upstream_mx() -> Vec<u8> {
 fn wire_fast_path_strips_the_upstream_opt_for_a_query_without_one() {
     use hickory_proto::op::Message;
     let upstream = Message::from_vec(&upstream_mx()).unwrap();
-    let handler = handler_with_cached_wire(upstream_mx());
+    let handler =
+        handler_with_cached_wire(cache_form(&upstream_mx(), 60, 0..=u32::MAX).expect("cacheable"));
 
     let mut plain = mx_query(None);
     plain[2] &= !0x01; // RD=0

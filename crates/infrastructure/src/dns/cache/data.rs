@@ -2,6 +2,7 @@ use crate::dns::wire_response;
 use bytes::Bytes;
 use ferrous_dns_domain::DnssecStatus;
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 #[repr(u8)]
@@ -57,14 +58,14 @@ pub enum CachedData {
 }
 
 impl CachedData {
-    /// The form the cache stores: a wire answer re-sectioned by
-    /// [`wire_response::cache_form`], anything else as is. `None` for a wire
-    /// answer that does not re-section.
-    pub(super) fn into_stored(self) -> Option<Self> {
+    /// The form the cache stores for an entry of `ttl` seconds: a wire answer
+    /// re-sectioned by [`wire_response::cache_form`], its record TTLs clamped
+    /// into `ttls`, anything else as is. `None` for a wire answer that does
+    /// not re-section.
+    pub(super) fn into_stored(self, ttl: u32, ttls: RangeInclusive<u32>) -> Option<Self> {
         match self {
-            Self::WireData(wire) => {
-                wire_response::cache_form(&wire).map(|wire| Self::WireData(Bytes::from(wire)))
-            }
+            Self::WireData(wire) => wire_response::cache_form(&wire, ttl, ttls)
+                .map(|wire| Self::WireData(Bytes::from(wire))),
             data @ (Self::IpAddresses(_) | Self::CanonicalName(_) | Self::NegativeResponse) => {
                 Some(data)
             }

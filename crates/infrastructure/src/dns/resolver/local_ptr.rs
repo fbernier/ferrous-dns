@@ -5,7 +5,7 @@ use ferrous_dns_application::ports::{
     DnsResolution, DnsResolver, PtrRecordRegistry, EMPTY_CNAME_CHAIN,
 };
 use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, PrivateIpFilter, RecordType};
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::PTR;
 use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
@@ -137,7 +137,8 @@ fn parse_ptr_target(hostname: &str) -> Option<Name> {
         .ok()
 }
 
-/// An authoritative NOERROR answering the PTR query `owner` with `targets`.
+/// An authoritative NOERROR answering the PTR query `owner` with `targets`,
+/// echoing its question (RFC 1035 §4.1.2): stubs drop answers without one.
 pub(super) fn ptr_resolution(
     owner: &str,
     targets: &[Name],
@@ -153,6 +154,10 @@ pub(super) fn ptr_resolution(
     let mut message = Message::new(0, MessageType::Response, OpCode::Query);
     message.metadata.response_code = ResponseCode::NoError;
     message.metadata.authoritative = true;
+    message.add_query(Query::query(
+        owner_name.clone(),
+        hickory_proto::rr::RecordType::PTR,
+    ));
     for target in targets {
         message.add_answer(Record::from_rdata(
             owner_name.clone(),

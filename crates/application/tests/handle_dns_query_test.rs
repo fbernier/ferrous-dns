@@ -43,14 +43,15 @@ fn served(addresses: &[IpAddr], ttl: u32) -> Option<(Vec<IpAddr>, u32)> {
 }
 
 /// A fast-path `respond` that serves every wire hit.
-fn served_wire(wire: &[u8]) -> Option<Vec<u8>> {
-    Some(wire.to_vec())
+fn served_wire(wire: &[u8], remaining: u32) -> Option<(Vec<u8>, u32)> {
+    Some((wire.to_vec(), remaining))
 }
 
 /// A cached wire answer for `mail.example.com`, as the cache layer reports it.
 fn cached_wire_resolution() -> DnsResolution {
     DnsResolution {
         upstream_wire_data: Some(bytes::Bytes::from_static(b"\x00\x01\x02\x03")),
+        min_ttl: Some(300),
         ..DnsResolution::new(vec![], true)
     }
 }
@@ -607,7 +608,7 @@ fn try_cache_wire_direct_returns_none_on_cache_miss() {
 }
 
 #[test]
-fn try_cache_wire_direct_returns_wire_bytes_on_cache_hit() {
+fn try_cache_wire_direct_hands_a_hit_and_what_its_entry_has_left_to_respond() {
     let resolver = Arc::new(MockDnsResolver::new());
     let filter = Arc::new(MockBlockFilterEngine::new());
     let log = Arc::new(MockQueryLogRepository::new());
@@ -624,7 +625,7 @@ fn try_cache_wire_direct_returns_wire_bytes_on_cache_hit() {
         served_wire,
     );
 
-    assert_eq!(result.as_deref(), Some(&b"\x00\x01\x02\x03"[..]));
+    assert_eq!(result, Some((b"\x00\x01\x02\x03".to_vec(), 300)));
     assert_eq!(log.sync_log_count(), 1);
 }
 
@@ -645,7 +646,7 @@ async fn fast_path_hits_declined_by_the_server_are_logged_once_by_the_slow_path(
         RecordType::MX,
         CLIENT_IP,
         ClientProtocol::Udp,
-        |_| None::<()>,
+        |_, _| None::<()>,
     );
     assert!(declined.is_none());
     let declined = use_case.try_cache_direct(

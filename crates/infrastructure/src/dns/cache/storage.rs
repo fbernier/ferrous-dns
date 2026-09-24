@@ -46,7 +46,8 @@ impl Ord for EvictionCandidate {
 }
 
 const BLOOM_TARGET_FP_RATE: f64 = 0.01;
-const STALE_SERVE_TTL: u32 = 2;
+/// The TTL a stale hit reports (RFC 8767 §4).
+pub(crate) const STALE_SERVE_TTL: u32 = 2;
 
 /// Message carried by a refresh queue.
 pub type RefreshRequest = (Arc<str>, RecordType);
@@ -173,16 +174,19 @@ impl DnsCache {
         let domain = domain.as_ref();
 
         // Hits leave the bloom alone: `rotate_bloom` re-seeds every live key,
-        // so reads never decide membership.
-        if let Some((arc_data, dnssec_status, remaining_ttl)) = l1_get(domain, record_type) {
-            self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
-            return Some((
-                CachedData::IpAddresses(super::data::CachedAddresses {
-                    addresses: arc_data,
-                }),
-                Some(dnssec_status),
-                Some(remaining_ttl),
-            ));
+        // so reads never decide membership. L1 mirrors L2's address answers,
+        // so only an A or AAAA probe is worth its lookup.
+        if matches!(record_type, RecordType::A | RecordType::AAAA) {
+            if let Some((arc_data, dnssec_status, remaining_ttl)) = l1_get(domain, record_type) {
+                self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                return Some((
+                    CachedData::IpAddresses(super::data::CachedAddresses {
+                        addresses: arc_data,
+                    }),
+                    Some(dnssec_status),
+                    Some(remaining_ttl),
+                ));
+            }
         }
 
         let borrowed = BorrowedKey::new(domain, *record_type);
@@ -281,11 +285,11 @@ impl DnsCache {
             return;
         }
 
-        let Some(data) = data.into_stored() else {
+        let ttl = self.clamp_ttl(ttl);
+        let Some(data) = data.into_stored(ttl, self.min_ttl..=self.max_ttl) else {
             debug!(domain = %domain, record_type = %record_type, "Answer does not re-section; not cached");
             return;
         };
-        let ttl = self.clamp_ttl(ttl);
         let key = CacheKey::from_lowercase(domain, record_type);
         let maybe_l1_addresses = data.as_ip_addresses().cloned();
 
@@ -335,7 +339,8 @@ impl DnsCache {
     ) {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
-        let Some(data) = data.into_stored() else {
+        // A local record reports its configured TTL, so its records keep theirs.
+        let Some(data) = data.into_stored(ttl, 0..=u32::MAX) else {
             return;
         };
         let key = CacheKey::from_lowercase(domain, record_type);
@@ -581,17 +586,20 @@ impl DnsCache {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
         let key = CacheKey::from_lowercase(domain, *record_type);
-        let now = coarse_now_secs();
-        let Some(new_data) = new_data.into_stored() else {
+        let Some(ttl) = new_ttl.or_else(|| self.cache.get(&key).map(|entry| entry.ttl)) else {
             return false;
         };
-
+        let ttl = self.clamp_ttl(ttl);
+        let Some(new_data) = new_data.into_stored(ttl, self.min_ttl..=self.max_ttl) else {
+            return false;
+        };
+        let now = coarse_now_secs();
         if let Some(mut entry) = self.cache.get_mut(&key) {
             let record = entry.value_mut();
             if record.is_permanent() || record.is_marked_for_deletion() {
                 return false;
             }
-            let ttl = self.clamp_ttl(new_ttl.unwrap_or(record.ttl));
+            // The new data counts its records' age from this `ttl` and instant.
             record.expires_at_secs = now + ttl as u64;
             record.inserted_at_secs = now;
             record.ttl = ttl;

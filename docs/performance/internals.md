@@ -49,7 +49,7 @@ The DNS sockets are dual-stack `AF_INET6`: an IPv4 `bind_address` is bound in v4
 ### L1 — thread-local hot cache
 
 - **1024 entries per worker thread**, LRU, compile-time constant, not sized by any config key. Total footprint is 1024 × the number of worker threads.
-- Holds **A/AAAA answers only** (`Arc<Vec<IpAddr>>`). CNAMEs, negative answers and wire-format records for other types live in L2 exclusively.
+- Holds **A/AAAA answers only** (`Arc<Vec<IpAddr>>`). CNAMEs, negative answers and wire-format records for other types live in L2 exclusively, so only A/AAAA lookups probe L1.
 - Keys are built in a stack buffer, so a lookup under 260 bytes of key allocates nothing.
 - Invalidated across threads through a global generation counter.
 
@@ -63,7 +63,7 @@ This is the real DNS cache, and it is what the `[dns] cache_*` keys configure.
 | Structure | Sharded `DashMap`, `cache_shard_amount` shards (auto: 4 × cores, clamped to 8–256) |
 | Eviction | `cache_eviction_strategy`: `hit_rate` (default), `lru`, `lfu`, `lfu-k` |
 | Eviction style | Probabilistic — samples `cache_eviction_sample_size` candidates instead of scanning |
-| Record types | **All of them** — A/AAAA as parsed IPs, CNAME, everything else as the upstream response, stored with its OPT replaced by an option-less one whose DO bit records whether the answer holds DNSSEC records |
+| Record types | **All of them** — A/AAAA as parsed IPs, CNAME, everything else as the upstream response with every record TTL clamped to `cache_min_ttl`..`cache_max_ttl`, its OPT replaced by one of ours: its DO bit records whether the answer holds DNSSEC records, and a private option (code 65001) holds the entry TTL and the offset of every record's TTL field. A hit rewrites each TTL to the record's TTL less the entry's age, capped at what the entry has left (RFC 1035 §3.2.1), with a record past its own TTL given the 2 s stale TTL (RFC 8767 §4) |
 | Negative answers | Separate negative cache with its own 300 s floor, deliberately outside `cache_min_ttl` / `cache_max_ttl` |
 | Miss short-circuit | A bloom filter sized at 2 × capacity (1% false positives) skips the map on definite misses |
 

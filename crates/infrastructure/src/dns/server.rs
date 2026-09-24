@@ -17,6 +17,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 const DEFAULT_TTL: u32 = 60;
+/// The OPT a fast-path client with OPT and without a COOKIE gets: it has DO
+/// clear, or the fast path would not serve it.
+const PLAIN_EDNS: EdnsReply<'static> = EdnsReply {
+    dnssec_ok: false,
+    cookie: None,
+    ede: None,
+};
 
 /// How domain-verdict blocks (blocklist, DGA, tunneling, C2 filter) are answered.
 ///
@@ -64,8 +71,9 @@ impl DnsServerHandler {
     /// Returns a ready-to-send cached wire response for non-IP record types (NS,
     /// CNAME, SOA, PTR, MX, TXT, SRV, SVCB, HTTPS) under the query's ID and RD
     /// bit, with AD cleared: the fast path serves only non-DO clients (RFC 6840
-    /// §5.8). `raw` is the query packet. `None` defers the query to the slow
-    /// path, which then logs it instead.
+    /// §5.8). Its TTLs count down the entry's time in the cache. `raw` is the
+    /// query packet. `None` defers the query to the slow path, which then logs
+    /// it instead.
     pub fn try_fast_path_wire(
         &self,
         query: &FastPathQuery,
@@ -78,14 +86,18 @@ impl DnsServerHandler {
             query.record_type,
             client_ip,
             protocol,
-            |wire| {
-                let reply = if query.has_edns()
-                    && query.edns_cookie(raw).is_none()
-                    && wire_response::is_plain_cached(wire)
-                {
-                    wire_response::patch_wire_header(wire, query.id, query.recursion_desired)
-                } else {
-                    self.relay_cached(wire, query, raw, client_ip)
+            |wire, remaining| {
+                let reply = match query.edns_cookie(raw) {
+                    None => wire_response::relay_cached(
+                        wire,
+                        query.id,
+                        query.recursion_desired,
+                        query.has_edns().then_some(&PLAIN_EDNS),
+                        remaining,
+                    ),
+                    Some(cookie) => {
+                        self.relay_cached_with_cookie(wire, query, cookie, client_ip, remaining)
+                    }
                 }?;
                 // Oversized-for-UDP hits bail to the slow path, which sets TC=1,
                 // as build_cache_hit_response does for A/AAAA.
@@ -95,25 +107,31 @@ impl DnsServerHandler {
         )
     }
 
-    /// The cached answer for a client without OPT or with a COOKIE, or one
-    /// holding DNSSEC RRs the client did not ask for. Out of line to keep the
-    /// plain EDNS hit small.
+    /// The cached answer for a client that sent `cookie`, which drops a reply
+    /// that does not echo it (RFC 7873 §5.3). Out of line: the server cookie
+    /// is an HMAC.
     #[inline(never)]
-    fn relay_cached(
+    fn relay_cached_with_cookie(
         &self,
         wire: &[u8],
         query: &FastPathQuery,
-        raw: &[u8],
+        cookie: &[u8],
         client_ip: IpAddr,
+        remaining: u32,
     ) -> Option<Vec<u8>> {
-        // RFC 7873 §5.3: a client drops a reply that does not echo its cookie.
-        let cookie = self.response_cookie(query.edns_cookie(raw), client_ip);
-        let reply = query.has_edns().then(|| EdnsReply {
+        let cookie = self.response_cookie(Some(cookie), client_ip);
+        let reply = EdnsReply {
             dnssec_ok: false,
             cookie: cookie.as_ref().map(EdnsCookie::as_bytes),
             ede: None,
-        });
-        wire_response::relay_cached(wire, query.id, query.recursion_desired, reply.as_ref())
+        };
+        wire_response::relay_cached(
+            wire,
+            query.id,
+            query.recursion_desired,
+            Some(&reply),
+            remaining,
+        )
     }
 
     /// The resolution path for every query the inline cache path did not
@@ -177,31 +195,35 @@ impl DnsServerHandler {
                 // that sent none (RFC 6891 §7). A client without DO loses the
                 // DNSSEC RRs it did not ask for (RFC 4035 §3.2.1).
                 let reply = query.edns_reply(cookie, None);
-                if let Some(bytes) = wire_response::relay_with_edns(
-                    wire_data,
-                    query.id,
-                    query.rd,
-                    set_ad,
-                    reply.as_ref(),
-                ) {
-                    return Some(maybe_truncate(bytes));
-                }
-                // Its extended RCODE needs an OPT to be relayed faithfully.
-                if query.edns.is_none() {
-                    return Some(query.respond(
-                        Rcode::ServFail,
-                        false,
-                        ResponseBody::Empty,
-                        None,
-                        None,
-                    ));
-                }
-                // An upstream message `relay_with_edns` cannot re-section (two
-                // OPTs, or one outside the additional section): relay it under
-                // the client's header, its OPT as it came.
-                let mut response = wire_data.to_vec();
-                wire_response::set_relay_header(&mut response, query.id, query.rd, set_ad);
-                return Some(maybe_truncate(response));
+                // A cache hit's TTLs count down its time in the cache (RFC
+                // 1035 §3.2.1), as the fast path's do.
+                let relayed = match (resolution.cache_hit, resolution.min_ttl) {
+                    (true, Some(remaining)) => wire_response::relay_aged(
+                        wire_data,
+                        query.id,
+                        query.rd,
+                        set_ad,
+                        reply.as_ref(),
+                        remaining,
+                    ),
+                    _ => wire_response::relay_with_edns(
+                        wire_data,
+                        query.id,
+                        query.rd,
+                        set_ad,
+                        reply.as_ref(),
+                    ),
+                };
+                // A message that does not re-section (two OPTs, one outside
+                // the additional section) or whose extended RCODE needs the
+                // OPT a client without one cannot get: relaying it as is
+                // would hand the client the upstream's OPT (RFC 6891 §7).
+                return Some(match relayed {
+                    Some(bytes) => maybe_truncate(bytes),
+                    None => {
+                        query.respond(Rcode::ServFail, false, ResponseBody::Empty, cookie, None)
+                    }
+                });
             }
         }
 

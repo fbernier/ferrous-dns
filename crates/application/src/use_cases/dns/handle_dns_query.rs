@@ -460,38 +460,47 @@ impl HandleDnsQueryUseCase {
     }
 
     /// Checks the cache for a non-IP record type (NS, CNAME, SOA, PTR, MX, TXT,
-    /// HTTPS, SRV, SVCB) and hands a hit's wire bytes to `respond`, which
-    /// builds the reply or declines it (`None`) for the slow path. Only a hit
-    /// `respond` answers is logged here; [`Self::execute`] logs a declined one.
+    /// HTTPS, SRV, SVCB) and hands a hit's wire bytes and the seconds its entry
+    /// has left to `respond`, which builds the reply or declines it (`None`)
+    /// for the slow path. Only a hit `respond` answers is logged here;
+    /// [`Self::execute`] logs a declined one.
     pub fn try_cache_wire_direct<R>(
         &self,
         domain: &str,
         record_type: RecordType,
         client_ip: IpAddr,
         protocol: ClientProtocol,
-        respond: impl FnOnce(&[u8]) -> Option<R>,
+        respond: impl FnOnce(&[u8], u32) -> Option<R>,
     ) -> Option<R> {
         let tsc_start = tsc_timer::now();
         let (group_id, _) = self.cache_gate(domain, client_ip)?;
 
-        let resolution = self.resolver.try_cache_str(domain, record_type)?;
-        let wire = resolution.upstream_wire_data.as_deref()?;
-        // The logged time is the cache probe's, read before `respond` allocates.
-        let elapsed_us = self
-            .log_queries
-            .then(|| tsc_timer::elapsed_us_since(tsc_start));
-        let reply = respond(wire)?;
-
-        if let Some(elapsed_us) = elapsed_us {
-            self.log(&Self::cache_hit_log(
+        let DnsResolution {
+            upstream_wire_data,
+            min_ttl,
+            dnssec_status,
+            ..
+        } = self.resolver.try_cache_str(domain, record_type)?;
+        let wire = upstream_wire_data.as_deref()?;
+        // The cache reports what every entry has left; the reply's TTLs need it.
+        let remaining = min_ttl?;
+        // Built before `respond`, which rarely declines, and logged only once
+        // it answers: the slow path logs a declined hit. The logged time is
+        // the cache probe's.
+        let log = self.log_queries.then(|| {
+            Self::cache_hit_log(
                 domain,
                 record_type,
                 client_ip,
                 protocol,
                 group_id,
-                elapsed_us,
-                resolution.dnssec_status,
-            ));
+                tsc_timer::elapsed_us_since(tsc_start),
+                dnssec_status,
+            )
+        });
+        let reply = respond(wire, remaining)?;
+        if let Some(log) = &log {
+            self.log(log);
         }
 
         Some(reply)
@@ -519,25 +528,30 @@ impl HandleDnsQueryUseCase {
         if !explicitly_allowed && self.is_suspicious_cached_answer(domain, &resolution) {
             return None;
         }
-        let elapsed_us = self
-            .log_queries
-            .then(|| tsc_timer::elapsed_us_since(tsc_start));
-        let reply = respond(&resolution.addresses, resolution.min_ttl.unwrap_or(60))?;
-
-        if let Some(elapsed_us) = elapsed_us {
-            self.log(&QueryLog {
-                dns64_synthesized: self.is_dns64_synthesized(record_type, &resolution.addresses),
-                answers: Some(Arc::clone(&resolution.addresses)),
-                ..Self::cache_hit_log(
-                    domain,
-                    record_type,
-                    client_ip,
-                    protocol,
-                    group_id,
-                    elapsed_us,
-                    resolution.dnssec_status,
-                )
-            });
+        let DnsResolution {
+            addresses,
+            min_ttl,
+            dnssec_status,
+            ..
+        } = resolution;
+        // Built before `respond`, which rarely declines, and logged only once
+        // it answers: the slow path logs a declined hit.
+        let log = self.log_queries.then(|| QueryLog {
+            dns64_synthesized: self.is_dns64_synthesized(record_type, &addresses),
+            answers: Some(Arc::clone(&addresses)),
+            ..Self::cache_hit_log(
+                domain,
+                record_type,
+                client_ip,
+                protocol,
+                group_id,
+                tsc_timer::elapsed_us_since(tsc_start),
+                dnssec_status,
+            )
+        });
+        let reply = respond(&addresses, min_ttl.unwrap_or(60))?;
+        if let Some(log) = &log {
+            self.log(log);
         }
 
         Some(reply)

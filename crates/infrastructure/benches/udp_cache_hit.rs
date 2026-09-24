@@ -2,8 +2,9 @@
 //! query, admit it through the use case (block filter, rate limiter, cache
 //! probe, query-log entry) and encode the reply. Run with and without an OPT
 //! record, for an address answer and for a cached upstream wire answer, plus
-//! the wire answer to a client sending a DNS Cookie and a signed wire answer
-//! (fetched with DO=1) to clients that did not set DO.
+//! the wire answer to a client sending a DNS Cookie, a signed wire answer
+//! (fetched with DO=1) to clients that did not set DO, and an eight-record
+//! wire answer, whose every TTL a hit counts down.
 
 #[path = "../tests/support/ports.rs"]
 mod ports;
@@ -41,6 +42,7 @@ const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
 const A_NAME: &str = "www.example.com";
 const MX_NAME: &str = "mail.example.com";
 const SIGNED_NAME: &str = "signed.example.com";
+const MANY_NAME: &str = "many.example.com";
 
 /// Every probe is served from the cache; an upstream call means a broken setup.
 struct NoUpstream;
@@ -70,9 +72,10 @@ fn cache() -> Arc<DnsCache> {
     }))
 }
 
-/// A cached upstream MX answer, OPT last as upstreams send it.
-fn upstream_mx() -> Bytes {
-    let name = Name::from_ascii("mail.example.com.").unwrap();
+/// A cached upstream MX answer holding `exchanges` records, OPT last as
+/// upstreams send it.
+fn upstream_mx(owner: &str, exchanges: u16) -> Bytes {
+    let name = Name::from_ascii(owner).unwrap();
     let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
     msg.metadata.recursion_desired = true;
     msg.metadata.recursion_available = true;
@@ -80,11 +83,14 @@ fn upstream_mx() -> Bytes {
         name.clone(),
         hickory_proto::rr::RecordType::MX,
     ));
-    msg.add_answer(Record::from_rdata(
-        name,
-        3600,
-        RData::MX(MX::new(10, Name::from_ascii("mx1.example.com.").unwrap())),
-    ));
+    for i in 1..=exchanges {
+        let exchange = Name::from_ascii(format!("mx{i}.example.com.")).unwrap();
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::MX(MX::new(10 * i, exchange)),
+        ));
+    }
     let mut opt = Edns::new();
     opt.set_max_payload(1232);
     msg.set_edns(opt);
@@ -179,7 +185,14 @@ fn handler(
     cache.insert(
         MX_NAME,
         RecordType::MX,
-        CachedData::WireData(upstream_mx()),
+        CachedData::WireData(upstream_mx("mail.example.com.", 1)),
+        3600,
+        None,
+    );
+    cache.insert(
+        MANY_NAME,
+        RecordType::MX,
+        CachedData::WireData(upstream_mx("many.example.com.", 8)),
         3600,
         None,
     );
@@ -256,6 +269,7 @@ fn udp_cache_hit(c: &mut Criterion) {
         ),
         ("mx_edns_signed", query(SIGNED_NAME, 15, true)),
         ("mx_plain_signed", query(SIGNED_NAME, 15, false)),
+        ("mx8_edns", query(MANY_NAME, 15, true)),
     ] {
         assert_ne!(serve(&handler, &raw, &mut out), 0, "{label} must hit");
         group.bench_function(label, |b| {

@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver, PtrRecordRegistry};
 use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::{LocalPtrResolver, PtrMap, PtrRegistry};
+use hickory_proto::op::{Message, Query};
+use hickory_proto::rr::Name;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +59,29 @@ async fn test_ptr_query_for_local_record_returns_wire_data() {
     );
     assert!(resolution.local_dns);
     assert_eq!(resolution.min_ttl, Some(300));
+}
+
+/// RFC 1035 §4.1.2: the answer carries the question it answers, which the
+/// relay hands to the client as is. Stubs drop answers without one.
+#[tokio::test]
+async fn synthesized_ptr_answers_echo_the_question() {
+    let records = vec![make_record("server", "local", "10.0.10.1", "A")];
+    let resolver = resolver_with(&records, Arc::new(MockInner));
+
+    let resolution = resolver
+        .resolve(&ptr_query("1.10.0.10.in-addr.arpa"))
+        .await
+        .unwrap();
+    let msg = Message::from_vec(&resolution.upstream_wire_data.unwrap()).unwrap();
+
+    assert_eq!(
+        msg.queries,
+        [Query::query(
+            Name::from_ascii("1.10.0.10.in-addr.arpa.").unwrap(),
+            hickory_proto::rr::RecordType::PTR,
+        )]
+    );
+    assert_eq!(msg.answers.len(), 1);
 }
 
 #[tokio::test]

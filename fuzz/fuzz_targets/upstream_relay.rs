@@ -22,6 +22,8 @@ use hickory_proto::rr::{Record, RecordType};
 use libfuzzer_sys::fuzz_target;
 
 const ID: u16 = 0xABCD;
+/// The TTL the cache gives a record past its own (RFC 8767 §4).
+const STALE_SERVE_TTL: u32 = 2;
 
 /// The records a client with DO as given gets from `records`, answering a
 /// `qtype` query (RFC 4035 §3.2.1, RFC 3225 §3).
@@ -88,13 +90,25 @@ fuzz_target!(|upstream: &[u8]| {
         edns.map(|e| e.dnssec_ok)
     );
 
-    // The fast path serves clients without DO, from the cache form.
+    // The fast path serves clients without DO, from the cache form. An entry
+    // as long-lived as a TTL can be, served before any time passed, keeps each
+    // TTL but those below the stale TTL (RFC 8767 §4), which rise to it.
     if dnssec_ok || ad {
         return;
     }
-    let cached = wire_response::cache_form(upstream).expect("relayed but not cacheable");
-    let served = wire_response::relay_cached(&cached, ID, rd, edns)
+    let cached =
+        wire_response::cache_form(upstream, u32::MAX, 0..=u32::MAX).expect("relayed but not cacheable");
+    let served = wire_response::relay_cached(&cached, ID, rd, edns, u32::MAX)
         .expect("relayed but not served from the cache");
     let served = Message::from_vec(&served).expect("the cache form served an invalid message");
-    assert_eq!(served, got, "the cache form serves another message");
+    let mut expected = got;
+    for record in expected
+        .answers
+        .iter_mut()
+        .chain(&mut expected.authorities)
+        .chain(&mut expected.additionals)
+    {
+        record.ttl = record.ttl.max(STALE_SERVE_TTL);
+    }
+    assert_eq!(served, expected, "the cache form serves another message");
 });
