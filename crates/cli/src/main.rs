@@ -30,12 +30,13 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let cli = args::Cli::parse();
+    let log_level = bootstrap::init_logging();
 
     let config_path = bootstrap::resolve_config_path(cli.config.as_deref());
     let overrides = bootstrap::config_overrides(&cli);
     let config = bootstrap::load_config(config_path.as_deref(), &overrides)?;
 
-    bootstrap::init_logging(&config);
+    bootstrap::apply_log_level(&log_level, &config);
 
     info!("Starting Ferrous DNS Server v{}", env!("CARGO_PKG_VERSION"));
 

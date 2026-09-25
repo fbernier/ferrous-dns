@@ -269,6 +269,7 @@ fn ignore_unused_bind_hosts(doc: &mut Table) {
                 key,
                 |host| parse_bind_host(host).is_ok(),
                 None,
+                Logged::Value,
                 "ignoring it because its listener is disabled",
             );
         }
@@ -285,6 +286,7 @@ fn ignore_unused_cookie_secret(doc: &mut Table) {
             "dns.dns_cookies.server_secret",
             |secret| parse_server_secret(secret).is_ok(),
             None,
+            Logged::Redacted,
             "ignoring it because DNS cookies are disabled",
         );
     }
@@ -298,6 +300,7 @@ fn default_unknown_eviction_strategy(doc: &mut Table) {
         "dns.cache_eviction_strategy",
         |name| CacheEvictionStrategy::from_str(name).is_ok(),
         Some(Value::String(hit_rate.to_string())),
+        Logged::Value,
         "using hit_rate, the strategy older releases ran for it",
     );
 }
@@ -309,8 +312,16 @@ fn disable_unparseable_local_dns_server(doc: &mut Table) {
         "dns.local_dns_server",
         |server| DnsConfig::parse_local_dns_server(server).is_ok(),
         None,
+        Logged::Value,
         "disabling local forwarding; set the router's IP address or IP:port to enable it",
     );
+}
+
+/// Whether a rewritten value may appear in the warning.
+#[derive(Clone, Copy)]
+enum Logged {
+    Value,
+    Redacted,
 }
 
 /// Replaces the string at dotted `key` when `is_valid` refuses it: with
@@ -320,6 +331,7 @@ fn replace_invalid(
     key: &str,
     is_valid: impl Fn(&str) -> bool,
     replacement: Option<Value>,
+    logged: Logged,
     instead: &str,
 ) {
     let Some((section, leaf)) = parent_mut(doc, key) else {
@@ -331,7 +343,10 @@ fn replace_invalid(
     if is_valid(value) {
         return;
     }
-    warn!(key, value, "Invalid config value: {instead}");
+    match logged {
+        Logged::Value => warn!(key, value, "Invalid config value: {instead}"),
+        Logged::Redacted => warn!(key, "Invalid config value: {instead}"),
+    }
     match replacement {
         Some(replacement) => section.insert(leaf.to_string(), replacement),
         None => section.remove(leaf),
