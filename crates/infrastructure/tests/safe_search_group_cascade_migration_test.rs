@@ -148,3 +148,25 @@ async fn on_a_fresh_database_deleting_a_group_deletes_its_safe_search_configs() 
 
     assert_eq!(config_groups(&pool).await, vec![3]);
 }
+
+#[tokio::test]
+async fn upgrade_drops_configs_of_a_deleted_group_instead_of_failing() {
+    let pool = pool().await;
+    migrate_up_to(&pool, CASCADE_VERSION).await;
+    // Foreign keys off so the seed can name a missing group.
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO groups (id, name) VALUES (2, 'Kids');
+         INSERT INTO safe_search_configs (id, group_id, engine, created_at, updated_at)
+         VALUES (1, 2, 'google', 't', 't'),
+                (2, 99, 'google', 't', 't');
+         PRAGMA foreign_keys = ON;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrate_all(&pool).await;
+
+    assert_eq!(config_groups(&pool).await, vec![2]);
+}

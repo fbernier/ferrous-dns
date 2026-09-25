@@ -5,7 +5,8 @@
 -- every column, the action CHECK, the UNIQUE name key, both indexes and the
 -- AUTOINCREMENT high-water mark (so deleted ids are never handed out again);
 -- regex_filters has no triggers, and nothing references it, so the drop
--- cascades nowhere.
+-- cascades nowhere. Filters whose group no longer exists are dropped, as
+-- group_id is NOT NULL.
 CREATE TABLE regex_filters_new (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT    NOT NULL UNIQUE,
@@ -21,7 +22,8 @@ CREATE TABLE regex_filters_new (
 INSERT INTO regex_filters_new
     (id, name, pattern, action, group_id, comment, enabled, created_at, updated_at)
 SELECT id, name, pattern, action, group_id, comment, enabled, created_at, updated_at
-FROM regex_filters;
+FROM regex_filters
+WHERE group_id IN (SELECT id FROM groups);
 
 DELETE FROM sqlite_sequence WHERE name = 'regex_filters_new';
 INSERT INTO sqlite_sequence (name, seq)

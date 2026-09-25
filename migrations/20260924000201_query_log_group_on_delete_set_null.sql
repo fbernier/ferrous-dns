@@ -1,7 +1,10 @@
 -- Deleting a group keeps its logged queries and drops their attribution;
 -- before, any group that had ever logged a query could not be deleted.
--- SQLite cannot alter a foreign key in place, so the table is rebuilt; nothing
--- references query_log, so the drop cascades nowhere.
+-- SQLite cannot alter a foreign key in place, so the table is rebuilt with the
+-- AUTOINCREMENT high-water mark (so deleted ids are never handed out again);
+-- nothing references query_log, so the drop cascades nowhere. Queries whose
+-- group no longer exists keep their row and lose the attribution, as a later
+-- group delete does.
 CREATE TABLE query_log_new (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     domain            TEXT    NOT NULL,
@@ -29,9 +32,14 @@ INSERT INTO query_log_new
      cache_refresh, dnssec_status, upstream_server, response_status, query_source, group_id,
      block_source, upstream_pool, dns64_synthesized, answers, protocol)
 SELECT id, domain, record_type, client_ip, blocked, response_time_ms, cache_hit, created_at,
-       cache_refresh, dnssec_status, upstream_server, response_status, query_source, group_id,
+       cache_refresh, dnssec_status, upstream_server, response_status, query_source,
+       CASE WHEN group_id IN (SELECT id FROM groups) THEN group_id END,
        block_source, upstream_pool, dns64_synthesized, answers, protocol
 FROM query_log;
+
+DELETE FROM sqlite_sequence WHERE name = 'query_log_new';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'query_log_new', seq FROM sqlite_sequence WHERE name = 'query_log';
 
 DROP TABLE query_log;
 

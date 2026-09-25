@@ -710,6 +710,8 @@ POST /api/client-subnets
 
 The subnet is stored in canonical form: host bits are cleared and IPv6 is lowercased and compressed, so `192.168.1.5/24` is stored as `192.168.1.0/24` and conflicts with an existing `192.168.1.0/24` (`409`).
 
+Subnets stored before canonicalisation are rewritten the same way at startup. If two stored rows name the same network, the older row is kept and the other is deleted, with a `WARN` naming both rows' ids and groups; clients in that subnet then belong to the kept row's group.
+
 ### Delete Subnet
 
 ```http

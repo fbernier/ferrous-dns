@@ -5,7 +5,8 @@
 -- every column, the UNIQUE (name, group_id) key, the three indexes and the
 -- AUTOINCREMENT high-water mark (so deleted ids are never handed out again);
 -- managed_domains has no triggers, and nothing references it, so the drop
--- cascades nowhere.
+-- cascades nowhere. Rules whose group no longer exists are dropped, as
+-- group_id is NOT NULL.
 CREATE TABLE managed_domains_new (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT    NOT NULL,
@@ -23,7 +24,8 @@ CREATE TABLE managed_domains_new (
 INSERT INTO managed_domains_new
     (id, name, domain, action, group_id, comment, enabled, created_at, updated_at, service_id)
 SELECT id, name, domain, action, group_id, comment, enabled, created_at, updated_at, service_id
-FROM managed_domains;
+FROM managed_domains
+WHERE group_id IN (SELECT id FROM groups);
 
 DELETE FROM sqlite_sequence WHERE name = 'managed_domains_new';
 INSERT INTO sqlite_sequence (name, seq)

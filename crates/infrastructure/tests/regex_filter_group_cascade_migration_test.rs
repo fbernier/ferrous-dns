@@ -168,3 +168,25 @@ async fn on_a_fresh_database_deleting_a_group_deletes_its_regex_filters() {
     assert!(!group_exists(&pool, 2).await);
     assert_eq!(filter_groups(&pool).await, vec![3]);
 }
+
+#[tokio::test]
+async fn upgrade_drops_filters_of_a_deleted_group_instead_of_failing() {
+    let pool = pool().await;
+    migrate_up_to(&pool, CASCADE_VERSION).await;
+    // Foreign keys off so the seed can name a missing group.
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO groups (id, name) VALUES (2, 'Kids');
+         INSERT INTO regex_filters (id, name, pattern, action, group_id, created_at, updated_at)
+         VALUES (1, 'kept', 'kept', 'deny', 2, 't', 't'),
+                (2, 'orphan', 'orphan', 'deny', 99, 't', 't');
+         PRAGMA foreign_keys = ON;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrate_all(&pool).await;
+
+    assert_eq!(filter_groups(&pool).await, vec![2]);
+}

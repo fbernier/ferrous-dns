@@ -2,9 +2,19 @@
 -- which cascade when a group is deleted. The pre-pivot `group_id` column was
 -- write-only yet still carried a foreign key (RESTRICT for blocklists), so a
 -- group that happened to be a source's first group could not be deleted.
--- The column is dropped by rebuilding each table. Migrations run inside a
--- transaction with foreign keys on, where dropping a parent table cascades
--- into its pivot, so the pivot rows are saved first and restored after.
+-- The column is dropped by rebuilding each table with its AUTOINCREMENT
+-- high-water mark (so deleted ids are never handed out again). Migrations run
+-- inside a transaction with foreign keys on, where dropping a parent table
+-- cascades into its pivot, so the pivot rows are saved first and restored
+-- after. Pivot rows naming a missing source or group are deleted instead, as
+-- both columns are NOT NULL and the restore would fail on them.
+
+DELETE FROM blocklist_source_groups
+WHERE source_id NOT IN (SELECT id FROM blocklist_sources)
+   OR group_id NOT IN (SELECT id FROM groups);
+DELETE FROM whitelist_source_groups
+WHERE source_id NOT IN (SELECT id FROM whitelist_sources)
+   OR group_id NOT IN (SELECT id FROM groups);
 
 CREATE TEMP TABLE saved_blocklist_source_groups AS
     SELECT source_id, group_id FROM blocklist_source_groups;
@@ -25,6 +35,9 @@ INSERT INTO blocklist_sources_new
     (id, name, url, comment, enabled, created_at, updated_at, last_synced_at)
 SELECT id, name, url, comment, enabled, created_at, updated_at, last_synced_at
 FROM blocklist_sources;
+DELETE FROM sqlite_sequence WHERE name = 'blocklist_sources_new';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'blocklist_sources_new', seq FROM sqlite_sequence WHERE name = 'blocklist_sources';
 DROP TABLE blocklist_sources;
 ALTER TABLE blocklist_sources_new RENAME TO blocklist_sources;
 
@@ -42,6 +55,9 @@ INSERT INTO whitelist_sources_new
     (id, name, url, comment, enabled, created_at, updated_at, last_synced_at)
 SELECT id, name, url, comment, enabled, created_at, updated_at, last_synced_at
 FROM whitelist_sources;
+DELETE FROM sqlite_sequence WHERE name = 'whitelist_sources_new';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'whitelist_sources_new', seq FROM sqlite_sequence WHERE name = 'whitelist_sources';
 DROP TABLE whitelist_sources;
 ALTER TABLE whitelist_sources_new RENAME TO whitelist_sources;
 

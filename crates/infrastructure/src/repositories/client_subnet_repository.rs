@@ -4,7 +4,7 @@ use ferrous_dns_application::ports::ClientSubnetRepository;
 use ferrous_dns_domain::{ClientSubnet, DomainError};
 use ipnetwork::IpNetwork;
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{instrument, warn};
 
@@ -134,28 +134,44 @@ impl ClientSubnetRepository for SqliteClientSubnetRepository {
 /// survives. SQL alone can't canonicalise IPv6 text (RFC 5952), hence Rust.
 pub async fn canonicalize_stored_subnets(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let rows: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, subnet_cidr FROM client_subnets ORDER BY id")
+    let rows: Vec<(i64, String, i64)> =
+        sqlx::query_as("SELECT id, subnet_cidr, group_id FROM client_subnets ORDER BY id")
             .fetch_all(&mut *tx)
             .await?;
 
-    let mut seen: HashSet<String> = HashSet::with_capacity(rows.len());
+    // Canonical text -> (id, group_id) of the row that keeps it.
+    let mut kept: HashMap<String, (i64, i64)> = HashMap::with_capacity(rows.len());
     let mut duplicates = Vec::new();
     let mut rewrites = Vec::new();
-    for (id, stored) in rows {
+    for (id, stored, group_id) in rows {
         let canonical = match ClientSubnet::parse_cidr(&stored) {
             Ok(network) => network.to_string(),
             Err(e) => {
                 warn!(id, subnet = %stored, error = %e, "Leaving unparseable client subnet as stored");
-                seen.insert(stored);
+                kept.entry(stored).or_insert((id, group_id));
                 continue;
             }
         };
-        if !seen.insert(canonical.clone()) {
-            warn!(id, subnet = %stored, canonical = %canonical, "Dropping duplicate client subnet");
+        if let Some(&(kept_id, kept_group_id)) = kept.get(&canonical) {
+            if kept_group_id == group_id {
+                warn!(
+                    dropped_id = id, dropped_subnet = %stored, dropped_group_id = group_id,
+                    kept_id, kept_group_id, canonical = %canonical,
+                    "Dropping duplicate client subnet"
+                );
+            } else {
+                warn!(
+                    dropped_id = id, dropped_subnet = %stored, dropped_group_id = group_id,
+                    kept_id, kept_group_id, canonical = %canonical,
+                    "Dropping duplicate client subnet from another group; clients in {canonical} now belong to group {kept_group_id}"
+                );
+            }
             duplicates.push(id);
-        } else if canonical != stored {
-            rewrites.push((id, canonical));
+        } else {
+            if canonical != stored {
+                rewrites.push((id, canonical.clone()));
+            }
+            kept.insert(canonical, (id, group_id));
         }
     }
 

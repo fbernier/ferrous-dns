@@ -25,16 +25,20 @@ async fn pool() -> SqlitePool {
         .unwrap()
 }
 
-async fn migrate_before_new(pool: &SqlitePool) {
+async fn migrate_below(pool: &SqlitePool, below: i64) {
     let mut old: Migrator = sqlx::migrate!("../../migrations");
     old.migrations = Cow::Owned(
         old.migrations
             .iter()
-            .filter(|m| m.version < FIRST_NEW_VERSION)
+            .filter(|m| m.version < below)
             .cloned()
             .collect(),
     );
     old.run(pool).await.unwrap();
+}
+
+async fn migrate_before_new(pool: &SqlitePool) {
+    migrate_below(pool, FIRST_NEW_VERSION).await;
 }
 
 async fn migrate_all(pool: &SqlitePool) {
@@ -195,7 +199,20 @@ async fn stored_subnets_are_canonicalised_and_duplicates_keep_the_oldest_row() {
     .await
     .unwrap();
 
-    canonicalize_stored_subnets(&pool).await.unwrap();
+    // Rows 1 and 2 are both 192.168.1.0/24 in different groups: 2 is dropped, 1 rewritten.
+    assert_eq!(canonicalize_stored_subnets(&pool).await.unwrap(), 3);
+    let kept: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT id, group_id FROM client_subnets WHERE subnet_cidr = '192.168.1.0/24'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept,
+        vec![(1, 2)],
+        "the oldest row and its group keep the network"
+    );
+
     let rows: Vec<(i64, String, i64)> =
         sqlx::query_as("SELECT id, subnet_cidr, group_id FROM client_subnets ORDER BY id")
             .fetch_all(&pool)
@@ -211,4 +228,139 @@ async fn stored_subnets_are_canonicalised_and_duplicates_keep_the_oldest_row() {
         ]
     );
     assert_eq!(canonicalize_stored_subnets(&pool).await.unwrap(), 0);
+}
+
+/// Each 0200..0202 rebuild, the AUTOINCREMENT table it rebuilds, and an insert
+/// valid on that table both before and after the rebuild.
+const REBUILDS: [(i64, &str, &str); 4] = [
+    (
+        20260924000200,
+        "managed_domains",
+        "INSERT INTO managed_domains (name, domain, action, group_id, created_at, updated_at)
+         VALUES (?, 'x.example', 'deny', 1, 't', 't') RETURNING id",
+    ),
+    (
+        20260924000201,
+        "query_log",
+        "INSERT INTO query_log (domain, record_type, client_ip) VALUES (?, 'A', '10.0.0.1')
+         RETURNING id",
+    ),
+    (
+        20260924000202,
+        "blocklist_sources",
+        "INSERT INTO blocklist_sources (name) VALUES (?) RETURNING id",
+    ),
+    (
+        20260924000202,
+        "whitelist_sources",
+        "INSERT INTO whitelist_sources (name) VALUES (?) RETURNING id",
+    ),
+];
+
+#[tokio::test]
+async fn rebuilds_never_hand_out_the_id_of_a_deleted_newest_row() {
+    for (version, table, insert) in REBUILDS {
+        let pool = pool().await;
+        migrate_below(&pool, version).await;
+        let mut newest = 0;
+        for name in ["a", "b", "c"] {
+            newest = sqlx::query_scalar(insert)
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(&format!("DELETE FROM {table} WHERE id = ?"))
+            .bind(newest)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        migrate_below(&pool, version + 1).await;
+
+        let next: i64 = sqlx::query_scalar(insert)
+            .bind("d")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            next > newest,
+            "{version} made {table} hand out id {next} again; its deleted newest row was {newest}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rows_naming_a_deleted_group_or_source_do_not_stop_the_upgrade() {
+    let pool = pool().await;
+    migrate_before_new(&pool).await;
+    // Foreign keys off so the seed can name a missing group or source.
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO groups (id, name) VALUES (2, 'Kids');
+         INSERT INTO managed_domains (id, name, domain, action, group_id, created_at, updated_at)
+             VALUES (1, 'kept', 'kept.example', 'deny', 2, 't', 't'),
+                    (2, 'orphan', 'orphan.example', 'deny', 99, 't', 't');
+         INSERT INTO query_log (domain, record_type, client_ip, group_id)
+             VALUES ('kept.example', 'A', '10.0.0.1', 2),
+                    ('orphan.example', 'A', '10.0.0.2', 99);
+         INSERT INTO blocklist_sources (id, name, group_id) VALUES (1, 'list', 2), (2, 'stale', 99);
+         INSERT INTO blocklist_source_groups (source_id, group_id) VALUES (1, 2), (1, 99), (7, 2);
+         INSERT INTO whitelist_sources (id, name, group_id) VALUES (1, 'allow', 2), (2, 'stale', 99);
+         INSERT INTO whitelist_source_groups (source_id, group_id) VALUES (1, 2), (1, 99), (7, 2);
+         PRAGMA foreign_keys = ON;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrate_all(&pool).await;
+
+    let rules: Vec<String> = sqlx::query_scalar("SELECT name FROM managed_domains ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rules, vec!["kept"], "a rule of a deleted group is dropped");
+
+    let logged: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT domain, group_id FROM query_log ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        logged,
+        vec![
+            ("kept.example".into(), Some(2)),
+            ("orphan.example".into(), None)
+        ],
+        "a query of a deleted group is kept without attribution"
+    );
+
+    for (sources, pivot) in [
+        ("blocklist_sources", "blocklist_source_groups"),
+        ("whitelist_sources", "whitelist_source_groups"),
+    ] {
+        let ids: Vec<i64> = sqlx::query_scalar(&format!("SELECT id FROM {sources} ORDER BY id"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![1, 2], "{sources} keeps every source");
+        let memberships: Vec<(i64, i64)> = sqlx::query_as(&format!(
+            "SELECT source_id, group_id FROM {pivot} ORDER BY source_id, group_id"
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            memberships,
+            vec![(1, 2)],
+            "{pivot} drops memberships naming a deleted group or source"
+        );
+    }
+
+    let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(violations.is_empty(), "{violations:?}");
 }
