@@ -94,7 +94,7 @@ sudo ufw allow 5353/udp
 
 ### Check 3: Are upstream servers reachable?
 
-Check the dashboard at **Settings > System Status > Upstream Health**. If all upstreams show "Unhealthy":
+Check the dashboard at **Settings > System Status > Upstream Health**. If all upstreams show "Unhealthy" (queries are still sent to them — the resolver fails open — but each may wait out the full timeout):
 
 - Verify your upstream URLs are correct in `ferrous-dns.toml`
 - Check network connectivity from the server: `dig @8.8.8.8 example.com`

@@ -14,7 +14,7 @@ use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::{
     CachedAddresses, CachedData, CachedDnssecStatus, DnsCache, DnsCacheAccess, DnsCacheConfig,
-    EvictionStrategy, LocalRecordStatus, NegativeQueryTracker,
+    EvictionStrategy, LocalRecordStatus,
 };
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,10 +57,8 @@ fn make_inner_cache() -> Arc<dyn DnsCacheAccess> {
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries: 1000,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 2.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -90,6 +88,7 @@ fn preload(cache: &dyn DnsCacheAccess, domain: &str, record_type: RecordType, ad
         }),
         300,
         Some(CachedDnssecStatus::Insecure),
+        false,
     );
 }
 
@@ -105,7 +104,6 @@ async fn leader_answers_from_a_cache_filled_after_the_callers_probe() {
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
         cache,
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 
@@ -167,7 +165,7 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
             &self,
             domain: &str,
             record_type: &RecordType,
-        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
+        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>, bool)> {
             let is_target = domain == self.target_domain && *record_type == self.target_type;
             if !is_target {
                 return self.inner.get(domain, record_type);
@@ -207,9 +205,10 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
             data: CachedData,
             ttl: u32,
             dnssec_status: Option<CachedDnssecStatus>,
+            local_dns: bool,
         ) {
             self.inner
-                .insert(domain, record_type, data, ttl, dnssec_status);
+                .insert(domain, record_type, data, ttl, dnssec_status, local_dns);
         }
     }
 
@@ -238,7 +237,6 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
         Arc::clone(&deferred) as Arc<dyn DnsCacheAccess>,
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
 

@@ -1,4 +1,5 @@
 use super::types::{DnskeyRecord, DsRecord, RrsigRecord};
+use super::validation::authority::to_fqdn;
 use crate::dns::forwarding::record_type_map::RecordTypeMapper;
 use ferrous_dns_domain::DomainError;
 use hickory_proto::dnssec::rdata::sig::SigInput;
@@ -6,394 +7,268 @@ use hickory_proto::dnssec::Algorithm;
 use hickory_proto::dnssec::TBS;
 use hickory_proto::rr::{DNSClass, Name, Record, SerialNumber};
 use ring::signature;
-use sha1::Digest as Sha1Digest;
+use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha384};
 use std::str::FromStr;
 
-pub struct SignatureVerifier;
+pub fn verify_rrsig(
+    rrsig: &RrsigRecord,
+    dnskey: &DnskeyRecord,
+    domain: &str,
+    records: &[Record],
+    now_secs: u32,
+) -> Result<bool, DomainError> {
+    let name = to_fqdn(domain).ok_or_else(|| {
+        DomainError::InvalidDnsResponse(format!("invalid RRset owner name: {domain}"))
+    })?;
+    verify_rrsig_with_name(rrsig, dnskey, &name, records, now_secs)
+}
 
-impl SignatureVerifier {
-    pub fn verify_rrsig(
-        &self,
-        rrsig: &RrsigRecord,
-        dnskey: &DnskeyRecord,
-        domain: &str,
-        records: &[Record],
-        now_secs: u32,
-    ) -> Result<bool, DomainError> {
-        let fqdn = if domain.ends_with('.') {
-            domain.to_owned()
-        } else {
-            format!("{}.", domain)
-        };
-        let name =
-            Name::from_str(&fqdn).map_err(|e| DomainError::InvalidDnsResponse(e.to_string()))?;
-        self.verify_rrsig_with_name(rrsig, dnskey, &name, records, now_secs)
+/// Like [`verify_rrsig`], but takes the RRset owner as a parsed [`Name`].
+///
+/// Preferred when the owner is already available as a `Name`: it avoids a
+/// presentation-format round-trip that mangles labels with characters the
+/// display form escapes (e.g. `!`), which would otherwise fail to re-parse.
+pub fn verify_rrsig_with_name(
+    rrsig: &RrsigRecord,
+    dnskey: &DnskeyRecord,
+    name: &Name,
+    records: &[Record],
+    now_secs: u32,
+) -> Result<bool, DomainError> {
+    if !rrsig.is_valid_at(now_secs) {
+        return Ok(false);
     }
 
-    /// Like [`verify_rrsig`], but takes the RRset owner as a parsed [`Name`].
-    ///
-    /// Preferred when the owner is already available as a `Name`: it avoids a
-    /// presentation-format round-trip that mangles labels with characters the
-    /// display form escapes (e.g. `!`), which would otherwise fail to re-parse.
-    pub fn verify_rrsig_with_name(
-        &self,
-        rrsig: &RrsigRecord,
-        dnskey: &DnskeyRecord,
-        name: &Name,
-        records: &[Record],
-        now_secs: u32,
-    ) -> Result<bool, DomainError> {
-        if !rrsig.is_valid_at(now_secs) {
-            return Ok(false);
-        }
-
-        let key_tag = dnskey.calculate_key_tag();
-        if key_tag != rrsig.key_tag {
-            return Ok(false);
-        }
-
-        if dnskey.algorithm != rrsig.algorithm {
-            return Ok(false);
-        }
-
-        let signer_name = Name::from_str(&rrsig.signer_name)
-            .map_err(|e| DomainError::InvalidDnsResponse(e.to_string()))?;
-        let hickory_type = RecordTypeMapper::to_hickory(&rrsig.type_covered);
-
-        let sig_input = SigInput {
-            type_covered: hickory_type,
-            algorithm: Algorithm::from_u8(rrsig.algorithm),
-            num_labels: rrsig.labels,
-            original_ttl: rrsig.original_ttl,
-            sig_expiration: SerialNumber::from(rrsig.signature_expiration),
-            sig_inception: SerialNumber::from(rrsig.signature_inception),
-            key_tag: rrsig.key_tag,
-            signer_name,
-        };
-
-        let tbs = TBS::from_input(name, DNSClass::IN, &sig_input, records.iter())
-            .map_err(|e| DomainError::InvalidDnsResponse(e.to_string()))?;
-        let data_to_verify = tbs.as_ref();
-
-        match rrsig.algorithm {
-            5 | 7 => self.verify_rsa_sha1(data_to_verify, &rrsig.signature, dnskey),
-            8 => self.verify_rsa_sha256(data_to_verify, &rrsig.signature, dnskey),
-            10 => self.verify_rsa_sha512(data_to_verify, &rrsig.signature, dnskey),
-            13 => self.verify_ecdsa_p256(data_to_verify, &rrsig.signature, dnskey),
-            14 => self.verify_ecdsa_p384(data_to_verify, &rrsig.signature, dnskey),
-            15 => self.verify_ed25519(data_to_verify, &rrsig.signature, dnskey),
-            16 => Err(DomainError::InvalidDnsResponse(
-                "Ed448 (algorithm 16) is not supported by this build".into(),
-            )),
-            _ => Err(DomainError::InvalidDnsResponse(format!(
-                "Unsupported DNSSEC algorithm: {}",
-                rrsig.algorithm
-            ))),
-        }
+    if dnskey.calculate_key_tag() != rrsig.key_tag || dnskey.algorithm != rrsig.algorithm {
+        return Ok(false);
     }
 
-    /// Whether this build implements the given DNSSEC signature algorithm
-    /// (matches the dispatch arms in [`verify_rrsig_with_name`]). Used to decide,
-    /// per RFC 6840 §5.2, whether a zone whose DS RRset names only algorithms we
-    /// cannot process must be treated as Insecure rather than Bogus.
-    pub fn is_supported_algorithm(algorithm: u8) -> bool {
-        matches!(algorithm, 5 | 7 | 8 | 10 | 13 | 14 | 15)
-    }
+    let signer_name = Name::from_str(&rrsig.signer_name)
+        .map_err(|e| DomainError::InvalidDnsResponse(e.to_string()))?;
 
-    pub fn verify_ds(
-        &self,
-        ds: &DsRecord,
-        dnskey: &DnskeyRecord,
-        owner_name: &str,
-    ) -> Result<bool, DomainError> {
-        let key_tag = dnskey.calculate_key_tag();
-        if key_tag != ds.key_tag {
-            return Ok(false);
-        }
+    let sig_input = SigInput {
+        type_covered: RecordTypeMapper::to_hickory(&rrsig.type_covered),
+        algorithm: Algorithm::from_u8(rrsig.algorithm),
+        num_labels: rrsig.labels,
+        original_ttl: rrsig.original_ttl,
+        sig_expiration: SerialNumber::from(rrsig.signature_expiration),
+        sig_inception: SerialNumber::from(rrsig.signature_inception),
+        key_tag: rrsig.key_tag,
+        signer_name,
+    };
 
-        if dnskey.algorithm != ds.algorithm {
-            return Ok(false);
-        }
+    let tbs = TBS::from_input(name, DNSClass::IN, &sig_input, records.iter())
+        .map_err(|e| DomainError::InvalidDnsResponse(e.to_string()))?;
+    let data = tbs.as_ref();
+    let sig = rrsig.signature.as_slice();
 
-        let dnskey_data = self.build_dnskey_data(dnskey, owner_name)?;
-
-        let computed_digest = match ds.digest_type {
-            1 => {
-                let mut hasher = sha1::Sha1::new();
-                hasher.update(&dnskey_data);
-                hasher.finalize().to_vec()
-            }
-            2 => {
-                let mut hasher = Sha256::new();
-                hasher.update(&dnskey_data);
-                hasher.finalize().to_vec()
-            }
-            4 => {
-                let mut hasher = Sha384::new();
-                hasher.update(&dnskey_data);
-                hasher.finalize().to_vec()
-            }
-            _ => {
-                return Err(DomainError::InvalidDnsResponse(format!(
-                    "Unsupported DS digest type: {}",
-                    ds.digest_type
-                )))
-            }
-        };
-
-        Ok(computed_digest == ds.digest)
-    }
-
-    fn verify_rsa_sha1(
-        &self,
-        data: &[u8],
-        sig: &[u8],
-        dnskey: &DnskeyRecord,
-    ) -> Result<bool, DomainError> {
-        let (exponent, modulus) = self.parse_rsa_key(&dnskey.public_key)?;
-        let public_key = signature::RsaPublicKeyComponents {
-            n: modulus,
-            e: exponent,
-        };
-        match public_key.verify(
+    // 1024-bit RSA ZSKs are still common in deployed DNSSEC zones (RFC 8624
+    // discourages but does not forbid them), so accept the full 1024..=8192
+    // range — the stricter 2048-minimum verifier rejects them and produces
+    // a false Bogus. Matches the behaviour of unbound/bind validators.
+    match rrsig.algorithm {
+        5 | 7 => verify_rsa(
             &signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
             data,
             sig,
-        ) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
-    }
-
-    fn verify_rsa_sha256(
-        &self,
-        data: &[u8],
-        sig: &[u8],
-        dnskey: &DnskeyRecord,
-    ) -> Result<bool, DomainError> {
-        if dnskey.public_key.len() < 3 {
-            return Err(DomainError::InvalidDnsResponse(
-                "RSA public key too short".into(),
-            ));
-        }
-
-        let (exponent, modulus) = self.parse_rsa_key(&dnskey.public_key)?;
-
-        let public_key = signature::RsaPublicKeyComponents {
-            n: modulus,
-            e: exponent,
-        };
-
-        // 1024-bit RSA ZSKs are still common in deployed DNSSEC zones (RFC 8624
-        // discourages but does not forbid them), so accept the full 1024..=8192
-        // range — the stricter 2048-minimum verifier rejects them and produces
-        // a false Bogus. Matches the behaviour of unbound/bind validators.
-        match public_key.verify(
+            dnskey,
+        ),
+        8 => verify_rsa(
             &signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY,
             data,
             sig,
-        ) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
-    }
-
-    fn verify_rsa_sha512(
-        &self,
-        data: &[u8],
-        sig: &[u8],
-        dnskey: &DnskeyRecord,
-    ) -> Result<bool, DomainError> {
-        let (exponent, modulus) = self.parse_rsa_key(&dnskey.public_key)?;
-        let public_key = signature::RsaPublicKeyComponents {
-            n: modulus,
-            e: exponent,
-        };
-        match public_key.verify(
+            dnskey,
+        ),
+        10 => verify_rsa(
             &signature::RSA_PKCS1_1024_8192_SHA512_FOR_LEGACY_USE_ONLY,
             data,
             sig,
-        ) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+            dnskey,
+        ),
+        13 => verify_ecdsa::<64>(
+            &signature::ECDSA_P256_SHA256_FIXED,
+            "ECDSA P-256",
+            data,
+            sig,
+            dnskey,
+        ),
+        14 => verify_ecdsa::<96>(
+            &signature::ECDSA_P384_SHA384_FIXED,
+            "ECDSA P-384",
+            data,
+            sig,
+            dnskey,
+        ),
+        15 => verify_ed25519(data, sig, dnskey),
+        16 => Err(DomainError::InvalidDnsResponse(
+            "Ed448 (algorithm 16) is not supported by this build".into(),
+        )),
+        _ => Err(DomainError::InvalidDnsResponse(format!(
+            "Unsupported DNSSEC algorithm: {}",
+            rrsig.algorithm
+        ))),
+    }
+}
+
+/// Whether this build implements the given DNSSEC signature algorithm
+/// (matches the dispatch arms in [`verify_rrsig_with_name`]). Used to decide,
+/// per RFC 6840 §5.2, whether a zone whose DS RRset names only algorithms we
+/// cannot process must be treated as Insecure rather than Bogus.
+pub fn is_supported_algorithm(algorithm: u8) -> bool {
+    matches!(algorithm, 5 | 7 | 8 | 10 | 13 | 14 | 15)
+}
+
+pub fn verify_ds(
+    ds: &DsRecord,
+    dnskey: &DnskeyRecord,
+    owner_name: &str,
+) -> Result<bool, DomainError> {
+    if dnskey.calculate_key_tag() != ds.key_tag || dnskey.algorithm != ds.algorithm {
+        return Ok(false);
     }
 
-    fn verify_ecdsa_p256(
-        &self,
-        data: &[u8],
-        sig: &[u8],
-        dnskey: &DnskeyRecord,
-    ) -> Result<bool, DomainError> {
-        if dnskey.public_key.len() != 64 {
-            return Err(DomainError::InvalidDnsResponse(
-                "Invalid ECDSA P-256 public key length".into(),
-            ));
+    let dnskey_data = build_dnskey_data(dnskey, owner_name)?;
+
+    let computed_digest = match ds.digest_type {
+        1 => Sha1::digest(&dnskey_data).to_vec(),
+        2 => Sha256::digest(&dnskey_data).to_vec(),
+        4 => Sha384::digest(&dnskey_data).to_vec(),
+        _ => {
+            return Err(DomainError::InvalidDnsResponse(format!(
+                "Unsupported DS digest type: {}",
+                ds.digest_type
+            )))
         }
+    };
 
-        if sig.len() != 64 {
-            return Err(DomainError::InvalidDnsResponse(
-                "Invalid ECDSA P-256 signature length".into(),
-            ));
-        }
+    Ok(computed_digest == ds.digest)
+}
 
-        let mut pk = [0u8; 65];
-        pk[0] = 0x04;
-        pk[1..].copy_from_slice(&dnskey.public_key);
+fn verify_rsa(
+    params: &'static signature::RsaParameters,
+    data: &[u8],
+    sig: &[u8],
+    dnskey: &DnskeyRecord,
+) -> Result<bool, DomainError> {
+    let (exponent, modulus) = parse_rsa_key(&dnskey.public_key)?;
+    let public_key = signature::RsaPublicKeyComponents {
+        n: modulus,
+        e: exponent,
+    };
+    Ok(public_key.verify(params, data, sig).is_ok())
+}
 
-        let public_key =
-            signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, &pk);
-
-        match public_key.verify(data, sig) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+/// `KEY_LEN` is the uncompressed point without its 0x04 prefix (RFC 6605 §4),
+/// which is also the fixed-width `r || s` signature length.
+fn verify_ecdsa<const KEY_LEN: usize>(
+    alg: &'static signature::EcdsaVerificationAlgorithm,
+    name: &str,
+    data: &[u8],
+    sig: &[u8],
+    dnskey: &DnskeyRecord,
+) -> Result<bool, DomainError> {
+    if dnskey.public_key.len() != KEY_LEN {
+        return Err(DomainError::InvalidDnsResponse(format!(
+            "Invalid {name} public key length"
+        )));
+    }
+    if sig.len() != KEY_LEN {
+        return Err(DomainError::InvalidDnsResponse(format!(
+            "Invalid {name} signature length"
+        )));
     }
 
-    fn verify_ecdsa_p384(
-        &self,
-        data: &[u8],
-        sig: &[u8],
-        dnskey: &DnskeyRecord,
-    ) -> Result<bool, DomainError> {
-        if dnskey.public_key.len() != 96 {
-            return Err(DomainError::InvalidDnsResponse(
-                "Invalid ECDSA P-384 public key length".into(),
-            ));
-        }
+    // Sized for the largest supported curve (P-384).
+    let mut point = [0u8; 97];
+    point[0] = 0x04;
+    point[1..=KEY_LEN].copy_from_slice(&dnskey.public_key);
 
-        if sig.len() != 96 {
-            return Err(DomainError::InvalidDnsResponse(
-                "Invalid ECDSA P-384 signature length".into(),
-            ));
-        }
+    Ok(signature::UnparsedPublicKey::new(alg, &point[..=KEY_LEN])
+        .verify(data, sig)
+        .is_ok())
+}
 
-        let mut pk = [0u8; 97];
-        pk[0] = 0x04;
-        pk[1..].copy_from_slice(&dnskey.public_key);
-
-        let public_key =
-            signature::UnparsedPublicKey::new(&signature::ECDSA_P384_SHA384_FIXED, &pk);
-
-        match public_key.verify(data, sig) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+fn verify_ed25519(data: &[u8], sig: &[u8], dnskey: &DnskeyRecord) -> Result<bool, DomainError> {
+    if dnskey.public_key.len() != 32 {
+        return Err(DomainError::InvalidDnsResponse(
+            "Invalid Ed25519 public key length".into(),
+        ));
+    }
+    if sig.len() != 64 {
+        return Err(DomainError::InvalidDnsResponse(
+            "Invalid Ed25519 signature length".into(),
+        ));
     }
 
-    fn verify_ed25519(
-        &self,
-        data: &[u8],
-        sig: &[u8],
-        dnskey: &DnskeyRecord,
-    ) -> Result<bool, DomainError> {
-        if dnskey.public_key.len() != 32 {
-            return Err(DomainError::InvalidDnsResponse(
-                "Invalid Ed25519 public key length".into(),
-            ));
-        }
+    Ok(
+        signature::UnparsedPublicKey::new(&signature::ED25519, &dnskey.public_key)
+            .verify(data, sig)
+            .is_ok(),
+    )
+}
 
-        if sig.len() != 64 {
-            return Err(DomainError::InvalidDnsResponse(
-                "Invalid Ed25519 signature length".into(),
-            ));
-        }
-
-        let public_key = signature::UnparsedPublicKey::new(&signature::ED25519, &dnskey.public_key);
-
-        match public_key.verify(data, sig) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
-    }
-
-    fn parse_rsa_key<'a>(&self, key_data: &'a [u8]) -> Result<(&'a [u8], &'a [u8]), DomainError> {
-        if key_data.is_empty() {
+/// Splits RFC 3110 RSA key material into (exponent, modulus).
+fn parse_rsa_key(key_data: &[u8]) -> Result<(&[u8], &[u8]), DomainError> {
+    let (exp_len, exp_start) = match key_data {
+        [] => {
             return Err(DomainError::InvalidDnsResponse(
                 "Empty RSA public key".into(),
-            ));
+            ))
         }
-
-        let first_byte = key_data[0];
-
-        let (exp_len, exp_start) = if first_byte == 0 {
-            if key_data.len() < 3 {
-                return Err(DomainError::InvalidDnsResponse(
-                    "RSA key too short for long form".into(),
-                ));
-            }
-            let exp_len = u16::from_be_bytes([key_data[1], key_data[2]]) as usize;
-            (exp_len, 3)
-        } else {
-            (first_byte as usize, 1)
-        };
-
-        let exp_end = exp_start + exp_len;
-        if exp_end > key_data.len() {
+        [0, hi, lo, ..] => (usize::from(u16::from_be_bytes([*hi, *lo])), 3),
+        [0, ..] => {
             return Err(DomainError::InvalidDnsResponse(
-                "RSA exponent extends beyond key data".into(),
-            ));
+                "RSA key too short for long form".into(),
+            ))
         }
+        [len, ..] => (usize::from(*len), 1),
+    };
 
-        let exponent = &key_data[exp_start..exp_end];
-        let modulus = &key_data[exp_end..];
-
-        if modulus.is_empty() {
-            return Err(DomainError::InvalidDnsResponse(
-                "RSA modulus is empty".into(),
-            ));
-        }
-
-        Ok((exponent, modulus))
+    let exp_end = exp_start + exp_len;
+    if exp_end > key_data.len() {
+        return Err(DomainError::InvalidDnsResponse(
+            "RSA exponent extends beyond key data".into(),
+        ));
     }
 
-    fn build_dnskey_data(
-        &self,
-        dnskey: &DnskeyRecord,
-        owner_name: &str,
-    ) -> Result<Vec<u8>, DomainError> {
-        let mut data = Vec::new();
-
-        let name_wire = self.name_to_wire(owner_name)?;
-        data.extend_from_slice(&name_wire);
-
-        data.extend_from_slice(&dnskey.flags.to_be_bytes());
-        data.push(dnskey.protocol);
-        data.push(dnskey.algorithm);
-        data.extend_from_slice(&dnskey.public_key);
-
-        Ok(data)
+    let (exponent, modulus) = key_data[exp_start..].split_at(exp_len);
+    if modulus.is_empty() {
+        return Err(DomainError::InvalidDnsResponse(
+            "RSA modulus is empty".into(),
+        ));
     }
 
-    fn name_to_wire(&self, name: &str) -> Result<Vec<u8>, DomainError> {
-        let mut wire = Vec::new();
+    Ok((exponent, modulus))
+}
 
-        let name = name.trim_end_matches('.');
+fn build_dnskey_data(dnskey: &DnskeyRecord, owner_name: &str) -> Result<Vec<u8>, DomainError> {
+    let mut data = name_to_wire(owner_name)?;
+    data.extend_from_slice(&dnskey.flags.to_be_bytes());
+    data.push(dnskey.protocol);
+    data.push(dnskey.algorithm);
+    data.extend_from_slice(&dnskey.public_key);
+    Ok(data)
+}
 
-        if name.is_empty() || name == "." {
-            wire.push(0);
-            return Ok(wire);
-        }
+/// Canonical (lowercased, RFC 4034 §6.2) wire form of a presentation name.
+fn name_to_wire(name: &str) -> Result<Vec<u8>, DomainError> {
+    let name = name.trim_end_matches('.');
+    let mut wire = Vec::with_capacity(name.len() + 2);
 
+    if !name.is_empty() {
         for label in name.split('.') {
             if label.is_empty() {
                 return Err(DomainError::InvalidDnsResponse("Empty DNS label".into()));
             }
-
             if label.len() > 63 {
                 return Err(DomainError::InvalidDnsResponse("DNS label too long".into()));
             }
-
             wire.push(label.len() as u8);
-
-            for &b in label.as_bytes() {
-                wire.push(b.to_ascii_lowercase());
-            }
+            wire.extend(label.bytes().map(|b| b.to_ascii_lowercase()));
         }
-
-        wire.push(0);
-
-        Ok(wire)
     }
+
+    wire.push(0);
+    Ok(wire)
 }

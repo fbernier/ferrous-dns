@@ -1,20 +1,16 @@
-use chrono::{Datelike, Timelike};
-use chrono_tz::Tz;
 use ferrous_dns_application::ports::{ScheduleProfileRepository, ScheduleStatePort};
 use ferrous_dns_domain::{evaluate_slots, GroupOverride, ScheduleAction};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+const INTERVAL_SECS: u64 = 60;
 
 pub struct ScheduleEvaluatorJob {
     repo: Arc<dyn ScheduleProfileRepository>,
     state: Arc<dyn ScheduleStatePort>,
-    interval_secs: u64,
-    shutdown: CancellationToken,
-    active_groups: Mutex<HashSet<i64>>,
+    active_groups: HashSet<i64>,
 }
 
 impl ScheduleEvaluatorJob {
@@ -25,46 +21,30 @@ impl ScheduleEvaluatorJob {
         Self {
             repo,
             state,
-            interval_secs: 60,
-            shutdown: CancellationToken::new(),
-            active_groups: Mutex::new(HashSet::new()),
+            active_groups: HashSet::new(),
         }
     }
 
-    pub fn with_interval(mut self, interval_secs: u64) -> Self {
-        self.interval_secs = interval_secs;
-        self
-    }
-
-    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
-        self.shutdown = token;
-        self
-    }
-
-    pub async fn start(self: Arc<Self>) {
+    pub fn spawn(mut self) {
         info!(
-            interval_secs = self.interval_secs,
+            interval_secs = INTERVAL_SECS,
             "Starting schedule evaluator job"
         );
 
-        let mut interval = tokio::time::interval(Duration::from_secs(self.interval_secs));
-        interval.tick().await;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(INTERVAL_SECS));
 
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => {
-                    info!("ScheduleEvaluatorJob: shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    self.state.sweep_expired();
-                    self.evaluate_all_schedules().await;
-                }
+            loop {
+                // The first tick completes immediately, so schedules are enforced right at startup.
+                interval.tick().await;
+                self.evaluate_once().await;
             }
-        }
+        });
     }
 
-    async fn evaluate_all_schedules(&self) {
+    pub async fn evaluate_once(&mut self) {
+        self.state.sweep_expired();
+
         let assignments = match self.repo.get_all_group_assignments().await {
             Ok(a) => a,
             Err(e) => {
@@ -74,27 +54,22 @@ impl ScheduleEvaluatorJob {
         };
 
         let current_group_ids: HashSet<i64> = assignments.iter().map(|(gid, _)| *gid).collect();
-
-        {
-            let mut prev = self.active_groups.lock().await;
-            for stale_id in prev.difference(&current_group_ids) {
-                self.state.clear(*stale_id);
-            }
-            *prev = current_group_ids;
+        for stale_id in self.active_groups.difference(&current_group_ids) {
+            self.state.clear(*stale_id);
         }
-
-        if assignments.is_empty() {
-            return;
-        }
+        self.active_groups = current_group_ids;
 
         for (group_id, profile_id) in &assignments {
+            // A transient load failure keeps the group's last override so enforcement does not flap.
             let profile = match self.repo.get_by_id(*profile_id).await {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     warn!(
+                        group_id,
                         profile_id,
-                        "ScheduleEvaluatorJob: profile not found, skipping"
+                        "ScheduleEvaluatorJob: assigned profile not found, clearing override"
                     );
+                    self.state.clear(*group_id);
                     continue;
                 }
                 Err(e) => {
@@ -111,23 +86,11 @@ impl ScheduleEvaluatorJob {
                 }
             };
 
-            let tz: Tz = match profile.timezone.parse() {
-                Ok(tz) => tz,
-                Err(_) => {
-                    warn!(
-                        timezone = %profile.timezone,
-                        profile_id,
-                        "ScheduleEvaluatorJob: invalid timezone, using UTC"
-                    );
-                    chrono_tz::UTC
-                }
-            };
+            let now = chrono::Utc::now()
+                .with_timezone(&profile.timezone)
+                .naive_local();
 
-            let now = chrono::Utc::now().with_timezone(&tz);
-            let weekday_bit = 1u8 << now.weekday().num_days_from_monday();
-            let now_time = format!("{:02}:{:02}", now.hour(), now.minute());
-
-            match evaluate_slots(&slots, weekday_bit, &now_time) {
+            match evaluate_slots(&slots, now) {
                 Some(ScheduleAction::BlockAll) => {
                     self.state.set(*group_id, GroupOverride::BlockAll);
                 }

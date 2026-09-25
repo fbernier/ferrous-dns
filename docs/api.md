@@ -83,6 +83,8 @@ Errors return an appropriate HTTP status code with:
 }
 ```
 
+Validation failures (a malformed name, URL, comment, CIDR, regex, action, etc.) return `400 Bad Request`. Creating or renaming something to a name that is already taken returns `409 Conflict`, as does deleting a group that still has assigned clients. Length limits count characters, not bytes.
+
 ---
 
 ## Health & System
@@ -233,13 +235,19 @@ Partial update — only include the sections you want to change:
 }
 ```
 
+The merged configuration is validated before anything is applied. An invalid value — an unknown `block_mode` or `dnssec_mode`, an unparseable server or sinkhole address, a `local_dns_server` that is not an IP address or `IP:port`, a zero interval, timeout or capacity such as `cache_compaction_interval: 0`, or a session lifetime whose expiry is past the latest representable date such as `session_ttl_hours: 4294967295` — returns **400** with `{ "success": false, "error": "…" }` naming the key, and neither the live server nor the file changes. A request that is valid but cannot be carried out (no writable config file, a failed pool hot-reload or file write) returns 200 with `success: false`.
+
+The file is rewritten atomically (a synced temp file renamed over it), so a crash mid-save leaves the old or the new file, never a truncated one. The new file keeps the old one's mode, owner and group. When the file cannot be replaced — a Docker single-file bind mount, a directory the server cannot write, or an owner or group the server cannot give the new file — it is rewritten in place instead.
+
 ### Reload Config
 
 ```http
 POST /api/config/reload
 ```
 
-Reloads the configuration from the TOML file without restarting the server. DNS, blocking, and cache settings take effect immediately. Server-level settings (ports, pihole_compat) require a full restart.
+Reloads the configuration from the TOML file without restarting the server. DNS, blocking, and cache settings take effect immediately. Server-level settings (ports, pihole_compat) require a full restart. A file that fails to parse or validate is reported with `success: false` and the running configuration is kept.
+
+The file is loaded the way startup loads it: command-line overrides the server was started with (`--dns-port`, `--web-port`, `--bind`, `--database`, `--log-level`) still win over the file. Changed upstream pools are rebuilt and swapped in live, as with `POST /api/config`; if that fails, nothing changes. A reload waits for any config save or backup import in progress, so it never interleaves with one. The Pi-hole `POST /api/action/restartdns` runs the same reload.
 
 ### Get Settings
 
@@ -270,7 +278,7 @@ POST /api/settings
 }
 ```
 
-`sinkhole_ipv4` / `sinkhole_ipv6` set a custom block target for `null_ip` mode (empty string = the null address `0.0.0.0` / `::`). A non-empty value that is not a valid address of the matching family is rejected with `{ "success": false, "error": "Invalid IPv4 sinkhole address: …" }` and nothing is saved. See [Custom Sinkhole IP](configuration/blocking.md#custom-sinkhole-ip).
+`sinkhole_ipv4` / `sinkhole_ipv6` set a custom block target for `null_ip` mode (empty string = the null address `0.0.0.0` / `::`). A non-empty value that is not a valid address of the matching family is rejected with **400** and `{ "success": false, "error": "Invalid IPv4 sinkhole address: …" }`, and nothing is saved. See [Custom Sinkhole IP](configuration/blocking.md#custom-sinkhole-ip). The same 400 applies to an unknown `block_mode` (`null_ip`, `nxdomain`, `nodata` or `refused`), a `local_dns_server` that is not an IP address or `IP:port`, and a DNS64 prefix that is not a `/96`. A `local_dns_server` given as a bare IP is saved as `IP:53`.
 
 The response carries `restart_required`: `true` when the save changed a setting (these only take effect after a restart), `false` when the form was saved unchanged.
 
@@ -409,10 +417,12 @@ Invalidates the current session. **Public** — no auth required (clears session
 ### Change Password
 
 ```http
-POST /api/auth/change-password
+POST /api/auth/password
 ```
 
-Changes the admin password. **Protected** — requires valid session or API token.
+Changes the password of the signed-in user and returns `204`. **Protected** — the session cookie names the user, so an API token alone is refused with `401`. A wrong `current_password` returns `401` and changes nothing.
+
+Every other session of that user is revoked, so a device signed in with the old password has to log in again. The session that made the change stays signed in.
 
 ```json
 {
@@ -435,7 +445,7 @@ Returns all active sessions. **Protected**.
 DELETE /api/auth/sessions/{id}
 ```
 
-Revokes a specific session by ID. **Protected**.
+Revokes a specific session by ID. **Protected**. Any authenticated caller — any user's session or any API token — can revoke any user's session, including the admin's; there is no ownership or role check.
 
 ---
 
@@ -501,6 +511,9 @@ DELETE /api/api-tokens/{id}
 
 ## User Management
 
+!!! warning "Roles are informational"
+    Every user has a `role` (`admin` or `viewer`), stored on the account and its sessions and shown in the UI and API responses. **Nothing enforces it**: a `viewer` can call every protected endpoint, including configuration changes, user management and API tokens. Give accounts only to people you would trust with full access.
+
 ### List Users
 
 ```http
@@ -518,9 +531,19 @@ POST /api/users
 ```json
 {
   "username": "operator",
-  "password": "secure-password"
+  "password": "secure-password",
+  "role": "viewer"
 }
 ```
+
+| Field | Type | Default | Description |
+|:------|:-----|:--------|:------------|
+| `username` | `str` | — | 1–64 alphanumeric characters, `-`, `_` or `.` |
+| `display_name` | `str` | — | Optional, up to 100 characters |
+| `password` | `str` | — | 8–256 characters |
+| `role` | `str` | `viewer` | `admin` or `viewer` (informational, see above); any other value is `400` |
+
+A username that is already taken returns `409`. The `[auth.admin]` username is always taken, even before its password is set in the setup wizard.
 
 ### Delete User
 
@@ -685,6 +708,10 @@ POST /api/client-subnets
 }
 ```
 
+The subnet is stored in canonical form: host bits are cleared and IPv6 is lowercased and compressed, so `192.168.1.5/24` is stored as `192.168.1.0/24` and conflicts with an existing `192.168.1.0/24` (`409`).
+
+Subnets stored before canonicalisation are rewritten the same way at startup. If two stored rows name the same network, the older row is kept and the other is deleted, with a `WARN` naming both rows' ids and groups; clients in that subnet then belong to the kept row's group.
+
 ### Delete Subnet
 
 ```http
@@ -710,9 +737,12 @@ POST /api/groups
 ```json
 {
   "name": "Kids",
-  "description": "Children's devices"
+  "comment": "Children's devices",
+  "enabled": true
 }
 ```
+
+`enabled` is optional and defaults to `true`; a group created with `"enabled": false` starts disabled.
 
 ### Get Group
 
@@ -731,6 +761,8 @@ PUT /api/groups/{id}
 ```http
 DELETE /api/groups/{id}
 ```
+
+Returns `409` if the group still has assigned clients. Managed domains (including the rules generated for a blocked service), regex filters, blocklist and allowlist memberships, blocked services, Safe Search settings, client subnets and schedule assignments are removed with the group, and the block filter is reloaded so they stop applying immediately; query-log entries keep their data but lose the group attribution.
 
 ### Get Group Clients
 
@@ -833,6 +865,8 @@ PUT    /api/whitelist-sources/{id}
 DELETE /api/whitelist-sources/{id}
 ```
 
+Creating, updating or deleting a whitelist source rebuilds the block filter, as blocklist source changes do, so the change applies without waiting for the daily sync. The rebuild re-downloads every enabled list.
+
 ---
 
 ## Managed Domains
@@ -867,6 +901,8 @@ PUT    /api/managed-domains/{id}
 DELETE /api/managed-domains/{id}
 ```
 
+`PUT` is a partial update: an absent field keeps its value. Send `"comment": null` to clear the comment.
+
 ---
 
 ## Regex Filters
@@ -898,6 +934,8 @@ GET    /api/regex-filters/{id}
 PUT    /api/regex-filters/{id}
 DELETE /api/regex-filters/{id}
 ```
+
+`PUT` is a partial update: an absent field keeps its value. Send `"comment": null` to clear the comment.
 
 ---
 
@@ -1175,8 +1213,8 @@ Several of these are mirrored under `/api/stats/database/*` for Pi-hole clients.
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET` | `/api/dns/blocking` | Current blocking status |
-| `POST` | `/api/dns/blocking` | Enable/disable blocking (optional `timer`) |
+| `GET` | `/api/dns/blocking` | Current blocking status (`timer`: seconds left, or `null`) |
+| `POST` | `/api/dns/blocking` | Set blocking (optional `timer`: flip back after N seconds) |
 
 **Domains (CRUD)**
 
@@ -1194,12 +1232,12 @@ Several of these are mirrored under `/api/stats/database/*` for Pi-hole clients.
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET` | `/api/lists` | List adlists |
-| `POST` | `/api/lists` | Create an adlist |
-| `GET` | `/api/lists/{id}` | Get an adlist |
-| `PUT` | `/api/lists/{id}` | Update an adlist |
-| `DELETE` | `/api/lists/{id}` | Delete an adlist |
-| `POST` | `/api/lists:batchDelete` | Batch delete |
+| `GET` | `/api/lists` | List adlists (optional `?type=allow\|block`) |
+| `POST` | `/api/lists?type=allow\|block` | Create an adlist |
+| `GET` | `/api/lists/{list}` | Lists with this address or id (optional `?type=`) |
+| `PUT` | `/api/lists/{list}?type=allow\|block` | Update an adlist |
+| `DELETE` | `/api/lists/{list}?type=allow\|block` | Delete an adlist |
+| `POST` | `/api/lists:batchDelete` | Batch delete (`[{item, type}]`) |
 
 **Groups (CRUD)**
 

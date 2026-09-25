@@ -40,6 +40,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "upstream_relay"
+path = "fuzz_targets/upstream_relay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "response_lowercase_0x20"
 path = "fuzz_targets/response_lowercase_0x20.rs"
 test = false

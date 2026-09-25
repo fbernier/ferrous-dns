@@ -1,8 +1,9 @@
 use crate::{
     dto::{
+        config::{sinkhole_to_string, RateLimitConfigResponse},
         AuthConfigResponse, BlockingConfigResponse, ConfigResponse, DatabaseConfigResponse,
         Dns64ConfigResponse, DnsConfigResponse, HealthCheckResponse, LoggingConfigResponse,
-        ServerConfigResponse, UpstreamPoolResponse, WebTlsConfigResponse,
+        ServerConfigResponse, SettingsDto, UpstreamPoolResponse, WebTlsConfigResponse,
     },
     state::AppState,
 };
@@ -22,23 +23,20 @@ use tracing::{debug, instrument};
 pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
     debug!("Fetching current configuration");
 
-    let config = state.config.read().await;
-    let config_path = state.resolve_config_path();
-
-    let writable = if let Some(ref path) = config_path {
-        tokio::fs::metadata(path)
+    let config_path = state.config_path.as_deref().map(String::from);
+    let writable = match &config_path {
+        Some(path) => tokio::fs::metadata(path)
             .await
-            .map(|m| !m.permissions().readonly())
-            .unwrap_or(false)
-    } else {
-        false
+            .is_ok_and(|m| !m.permissions().readonly()),
+        None => false,
     };
+    let config = state.config.read().await;
 
     Json(ConfigResponse {
         server: ServerConfigResponse {
             dns_port: config.server.dns_port,
             web_port: config.server.web_port,
-            bind_address: config.server.bind_address.clone(),
+            bind_address: config.server.bind_address.to_string(),
             pihole_compat: config.server.pihole_compat,
             web_tls: WebTlsConfigResponse {
                 enabled: config.server.web_tls.enabled,
@@ -54,7 +52,7 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
                 .iter()
                 .map(|p| UpstreamPoolResponse {
                     name: p.name.clone(),
-                    strategy: format!("{:?}", p.strategy).to_lowercase(),
+                    strategy: p.strategy.as_str().to_string(),
                     priority: p.priority,
                     servers: p.servers.clone(),
                     weight: p.weight,
@@ -72,7 +70,7 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
             cache_ttl: config.dns.cache_ttl,
             dnssec_mode: config.dns.effective_dnssec_mode().as_str().to_string(),
             dnssec_enabled: config.dns.effective_dnssec_mode().validates(),
-            cache_eviction_strategy: config.dns.cache_eviction_strategy.clone(),
+            cache_eviction_strategy: config.dns.cache_eviction_strategy,
             cache_max_entries: config.dns.cache_max_entries,
             cache_min_hit_rate: config.dns.cache_min_hit_rate,
             cache_min_frequency: config.dns.cache_min_frequency,
@@ -89,7 +87,7 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
             local_domain: config.dns.local_domain.clone(),
             local_dns_server: config.dns.local_dns_server.clone(),
             mdns_enabled: config.dns.mdns_enabled,
-            rate_limit: crate::dto::config::RateLimitConfigResponse {
+            rate_limit: RateLimitConfigResponse {
                 enabled: config.dns.rate_limit.enabled,
                 queries_per_second: config.dns.rate_limit.queries_per_second,
                 burst_size: config.dns.rate_limit.burst_size,
@@ -109,10 +107,10 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
             enabled: config.blocking.enabled,
             custom_blocked: config.blocking.custom_blocked.clone(),
             whitelist: config.blocking.whitelist.clone(),
-            block_mode: crate::dto::config::block_mode_to_string(config.blocking.block_mode),
+            block_mode: config.blocking.block_mode.as_str().to_string(),
             block_ttl: config.blocking.block_ttl,
-            sinkhole_ipv4: crate::dto::config::sinkhole_to_string(config.blocking.sinkhole_ipv4),
-            sinkhole_ipv6: crate::dto::config::sinkhole_to_string(config.blocking.sinkhole_ipv6),
+            sinkhole_ipv4: sinkhole_to_string(config.blocking.sinkhole_ipv4),
+            sinkhole_ipv6: sinkhole_to_string(config.blocking.sinkhole_ipv6),
         },
         dns64: Dns64ConfigResponse {
             enabled: config.dns64.enabled,
@@ -143,13 +141,12 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
     path = "/settings",
     tag = "config",
     responses(
-        (status = 200, description = "Current DNS settings", body = crate::dto::SettingsDto),
+        (status = 200, description = "Current DNS settings", body = SettingsDto),
     ),
     security(("session_cookie" = []), ("api_key" = [])),
 )]
 #[instrument(skip(state), name = "api_get_settings")]
-pub async fn get_settings(State(state): State<AppState>) -> Json<crate::dto::SettingsDto> {
+pub async fn get_settings(State(state): State<AppState>) -> Json<SettingsDto> {
     debug!("Fetching settings");
-    let response = get_config(State(state)).await;
-    Json(response.0.into())
+    Json(SettingsDto::from(&*state.config.read().await))
 }

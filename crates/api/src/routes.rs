@@ -7,15 +7,8 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-/// Builds the API router and returns the matching OpenAPI document.
-///
-/// All handlers exposed here are annotated with `#[utoipa::path]` so the
-/// `OpenApiRouter::routes(routes!(...))` macro registers both the axum
-/// route and its OpenAPI path operation. Submodules that already return a
-/// classic `axum::Router` are merged in via the `From<Router>` impl
-/// (their routes still work but aren't reflected in the spec — each
-/// submodule annotates handlers individually and exposes them via its
-/// own `OpenApiRouter` builder).
+/// Builds the API router and returns the matching OpenAPI document; every
+/// route is registered through `routes!`, so the spec lists all of them.
 pub fn create_api_router_with_openapi(state: AppState) -> (Router, utoipa::openapi::OpenApi) {
     let public_routes = OpenApiRouter::new()
         .routes(routes!(handlers::auth::get_auth_status_public))
@@ -86,16 +79,9 @@ pub fn create_api_router_with_openapi(state: AppState) -> (Router, utoipa::opena
         .merge(handlers::backup::routes())
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    let (router, openapi) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(public_routes)
         .merge(protected_router)
         .with_state(state)
-        .split_for_parts();
-
-    (router, openapi)
-}
-
-/// Backwards-compatible router builder that drops the OpenAPI document.
-pub fn create_api_routes(state: AppState) -> Router {
-    create_api_router_with_openapi(state).0
+        .split_for_parts()
 }

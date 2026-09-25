@@ -1,5 +1,5 @@
 use ferrous_dns_application::ports::ConfigRepository;
-use ferrous_dns_domain::{Config, LocalDnsRecord};
+use ferrous_dns_domain::{Config, LocalDnsRecord, LocalRecordType};
 use ferrous_dns_infrastructure::repositories::TomlConfigRepository;
 
 fn minimal_toml() -> &'static str {
@@ -86,12 +86,10 @@ fn config_with_records(records: Vec<LocalDnsRecord>) -> Config {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("base.toml");
     std::fs::write(&path, minimal_toml()).unwrap();
-    let mut config = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let mut config = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     config.dns.local_records = records;
     config
 }
-
-// ── TomlConfigRepository: save_local_records ────────────────────────────────
 
 #[tokio::test]
 async fn test_save_local_records_writes_to_correct_path() {
@@ -102,8 +100,8 @@ async fn test_save_local_records_writes_to_correct_path() {
     let config = config_with_records(vec![LocalDnsRecord {
         hostname: "myserver".to_string(),
         domain: Some("lan".to_string()),
-        ip: "10.0.0.10".to_string(),
-        record_type: "A".to_string(),
+        ip: "10.0.0.10".parse().unwrap(),
+        record_type: LocalRecordType::A,
         ttl: Some(300),
     }]);
 
@@ -126,15 +124,15 @@ async fn test_save_local_records_roundtrips_multiple_records() {
         LocalDnsRecord {
             hostname: "host1".to_string(),
             domain: Some("local".to_string()),
-            ip: "192.168.1.10".to_string(),
-            record_type: "A".to_string(),
+            ip: "192.168.1.10".parse().unwrap(),
+            record_type: LocalRecordType::A,
             ttl: Some(60),
         },
         LocalDnsRecord {
             hostname: "host2".to_string(),
             domain: None,
-            ip: "192.168.1.20".to_string(),
-            record_type: "A".to_string(),
+            ip: "fd00::20".parse().unwrap(),
+            record_type: LocalRecordType::AAAA,
             ttl: None,
         },
     ]);
@@ -142,13 +140,8 @@ async fn test_save_local_records_roundtrips_multiple_records() {
     let repo = TomlConfigRepository::new(path.to_str().unwrap().to_string());
     repo.save_local_records(&config).await.unwrap();
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
-    assert_eq!(reloaded.dns.local_records.len(), 2);
-    assert_eq!(reloaded.dns.local_records[0].hostname, "host1");
-    assert_eq!(reloaded.dns.local_records[0].ip, "192.168.1.10");
-    assert_eq!(reloaded.dns.local_records[1].hostname, "host2");
-    assert_eq!(reloaded.dns.local_records[1].ip, "192.168.1.20");
-    assert!(reloaded.dns.local_records[1].domain.is_none());
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(reloaded.dns.local_records, config.dns.local_records);
 }
 
 #[tokio::test]
@@ -167,7 +160,7 @@ async fn test_save_local_records_clears_records_when_empty() {
     let repo = TomlConfigRepository::new(path.to_str().unwrap().to_string());
     repo.save_local_records(&config).await.unwrap();
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(reloaded.dns.local_records.is_empty());
 }
 
@@ -193,8 +186,8 @@ async fn test_toml_repository_uses_injected_path_not_cwd() {
     let config = config_with_records(vec![LocalDnsRecord {
         hostname: "unique-host".to_string(),
         domain: Some("test".to_string()),
-        ip: "10.99.99.99".to_string(),
-        record_type: "A".to_string(),
+        ip: "10.99.99.99".parse().unwrap(),
+        record_type: LocalRecordType::A,
         ttl: Some(120),
     }]);
 

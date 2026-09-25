@@ -15,10 +15,8 @@ fn make_cache() -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.0,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -48,19 +46,25 @@ fn addresses_of(data: &CachedData) -> Vec<IpAddr> {
 #[test]
 fn test_permanent_entry_reports_its_configured_ttl() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
 
-    let (_, _, remaining) = cache
+    let (_, _, remaining, _) = cache
         .get("nas.home.lan", &RecordType::A)
         .expect("permanent entry must be readable");
 
     assert_eq!(remaining, Some(300));
+}
+
+#[test]
+fn test_permanent_entry_remaining_ttl_is_its_configured_ttl() {
+    let cache = make_cache();
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
+
+    assert_eq!(
+        cache.get_remaining_ttl("nas.home.lan", &RecordType::A),
+        Some(300),
+        "a never-expiring entry must not report the distance to its sentinel expiry"
+    );
 }
 
 #[test]
@@ -71,12 +75,11 @@ fn test_permanent_entry_ttl_survives_a_second_read_from_l1() {
         RecordType::A,
         make_ip_data("10.0.0.6"),
         120,
-        None,
     );
 
     // First read promotes into the thread-local L1; the second is served from it.
     let _ = cache.get("printer.home.lan", &RecordType::A);
-    let (_, _, remaining) = cache
+    let (_, _, remaining, _) = cache
         .get("printer.home.lan", &RecordType::A)
         .expect("permanent entry must still be readable");
 
@@ -90,13 +93,7 @@ fn test_permanent_entry_ttl_survives_a_second_read_from_l1() {
 #[test]
 fn test_clear_preserves_permanent_entries() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
     cache.insert(
         "example.com",
         RecordType::A,
@@ -112,7 +109,7 @@ fn test_clear_preserves_permanent_entries() {
         "an upstream answer must not survive a flush"
     );
 
-    let (data, _, remaining) = cache
+    let (data, _, remaining, _) = cache
         .get("nas.home.lan", &RecordType::A)
         .expect("a local DNS record must survive a flush — nothing reloads it");
     assert_eq!(
@@ -126,13 +123,7 @@ fn test_clear_preserves_permanent_entries() {
 #[test]
 fn test_is_permanent_distinguishes_the_two_kinds() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
     cache.insert(
         "example.com",
         RecordType::A,
@@ -151,13 +142,7 @@ fn test_is_permanent_distinguishes_the_two_kinds() {
 #[test]
 fn test_removed_permanent_entry_is_no_longer_permanent() {
     let cache = make_cache();
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
 
     assert!(cache.remove("nas.home.lan", &RecordType::A));
 
@@ -167,4 +152,30 @@ fn test_removed_permanent_entry_is_no_longer_permanent() {
         cache.get("nas.home.lan", &RecordType::A).is_none(),
         "a removed entry must not come back through clear()"
     );
+}
+
+/// A local record added while an upstream answer for the same name was in
+/// flight: that answer then reaches `insert`, and must not replace the local
+/// record in the shared map or in the thread-local L1.
+#[test]
+fn test_upstream_insert_does_not_replace_a_permanent_entry() {
+    let cache = make_cache();
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
+    cache.insert(
+        "nas.home.lan",
+        RecordType::A,
+        make_ip_data("203.0.113.9"),
+        60,
+        None,
+    );
+
+    let (data, _, _, _) = cache
+        .get("nas.home.lan", &RecordType::A)
+        .expect("the local record is still readable");
+    assert_eq!(
+        addresses_of(&data),
+        vec!["10.0.0.5".parse::<IpAddr>().unwrap()]
+    );
+    assert_eq!(cache.get_ttl("nas.home.lan", &RecordType::A), Some(300));
+    assert!(cache.is_permanent("nas.home.lan", &RecordType::A));
 }

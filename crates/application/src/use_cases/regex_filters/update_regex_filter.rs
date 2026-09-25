@@ -1,8 +1,12 @@
-use ferrous_dns_domain::{DomainAction, DomainError, RegexFilter};
+use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::validate_comment;
+use ferrous_dns_domain::{DomainError, RegexFilter};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
 
-use crate::ports::{BlockFilterEnginePort, GroupRepository, RegexFilterRepository};
+use crate::ports::{
+    BlockFilterEnginePort, GroupRepository, RegexFilterRepository, RegexFilterUpdate,
+};
 
 pub struct UpdateRegexFilterUseCase {
     repo: Arc<dyn RegexFilterRepository>,
@@ -24,46 +28,32 @@ impl UpdateRegexFilterUseCase {
     }
 
     #[instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         id: i64,
-        name: Option<String>,
-        pattern: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
+        update: RegexFilterUpdate,
     ) -> Result<RegexFilter, DomainError> {
         self.repo
             .get_by_id(id)
             .await?
             .ok_or(DomainError::RegexFilterNotFound(id))?;
 
-        if let Some(ref n) = name {
+        if let Some(ref n) = update.name {
             RegexFilter::validate_name(n).map_err(DomainError::InvalidRegexFilter)?;
         }
 
-        if let Some(ref p) = pattern {
+        if let Some(ref p) = update.pattern {
             RegexFilter::validate_pattern(p).map_err(DomainError::InvalidRegexFilter)?;
         }
 
-        if let Some(ref c) = comment {
-            RegexFilter::validate_comment(&Some(Arc::from(c.as_str())))
-                .map_err(DomainError::InvalidRegexFilter)?;
+        validate_comment(update.comment.as_ref().and_then(Option::as_deref))
+            .map_err(DomainError::InvalidRegexFilter)?;
+
+        if let Some(gid) = update.group_id {
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
-        if let Some(gid) = group_id {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
-        }
-
-        let updated = self
-            .repo
-            .update(id, name, pattern, action, group_id, comment, enabled)
-            .await?;
+        let updated = self.repo.update(id, update).await?;
 
         info!(
             filter_id = ?id,

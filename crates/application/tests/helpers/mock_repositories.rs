@@ -3,14 +3,13 @@
 
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{
-    BlockFilterEnginePort, BlocklistRepository, BlocklistSourceRepository, ClientRepository,
-    DnsResolution, DnsResolver, FilterDecision, GroupRepository, ManagedDomainRepository,
-    QueryLogRepository, TimeGranularity, WhitelistRepository, WhitelistSourceRepository,
+    BlockFilterEnginePort, BlocklistSourceRepository, ClientRepository, DnsResolution, DnsResolver,
+    FilterDecision, GroupRepository, ManagedDomainRepository, ManagedDomainUpdate,
+    QueryLogRepository, TimeGranularity, WhitelistSourceRepository,
 };
 use ferrous_dns_domain::{
-    blocklist::BlockedDomain, BlockSource, BlocklistSource, Client, ClientStats, DnsQuery,
-    DnssecStats, DomainAction, DomainError, Group, ManagedDomain, QueryLog, QueryStats, RecordType,
-    WhitelistSource, WhitelistedDomain,
+    BlockSource, BlocklistSource, Client, ClientStats, DnsQuery, DnssecStats, DomainAction,
+    DomainError, Group, ManagedDomain, QueryLog, QueryStats, RecordType, WhitelistSource,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -117,98 +116,6 @@ impl DnsResolver for MockDnsResolver {
 }
 
 #[derive(Clone)]
-pub struct MockBlocklistRepository {
-    blocked_domains: Arc<RwLock<Vec<BlockedDomain>>>,
-}
-
-impl MockBlocklistRepository {
-    pub fn new() -> Self {
-        Self {
-            blocked_domains: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    pub fn with_blocked_domains(domains: Vec<&str>) -> Self {
-        let blocked = domains
-            .into_iter()
-            .map(|d| BlockedDomain {
-                domain: d.to_string(),
-                id: None,
-                added_at: None,
-            })
-            .collect();
-
-        Self {
-            blocked_domains: Arc::new(RwLock::new(blocked)),
-        }
-    }
-
-    pub async fn add_blocked_domains(&self, domains: Vec<&str>) {
-        let mut blocked = self.blocked_domains.write().await;
-        for domain in domains {
-            blocked.push(BlockedDomain {
-                domain: domain.to_string(),
-                id: None,
-                added_at: None,
-            });
-        }
-    }
-
-    pub async fn clear(&self) {
-        self.blocked_domains.write().await.clear();
-    }
-
-    pub async fn count(&self) -> usize {
-        self.blocked_domains.read().await.len()
-    }
-}
-
-impl Default for MockBlocklistRepository {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl BlocklistRepository for MockBlocklistRepository {
-    async fn get_all(&self) -> Result<Vec<BlockedDomain>, DomainError> {
-        Ok(self.blocked_domains.read().await.clone())
-    }
-
-    async fn get_all_paged(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<BlockedDomain>, u64), DomainError> {
-        let domains = self.blocked_domains.read().await;
-        let total = domains.len() as u64;
-        let paged = domains
-            .iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .cloned()
-            .collect();
-        Ok((paged, total))
-    }
-
-    async fn add_domain(&self, domain: &BlockedDomain) -> Result<(), DomainError> {
-        self.blocked_domains.write().await.push(domain.clone());
-        Ok(())
-    }
-
-    async fn remove_domain(&self, domain: &str) -> Result<(), DomainError> {
-        let mut domains = self.blocked_domains.write().await;
-        domains.retain(|d| d.domain != domain);
-        Ok(())
-    }
-
-    async fn is_blocked(&self, domain: &str) -> Result<bool, DomainError> {
-        let domains = self.blocked_domains.read().await;
-        Ok(domains.iter().any(|d| d.domain == domain))
-    }
-}
-
-#[derive(Clone)]
 pub struct MockQueryLogRepository {
     logs: Arc<RwLock<Vec<QueryLog>>>,
     sync_logs: Arc<std::sync::Mutex<Vec<QueryLog>>>,
@@ -298,11 +205,13 @@ impl QueryLogRepository for MockQueryLogRepository {
     async fn get_recent_paged(
         &self,
         limit: u32,
-        offset: u32,
+        page: ferrous_dns_application::ports::PageAt,
         period_hours: f32,
-        _cursor: Option<i64>,
         _filter: &ferrous_dns_domain::QueryLogFilter,
     ) -> Result<ferrous_dns_application::ports::PagedQueryResult, DomainError> {
+        let ferrous_dns_application::ports::PageAt::Offset(offset) = page else {
+            unimplemented!()
+        };
         let all = self.get_recent(limit + offset, period_hours).await?;
         let total = all.len() as u64;
         let start = (offset as usize).min(all.len());
@@ -380,7 +289,7 @@ impl QueryLogRepository for MockQueryLogRepository {
 
     async fn get_timeline(
         &self,
-        _period_hours: u32,
+        _period_hours: f32,
         _granularity: TimeGranularity,
     ) -> Result<Vec<ferrous_dns_application::ports::TimelineBucket>, DomainError> {
         Ok(Vec::new())
@@ -767,6 +676,14 @@ impl ClientRepository for MockClientRepository {
         Ok(clients.get(&id).cloned())
     }
 
+    async fn get_by_ip(&self, ip_address: IpAddr) -> Result<Option<Client>, DomainError> {
+        let clients = self.clients.read().await;
+        Ok(clients
+            .values()
+            .find(|c| c.ip_address == ip_address)
+            .cloned())
+    }
+
     async fn assign_group(&self, client_id: i64, group_id: i64) -> Result<(), DomainError> {
         let mut clients = self.clients.write().await;
 
@@ -837,7 +754,7 @@ impl BlocklistSourceRepository for MockBlocklistSourceRepository {
         let mut sources = self.sources.write().await;
 
         if sources.iter().any(|s| s.name.as_ref() == name.as_str()) {
-            return Err(DomainError::InvalidBlocklistSource(format!(
+            return Err(DomainError::AlreadyExists(format!(
                 "Blocklist source '{}' already exists",
                 name
             )));
@@ -926,13 +843,15 @@ pub struct MockGroupRepository {
 
 impl MockGroupRepository {
     pub fn new() -> Self {
-        let protected = Group::new(
-            Some(1),
-            Arc::from("Protected"),
-            true,
-            Some(Arc::from("Default group")),
-            true,
-        );
+        let protected = Group {
+            id: Some(1),
+            name: Arc::from("Protected"),
+            enabled: true,
+            comment: Some(Arc::from("Default group")),
+            is_default: true,
+            created_at: None,
+            updated_at: None,
+        };
         Self {
             groups: Arc::new(RwLock::new(vec![protected])),
             next_id: Arc::new(RwLock::new(2)),
@@ -955,19 +874,31 @@ impl Default for MockGroupRepository {
 
 #[async_trait]
 impl GroupRepository for MockGroupRepository {
-    async fn create(&self, name: String, comment: Option<String>) -> Result<Group, DomainError> {
+    async fn create(
+        &self,
+        name: String,
+        comment: Option<String>,
+        enabled: bool,
+    ) -> Result<Group, DomainError> {
         let mut groups = self.groups.write().await;
+        if groups.iter().any(|g| g.name.as_ref() == name.as_str()) {
+            return Err(DomainError::AlreadyExists(format!(
+                "Group '{name}' already exists"
+            )));
+        }
         let mut next_id = self.next_id.write().await;
         let id = *next_id;
         *next_id += 1;
 
-        let group = Group::new(
-            Some(id),
-            Arc::from(name.as_str()),
-            true,
-            comment.as_deref().map(Arc::from),
-            false,
-        );
+        let group = Group {
+            id: Some(id),
+            name: Arc::from(name.as_str()),
+            enabled,
+            comment: comment.as_deref().map(Arc::from),
+            is_default: false,
+            created_at: None,
+            updated_at: None,
+        };
         groups.push(group.clone());
         Ok(group)
     }
@@ -1039,82 +970,6 @@ impl GroupRepository for MockGroupRepository {
 }
 
 #[derive(Clone)]
-pub struct MockWhitelistRepository {
-    whitelisted_domains: Arc<RwLock<Vec<WhitelistedDomain>>>,
-}
-
-impl MockWhitelistRepository {
-    pub fn new() -> Self {
-        Self {
-            whitelisted_domains: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    pub fn with_whitelisted_domains(domains: Vec<&str>) -> Self {
-        let whitelisted = domains
-            .into_iter()
-            .map(|d| WhitelistedDomain {
-                domain: d.to_string(),
-                id: None,
-                added_at: None,
-            })
-            .collect();
-
-        Self {
-            whitelisted_domains: Arc::new(RwLock::new(whitelisted)),
-        }
-    }
-
-    pub async fn add_whitelisted_domains(&self, domains: Vec<&str>) {
-        let mut whitelisted = self.whitelisted_domains.write().await;
-        for domain in domains {
-            whitelisted.push(WhitelistedDomain {
-                domain: domain.to_string(),
-                id: None,
-                added_at: None,
-            });
-        }
-    }
-
-    pub async fn clear(&self) {
-        self.whitelisted_domains.write().await.clear();
-    }
-
-    pub async fn count(&self) -> usize {
-        self.whitelisted_domains.read().await.len()
-    }
-}
-
-impl Default for MockWhitelistRepository {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl WhitelistRepository for MockWhitelistRepository {
-    async fn get_all(&self) -> Result<Vec<WhitelistedDomain>, DomainError> {
-        Ok(self.whitelisted_domains.read().await.clone())
-    }
-
-    async fn add_domain(&self, domain: &WhitelistedDomain) -> Result<(), DomainError> {
-        self.whitelisted_domains.write().await.push(domain.clone());
-        Ok(())
-    }
-
-    async fn remove_domain(&self, domain: &str) -> Result<(), DomainError> {
-        let mut domains = self.whitelisted_domains.write().await;
-        domains.retain(|d| d.domain != domain);
-        Ok(())
-    }
-
-    async fn is_whitelisted(&self, domain: &str) -> Result<bool, DomainError> {
-        let domains = self.whitelisted_domains.read().await;
-        Ok(domains.iter().any(|d| d.domain == domain))
-    }
-}
-
-#[derive(Clone)]
 pub struct MockWhitelistSourceRepository {
     sources: Arc<RwLock<Vec<WhitelistSource>>>,
     next_id: Arc<RwLock<i64>>,
@@ -1156,7 +1011,7 @@ impl WhitelistSourceRepository for MockWhitelistSourceRepository {
         let mut sources = self.sources.write().await;
 
         if sources.iter().any(|s| s.name.as_ref() == name.as_str()) {
-            return Err(DomainError::InvalidWhitelistSource(format!(
+            return Err(DomainError::AlreadyExists(format!(
                 "Whitelist source '{}' already exists",
                 name
             )));
@@ -1240,7 +1095,7 @@ impl WhitelistSourceRepository for MockWhitelistSourceRepository {
 pub struct DnsResolutionBuilder {
     addresses: Vec<IpAddr>,
     cache_hit: bool,
-    dnssec_status: Option<&'static str>,
+    dnssec_status: Option<ferrous_dns_domain::DnssecStatus>,
     cname_chain: Arc<[Arc<str>]>,
     upstream_server: Option<Arc<str>>,
 }
@@ -1271,7 +1126,7 @@ impl DnsResolutionBuilder {
         self
     }
 
-    pub fn with_dnssec(mut self, status: &'static str) -> Self {
+    pub fn with_dnssec(mut self, status: ferrous_dns_domain::DnssecStatus) -> Self {
         self.dnssec_status = Some(status);
         self
     }
@@ -1291,6 +1146,7 @@ impl DnsResolutionBuilder {
             addresses: std::sync::Arc::new(self.addresses),
             cache_hit: self.cache_hit,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: self.dnssec_status,
             cname_chain: self.cname_chain,
             upstream_server: self.upstream_server,
@@ -1307,78 +1163,6 @@ impl Default for DnsResolutionBuilder {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_mock_dns_resolver() {
-        let resolver = MockDnsResolver::new();
-
-        let resolution = DnsResolutionBuilder::new()
-            .with_address("1.1.1.1")
-            .cache_hit()
-            .build();
-
-        resolver.set_response("example.com", resolution).await;
-
-        let query = DnsQuery {
-            domain: "example.com".into(),
-            record_type: RecordType::A,
-        };
-
-        let result = resolver.resolve(&query).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().cache_hit);
-    }
-
-    #[tokio::test]
-    async fn test_mock_blocklist() {
-        let blocklist =
-            MockBlocklistRepository::with_blocked_domains(vec!["ads.com", "tracker.com"]);
-
-        assert!(blocklist.is_blocked("ads.com").await.unwrap());
-        assert!(!blocklist.is_blocked("google.com").await.unwrap());
-
-        assert_eq!(blocklist.count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn test_mock_query_log() {
-        let log_repo = MockQueryLogRepository::new();
-
-        let log = QueryLog {
-            id: None,
-            domain: "test.com".into(),
-            record_type: RecordType::A,
-            client_ip: IpAddr::from_str("192.168.1.1").unwrap(),
-            client_hostname: None,
-            blocked: false,
-            response_time_us: Some(10),
-            cache_hit: true,
-            cache_refresh: false,
-            dnssec_status: None,
-            dns64_synthesized: false,
-            answers: None,
-            upstream_server: None,
-            upstream_pool: None,
-            response_status: None,
-            timestamp: None,
-            query_source: Default::default(),
-            protocol: None,
-            group_id: None,
-            block_source: None,
-        };
-
-        log_repo.log_query(&log).await.unwrap();
-
-        assert_eq!(log_repo.count().await, 1);
-        assert_eq!(log_repo.get_cache_hits().await.len(), 1);
-    }
-}
-
-// ── MockManagedDomainRepository ────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct MockManagedDomainRepository {
@@ -1422,8 +1206,11 @@ impl ManagedDomainRepository for MockManagedDomainRepository {
     ) -> Result<ManagedDomain, DomainError> {
         let mut domains = self.domains.write().await;
 
-        if domains.iter().any(|d| d.name.as_ref() == name.as_str()) {
-            return Err(DomainError::InvalidManagedDomain(format!(
+        if domains
+            .iter()
+            .any(|d| d.name.as_ref() == name.as_str() && d.group_id == group_id)
+        {
+            return Err(DomainError::AlreadyExists(format!(
                 "Managed domain '{}' already exists",
                 name
             )));
@@ -1478,12 +1265,7 @@ impl ManagedDomainRepository for MockManagedDomainRepository {
     async fn update(
         &self,
         id: i64,
-        name: Option<String>,
-        domain: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
+        update: ManagedDomainUpdate,
     ) -> Result<ManagedDomain, DomainError> {
         let mut domains = self.domains.write().await;
 
@@ -1492,22 +1274,22 @@ impl ManagedDomainRepository for MockManagedDomainRepository {
             .find(|d| d.id == Some(id))
             .ok_or(DomainError::ManagedDomainNotFound(id))?;
 
-        if let Some(n) = name {
+        if let Some(n) = update.name {
             managed.name = Arc::from(n.as_str());
         }
-        if let Some(d) = domain {
+        if let Some(d) = update.domain {
             managed.domain = Arc::from(d.as_str());
         }
-        if let Some(a) = action {
+        if let Some(a) = update.action {
             managed.action = a;
         }
-        if let Some(gid) = group_id {
+        if let Some(gid) = update.group_id {
             managed.group_id = gid;
         }
-        if let Some(c) = comment {
-            managed.comment = Some(Arc::from(c.as_str()));
+        if let Some(c) = update.comment {
+            managed.comment = c.as_deref().map(Arc::from);
         }
-        if let Some(e) = enabled {
+        if let Some(e) = update.enabled {
             managed.enabled = e;
         }
 
@@ -1568,8 +1350,6 @@ impl ManagedDomainRepository for MockManagedDomainRepository {
         Ok((len_before - domains.len()) as u64)
     }
 }
-
-// ── MockBlockFilterEngine ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct MockBlockFilterEngine {
@@ -1650,6 +1430,17 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
         FilterDecision::Allow
     }
 
+    fn explain(&self, _domain: &str, _group_id: i64) -> ferrous_dns_domain::FilterExplanation {
+        unimplemented!()
+    }
+    fn match_candidate(
+        &self,
+        _domains: &[String],
+        _list_lines: &[String],
+        _regexes: &[String],
+    ) -> Result<Vec<bool>, DomainError> {
+        unimplemented!()
+    }
     fn store_cname_decision(&self, domain: &str, _group_id: i64, _ttl_secs: u64) {
         self.cname_blocked_domains
             .write()
@@ -1679,8 +1470,6 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
 
     fn set_blocking_enabled(&self, _enabled: bool) {}
 }
-
-// ── MockTunnelingFlagStore ─────────────────────────────────────────────────────
 
 use ferrous_dns_application::ports::TunnelingFlagStore;
 
@@ -1712,8 +1501,6 @@ impl TunnelingFlagStore for MockTunnelingFlagStore {
     }
 }
 
-// ── MockNxdomainHijackIpStore ─────────────────────────────────────────────────
-
 use ferrous_dns_application::ports::NxdomainHijackIpStore;
 
 pub struct MockNxdomainHijackIpStore {
@@ -1744,8 +1531,6 @@ impl NxdomainHijackIpStore for MockNxdomainHijackIpStore {
     }
 }
 
-// ── MockResponseIpFilterStore ─────────────────────────────────────────────────
-
 use ferrous_dns_application::ports::ResponseIpFilterStore;
 
 pub struct MockResponseIpFilterStore {
@@ -1775,8 +1560,6 @@ impl ResponseIpFilterStore for MockResponseIpFilterStore {
         self.blocked_ips.read().unwrap().contains(ip)
     }
 }
-
-// ── MockDgaFlagStore ──────────────────────────────────────────────────────────
 
 use ferrous_dns_application::ports::DgaFlagStore;
 

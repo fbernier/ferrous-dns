@@ -31,10 +31,8 @@ fn make_cache(max_entries: usize) -> Arc<DnsCache> {
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -88,7 +86,7 @@ fn test_fallback_eviction_returns_instead_of_deadlocking() {
     let evicting = Arc::clone(&cache);
     run_with_deadlock_guard("evict_entries", move || evicting.evict_entries());
 
-    assert_eq!(cache.size(), 0, "the single entry should have been evicted");
+    assert_eq!(cache.len(), 0, "the single entry should have been evicted");
     assert_eq!(
         cache.metrics().evictions.load(Ordering::Relaxed),
         1,
@@ -99,13 +97,7 @@ fn test_fallback_eviction_returns_instead_of_deadlocking() {
 #[test]
 fn test_fallback_eviction_keeps_permanent_entries() {
     let cache = make_cache(8);
-    cache.insert_permanent(
-        "nas.home.lan",
-        RecordType::A,
-        make_ip_data("10.0.0.5"),
-        300,
-        None,
-    );
+    cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
     cache.insert(
         "example.com",
         RecordType::A,
@@ -121,7 +113,7 @@ fn test_fallback_eviction_keeps_permanent_entries() {
     // reloads them, and dropping one here would leave `permanent_records`
     // claiming a name the backing map no longer holds.
     assert_eq!(
-        cache.size(),
+        cache.len(),
         1,
         "only the non-permanent entry should have been evicted"
     );
@@ -139,13 +131,13 @@ fn test_fallback_eviction_terminates_when_every_entry_is_permanent() {
         ("nas.home.lan", "10.0.0.5"),
         ("printer.home.lan", "10.0.0.6"),
     ] {
-        cache.insert_permanent(domain, RecordType::A, make_ip_data(ip), 300, None);
+        cache.insert_permanent(domain, RecordType::A, make_ip_data(ip), 300);
     }
 
     let evicting = Arc::clone(&cache);
     run_with_deadlock_guard("evict_entries", move || evicting.evict_entries());
 
-    assert_eq!(cache.size(), 2, "permanent entries are never evicted");
+    assert_eq!(cache.len(), 2, "permanent entries are never evicted");
     assert_eq!(
         cache.metrics().evictions.load(Ordering::Relaxed),
         0,

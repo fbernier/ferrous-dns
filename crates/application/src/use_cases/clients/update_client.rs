@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{Client, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -6,27 +7,21 @@ use crate::ports::{BlockFilterEnginePort, ClientRepository, GroupRepository};
 
 pub struct UpdateClientUseCase {
     client_repo: Arc<dyn ClientRepository>,
-    group_repo: Option<Arc<dyn GroupRepository>>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    group_repo: Arc<dyn GroupRepository>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl UpdateClientUseCase {
-    pub fn new(client_repo: Arc<dyn ClientRepository>) -> Self {
+    pub fn new(
+        client_repo: Arc<dyn ClientRepository>,
+        group_repo: Arc<dyn GroupRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
+    ) -> Self {
         Self {
             client_repo,
-            group_repo: None,
-            block_filter_engine: None,
+            group_repo,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
-    }
-
-    pub fn with_group_repo(mut self, repo: Arc<dyn GroupRepository>) -> Self {
-        self.group_repo = Some(repo);
-        self
     }
 
     #[instrument(skip(self))]
@@ -51,12 +46,7 @@ impl UpdateClientUseCase {
         let group_changed = group_id.is_some_and(|gid| client.group_id != Some(gid));
 
         if let Some(gid) = group_id {
-            if let Some(ref group_repo) = self.group_repo {
-                group_repo
-                    .get_by_id(gid)
-                    .await?
-                    .ok_or(DomainError::GroupNotFound(gid))?;
-            }
+            require_group(self.group_repo.as_ref(), gid).await?;
             self.client_repo.assign_group(client_id, gid).await?;
         }
 
@@ -69,10 +59,8 @@ impl UpdateClientUseCase {
         info!(client_id, hostname = ?hostname, group_id = ?group_id, "Client updated");
 
         if group_changed {
-            if let Some(ref engine) = self.block_filter_engine {
-                if let Err(e) = engine.load_client_groups().await {
-                    error!(error = %e, "Failed to reload client groups after client update");
-                }
+            if let Err(e) = self.block_filter_engine.load_client_groups().await {
+                error!(error = %e, "Failed to reload client groups after client update");
             }
         }
 

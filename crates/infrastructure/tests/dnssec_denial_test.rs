@@ -6,10 +6,10 @@
 //! full chain are covered by the live smoke tests.
 
 use data_encoding::BASE32_DNSSEC;
+use ferrous_dns_domain::DnssecStatus;
 use ferrous_dns_infrastructure::dns::dnssec::validation::denial::{
     prove_denial, prove_wildcard_expansion, VerifiedNsec, VerifiedNsec3,
 };
-use ferrous_dns_infrastructure::dns::dnssec::validation::ValidationResult;
 use hickory_proto::dnssec::rdata::{NSEC, NSEC3};
 use hickory_proto::dnssec::Nsec3HashAlgorithm;
 use hickory_proto::op::ResponseCode;
@@ -72,7 +72,7 @@ fn nsec1_nodata_secure_when_type_absent() {
         &[],
         &nsecs,
     );
-    assert_eq!(result, ValidationResult::Secure);
+    assert_eq!(result, DnssecStatus::Secure);
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn nsec1_nodata_bogus_when_type_present() {
         &[],
         &nsecs,
     );
-    assert_eq!(result, ValidationResult::Bogus);
+    assert_eq!(result, DnssecStatus::Bogus);
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn nsec1_nxdomain_secure_with_cover_and_wildcard() {
         &[],
         &nsecs,
     );
-    assert_eq!(result, ValidationResult::Secure);
+    assert_eq!(result, DnssecStatus::Secure);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn nsec1_nxdomain_bogus_without_wildcard_proof() {
         &[],
         &nsecs,
     );
-    assert_eq!(result, ValidationResult::Bogus);
+    assert_eq!(result, DnssecStatus::Bogus);
 }
 
 // ----------------------------- NSEC3 ---------------------------------------
@@ -168,7 +168,7 @@ fn nsec3_nodata_secure_on_matching_record_without_type() {
         &nsec3s,
         &[],
     );
-    assert_eq!(result, ValidationResult::Secure);
+    assert_eq!(result, DnssecStatus::Secure);
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn nsec3_nodata_bogus_when_matching_record_has_type() {
         &nsec3s,
         &[],
     );
-    assert_eq!(result, ValidationResult::Bogus);
+    assert_eq!(result, DnssecStatus::Bogus);
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn nsec3_ds_nodata_optout_is_insecure() {
         &nsec3s,
         &[],
     );
-    assert_eq!(result, ValidationResult::Insecure);
+    assert_eq!(result, DnssecStatus::Insecure);
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn nsec3_nxdomain_secure_closest_encloser_proof() {
         &nsec3s,
         &[],
     );
-    assert_eq!(result, ValidationResult::Secure);
+    assert_eq!(result, DnssecStatus::Secure);
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn nsec3_high_iterations_is_insecure() {
         &nsec3s,
         &[],
     );
-    assert_eq!(result, ValidationResult::Insecure);
+    assert_eq!(result, DnssecStatus::Insecure);
 }
 
 // ------------------- wildcard expansion (RFC 4035 §5.3.4) ------------------
@@ -285,7 +285,7 @@ fn wildcard_expansion_secure_when_exact_name_denied() {
         data: &cover,
     }];
     let result = prove_wildcard_expansion(&n("foo.example.com."), 2, &[], &nsecs);
-    assert_eq!(result, ValidationResult::Secure);
+    assert_eq!(result, DnssecStatus::Secure);
 }
 
 #[test]
@@ -298,7 +298,7 @@ fn wildcard_expansion_bogus_when_exact_name_not_denied() {
         data: &other,
     }];
     let result = prove_wildcard_expansion(&n("foo.example.com."), 2, &[], &nsecs);
-    assert_eq!(result, ValidationResult::Bogus);
+    assert_eq!(result, DnssecStatus::Bogus);
 }
 
 #[test]
@@ -312,5 +312,5 @@ fn no_denial_records_is_bogus() {
         &[],
         &[],
     );
-    assert_eq!(result, ValidationResult::Bogus);
+    assert_eq!(result, DnssecStatus::Bogus);
 }

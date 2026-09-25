@@ -1,3 +1,3 @@
 pub mod period;
 
-pub use period::{parse_period, validate_period};
+pub use period::{default_period, period_hours};

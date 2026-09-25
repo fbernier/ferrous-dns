@@ -1,6 +1,5 @@
-use ferrous_dns_infrastructure::dns::proxy_protocol::{
-    read_proxy_v2_client_ip, ProxyProtocolError,
-};
+use ferrous_dns_domain::DomainError;
+use ferrous_dns_infrastructure::dns::proxy_protocol::read_proxy_v2_client_ip;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const PROXY_V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
@@ -104,7 +103,7 @@ async fn test_proxy_v2_invalid_signature_returns_error() {
     let mut stream = header.as_slice();
     let result = read_proxy_v2_client_ip(&mut stream, peer_addr).await;
 
-    assert!(matches!(result, Err(ProxyProtocolError::InvalidSignature)));
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
@@ -116,7 +115,7 @@ async fn test_proxy_v2_invalid_version_returns_error() {
     let mut stream = header.as_slice();
     let result = read_proxy_v2_client_ip(&mut stream, peer_addr).await;
 
-    assert!(matches!(result, Err(ProxyProtocolError::InvalidVersion)));
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
@@ -149,7 +148,7 @@ async fn test_proxy_v2_empty_stream_returns_io_error() {
     let mut stream: &[u8] = &[];
     let result = read_proxy_v2_client_ip(&mut stream, peer_addr).await;
 
-    assert!(matches!(result, Err(ProxyProtocolError::Io(_))));
+    assert!(matches!(result, Err(DomainError::IoError(_))));
 }
 
 #[tokio::test]
@@ -160,7 +159,7 @@ async fn test_proxy_v2_truncated_header_returns_io_error() {
     let mut stream = partial;
     let result = read_proxy_v2_client_ip(&mut stream, peer_addr).await;
 
-    assert!(matches!(result, Err(ProxyProtocolError::Io(_))));
+    assert!(matches!(result, Err(DomainError::IoError(_))));
 }
 
 #[tokio::test]
@@ -172,7 +171,7 @@ async fn test_proxy_v2_unknown_command_returns_error() {
     let mut stream = header.as_slice();
     let result = read_proxy_v2_client_ip(&mut stream, peer_addr).await;
 
-    assert!(matches!(result, Err(ProxyProtocolError::UnknownCommand)));
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
@@ -187,10 +186,7 @@ async fn test_proxy_v2_additional_len_too_large_returns_error() {
     let mut stream = header.as_slice();
     let result = read_proxy_v2_client_ip(&mut stream, peer_addr).await;
 
-    assert!(matches!(
-        result,
-        Err(ProxyProtocolError::AdditionalLenTooLarge)
-    ));
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
@@ -206,7 +202,7 @@ async fn test_proxy_v2_tcp4_truncated_address_block_returns_io_error() {
     let mut stream = header.as_slice();
     let result = read_proxy_v2_client_ip(&mut stream, peer_addr).await;
 
-    assert!(matches!(result, Err(ProxyProtocolError::Io(_))));
+    assert!(matches!(result, Err(DomainError::IoError(_))));
 }
 
 #[tokio::test]

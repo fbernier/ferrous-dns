@@ -14,13 +14,9 @@ pub struct CacheMetrics {
     pub lazy_deletions: AtomicU64,
     pub compactions: AtomicU64,
     pub batch_evictions: AtomicU64,
-    pub adaptive_adjustments: AtomicU64,
 
-    /// Phase 6: counts upstream resolution failures that were NOT cached as
-    /// NXDOMAIN — timeouts, connection refused/reset, no healthy servers,
-    /// invalid responses, etc. Caching these would poison the negative cache
-    /// during transient upstream instability and hand clients fake NXDOMAIN
-    /// answers for legitimate domains.
+    /// Upstream failures deliberately not cached as NXDOMAIN (timeouts,
+    /// refused/reset connections, no healthy servers, invalid responses).
     pub transient_upstream_errors: AtomicU64,
 
     /// Serve-stale repairs that could not be queued because the stale channel
@@ -29,8 +25,7 @@ pub struct CacheMetrics {
     pub stale_refresh_drops: AtomicU64,
 
     /// Optimistic candidates a cycle cut because its backlog did not fit in the
-    /// queue. Non-zero means the working set outgrew the queue, which is the
-    /// signal that used to be missing when the fixed pacer silently starved it.
+    /// queue. Non-zero means the working set outgrew the queue.
     pub optimistic_refresh_shed: AtomicU64,
 }
 

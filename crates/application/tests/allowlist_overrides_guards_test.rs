@@ -114,7 +114,7 @@ fn build(resolver: MockDnsResolver, fixture: Fixture) -> HandleDnsQueryUseCase {
     .with_tunneling_flag_store(tunneling_store)
     .with_dga_detection(&dga_config)
     .with_dga_flag_store(dga_store)
-    .with_rebinding_protection(true, None, &[])
+    .with_rebinding_protection(None, &[])
     .with_nxdomain_hijack_detection(&hijack_config, hijack_store)
     .with_response_ip_filter(&c2_config, c2_store)
 }
@@ -126,8 +126,6 @@ async fn resolver_with_ip(domain: &str, ip: &str) -> MockDnsResolver {
         .await;
     resolver
 }
-
-// ── DGA ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn explicit_allow_clears_a_dga_false_positive() {
@@ -196,8 +194,6 @@ async fn explicit_allow_clears_a_background_dga_flag() {
         "an explicit allow must also clear a domain flagged by the phase-2 analyzer"
     );
 }
-
-// ── Tunneling ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn explicit_allow_clears_a_tunneling_false_positive() {
@@ -276,8 +272,6 @@ async fn explicit_allow_clears_a_background_tunneling_flag() {
     );
 }
 
-// ── Rebinding ────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn explicit_allow_clears_a_rebinding_false_positive() {
     let control = build(
@@ -309,8 +303,6 @@ async fn explicit_allow_clears_a_rebinding_false_positive() {
         "an explicitly allowed domain must not be blocked by rebinding protection"
     );
 }
-
-// ── NXDOMAIN hijack ──────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn explicit_allow_clears_an_nxdomain_hijack_false_positive() {
@@ -347,8 +339,6 @@ async fn explicit_allow_clears_an_nxdomain_hijack_false_positive() {
         "an explicitly allowed domain must not be blocked by NXDOMAIN hijack detection"
     );
 }
-
-// ── Response IP filter ───────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn explicit_allow_clears_a_response_ip_false_positive() {

@@ -1,6 +1,6 @@
+use super::guard_whitelist::GuardWhitelist;
 use ferrous_dns_domain::{RecordType, TunnelingAction, TunnelingDetectionConfig};
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 /// Outcome of the hot-path tunneling check (phase 1).
@@ -15,62 +15,6 @@ pub(super) enum TunnelingVerdict {
     },
 }
 
-/// Parsed CIDR range for client whitelist matching.
-struct CidrRange {
-    network: u128,
-    mask: u128,
-}
-
-impl CidrRange {
-    fn parse(cidr: &str) -> Option<Self> {
-        let (addr_str, prefix_str) = cidr.split_once('/')?;
-        let prefix: u8 = prefix_str.parse().ok()?;
-
-        if let Ok(v4) = addr_str.parse::<Ipv4Addr>() {
-            if prefix > 32 {
-                return None;
-            }
-            let v4_bits = u32::from(v4);
-            let v4_mask = if prefix == 0 {
-                0u32
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            // Map to IPv4-mapped IPv6 space: ::ffff:a.b.c.d
-            let mapped = (v4_bits as u128) | 0xFFFF_0000_0000u128;
-            let mapped_mask = (v4_mask as u128) | 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_0000_0000u128;
-            Some(Self {
-                network: mapped & mapped_mask,
-                mask: mapped_mask,
-            })
-        } else if let Ok(v6) = addr_str.parse::<Ipv6Addr>() {
-            if prefix > 128 {
-                return None;
-            }
-            let bits = u128::from(v6);
-            let mask = if prefix == 0 {
-                0u128
-            } else {
-                (u128::MAX >> (128 - prefix)) << (128 - prefix)
-            };
-            Some(Self {
-                network: bits & mask,
-                mask,
-            })
-        } else {
-            None
-        }
-    }
-
-    fn contains(&self, ip: IpAddr) -> bool {
-        let bits = match ip {
-            IpAddr::V4(v4) => u32::from(v4) as u128 | 0xFFFF_0000_0000u128,
-            IpAddr::V6(v6) => u128::from(v6),
-        };
-        (bits & self.mask) == self.network
-    }
-}
-
 /// Guards DNS queries against tunneling attempts on the hot path.
 ///
 /// Performs O(1) checks only: FQDN length, label length, and NULL record type.
@@ -81,12 +25,10 @@ pub(super) struct TunnelingGuard {
     max_fqdn_length: usize,
     max_label_length: usize,
     block_null_queries: bool,
-    domain_whitelist: HashSet<Box<str>>,
-    client_whitelist: Vec<CidrRange>,
+    whitelist: GuardWhitelist,
 }
 
 impl TunnelingGuard {
-    /// Creates a guard from the domain-layer configuration.
     pub(super) fn from_config(config: &TunnelingDetectionConfig) -> Self {
         Self {
             enabled: config.enabled,
@@ -94,20 +36,14 @@ impl TunnelingGuard {
             max_fqdn_length: config.max_fqdn_length,
             max_label_length: config.max_label_length,
             block_null_queries: config.block_null_queries,
-            domain_whitelist: config
-                .domain_whitelist
-                .iter()
-                .map(|s| s.to_lowercase().into_boxed_str())
-                .collect(),
-            client_whitelist: config
-                .client_whitelist
-                .iter()
-                .filter_map(|s| CidrRange::parse(s))
-                .collect(),
+            whitelist: GuardWhitelist::new(
+                "dns.tunneling_detection",
+                &config.domain_whitelist,
+                &config.client_whitelist,
+            ),
         }
     }
 
-    /// Creates a disabled guard that never triggers.
     pub(super) fn disabled() -> Self {
         Self {
             enabled: false,
@@ -115,21 +51,16 @@ impl TunnelingGuard {
             max_fqdn_length: 120,
             max_label_length: 50,
             block_null_queries: true,
-            domain_whitelist: HashSet::new(),
-            client_whitelist: Vec::new(),
+            whitelist: GuardWhitelist::new("dns.tunneling_detection", &[], &[]),
         }
     }
 
-    /// Returns the configured action for detected tunneling.
     pub(super) fn action(&self) -> TunnelingAction {
         self.action
     }
 
-    /// Returns `true` if the client IP is in the configured whitelist.
     pub(super) fn is_client_whitelisted(&self, client_ip: IpAddr) -> bool {
-        self.client_whitelist
-            .iter()
-            .any(|cidr| cidr.contains(client_ip))
+        self.whitelist.contains_client(client_ip)
     }
 
     /// Performs O(1) tunneling checks on the hot path.
@@ -149,18 +80,8 @@ impl TunnelingGuard {
             return TunnelingVerdict::Clean;
         }
 
-        // O(1) HashSet lookup (case-insensitive via pre-lowercased keys)
-        if domain.len() <= 253 {
-            let mut buf = [0u8; 253];
-            let bytes = domain.as_bytes();
-            let len = bytes.len();
-            for (i, &b) in bytes.iter().enumerate() {
-                buf[i] = b.to_ascii_lowercase();
-            }
-            let lower = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
-            if self.domain_whitelist.contains(lower) {
-                return TunnelingVerdict::Clean;
-            }
+        if self.whitelist.contains_domain(domain) {
+            return TunnelingVerdict::Clean;
         }
 
         if domain.len() > self.max_fqdn_length {

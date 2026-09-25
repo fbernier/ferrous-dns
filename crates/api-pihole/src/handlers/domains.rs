@@ -2,33 +2,50 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use ferrous_dns_domain::DomainAction;
+use ferrous_dns_application::ports::{ManagedDomainUpdate, RegexFilterUpdate};
+use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain, RegexFilter};
 
 use crate::{
     dto::domains::{
         BatchDeleteRequest, CreateDomainRequest, DomainsListResponse, PiholeDomainEntry,
     },
     errors::PiholeApiError,
+    handlers::require_id,
     state::PiholeAppState,
 };
 
-fn map_type(t: &str) -> Option<DomainAction> {
-    match t {
-        "allow" => Some(DomainAction::Allow),
-        "deny" => Some(DomainAction::Deny),
-        _ => None,
+/// The `{kind}` path segment: exact entries are managed domains, regex
+/// entries are regex filters.
+#[derive(Clone, Copy)]
+enum DomainKind {
+    Exact,
+    Regex,
+}
+
+impl DomainKind {
+    fn from_path(kind: &str) -> Option<Self> {
+        match kind {
+            "exact" => Some(Self::Exact),
+            "regex" => Some(Self::Regex),
+            _ => None,
+        }
     }
 }
 
-fn domain_to_entry(
-    d: &ferrous_dns_domain::ManagedDomain,
-) -> Result<PiholeDomainEntry, PiholeApiError> {
+fn parse_kind(kind: &str) -> Result<DomainKind, DomainError> {
+    DomainKind::from_path(kind)
+        .ok_or_else(|| DomainError::InvalidDomainName(format!("Unknown kind: {kind}")))
+}
+
+fn parse_action(domain_type: &str) -> Result<DomainAction, DomainError> {
+    domain_type
+        .parse()
+        .map_err(|_| DomainError::InvalidDomainName(format!("Unknown domain type: {domain_type}")))
+}
+
+fn domain_to_entry(d: &ManagedDomain) -> Result<PiholeDomainEntry, DomainError> {
     Ok(PiholeDomainEntry {
-        id: d.id.ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                "managed domain missing id".into(),
-            ))
-        })?,
+        id: require_id(d.id, "managed domain")?,
         domain: d.domain.to_string(),
         r#type: d.action.to_str(),
         kind: "exact",
@@ -40,15 +57,9 @@ fn domain_to_entry(
     })
 }
 
-fn regex_to_entry(
-    r: &ferrous_dns_domain::RegexFilter,
-) -> Result<PiholeDomainEntry, PiholeApiError> {
+fn regex_to_entry(r: &RegexFilter) -> Result<PiholeDomainEntry, DomainError> {
     Ok(PiholeDomainEntry {
-        id: r.id.ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                "regex filter missing id".into(),
-            ))
-        })?,
+        id: require_id(r.id, "regex filter")?,
         domain: r.pattern.to_string(),
         r#type: r.action.to_str(),
         kind: "regex",
@@ -107,11 +118,7 @@ pub async fn list_by_type(
     State(state): State<PiholeAppState>,
     Path(domain_type): Path<String>,
 ) -> Result<Json<DomainsListResponse>, PiholeApiError> {
-    let action = map_type(&domain_type).ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::InvalidDomainName(format!(
-            "Unknown domain type: {domain_type}"
-        )))
-    })?;
+    let action = parse_action(&domain_type)?;
 
     let (managed, regexes) = tokio::join!(
         state.blocking.get_managed_domains.get_all(),
@@ -147,14 +154,10 @@ pub async fn list_by_type_kind(
     State(state): State<PiholeAppState>,
     Path((domain_type, kind)): Path<(String, String)>,
 ) -> Result<Json<DomainsListResponse>, PiholeApiError> {
-    let action = map_type(&domain_type).ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::InvalidDomainName(format!(
-            "Unknown domain type: {domain_type}"
-        )))
-    })?;
+    let action = parse_action(&domain_type)?;
 
-    let domains: Vec<PiholeDomainEntry> = match kind.as_str() {
-        "exact" => {
+    let domains: Vec<PiholeDomainEntry> = match DomainKind::from_path(&kind) {
+        Some(DomainKind::Exact) => {
             let managed = state.blocking.get_managed_domains.get_all().await?;
             managed
                 .iter()
@@ -162,7 +165,7 @@ pub async fn list_by_type_kind(
                 .map(domain_to_entry)
                 .collect::<Result<Vec<_>, _>>()?
         }
-        "regex" => {
+        Some(DomainKind::Regex) => {
             let regexes = state.blocking.get_regex_filters.get_all().await?;
             regexes
                 .iter()
@@ -170,7 +173,7 @@ pub async fn list_by_type_kind(
                 .map(regex_to_entry)
                 .collect::<Result<Vec<_>, _>>()?
         }
-        _ => Vec::new(),
+        None => Vec::new(),
     };
 
     Ok(Json(DomainsListResponse { domains }))
@@ -197,11 +200,7 @@ pub async fn create_domain(
     Path((domain_type, kind)): Path<(String, String)>,
     Json(body): Json<CreateDomainRequest>,
 ) -> Result<impl IntoResponse, PiholeApiError> {
-    let action = map_type(&domain_type).ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::InvalidDomainName(format!(
-            "Unknown domain type: {domain_type}"
-        )))
-    })?;
+    let action = parse_action(&domain_type)?;
     let group_id = body
         .groups
         .as_ref()
@@ -209,8 +208,8 @@ pub async fn create_domain(
         .unwrap_or(1);
     let enabled = body.enabled.unwrap_or(true);
 
-    match kind.as_str() {
-        "exact" => {
+    match parse_kind(&kind)? {
+        DomainKind::Exact => {
             let name = body.domain.clone();
             let result = state
                 .blocking
@@ -220,7 +219,7 @@ pub async fn create_domain(
             let entry = domain_to_entry(&result)?;
             Ok((StatusCode::CREATED, Json(entry)))
         }
-        "regex" => {
+        DomainKind::Regex => {
             let name = body.domain.clone();
             let result = state
                 .blocking
@@ -230,9 +229,6 @@ pub async fn create_domain(
             let entry = regex_to_entry(&result)?;
             Ok((StatusCode::CREATED, Json(entry)))
         }
-        _ => Err(PiholeApiError(
-            ferrous_dns_domain::DomainError::InvalidDomainName(format!("Unknown kind: {kind}")),
-        )),
     }
 }
 
@@ -258,73 +254,59 @@ pub async fn update_domain(
     Path((domain_type, kind, domain_name)): Path<(String, String, String)>,
     Json(body): Json<CreateDomainRequest>,
 ) -> Result<Json<PiholeDomainEntry>, PiholeApiError> {
-    let action = map_type(&domain_type);
+    // An unknown type keeps the entry's current action.
+    let action = domain_type.parse::<DomainAction>().ok();
     let group_id = body.groups.as_ref().and_then(|g| g.first().copied());
 
-    match kind.as_str() {
-        "exact" => {
+    match parse_kind(&kind)? {
+        DomainKind::Exact => {
             let all = state.blocking.get_managed_domains.get_all().await?;
             let existing = all
                 .iter()
                 .find(|d| d.domain.as_ref() == domain_name)
-                .ok_or_else(|| {
-                    PiholeApiError(ferrous_dns_domain::DomainError::NotFound(format!(
-                        "Domain {domain_name} not found"
-                    )))
-                })?;
-            let id = existing.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
+                .ok_or_else(|| DomainError::NotFound(format!("Domain {domain_name} not found")))?;
+            let id = require_id(existing.id, "managed domain")?;
             let result = state
                 .blocking
                 .update_managed_domain
                 .execute(
                     id,
-                    None,
-                    Some(body.domain),
-                    action,
-                    group_id,
-                    body.comment,
-                    body.enabled,
+                    ManagedDomainUpdate {
+                        domain: Some(body.domain),
+                        action,
+                        group_id,
+                        comment: body.comment.map(Some),
+                        enabled: body.enabled,
+                        ..Default::default()
+                    },
                 )
                 .await?;
             Ok(Json(domain_to_entry(&result)?))
         }
-        "regex" => {
+        DomainKind::Regex => {
             let all = state.blocking.get_regex_filters.get_all().await?;
             let existing = all
                 .iter()
                 .find(|r| r.pattern.as_ref() == domain_name)
-                .ok_or_else(|| {
-                    PiholeApiError(ferrous_dns_domain::DomainError::NotFound(format!(
-                        "Regex {domain_name} not found"
-                    )))
-                })?;
-            let id = existing.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
+                .ok_or_else(|| DomainError::NotFound(format!("Regex {domain_name} not found")))?;
+            let id = require_id(existing.id, "regex filter")?;
             let result = state
                 .blocking
                 .update_regex_filter
                 .execute(
                     id,
-                    None,
-                    Some(body.domain),
-                    action,
-                    group_id,
-                    body.comment,
-                    body.enabled,
+                    RegexFilterUpdate {
+                        pattern: Some(body.domain),
+                        action,
+                        group_id,
+                        comment: body.comment.map(Some),
+                        enabled: body.enabled,
+                        ..Default::default()
+                    },
                 )
                 .await?;
             Ok(Json(regex_to_entry(&result)?))
         }
-        _ => Err(PiholeApiError(
-            ferrous_dns_domain::DomainError::InvalidDomainName(format!("Unknown kind: {kind}")),
-        )),
     }
 }
 
@@ -348,51 +330,34 @@ pub async fn delete_domain(
     State(state): State<PiholeAppState>,
     Path((domain_type, kind, domain_name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, PiholeApiError> {
-    let action = map_type(&domain_type).ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::InvalidDomainName(format!(
-            "Unknown domain type: {domain_type}"
-        )))
-    })?;
+    let action = parse_action(&domain_type)?;
 
-    match kind.as_str() {
-        "exact" => {
+    match parse_kind(&kind)? {
+        DomainKind::Exact => {
             let all = state.blocking.get_managed_domains.get_all().await?;
             let existing = all
                 .iter()
                 .find(|d| d.domain.as_ref() == domain_name && d.action == action)
                 .ok_or_else(|| {
-                    PiholeApiError(ferrous_dns_domain::DomainError::NotFound(format!(
+                    DomainError::NotFound(format!(
                         "Domain {domain_name} not found in {domain_type} list"
-                    )))
+                    ))
                 })?;
-            let id = existing.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
+            let id = require_id(existing.id, "managed domain")?;
             state.blocking.delete_managed_domain.execute(id).await?;
         }
-        "regex" => {
+        DomainKind::Regex => {
             let all = state.blocking.get_regex_filters.get_all().await?;
             let existing = all
                 .iter()
                 .find(|r| r.pattern.as_ref() == domain_name && r.action == action)
                 .ok_or_else(|| {
-                    PiholeApiError(ferrous_dns_domain::DomainError::NotFound(format!(
+                    DomainError::NotFound(format!(
                         "Regex {domain_name} not found in {domain_type} list"
-                    )))
+                    ))
                 })?;
-            let id = existing.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
+            let id = require_id(existing.id, "regex filter")?;
             state.blocking.delete_regex_filter.execute(id).await?;
-        }
-        _ => {
-            return Err(PiholeApiError(
-                ferrous_dns_domain::DomainError::InvalidDomainName(format!("Unknown kind: {kind}")),
-            ));
         }
     }
 
@@ -427,21 +392,13 @@ pub async fn batch_delete(
             .iter()
             .find(|d| d.domain.as_ref() == item.as_str())
         {
-            let id = d.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
+            let id = require_id(d.id, "managed domain")?;
             state.blocking.delete_managed_domain.execute(id).await?;
         } else if let Some(r) = all_regex
             .iter()
             .find(|r| r.pattern.as_ref() == item.as_str())
         {
-            let id = r.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
+            let id = require_id(r.id, "regex filter")?;
             state.blocking.delete_regex_filter.execute(id).await?;
         }
     }

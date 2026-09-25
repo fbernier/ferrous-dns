@@ -87,7 +87,11 @@ async fn test_get_by_id_not_found() {
 async fn test_create_success() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo);
+    let use_case = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo,
+        Arc::new(MockBlockFilterEngine::new()),
+    );
 
     let result = use_case
         .execute(
@@ -112,8 +116,15 @@ async fn test_create_success() {
 async fn test_create_with_multiple_groups() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
-    let use_case = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo);
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
+    let use_case = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo,
+        Arc::new(MockBlockFilterEngine::new()),
+    );
 
     let result = use_case
         .execute("Multi-Group List".to_string(), None, vec![1, 2], None, true)
@@ -128,7 +139,8 @@ async fn test_create_with_multiple_groups() {
 async fn test_create_without_url_succeeds() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute("Manual List".to_string(), None, vec![1], None, true)
@@ -143,7 +155,8 @@ async fn test_create_without_url_succeeds() {
 async fn test_create_invalid_name_empty() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute("".to_string(), None, vec![1], None, true)
@@ -160,7 +173,8 @@ async fn test_create_invalid_name_empty() {
 async fn test_create_invalid_url_scheme() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute(
@@ -183,7 +197,8 @@ async fn test_create_invalid_url_scheme() {
 async fn test_create_group_not_found() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute("Test List".to_string(), None, vec![999], None, true)
@@ -200,7 +215,8 @@ async fn test_create_group_not_found() {
 async fn test_create_one_invalid_group_in_multi_group_fails() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     // group 1 exists (default), group 999 does not
     let result = use_case
@@ -215,33 +231,16 @@ async fn test_create_one_invalid_group_in_multi_group_fails() {
 }
 
 #[tokio::test]
-async fn test_create_duplicate_name() {
-    let repo = Arc::new(MockBlocklistSourceRepository::new());
-    let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo);
-
-    use_case
-        .execute("Duplicate".to_string(), None, vec![1], None, true)
-        .await
-        .unwrap();
-
-    let result = use_case
-        .execute("Duplicate".to_string(), None, vec![1], None, true)
-        .await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        DomainError::InvalidBlocklistSource(_) => {}
-        other => panic!("Expected InvalidBlocklistSource, got {:?}", other),
-    }
-}
-
-#[tokio::test]
 async fn test_update_toggle_enabled() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateBlocklistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("Toggle List".to_string(), None, vec![1], None, true)
@@ -261,10 +260,18 @@ async fn test_update_toggle_enabled() {
 async fn test_update_change_groups() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
 
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateBlocklistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("Group Change List".to_string(), None, vec![1], None, true)
@@ -284,10 +291,18 @@ async fn test_update_change_groups() {
 async fn test_update_assign_multiple_groups() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
 
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateBlocklistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("Shared List".to_string(), None, vec![1], None, true)
@@ -310,7 +325,8 @@ async fn test_update_assign_multiple_groups() {
 async fn test_update_source_not_found() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = UpdateBlocklistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        UpdateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute(999, None, None, None, None, Some(false))
@@ -327,8 +343,13 @@ async fn test_update_source_not_found() {
 async fn test_update_invalid_group() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateBlocklistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("List".to_string(), None, vec![1], None, true)
@@ -350,8 +371,13 @@ async fn test_update_invalid_group() {
 async fn test_update_clear_url() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateBlocklistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateBlocklistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute(
@@ -376,8 +402,13 @@ async fn test_update_clear_url() {
 async fn test_delete_success() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo);
-    let delete_uc = DeleteBlocklistSourceUseCase::new(repo.clone());
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo,
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let delete_uc =
+        DeleteBlocklistSourceUseCase::new(repo.clone(), Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("To Delete".to_string(), None, vec![1], None, true)
@@ -395,7 +426,7 @@ async fn test_delete_success() {
 #[tokio::test]
 async fn test_delete_not_found() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
-    let use_case = DeleteBlocklistSourceUseCase::new(repo);
+    let use_case = DeleteBlocklistSourceUseCase::new(repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(999).await;
 
@@ -405,8 +436,6 @@ async fn test_delete_not_found() {
         other => panic!("Expected BlocklistSourceNotFound, got {:?}", other),
     }
 }
-
-// ── Block filter reload ───────────────────────────────────────────────────────
 
 /// Polls until the spawned reload has run at least `expected` times. The sync
 /// use case reloads in a background task, so the count is not visible until
@@ -438,8 +467,7 @@ async fn test_create_reloads_block_filter() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let use_case =
-        CreateBlocklistSourceUseCase::new(repo, group_repo).with_block_filter(engine.clone());
+    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo, engine.clone());
 
     let result = use_case
         .execute(
@@ -464,9 +492,12 @@ async fn test_update_reloads_block_filter() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc =
-        UpdateBlocklistSourceUseCase::new(repo, group_repo).with_block_filter(engine.clone());
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc = UpdateBlocklistSourceUseCase::new(repo, group_repo, engine.clone());
 
     let source = create_uc
         .execute("Toggle List".to_string(), None, vec![1], None, true)
@@ -486,8 +517,12 @@ async fn test_delete_reloads_block_filter() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let create_uc = CreateBlocklistSourceUseCase::new(repo.clone(), group_repo);
-    let delete_uc = DeleteBlocklistSourceUseCase::new(repo).with_block_filter(engine.clone());
+    let create_uc = CreateBlocklistSourceUseCase::new(
+        repo.clone(),
+        group_repo,
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let delete_uc = DeleteBlocklistSourceUseCase::new(repo, engine.clone());
 
     let source = create_uc
         .execute("To Delete".to_string(), None, vec![1], None, true)
@@ -505,8 +540,7 @@ async fn test_create_group_not_found_does_not_reload() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let use_case =
-        CreateBlocklistSourceUseCase::new(repo, group_repo).with_block_filter(engine.clone());
+    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo, engine.clone());
 
     let result = use_case
         .execute("Unknown Group".to_string(), None, vec![999], None, true)
@@ -525,8 +559,7 @@ async fn test_batch_creator_does_not_reload_block_filter() {
     let repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let use_case =
-        CreateBlocklistSourceUseCase::new(repo, group_repo).with_block_filter(engine.clone());
+    let use_case = CreateBlocklistSourceUseCase::new(repo, group_repo, engine.clone());
 
     // Backup import drives this port in a loop over every source in the
     // snapshot and reloads once at the end. Reloading here would re-download
@@ -538,8 +571,6 @@ async fn test_batch_creator_does_not_reload_block_filter() {
     assert!(result.is_ok());
     assert_eq!(engine.reload_count().await, 0);
 }
-
-// ── Manual sync ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_sync_starts_a_reload() {

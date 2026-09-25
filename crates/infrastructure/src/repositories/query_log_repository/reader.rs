@@ -1,15 +1,47 @@
-use super::helpers::{hours_ago_cutoff, row_to_query_log, seconds_ago_cutoff, window_start_bucket};
+use super::helpers::{row_to_query_log, window_start_bucket};
 use super::rollup;
-use chrono::Utc;
-use ferrous_dns_application::ports::PagedQueryResult;
-use ferrous_dns_domain::query_log::{ClientProtocol, DnssecStats, QueryCategory, QueryLogFilter};
+use crate::repositories::{db_err, hours_ago_cutoff, seconds_ago_cutoff, sql_ts};
+use chrono::{TimeDelta, Utc};
+use ferrous_dns_application::ports::{PageAt, PagedQueryResult};
+use ferrous_dns_domain::entities::query_log::{
+    ClientProtocol, DnssecStats, DnssecStatusFilter, QueryCategory, QueryLogFilter,
+};
 use ferrous_dns_domain::{DomainError, QueryLog, QueryStats};
 use sqlx::{Row, SqlitePool};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, info, instrument};
 
 /// SQL mirror of `BlockSource::is_malware`; the rollup backfill carries the same list.
 const MALWARE_FILTER: &str = " AND q.block_source IN ('dns_tunneling', 'dns_rebinding', 'nxdomain_hijack', 'response_ip_filter', 'dga_detection')";
+
+/// Every column `row_to_query_log` reads, joined to the client hostname, followed by `$tail`.
+macro_rules! select_query_log {
+    ($tail:literal) => {
+        concat!(
+            "SELECT q.id, q.domain, q.record_type, q.client_ip, q.blocked, q.response_time_ms,
+                    q.cache_hit, q.cache_refresh, q.dnssec_status, q.dns64_synthesized, q.answers, q.upstream_server,
+                    q.upstream_pool, q.response_status, q.query_source, q.protocol, q.group_id, q.block_source,
+                    datetime(q.created_at) AS created_at, c.hostname
+             FROM query_log q
+             LEFT JOIN clients c ON q.client_ip = c.ip_address",
+            $tail
+        )
+    };
+}
+
+/// `%needle%` for `LIKE ? ESCAPE '\'`, so `%`, `_` and `\` in user input match literally.
+fn contains_pattern(needle: &str) -> String {
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for ch in needle.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
 
 #[instrument(skip(pool))]
 pub(super) async fn get_recent(
@@ -22,27 +54,17 @@ pub(super) async fn get_recent(
         period_hours, "Fetching recent queries with time filter"
     );
 
-    let cutoff = hours_ago_cutoff(period_hours);
-    let rows = sqlx::query(
-        "SELECT q.id, q.domain, q.record_type, q.client_ip, q.blocked, q.response_time_ms,
-                q.cache_hit, q.cache_refresh, q.dnssec_status, q.dns64_synthesized, q.answers, q.upstream_server,
-                q.upstream_pool, q.response_status, q.query_source, q.protocol, q.group_id, q.block_source,
-                datetime(q.created_at) as created_at, c.hostname
-         FROM query_log q
-         LEFT JOIN clients c ON q.client_ip = c.ip_address
-         WHERE q.created_at >= ?
-           AND q.query_source = 'client'
-         ORDER BY q.created_at DESC
-         LIMIT ?",
-    )
-    .bind(cutoff)
+    let rows = sqlx::query(select_query_log!(
+        " WHERE q.created_at >= ?
+            AND q.query_source = 'client'
+          ORDER BY q.created_at DESC, q.id DESC
+          LIMIT ?"
+    ))
+    .bind(hours_ago_cutoff(period_hours))
     .bind(limit as i64)
     .fetch_all(pool)
     .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch recent queries");
-        DomainError::DatabaseError(e.to_string())
-    })?;
+    .map_err(db_err("Failed to fetch recent queries"))?;
 
     let entries: Vec<QueryLog> = rows.into_iter().filter_map(row_to_query_log).collect();
     debug!(count = entries.len(), "Recent queries fetched successfully");
@@ -53,16 +75,14 @@ pub(super) async fn get_recent(
 pub(super) async fn get_recent_paged(
     pool: &SqlitePool,
     limit: u32,
-    offset: u32,
+    page: PageAt,
     period_hours: f32,
-    cursor: Option<i64>,
     filter: &QueryLogFilter,
 ) -> Result<PagedQueryResult, DomainError> {
     debug!(
         limit,
-        offset,
+        ?page,
         period_hours,
-        cursor,
         ?filter,
         "Fetching paginated queries"
     );
@@ -73,14 +93,14 @@ pub(super) async fn get_recent_paged(
         .domain
         .as_deref()
         .filter(|d| !d.is_empty())
-        .map(|d| format!("%{d}%"));
+        .map(contains_pattern);
     let client_pattern = filter
         .client
         .as_deref()
         .filter(|c| !c.is_empty())
-        .map(|c| format!("%{c}%"));
+        .map(contains_pattern);
 
-    // Each arm is a static SQL fragment — no user input is interpolated.
+    // Every fragment is static SQL; user input only ever reaches the query as a bind.
     let category_clause = match filter.category {
         Some(QueryCategory::Allowed) => " AND q.blocked = 0",
         Some(QueryCategory::Blocked) => " AND q.blocked = 1",
@@ -90,14 +110,13 @@ pub(super) async fn get_recent_paged(
         Some(QueryCategory::Malware) => MALWARE_FILTER,
         None => "",
     };
-
     let domain_clause = if domain_pattern.is_some() {
-        " AND q.domain LIKE ?"
+        " AND q.domain LIKE ? ESCAPE '\\'"
     } else {
         ""
     };
     let client_clause = if client_pattern.is_some() {
-        " AND (q.client_ip LIKE ? OR c.hostname LIKE ?)"
+        " AND (q.client_ip LIKE ? ESCAPE '\\' OR c.hostname LIKE ? ESCAPE '\\')"
     } else {
         ""
     };
@@ -111,20 +130,16 @@ pub(super) async fn get_recent_paged(
     } else {
         ""
     };
-    // The `"any"` sentinel matches any validated row; otherwise exact match on
-    // the bound status string. Each arm is a static SQL fragment.
-    let dnssec_clause = match filter.dnssec_status.as_deref() {
-        Some("any") => " AND q.dnssec_status IS NOT NULL",
-        Some(_) => " AND q.dnssec_status = ?",
+    let dnssec_clause = match filter.dnssec_status {
+        Some(DnssecStatusFilter::Any) => " AND q.dnssec_status IS NOT NULL",
+        Some(DnssecStatusFilter::Is(_)) => " AND q.dnssec_status = ?",
         None => "",
     };
-    // Static fragment (no bound param) so it doesn't disturb `bind_filters!`.
     let dns64_clause = match filter.dns64_synthesized {
         Some(true) => " AND q.dns64_synthesized = 1",
         Some(false) => " AND q.dns64_synthesized = 0",
         None => "",
     };
-    // Closed enum, so each arm is a static fragment too — no bind needed.
     let protocol_clause = match filter.protocol {
         Some(ClientProtocol::Udp) => " AND q.protocol = 'udp'",
         Some(ClientProtocol::Tcp) => " AND q.protocol = 'tcp'",
@@ -133,10 +148,21 @@ pub(super) async fn get_recent_paged(
         Some(ClientProtocol::Doq) => " AND q.protocol = 'doq'",
         None => "",
     };
+    let filters = [
+        domain_clause,
+        category_clause,
+        client_clause,
+        type_clause,
+        upstream_clause,
+        dnssec_clause,
+        dns64_clause,
+        protocol_clause,
+    ]
+    .concat();
 
-    // Binds the conditional filter parameters in a fixed order.
+    // Binds the `?` of `filters`, in the order its fragments are concatenated.
     macro_rules! bind_filters {
-        ($query:expr, $filter:expr) => {{
+        ($query:expr) => {{
             let mut q = $query;
             if let Some(ref pat) = domain_pattern {
                 q = q.bind(pat);
@@ -144,16 +170,14 @@ pub(super) async fn get_recent_paged(
             if let Some(ref pat) = client_pattern {
                 q = q.bind(pat).bind(pat);
             }
-            if let Some(ref rt) = $filter.record_type {
+            if let Some(ref rt) = filter.record_type {
                 q = q.bind(rt.as_str());
             }
-            if let Some(ref up) = $filter.upstream {
+            if let Some(ref up) = filter.upstream {
                 q = q.bind(up);
             }
-            if let Some(ref status) = $filter.dnssec_status {
-                if status != "any" {
-                    q = q.bind(status.as_str());
-                }
+            if let Some(DnssecStatusFilter::Is(status)) = filter.dnssec_status {
+                q = q.bind(status.as_str());
             }
             q
         }};
@@ -161,92 +185,82 @@ pub(super) async fn get_recent_paged(
 
     let (rows_result, filtered_count_result, total_count_result) = tokio::join!(
         async {
-            if let Some(cursor_id) = cursor {
-                let sql = format!(
-                    "SELECT q.id, q.domain, q.record_type, q.client_ip, q.blocked, q.response_time_ms,
-                            q.cache_hit, q.cache_refresh, q.dnssec_status, q.dns64_synthesized, q.answers, q.upstream_server,
-                            q.upstream_pool, q.response_status, q.query_source, q.protocol, q.group_id, q.block_source,
-                            datetime(q.created_at) as created_at, c.hostname
-                     FROM query_log q
-                     LEFT JOIN clients c ON q.client_ip = c.ip_address
-                     WHERE q.id < ?
-                       AND q.query_source = 'client'
-                       AND q.created_at >= ?
-                       {domain_clause}{category_clause}{client_clause}{type_clause}{upstream_clause}{dnssec_clause}{dns64_clause}{protocol_clause}
-                     ORDER BY q.id DESC
-                     LIMIT ?"
-                );
-                let q = sqlx::query(&sql).bind(cursor_id).bind(&cutoff);
-                let q = bind_filters!(q, filter);
-                q.bind(fetch_limit).fetch_all(pool).await
-            } else {
-                let sql = format!(
-                    "SELECT q.id, q.domain, q.record_type, q.client_ip, q.blocked, q.response_time_ms,
-                            q.cache_hit, q.cache_refresh, q.dnssec_status, q.dns64_synthesized, q.answers, q.upstream_server,
-                            q.upstream_pool, q.response_status, q.query_source, q.protocol, q.group_id, q.block_source,
-                            datetime(q.created_at) as created_at, c.hostname
-                     FROM query_log q
-                     LEFT JOIN clients c ON q.client_ip = c.ip_address
-                     WHERE q.created_at >= ?
-                       AND q.query_source = 'client'
-                       {domain_clause}{category_clause}{client_clause}{type_clause}{upstream_clause}{dnssec_clause}{dns64_clause}{protocol_clause}
-                     ORDER BY q.created_at DESC
-                     LIMIT ? OFFSET ?"
-                );
-                let q = sqlx::query(&sql).bind(&cutoff);
-                let q = bind_filters!(q, filter);
-                q.bind(fetch_limit)
-                    .bind(offset as i64)
-                    .fetch_all(pool)
-                    .await
+            // Every page orders by `(created_at, id)`: `id` breaks the ties of a
+            // flush, which stamps its whole batch alike. A cursor page continues
+            // after the cursor row's key, not its id alone, since a backwards
+            // clock step gives newer rows (higher ids) older timestamps. A cursor
+            // row deleted by retention has no key left, so the page continues
+            // below its id, which is monotonic.
+            match page {
+                PageAt::Cursor(cursor_id) => {
+                    let sql = format!(
+                        select_query_log!(
+                            " WHERE CASE WHEN EXISTS (SELECT 1 FROM query_log c WHERE c.id = ?)
+                                    THEN (q.created_at, q.id) <
+                                         (SELECT c.created_at, c.id FROM query_log c WHERE c.id = ?)
+                                    ELSE q.id < ? END
+                                AND q.query_source = 'client'
+                                AND q.created_at >= ?{filters}
+                              ORDER BY q.created_at DESC, q.id DESC
+                              LIMIT ?"
+                        ),
+                        filters = filters
+                    );
+                    let q = sqlx::query(&sql)
+                        .bind(cursor_id)
+                        .bind(cursor_id)
+                        .bind(cursor_id)
+                        .bind(&cutoff);
+                    bind_filters!(q).bind(fetch_limit).fetch_all(pool).await
+                }
+                PageAt::Offset(offset) => {
+                    let sql = format!(
+                        select_query_log!(
+                            " WHERE q.created_at >= ?
+                                AND q.query_source = 'client'{filters}
+                              ORDER BY q.created_at DESC, q.id DESC
+                              LIMIT ? OFFSET ?"
+                        ),
+                        filters = filters
+                    );
+                    let q = sqlx::query(&sql).bind(&cutoff);
+                    bind_filters!(q)
+                        .bind(fetch_limit)
+                        .bind(i64::from(offset))
+                        .fetch_all(pool)
+                        .await
+                }
             }
         },
         async {
             let count_sql = format!(
                 "SELECT COUNT(*) as cnt FROM query_log q
                  LEFT JOIN clients c ON q.client_ip = c.ip_address
-                 WHERE q.query_source = 'client' AND q.created_at >= ?{domain_clause}{category_clause}{client_clause}{type_clause}{upstream_clause}{dnssec_clause}{dns64_clause}{protocol_clause}"
+                 WHERE q.query_source = 'client' AND q.created_at >= ?{filters}"
             );
             let q = sqlx::query(&count_sql).bind(&cutoff);
-            let q = bind_filters!(q, filter);
-            q.fetch_one(pool).await
+            bind_filters!(q).fetch_one(pool).await
         },
-        async {
-            sqlx::query(
-                "SELECT COUNT(*) as cnt FROM query_log q
-                 WHERE q.query_source = 'client' AND q.created_at >= ?",
-            )
-            .bind(&cutoff)
-            .fetch_one(pool)
-            .await
-        }
+        sqlx::query(
+            "SELECT COUNT(*) as cnt FROM query_log q
+             WHERE q.query_source = 'client' AND q.created_at >= ?",
+        )
+        .bind(&cutoff)
+        .fetch_one(pool)
     );
 
-    let rows = rows_result.map_err(|e| {
-        error!(error = %e, "Failed to fetch paginated queries");
-        DomainError::DatabaseError(e.to_string())
-    })?;
-
+    let mut rows = rows_result.map_err(db_err("Failed to fetch paginated queries"))?;
     let records_filtered = filtered_count_result
-        .map(|r| r.get::<i64, _>("cnt") as u64)
-        .map_err(|e| {
-            error!(error = %e, "Failed to count filtered queries");
-            DomainError::DatabaseError(e.to_string())
-        })?;
-
+        .map_err(db_err("Failed to count filtered queries"))?
+        .get::<i64, _>("cnt") as u64;
     let records_total = total_count_result
-        .map(|r| r.get::<i64, _>("cnt") as u64)
-        .map_err(|e| {
-            error!(error = %e, "Failed to count total queries");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to count total queries"))?
+        .get::<i64, _>("cnt") as u64;
 
-    let mut rows = rows;
     let has_more = rows.len() as u32 > limit;
     if has_more {
         rows.truncate(limit as usize);
     }
-
     let next_cursor = if has_more {
         rows.last().map(|r| r.get::<i64, _>("id"))
     } else {
@@ -265,13 +279,6 @@ pub(super) async fn get_recent_paged(
         records_filtered,
         next_cursor,
     })
-}
-
-fn db_error(context: &'static str) -> impl FnOnce(sqlx::Error) -> DomainError {
-    move |e| {
-        error!(error = %e, "{context}");
-        DomainError::DatabaseError(e.to_string())
-    }
 }
 
 /// Mean of a microsecond sum over `n` samples, in milliseconds.
@@ -338,11 +345,11 @@ pub(super) async fn get_stats(
         .fetch_all(pool),
     );
 
-    let row = totals.map_err(db_error("Failed to fetch statistics"))?;
-    let type_rows = type_rows.map_err(db_error("Failed to fetch type distribution"))?;
+    let row = totals.map_err(db_err("Failed to fetch statistics"))?;
+    let type_rows = type_rows.map_err(db_err("Failed to fetch type distribution"))?;
     let block_source_rows =
-        block_source_rows.map_err(db_error("Failed to fetch block source statistics"))?;
-    let upstream_rows = upstream_rows.map_err(db_error("Failed to fetch upstream statistics"))?;
+        block_source_rows.map_err(db_err("Failed to fetch block source statistics"))?;
+    let upstream_rows = upstream_rows.map_err(db_err("Failed to fetch upstream statistics"))?;
 
     let col = |name: &str| row.get::<i64, _>(name);
     let total = col("total") as u64;
@@ -437,7 +444,7 @@ pub(super) async fn get_dnssec_stats(
     .bind(window_start_bucket(period_hours))
     .fetch_one(pool)
     .await
-    .map_err(db_error("Failed to fetch DNSSEC statistics"))?;
+    .map_err(db_err("Failed to fetch DNSSEC statistics"))?;
 
     let count = |col: &str| row.get::<i64, _>(col) as u64;
     Ok(DnssecStats {
@@ -464,7 +471,7 @@ pub(super) async fn count_queries_since(
     .bind(cutoff)
     .fetch_one(pool)
     .await
-    .map_err(db_error("Failed to count queries"))?;
+    .map_err(db_err("Failed to count queries"))?;
 
     Ok(row.get::<i64, _>("count") as u64)
 }
@@ -486,7 +493,7 @@ pub(super) async fn get_cache_stats(
     .bind(window_start_bucket(period_hours))
     .fetch_one(pool)
     .await
-    .map_err(db_error("Failed to fetch cache statistics"))?;
+    .map_err(db_err("Failed to fetch cache statistics"))?;
 
     let total_hits = row.get::<i64, _>("hits") as u64;
     let total_misses = row.get::<i64, _>("misses") as u64;
@@ -514,110 +521,61 @@ pub(super) async fn get_cache_stats(
     })
 }
 
-#[instrument(skip(pool))]
-pub(super) async fn get_top_blocked_domains(
-    pool: &SqlitePool,
-    limit: u32,
-    period_hours: f32,
-) -> Result<Vec<(String, u64)>, DomainError> {
-    let cutoff = hours_ago_cutoff(period_hours);
-    let rows = sqlx::query(
-        "SELECT domain, COUNT(*) as count
-         FROM query_log
-         WHERE blocked = 1
-           AND created_at >= ?
-           AND query_source = 'client'
-         GROUP BY domain
-         ORDER BY count DESC
-         LIMIT ?",
-    )
-    .bind(cutoff)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch top blocked domains");
-        DomainError::DatabaseError(e.to_string())
-    })?;
+/// Which rows a top-domains ranking counts.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DomainVerdict {
+    Blocked,
+    Allowed,
+    Any,
+}
 
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let domain: String = r.get("domain");
-            let count = r.get::<i64, _>("count") as u64;
-            (domain, count)
-        })
-        .collect())
+macro_rules! top_domains_sql {
+    ($verdict:literal) => {
+        concat!(
+            "SELECT domain, COUNT(*) as count
+             FROM query_log
+             WHERE created_at >= ?
+               AND query_source = 'client'",
+            $verdict,
+            "
+             GROUP BY domain
+             ORDER BY count DESC
+             LIMIT ?"
+        )
+    };
 }
 
 #[instrument(skip(pool))]
-pub(super) async fn get_top_allowed_domains(
+pub(super) async fn get_top_domains(
     pool: &SqlitePool,
+    verdict: DomainVerdict,
     limit: u32,
     period_hours: f32,
 ) -> Result<Vec<(String, u64)>, DomainError> {
-    let cutoff = hours_ago_cutoff(period_hours);
-    let rows = sqlx::query(
-        "SELECT domain, COUNT(*) as count
-         FROM query_log
-         WHERE blocked = 0
-           AND created_at >= ?
-           AND query_source = 'client'
-         GROUP BY domain
-         ORDER BY count DESC
-         LIMIT ?",
-    )
-    .bind(cutoff)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch top allowed domains");
-        DomainError::DatabaseError(e.to_string())
-    })?;
+    let (sql, context) = match verdict {
+        DomainVerdict::Blocked => (
+            top_domains_sql!(" AND blocked = 1"),
+            "Failed to fetch top blocked domains",
+        ),
+        DomainVerdict::Allowed => (
+            top_domains_sql!(" AND blocked = 0"),
+            "Failed to fetch top allowed domains",
+        ),
+        DomainVerdict::Any => (
+            top_domains_sql!(""),
+            "Failed to fetch distinct recent domains",
+        ),
+    };
+    let rows = sqlx::query(sql)
+        .bind(hours_ago_cutoff(period_hours))
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err(context))?;
 
     Ok(rows
         .into_iter()
-        .map(|r| {
-            let domain: String = r.get("domain");
-            let count = r.get::<i64, _>("count") as u64;
-            (domain, count)
-        })
-        .collect())
-}
-
-#[instrument(skip(pool))]
-pub(super) async fn get_distinct_recent_domains(
-    pool: &SqlitePool,
-    limit: u32,
-    period_hours: f32,
-) -> Result<Vec<(String, u64)>, DomainError> {
-    let cutoff = hours_ago_cutoff(period_hours);
-    let rows = sqlx::query(
-        "SELECT domain, COUNT(*) as count
-         FROM query_log
-         WHERE created_at >= ?
-           AND query_source = 'client'
-         GROUP BY domain
-         ORDER BY count DESC
-         LIMIT ?",
-    )
-    .bind(cutoff)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch distinct recent domains");
-        DomainError::DatabaseError(e.to_string())
-    })?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let domain: String = r.get("domain");
-            let count = r.get::<i64, _>("count") as u64;
-            (domain, count)
-        })
+        .map(|r| (r.get("domain"), r.get::<i64, _>("count") as u64))
         .collect())
 }
 
@@ -642,10 +600,7 @@ pub(super) async fn get_top_clients(
     .bind(limit as i64)
     .fetch_all(pool)
     .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to fetch top clients");
-        DomainError::DatabaseError(e.to_string())
-    })?;
+    .map_err(db_err("Failed to fetch top clients"))?;
 
     Ok(rows
         .into_iter()
@@ -659,23 +614,22 @@ pub(super) async fn get_top_clients(
 }
 
 pub(super) async fn delete_older_than(pool: &SqlitePool, days: u32) -> Result<u64, DomainError> {
-    let cutoff_at = Utc::now() - chrono::Duration::days(days as i64);
-    let cutoff = cutoff_at.format("%Y-%m-%d %H:%M:%S").to_string();
+    // A retention reaching past the calendar's start means no row is old enough.
+    let Some(cutoff_at) = Utc::now().checked_sub_signed(TimeDelta::days(i64::from(days))) else {
+        return Ok(0);
+    };
+    let cutoff = sql_ts(cutoff_at);
     let mut total_deleted: u64 = 0;
 
     loop {
-        let result = sqlx::query(
+        let deleted = sqlx::query(
             "DELETE FROM query_log WHERE rowid IN (SELECT rowid FROM query_log WHERE created_at < ? LIMIT 5000)",
         )
         .bind(&cutoff)
         .execute(pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to delete old query logs");
-            DomainError::DatabaseError(format!("Failed to delete old query logs: {}", e))
-        })?;
-
-        let deleted = result.rows_affected();
+        .map_err(db_err("Failed to delete old query logs"))?
+        .rows_affected();
         if deleted == 0 {
             break;
         }
@@ -686,7 +640,7 @@ pub(super) async fn delete_older_than(pool: &SqlitePool, days: u32) -> Result<u6
     // A bucket straddling the cutoff goes whole, so `days = 0` clears everything.
     rollup::prune_before(pool, cutoff_at.timestamp())
         .await
-        .map_err(db_error("Failed to prune query log rollups"))?;
+        .map_err(db_err("Failed to prune query log rollups"))?;
 
     info!(
         deleted = total_deleted,
@@ -707,8 +661,8 @@ mod tests {
 
     #[test]
     fn sql_malware_lists_match_block_source_classification() {
-        let expected: BTreeSet<&str> = (0..=u8::MAX)
-            .filter_map(BlockSource::from_u8)
+        let expected: BTreeSet<&str> = BlockSource::ALL
+            .into_iter()
             .filter(|s| s.is_malware())
             .map(|s| s.to_str())
             .collect();

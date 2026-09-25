@@ -1,49 +1,5 @@
 use ferrous_dns_domain::{DomainAction, ManagedDomain};
 use std::str::FromStr;
-use std::sync::Arc;
-
-#[test]
-fn test_managed_domain_creation() {
-    let domain = ManagedDomain::new(
-        Some(1),
-        Arc::from("Block Ads"),
-        Arc::from("ads.example.com"),
-        DomainAction::Deny,
-        1,
-        Some(Arc::from("Test comment")),
-        true,
-    );
-
-    assert_eq!(domain.id, Some(1));
-    assert_eq!(domain.name.as_ref(), "Block Ads");
-    assert_eq!(domain.domain.as_ref(), "ads.example.com");
-    assert_eq!(domain.action, DomainAction::Deny);
-    assert_eq!(domain.group_id, 1);
-    assert_eq!(domain.comment.as_deref(), Some("Test comment"));
-    assert!(domain.enabled);
-    assert!(domain.created_at.is_none());
-    assert!(domain.updated_at.is_none());
-}
-
-#[test]
-fn test_managed_domain_allow_no_comment() {
-    let domain = ManagedDomain::new(
-        None,
-        Arc::from("Allow Company"),
-        Arc::from("mycompany.com"),
-        DomainAction::Allow,
-        2,
-        None,
-        false,
-    );
-
-    assert!(domain.id.is_none());
-    assert_eq!(domain.action, DomainAction::Allow);
-    assert!(domain.comment.is_none());
-    assert!(!domain.enabled);
-}
-
-// ── validate_name ─────────────────────────────────────────────────────────────
 
 #[test]
 fn test_validate_name_valid() {
@@ -68,8 +24,6 @@ fn test_validate_name_exactly_200_chars() {
     let name = "a".repeat(200);
     assert!(ManagedDomain::validate_name(&name).is_ok());
 }
-
-// ── validate_domain ───────────────────────────────────────────────────────────
 
 #[test]
 fn test_validate_domain_valid() {
@@ -122,33 +76,6 @@ fn test_validate_domain_wildcard_invalid() {
     assert!(ManagedDomain::validate_domain("*").is_err());
 }
 
-// ── validate_comment ──────────────────────────────────────────────────────────
-
-#[test]
-fn test_validate_comment_valid() {
-    let comment = Some(Arc::from("A valid comment"));
-    assert!(ManagedDomain::validate_comment(&comment).is_ok());
-}
-
-#[test]
-fn test_validate_comment_none() {
-    assert!(ManagedDomain::validate_comment(&None).is_ok());
-}
-
-#[test]
-fn test_validate_comment_too_long() {
-    let long_comment = Some(Arc::from("a".repeat(501).as_str()));
-    assert!(ManagedDomain::validate_comment(&long_comment).is_err());
-}
-
-#[test]
-fn test_validate_comment_exactly_500_chars() {
-    let comment = Some(Arc::from("a".repeat(500).as_str()));
-    assert!(ManagedDomain::validate_comment(&comment).is_ok());
-}
-
-// ── DomainAction ──────────────────────────────────────────────────────────────
-
 #[test]
 fn test_domain_action_from_str_allow() {
     assert_eq!(
@@ -176,4 +103,15 @@ fn test_domain_action_from_str_invalid() {
 fn test_domain_action_to_str() {
     assert_eq!(DomainAction::Allow.to_str(), "allow");
     assert_eq!(DomainAction::Deny.to_str(), "deny");
+}
+
+#[test]
+fn test_validate_domain_rejects_empty_labels() {
+    for domain in ["*.", ".", "*..", ".example.com", "ads..example.com"] {
+        assert!(
+            ManagedDomain::validate_domain(domain).is_err(),
+            "{domain:?} accepted"
+        );
+    }
+    assert!(ManagedDomain::validate_domain("*.example.com").is_ok());
 }

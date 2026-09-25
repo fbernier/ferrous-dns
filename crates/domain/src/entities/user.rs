@@ -1,8 +1,10 @@
+use crate::DomainError;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Source of a user account: TOML config file or SQLite database.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserSource {
     /// Admin defined in `ferrous-dns.toml` — always recoverable via file edit.
     Toml,
@@ -10,12 +12,19 @@ pub enum UserSource {
     Database,
 }
 
-/// Role assigned to a user, controlling access level.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl UserSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Toml => "toml",
+            Self::Database => "database",
+        }
+    }
+}
+
+/// Role recorded on a user and its sessions; informational only, nothing enforces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserRole {
-    /// Full access: read, write, manage users and tokens.
     Admin,
-    /// Read-only: dashboard, query log, stats. No config changes.
     Viewer,
 }
 
@@ -26,17 +35,17 @@ impl UserRole {
             Self::Viewer => "viewer",
         }
     }
+}
 
-    pub fn parse(s: &str) -> Result<Self, String> {
+impl FromStr for UserRole {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "admin" => Ok(Self::Admin),
             "viewer" => Ok(Self::Viewer),
-            other => Err(format!("Invalid role: {other}")),
+            other => Err(DomainError::InvalidInput(format!("Invalid role: {other}"))),
         }
-    }
-
-    pub fn can_write(&self) -> bool {
-        matches!(self, Self::Admin)
     }
 }
 
@@ -55,25 +64,6 @@ pub struct User {
 }
 
 impl User {
-    pub fn new(
-        username: Arc<str>,
-        password_hash: Arc<str>,
-        role: UserRole,
-        source: UserSource,
-    ) -> Self {
-        Self {
-            id: None,
-            username,
-            display_name: None,
-            password_hash,
-            role,
-            source,
-            enabled: true,
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
     /// TOML admin cannot be deleted or disabled via API.
     pub fn is_protected(&self) -> bool {
         self.source == UserSource::Toml

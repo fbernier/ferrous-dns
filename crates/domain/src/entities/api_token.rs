@@ -20,27 +20,14 @@ pub struct ApiToken {
 }
 
 impl ApiToken {
-    pub fn new(name: Arc<str>, key_prefix: Arc<str>, key_hash: Arc<str>) -> Self {
-        Self {
-            id: None,
-            name,
-            key_prefix,
-            key_hash,
-            key_raw: None,
-            created_at: None,
-            last_used_at: None,
-        }
-    }
-
-    /// Validates that a token name meets naming constraints.
     pub fn validate_name(name: &str) -> Result<(), DomainError> {
         if name.is_empty() {
-            return Err(DomainError::ConfigError(
+            return Err(DomainError::InvalidInput(
                 "Token name cannot be empty".to_string(),
             ));
         }
         if name.len() > 100 {
-            return Err(DomainError::ConfigError(
+            return Err(DomainError::InvalidInput(
                 "Token name cannot exceed 100 characters".to_string(),
             ));
         }
@@ -48,7 +35,7 @@ impl ApiToken {
             .chars()
             .all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_');
         if !valid {
-            return Err(DomainError::ConfigError(
+            return Err(DomainError::InvalidInput(
                 "Token name can only contain alphanumeric characters, spaces, hyphens, and underscores"
                     .to_string(),
             ));

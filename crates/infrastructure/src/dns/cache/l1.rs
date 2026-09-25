@@ -10,11 +10,14 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-type L1Hit = (Arc<Vec<IpAddr>>, CachedDnssecStatus, u32);
+/// Addresses, DNSSEC status, whether the local DNS server answered, remaining TTL.
+type L1Hit = (Arc<Vec<IpAddr>>, CachedDnssecStatus, bool, u32);
 
 struct L1Entry {
     addresses: Arc<Vec<IpAddr>>,
     dnssec_status: CachedDnssecStatus,
+    // Sits in the padding after `dnssec_status`: the entry stays 24 bytes.
+    local_dns: bool,
     expires_secs: u64,
 }
 
@@ -25,45 +28,61 @@ struct L1State {
 
 static L1_GLOBAL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+const L1_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
+    Some(capacity) => capacity,
+    None => NonZeroUsize::MIN,
+};
+
+/// Longest `"Type:domain"` key built on the stack; longer ones use the heap.
+const STACK_KEY_LEN: usize = 260;
+
 thread_local! {
     static L1_CACHE: RefCell<L1State> =
         RefCell::new(L1State {
-            cache: LruCache::with_hasher(
-                NonZeroUsize::new(1024).unwrap(),
-                FxBuildHasher
-            ),
+            cache: LruCache::with_hasher(L1_CAPACITY, FxBuildHasher),
             generation: 0,
         });
 }
 
+/// Writes the `"Type:domain"` key into `buf`, ASCII-lowercasing the domain so
+/// every case variant shares an entry (RFC 1035 §2.3.3). `None` if it does
+/// not fit.
+#[inline(always)]
+fn stack_key<'b>(
+    buf: &'b mut [u8; STACK_KEY_LEN],
+    type_str: &str,
+    domain: &str,
+) -> Option<&'b str> {
+    let type_len = type_str.len();
+    let key = buf.get_mut(..type_len + 1 + domain.len())?;
+    key[..type_len].copy_from_slice(type_str.as_bytes());
+    key[type_len] = b':';
+    for (dst, &b) in key[type_len + 1..].iter_mut().zip(domain.as_bytes()) {
+        *dst = b.to_ascii_lowercase();
+    }
+    // SAFETY: `type_str` and `domain` are valid UTF-8 and ASCII lowercasing
+    // rewrites only single-byte scalars, so `key` is valid UTF-8 as well.
+    Some(unsafe { std::str::from_utf8_unchecked(key) })
+}
+
+/// [`stack_key`] for a key too long for the stack buffer.
+fn heap_key(type_str: &str, domain: &str) -> CompactString {
+    let mut key = CompactString::with_capacity(type_str.len() + 1 + domain.len());
+    key.push_str(type_str);
+    key.push(':');
+    key.push_str(domain);
+    key.as_mut_str()[type_str.len() + 1..].make_ascii_lowercase();
+    key
+}
+
 /// Looks up a domain in the thread-local L1 cache, returning addresses and remaining TTL.
-///
-/// The composite key `"Type:domain"` is built byte-by-byte with ASCII-lowercasing
-/// applied to the domain portion (RFC 1035 §2.3.3: DNS is case-insensitive).
-/// All lowercasing happens in the stack buffer — zero heap allocation.
 #[inline]
 pub fn l1_get(domain: &str, record_type: &RecordType) -> Option<L1Hit> {
     let type_str = record_type.as_str();
-    let type_len = type_str.len();
-    let dom_len = domain.len();
-    let total = type_len + 1 + dom_len;
-
-    let mut buf = [0u8; 260];
-    if total <= buf.len() {
-        buf[..type_len].copy_from_slice(type_str.as_bytes());
-        buf[type_len] = b':';
-        for (i, &b) in domain.as_bytes().iter().enumerate() {
-            buf[type_len + 1 + i] = b.to_ascii_lowercase();
-        }
-        // SAFETY: composed from valid UTF-8 (type_str + ':' + ASCII-lowercased domain)
-        let key_str = unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
-        lookup_l1(key_str)
-    } else {
-        let mut key = CompactString::with_capacity(total);
-        key.push_str(type_str);
-        key.push(':');
-        key.push_str(&domain.to_ascii_lowercase());
-        lookup_l1(&key)
+    let mut buf = [0u8; STACK_KEY_LEN];
+    match stack_key(&mut buf, type_str, domain) {
+        Some(key) => lookup_l1(key),
+        None => lookup_l1(&heap_key(type_str, domain)),
     }
 }
 
@@ -81,7 +100,12 @@ fn lookup_l1(key_str: &str) -> Option<L1Hit> {
             let now = coarse_now_secs();
             if now < entry.expires_secs {
                 let remaining = (entry.expires_secs - now).min(u32::MAX as u64) as u32;
-                return Some((Arc::clone(&entry.addresses), entry.dnssec_status, remaining));
+                return Some((
+                    Arc::clone(&entry.addresses),
+                    entry.dnssec_status,
+                    entry.local_dns,
+                    remaining,
+                ));
             }
             state.cache.pop(key_str);
         }
@@ -90,38 +114,20 @@ fn lookup_l1(key_str: &str) -> Option<L1Hit> {
 }
 
 /// Inserts a resolved entry into the thread-local L1 cache with an expiration timestamp.
-///
-/// The composite key `"Type:domain"` is built byte-by-byte with ASCII-lowercasing
-/// applied to the domain portion so lookups from any case variant hit the same
-/// entry (RFC 1035 §2.3.3). Lowercasing happens in-place in the stack buffer.
 #[inline]
 pub fn l1_insert(
     domain: &str,
     record_type: &RecordType,
     addresses: Arc<Vec<IpAddr>>,
     dnssec_status: CachedDnssecStatus,
+    local_dns: bool,
     expires_secs: u64,
 ) {
     let type_str = record_type.as_str();
-    let type_len = type_str.len();
-    let dom_len = domain.len();
-    let total = type_len + 1 + dom_len;
-
-    let mut buf = [0u8; 260];
-    let key = if total <= buf.len() {
-        buf[..type_len].copy_from_slice(type_str.as_bytes());
-        buf[type_len] = b':';
-        for (i, &b) in domain.as_bytes().iter().enumerate() {
-            buf[type_len + 1 + i] = b.to_ascii_lowercase();
-        }
-        // SAFETY: composed from valid UTF-8 (type_str + ':' + ASCII-lowercased domain)
-        CompactString::from(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
-    } else {
-        let mut key = CompactString::with_capacity(total);
-        key.push_str(type_str);
-        key.push(':');
-        key.push_str(&domain.to_ascii_lowercase());
-        key
+    let mut buf = [0u8; STACK_KEY_LEN];
+    let key = match stack_key(&mut buf, type_str, domain) {
+        Some(key) => CompactString::from(key),
+        None => heap_key(type_str, domain),
     };
 
     L1_CACHE.with(|state| {
@@ -130,6 +136,7 @@ pub fn l1_insert(
             L1Entry {
                 addresses,
                 dnssec_status,
+                local_dns,
                 expires_secs,
             },
         );

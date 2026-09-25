@@ -8,6 +8,16 @@ pub enum UpstreamStatus {
     Unknown,
 }
 
+impl UpstreamStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpstreamStatus::Healthy => "Healthy",
+            UpstreamStatus::Unhealthy => "Unhealthy",
+            UpstreamStatus::Unknown => "Unknown",
+        }
+    }
+}
+
 /// Aggregate health status for a server that resolves to multiple IP endpoints.
 ///
 /// `Partial` means at least one endpoint is healthy and at least one is not —
@@ -24,6 +34,17 @@ pub enum AggregateStatus {
     Unknown,
 }
 
+impl AggregateStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AggregateStatus::Healthy => "Healthy",
+            AggregateStatus::Partial => "Partial",
+            AggregateStatus::Unhealthy => "Unhealthy",
+            AggregateStatus::Unknown => "Unknown",
+        }
+    }
+}
+
 /// IP address family of a resolved endpoint.
 #[derive(Debug, Clone, Copy)]
 pub enum IpFamily {
@@ -31,6 +52,16 @@ pub enum IpFamily {
     Ipv6,
     /// Address could not be classified (e.g. hostname not yet resolved).
     Unknown,
+}
+
+impl IpFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IpFamily::Ipv4 => "ipv4",
+            IpFamily::Ipv6 => "ipv6",
+            IpFamily::Unknown => "unknown",
+        }
+    }
 }
 
 /// Health details for a single resolved IP endpoint.

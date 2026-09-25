@@ -74,7 +74,32 @@ async fn match_candidate_rejects_invalid_regex() {
     let err = engine
         .match_candidate(&v(&["x.com"]), &[], &v(&["(unclosed"]))
         .expect_err("invalid regex must error");
-    assert!(matches!(err, DomainError::InvalidDomainName(_)));
+    assert!(matches!(err, DomainError::InvalidRegexFilter(_)));
+}
+
+/// The preview must agree with enforcement: a `*.` rule covers subdomains
+/// only, while `||domain^` also covers the apex.
+#[tokio::test]
+async fn match_candidate_wildcard_excludes_the_apex_like_the_live_index() {
+    let (engine, _dir) = build_engine().await;
+    let result = engine
+        .match_candidate(
+            &v(&["tracker.io", "a.tracker.io", "ads.net", "x.ads.net"]),
+            &v(&["*.tracker.io", "||ads.net^"]),
+            &[],
+        )
+        .expect("ok");
+    assert_eq!(result, vec![false, true, true, true]);
+}
+
+/// Regex filters are compiled case-insensitively, so a candidate regex is too.
+#[tokio::test]
+async fn match_candidate_regex_is_case_insensitive_like_regex_filters() {
+    let (engine, _dir) = build_engine().await;
+    let result = engine
+        .match_candidate(&v(&["ads.example.com"]), &[], &v(&["^ADS\\."]))
+        .expect("ok");
+    assert_eq!(result, vec![true]);
 }
 
 #[tokio::test]

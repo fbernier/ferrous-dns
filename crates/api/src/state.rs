@@ -2,7 +2,6 @@ use ferrous_dns_application::ports::{
     ConfigFilePersistence, DnsCachePort, DnssecStatsPort, TlsCertificatePort, UpstreamHealthPort,
     UpstreamReloadPort,
 };
-use ferrous_dns_application::services::SubnetMatcherService;
 use ferrous_dns_application::use_cases::{
     AssignClientGroupUseCase, AssignScheduleProfileUseCase, AuthenticatePasskeyUseCase,
     BacktestBlocklistsUseCase, BlockServiceUseCase, ChangePasswordUseCase, ConfirmTotpUseCase,
@@ -23,18 +22,18 @@ use ferrous_dns_application::use_cases::{
     GetSafeSearchConfigsUseCase, GetScheduleProfilesUseCase, GetServiceCatalogUseCase,
     GetTimelineUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetUsersUseCase,
     GetWhitelistSourcesUseCase, GetWhitelistUseCase, ImportConfigUseCase, LoginUseCase,
-    LogoutUseCase, ManageTimeSlotsUseCase, RegisterPasskeyUseCase, SetupPasswordUseCase,
-    SetupTotpUseCase, SyncBlocklistSourcesUseCase, TestDomainUseCase, ToggleSafeSearchUseCase,
-    UnblockServiceUseCase, UpdateApiTokenUseCase, UpdateBlocklistSourceUseCase,
-    UpdateClientUseCase, UpdateCustomServiceUseCase, UpdateGroupUseCase, UpdateLocalRecordUseCase,
-    UpdateManagedDomainUseCase, UpdateRegexFilterUseCase, UpdateScheduleProfileUseCase,
-    UpdateWhitelistSourceUseCase, ValidateApiTokenUseCase, ValidateSessionUseCase,
-    VerifyMfaUseCase,
+    LogoutUseCase, ManageTimeSlotsUseCase, RegisterPasskeyUseCase, ReloadConfigUseCase,
+    SetupPasswordUseCase, SetupTotpUseCase, SyncBlocklistSourcesUseCase, TestDomainUseCase,
+    ToggleSafeSearchUseCase, UnblockServiceUseCase, UpdateApiTokenUseCase,
+    UpdateBlocklistSourceUseCase, UpdateClientUseCase, UpdateCustomServiceUseCase,
+    UpdateGroupUseCase, UpdateLocalRecordUseCase, UpdateManagedDomainUseCase,
+    UpdateRegexFilterUseCase, UpdateScheduleProfileUseCase, UpdateWhitelistSourceUseCase,
+    ValidateApiTokenUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
 };
 use ferrous_dns_domain::Config;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct QueryUseCases {
@@ -77,7 +76,6 @@ pub struct ClientUseCases {
     pub get_client_subnets: Arc<GetClientSubnetsUseCase>,
     pub create_client_subnet: Arc<CreateClientSubnetUseCase>,
     pub delete_client_subnet: Arc<DeleteClientSubnetUseCase>,
-    pub subnet_matcher: Arc<SubnetMatcherService>,
 }
 
 #[derive(Clone)]
@@ -152,13 +150,11 @@ pub struct AuthUseCases {
     pub create_user: Arc<CreateUserUseCase>,
     pub get_users: Arc<GetUsersUseCase>,
     pub delete_user: Arc<DeleteUserUseCase>,
-    // MFA (TOTP + recovery codes)
     pub verify_mfa: Arc<VerifyMfaUseCase>,
     pub setup_totp: Arc<SetupTotpUseCase>,
     pub confirm_totp: Arc<ConfirmTotpUseCase>,
     pub disable_mfa: Arc<DisableMfaUseCase>,
     pub get_mfa_status: Arc<GetMfaStatusUseCase>,
-    // WebAuthn passkeys
     pub register_passkey: Arc<RegisterPasskeyUseCase>,
     pub authenticate_passkey: Arc<AuthenticatePasskeyUseCase>,
     pub discoverable_passkey_login: Arc<DiscoverablePasskeyLoginUseCase>,
@@ -184,8 +180,14 @@ pub struct AppState {
     pub auth: AuthUseCases,
     pub backup: BackupUseCases,
     pub config: Arc<RwLock<Config>>,
+    /// Serializes the API's config read-modify-write so the live upstream
+    /// pools always match the last saved ones; `config` stays readable while
+    /// a save waits on the pool hot-reload.
+    pub config_writer: Arc<Mutex<()>>,
     pub config_file_persistence: Arc<dyn ConfigFilePersistence>,
     pub config_path: Option<Arc<str>>,
+    /// Absent when the server runs without a config file.
+    pub reload_config: Option<Arc<ReloadConfigUseCase>>,
     pub tls_cert: Arc<dyn TlsCertificatePort>,
     /// Whether the web server is actually serving HTTPS. Drives the session
     /// cookie's `Secure` attribute, so it must not be taken from the
@@ -201,25 +203,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Resolves the effective config file path: explicit CLI path first, then auto-discovery.
-    pub fn resolve_config_path(&self) -> Option<String> {
-        self.config_path
-            .as_deref()
-            .map(String::from)
-            .or_else(ferrous_dns_domain::Config::get_config_path)
-    }
-
-    /// Returns whether authentication is globally enabled.
     pub async fn auth_enabled(&self) -> bool {
         self.auth.get_auth_status.execute().await.auth_enabled
     }
 
-    /// Records that a saved change only takes effect after a restart.
     pub fn mark_restart_pending(&self) {
         self.restart_pending.store(true, Ordering::Relaxed);
     }
 
-    /// Whether a saved change is still waiting for a restart.
     pub fn is_restart_pending(&self) -> bool {
         self.restart_pending.load(Ordering::Relaxed)
     }

@@ -78,6 +78,7 @@ fn should_round_trip_oversized_non_ascii_domain_through_l1() {
         &RecordType::A,
         Arc::new(vec![addr]),
         CachedDnssecStatus::Insecure,
+        false,
         expires,
     );
 

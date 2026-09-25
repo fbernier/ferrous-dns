@@ -1,14 +1,9 @@
+use crate::errors::domain_error::DomainError;
+use crate::value_objects::validators::exceeds_chars;
+use chrono::{Datelike, NaiveDateTime, NaiveTime};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownScheduleAction(pub String);
-
-impl std::fmt::Display for UnknownScheduleAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown schedule action: '{}'", self.0)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,22 +22,24 @@ impl ScheduleAction {
 }
 
 impl std::str::FromStr for ScheduleAction {
-    type Err = UnknownScheduleAction;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "block_all" => Ok(ScheduleAction::BlockAll),
             "allow_all" => Ok(ScheduleAction::AllowAll),
-            _ => Err(UnknownScheduleAction(s.to_owned())),
+            other => Err(DomainError::InvalidInput(format!(
+                "unknown schedule action: '{other}'"
+            ))),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ScheduleProfile {
     pub id: Option<i64>,
     pub name: Arc<str>,
-    pub timezone: Arc<str>,
+    pub timezone: Tz,
     pub comment: Option<Arc<str>>,
     pub created_at: Option<Arc<str>>,
     pub updated_at: Option<Arc<str>>,
@@ -53,53 +50,36 @@ impl ScheduleProfile {
         if name.is_empty() {
             return Err("name cannot be empty".into());
         }
-        if name.len() > 100 {
-            return Err(format!(
-                "name cannot exceed 100 characters, got {}",
-                name.len()
-            ));
+        if exceeds_chars(name, 100) {
+            return Err("name cannot exceed 100 characters".into());
         }
         Ok(())
     }
 
-    pub fn validate_timezone(tz: &str) -> Result<(), String> {
+    pub fn parse_timezone(tz: &str) -> Result<Tz, String> {
         if tz.is_empty() {
             return Err("timezone cannot be empty".into());
         }
-        if tz.len() > 64 {
-            return Err(format!(
-                "timezone cannot exceed 64 characters, got {}",
-                tz.len()
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn validate_comment(comment: &Option<Arc<str>>) -> Result<(), String> {
-        if let Some(c) = comment {
-            if c.len() > 500 {
-                return Err(format!(
-                    "comment cannot exceed 500 characters, got {}",
-                    c.len()
-                ));
-            }
-        }
-        Ok(())
+        tz.parse::<Tz>()
+            .map_err(|_| format!("unknown IANA timezone '{tz}'"))
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TimeSlot {
     pub id: Option<i64>,
     pub profile_id: i64,
     pub days: u8,
-    pub start_time: Arc<str>,
-    pub end_time: Arc<str>,
+    pub start_time: NaiveTime,
+    pub end_time: NaiveTime,
     pub action: ScheduleAction,
     pub created_at: Option<Arc<str>>,
 }
 
 impl TimeSlot {
+    /// Wire format of slot times in the API and the `time_slots` columns.
+    pub const TIME_FORMAT: &'static str = "%H:%M";
+
     pub fn validate_days(days: u8) -> Result<(), String> {
         if days == 0 {
             return Err("at least one day must be selected".into());
@@ -110,47 +90,42 @@ impl TimeSlot {
         Ok(())
     }
 
-    pub fn validate_time_format(time: &str) -> Result<(), String> {
-        let parts: Vec<&str> = time.split(':').collect();
-        if parts.len() != 2 {
+    /// Accepts only zero-padded `HH:MM`, the exact form written to the API and database.
+    pub fn parse_time(time: &str) -> Result<NaiveTime, String> {
+        let &[h1, h2, b':', m1, m2] = time.as_bytes() else {
+            return Err(format!("time must be in HH:MM format, got '{time}'"));
+        };
+        if ![h1, h2, m1, m2].iter().all(u8::is_ascii_digit) {
             return Err(format!("time must be in HH:MM format, got '{time}'"));
         }
-        let hours: u8 = parts[0]
-            .parse()
-            .map_err(|_| format!("invalid hours in '{time}'"))?;
-        let minutes: u8 = parts[1]
-            .parse()
-            .map_err(|_| format!("invalid minutes in '{time}'"))?;
-        if hours > 23 {
-            return Err(format!("hours must be 0–23, got {hours}"));
-        }
-        if minutes > 59 {
-            return Err(format!("minutes must be 0–59, got {minutes}"));
-        }
-        Ok(())
+        let hours = u32::from(h1 - b'0') * 10 + u32::from(h2 - b'0');
+        let minutes = u32::from(m1 - b'0') * 10 + u32::from(m2 - b'0');
+        NaiveTime::from_hms_opt(hours, minutes, 0)
+            .ok_or_else(|| format!("time must be between 00:00 and 23:59, got '{time}'"))
     }
 
-    pub fn validate_time_range(start_time: &str, end_time: &str) -> Result<(), String> {
+    pub fn validate_time_range(start_time: NaiveTime, end_time: NaiveTime) -> Result<(), String> {
         if start_time >= end_time {
             return Err(format!(
-                "start_time '{start_time}' must be before end_time '{end_time}'"
+                "start_time '{}' must be before end_time '{}'",
+                start_time.format(Self::TIME_FORMAT),
+                end_time.format(Self::TIME_FORMAT)
             ));
         }
         Ok(())
     }
 }
 
-pub fn evaluate_slots(
-    slots: &[TimeSlot],
-    weekday_bit: u8,
-    now_time: &str,
-) -> Option<ScheduleAction> {
+/// `now` is the wall-clock time in the profile's timezone; slots are `[start, end)`.
+pub fn evaluate_slots(slots: &[TimeSlot], now: NaiveDateTime) -> Option<ScheduleAction> {
+    let weekday_bit = 1u8 << now.weekday().num_days_from_monday();
+    let time = now.time();
     let mut found_allow = false;
     for slot in slots {
         if slot.days & weekday_bit == 0 {
             continue;
         }
-        if now_time < slot.start_time.as_ref() || now_time >= slot.end_time.as_ref() {
+        if time < slot.start_time || time >= slot.end_time {
             continue;
         }
         match slot.action {

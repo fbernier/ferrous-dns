@@ -1,9 +1,12 @@
+use crate::repositories::{db_err, is_fk_violation, is_unique_violation, sql_now};
 use async_trait::async_trait;
 use ferrous_dns_application::ports::BlockedServiceRepository;
 use ferrous_dns_domain::{BlockedService, DomainError};
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tracing::{error, instrument};
+use tracing::instrument;
+
+type BlockedServiceRow = (i64, String, i64, String);
 
 pub struct SqliteBlockedServiceRepository {
     pool: SqlitePool,
@@ -14,7 +17,7 @@ impl SqliteBlockedServiceRepository {
         Self { pool }
     }
 
-    fn row_to_entity(row: (i64, String, i64, String)) -> BlockedService {
+    fn row_to_entity(row: BlockedServiceRow) -> BlockedService {
         let (id, service_id, group_id, created_at) = row;
         BlockedService {
             id: Some(id),
@@ -33,7 +36,7 @@ impl BlockedServiceRepository for SqliteBlockedServiceRepository {
         service_id: &str,
         group_id: i64,
     ) -> Result<BlockedService, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
         let result = sqlx::query(
             "INSERT INTO blocked_services (service_id, group_id, created_at) VALUES (?, ?, ?)",
@@ -44,14 +47,14 @@ impl BlockedServiceRepository for SqliteBlockedServiceRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint failed") {
+            if is_unique_violation(&e) {
                 DomainError::BlockedServiceAlreadyExists(format!(
-                    "{} for group {}",
-                    service_id, group_id
+                    "{service_id} for group {group_id}"
                 ))
+            } else if is_fk_violation(&e) {
+                DomainError::GroupNotFound(group_id)
             } else {
-                error!(error = %e, "Failed to block service");
-                DomainError::DatabaseError(e.to_string())
+                db_err("Failed to block service")(e)
             }
         })?;
 
@@ -73,15 +76,11 @@ impl BlockedServiceRepository for SqliteBlockedServiceRepository {
                 .bind(group_id)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| {
-                    error!(error = %e, "Failed to unblock service");
-                    DomainError::DatabaseError(e.to_string())
-                })?;
+                .map_err(db_err("Failed to unblock service"))?;
 
         if result.rows_affected() == 0 {
             return Err(DomainError::NotFound(format!(
-                "Blocked service {} for group {}",
-                service_id, group_id
+                "Blocked service {service_id} for group {group_id}"
             )));
         }
 
@@ -93,33 +92,27 @@ impl BlockedServiceRepository for SqliteBlockedServiceRepository {
         &self,
         group_id: i64,
     ) -> Result<Vec<BlockedService>, DomainError> {
-        let rows = sqlx::query_as::<_, (i64, String, i64, String)>(
+        let rows = sqlx::query_as::<_, BlockedServiceRow>(
             "SELECT id, service_id, group_id, created_at
              FROM blocked_services WHERE group_id = ? ORDER BY service_id ASC",
         )
         .bind(group_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to get blocked services for group");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to get blocked services for group"))?;
 
         Ok(rows.into_iter().map(Self::row_to_entity).collect())
     }
 
     #[instrument(skip(self))]
     async fn get_all_blocked(&self) -> Result<Vec<BlockedService>, DomainError> {
-        let rows = sqlx::query_as::<_, (i64, String, i64, String)>(
+        let rows = sqlx::query_as::<_, BlockedServiceRow>(
             "SELECT id, service_id, group_id, created_at
              FROM blocked_services ORDER BY service_id ASC",
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to get all blocked services");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to get all blocked services"))?;
 
         Ok(rows.into_iter().map(Self::row_to_entity).collect())
     }
@@ -130,10 +123,7 @@ impl BlockedServiceRepository for SqliteBlockedServiceRepository {
             .bind(service_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to delete all blocked services for service");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to delete all blocked services for service"))?;
 
         Ok(result.rows_affected())
     }

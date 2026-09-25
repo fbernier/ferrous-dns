@@ -2,6 +2,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use ferrous_dns_domain::{Client, DomainError};
+use std::net::IpAddr;
 
 use crate::{
     dto::clients::{
@@ -10,6 +12,7 @@ use crate::{
     },
     dto::domains::BatchDeleteRequest,
     errors::PiholeApiError,
+    handlers::require_id,
     state::PiholeAppState,
 };
 
@@ -19,13 +22,9 @@ pub struct ClientQueryParams {
     pub offset: Option<u32>,
 }
 
-fn client_to_entry(c: &ferrous_dns_domain::Client) -> Result<PiholeClientEntry, PiholeApiError> {
+fn client_to_entry(c: &Client) -> Result<PiholeClientEntry, DomainError> {
     Ok(PiholeClientEntry {
-        id: c.id.ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                "client missing id".into(),
-            ))
-        })?,
+        id: require_id(c.id, "client")?,
         ip: c.ip_address.to_string(),
         name: c
             .hostname
@@ -37,6 +36,19 @@ fn client_to_entry(c: &ferrous_dns_domain::Client) -> Result<PiholeClientEntry, 
         date_added: c.first_seen.clone(),
         date_modified: c.last_seen.clone(),
     })
+}
+
+/// Resolves the `{client}` path segment; one that is not an IP names no client.
+async fn find_client_id(state: &PiholeAppState, client: &str) -> Result<i64, DomainError> {
+    let not_found = || DomainError::ClientNotFound(format!("Client {client} not found"));
+    let ip: IpAddr = client.parse().map_err(|_| not_found())?;
+    let found = state
+        .clients
+        .get_clients
+        .get_by_ip(ip)
+        .await?
+        .ok_or_else(not_found)?;
+    require_id(found.id, "client")
 }
 
 /// Pi-hole v6 GET /api/clients — list all clients.
@@ -83,11 +95,10 @@ pub async fn create_client(
     State(state): State<PiholeAppState>,
     Json(body): Json<CreateClientRequest>,
 ) -> Result<impl IntoResponse, PiholeApiError> {
-    let ip: std::net::IpAddr = body.ip.parse().map_err(|_| {
-        PiholeApiError(ferrous_dns_domain::DomainError::InvalidIpAddress(
-            body.ip.clone(),
-        ))
-    })?;
+    let ip: IpAddr = body
+        .ip
+        .parse()
+        .map_err(|_| DomainError::InvalidIpAddress(body.ip.clone()))?;
     let group_id = body.groups.as_ref().and_then(|g| g.first().copied());
     let result = state
         .clients
@@ -117,20 +128,7 @@ pub async fn update_client(
     Path(client_ip): Path<String>,
     Json(body): Json<UpdateClientRequest>,
 ) -> Result<Json<PiholeClientEntry>, PiholeApiError> {
-    let clients = state.clients.get_clients.get_all(1000, 0).await?;
-    let client = clients
-        .iter()
-        .find(|c| c.ip_address.to_string() == client_ip)
-        .ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::ClientNotFound(format!(
-                "Client {client_ip} not found"
-            )))
-        })?;
-    let id = client.id.ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-            "record missing id".into(),
-        ))
-    })?;
+    let id = find_client_id(&state, &client_ip).await?;
     let group_id = body.groups.as_ref().and_then(|g| g.first().copied());
     let result = state
         .clients
@@ -158,20 +156,7 @@ pub async fn delete_client(
     State(state): State<PiholeAppState>,
     Path(client_ip): Path<String>,
 ) -> Result<StatusCode, PiholeApiError> {
-    let clients = state.clients.get_clients.get_all(1000, 0).await?;
-    let client = clients
-        .iter()
-        .find(|c| c.ip_address.to_string() == client_ip)
-        .ok_or_else(|| {
-            PiholeApiError(ferrous_dns_domain::DomainError::ClientNotFound(format!(
-                "Client {client_ip} not found"
-            )))
-        })?;
-    let id = client.id.ok_or_else(|| {
-        PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-            "record missing id".into(),
-        ))
-    })?;
+    let id = find_client_id(&state, &client_ip).await?;
     state.clients.delete_client.execute(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -218,15 +203,17 @@ pub async fn batch_delete(
     State(state): State<PiholeAppState>,
     Json(body): Json<BatchDeleteRequest>,
 ) -> Result<StatusCode, PiholeApiError> {
-    let clients = state.clients.get_clients.get_all(1000, 0).await?;
-    for item in &body.items {
-        if let Some(c) = clients.iter().find(|c| c.ip_address.to_string() == *item) {
-            let id = c.id.ok_or_else(|| {
-                PiholeApiError(ferrous_dns_domain::DomainError::DatabaseError(
-                    "record missing id".into(),
-                ))
-            })?;
-            state.clients.delete_client.execute(id).await?;
+    for ip in body
+        .items
+        .iter()
+        .filter_map(|item| item.parse::<IpAddr>().ok())
+    {
+        if let Some(c) = state.clients.get_clients.get_by_ip(ip).await? {
+            state
+                .clients
+                .delete_client
+                .execute(require_id(c.id, "client")?)
+                .await?;
         }
     }
     Ok(StatusCode::NO_CONTENT)

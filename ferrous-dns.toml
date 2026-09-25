@@ -28,6 +28,12 @@ pihole_compat = true
 # unauthenticated (the standard scrape convention). Opt-in; disabled by default.
 # metrics_enabled = true
 
+# Reverse proxies allowed to name the DoH client through X-Forwarded-For /
+# X-Real-IP. Every other DoH request is attributed to its connecting address,
+# so a client cannot pick another device's group. Setting the list replaces the
+# default; add your proxy's address when it does not run on this host.
+# trusted_proxies = ["127.0.0.0/8", "::1/128"]
+
 
 # ── Web HTTPS (TLS for Dashboard / API) ──────────────────────────────────────
 # When enabled, the web dashboard and REST API are served over HTTPS on the
@@ -44,24 +50,25 @@ tls_key_path  = "/data/key.pem"
 # ── Encrypted DNS (DoT / DoH / DoQ) ───────────────────────────────────────────
 # Serves DNS-over-TLS (RFC 7858), DNS-over-HTTPS (RFC 8484), and/or
 # DNS-over-QUIC (RFC 9250).
-# Requires a TLS certificate and private key in PEM format.
+# DoT and DoQ need a TLS certificate and private key in PEM format.
 # Default paths point to /data/ — the standard Docker volume for Ferrous DNS.
-# If the cert/key files are absent at startup, the affected listeners are skipped
-# with a warning; the server continues to serve plain DNS normally.
-# For DoH, HTTPS termination is handled by a reverse proxy (nginx/Traefik/Caddy).
+# If the cert/key files are absent at startup, DoT and DoQ are skipped with a
+# warning; the server continues to serve plain DNS normally.
+# DoH is plain HTTP and needs no certificate: HTTPS termination is handled by a
+# reverse proxy (nginx/Traefik/Caddy), or by [server.web_tls] on web_port.
 
 # [server.encrypted_dns]
 # dot_enabled   = true                    # Enable DoT listener on dot_port
 # dot_port      = 853                     # TCP port for DNS-over-TLS (standard: 853)
 # dot_bind_address = "[::]"               # Address for the DoT listener (omit to inherit [server].bind_address)
 # doh_enabled   = true                    # Enable /dns-query endpoint on web_port or doh_port
-# doh_port      = 443                     # Dedicated port for DoH (omit to co-host on web_port)
+# doh_port      = 8053                    # Dedicated plain-HTTP port for DoH behind a proxy (omit to co-host on web_port)
 # doh_bind_address = "[::]"               # Address for the dedicated DoH listener (ignored when doh_port is omitted)
 # doq_enabled   = true                    # Enable DoQ listener on doq_port
 # doq_port      = 853                     # UDP port for DNS-over-QUIC (standard: 853; no collision with TCP dot_port)
 # doq_bind_address = "[::]"               # Address for the DoQ listener (omit to inherit [server].bind_address)
-# tls_cert_path = "/data/cert.pem"
-# tls_key_path  = "/data/key.pem"
+# tls_cert_path = "/data/cert.pem"         # DoT/DoQ certificate
+# tls_key_path  = "/data/key.pem"          # DoT/DoQ private key
 
 
 # ── DNS Resolution ────────────────────────────────────────────────────────────
@@ -96,7 +103,7 @@ cache_ttl = 7200                        # Default TTL (seconds) for cached entri
 cache_min_ttl = 300                     # Minimum TTL; recommended >= 240 so the refresh job can act before expiry
 cache_max_ttl = 86400                   # Maximum TTL; caps values returned by upstream
 cache_max_entries = 200000              # Maximum number of entries the cache can hold
-cache_eviction_strategy = "hit_rate"    # Eviction policy: "hit_rate", "lfu", or "lru"
+cache_eviction_strategy = "hit_rate"    # Eviction policy: "hit_rate", "lfu", "lfu-k" or "lru"; anything else runs as hit_rate with a warning
 cache_compaction_interval = 600         # Seconds between full cache compaction runs (removes expired entries)
 cache_batch_eviction_percentage = 0.1   # Fraction of cache to evict in one pass when full (0.1 = 10%)
 cache_adaptive_thresholds = false       # Automatically tune eviction thresholds based on observed hit rates
@@ -142,7 +149,7 @@ burst_size = 500                        # 2× QPS — absorbs page loads (50+ qu
 ipv4_prefix_len = 24                    # /24 groups the entire home LAN as one subnet
 ipv6_prefix_len = 48                    # /48 is the standard home delegation (more generous than /56)
 whitelist = []
-nxdomain_per_second = 50                # 20% of QPS — IoT devices probe many subdomains legitimately
+nxdomain_per_second = 50                # Only NXDOMAIN answers over this are limited; local_dns_server answers are never charged
 slip_ratio = 2                          # 50% of rate-limited responses send TC=1 (forces TCP retry)
 dry_run = false                         # Enforce limits in production (set true to test first)
 tcp_max_connections_per_ip = 30         # Browsers + DoH clients pool TCP; 100 devices behind NAT need room
@@ -171,7 +178,7 @@ nxdomain_ratio_threshold = 0.20         # Phase 2: NXDOMAIN > 20% for a client+a
 confidence_threshold = 0.7              # Phase 2: minimum score to flag (0.0-1.0)
 stale_entry_ttl_secs = 300              # Eviction of idle tracking entries (seconds)
 domain_whitelist = []                   # Domains exempt from detection
-client_whitelist = []                   # Client CIDRs exempt from detection
+client_whitelist = []                   # Client CIDRs or IPs exempt from detection
 
 
 # ── DGA Detection (Domain Generation Algorithm) ────────────────────────────
@@ -220,7 +227,7 @@ hijack_ip_ttl_secs = 3600              # Eviction TTL for unconfirmed hijack IPs
 [dns.response_ip_filter]
 enabled = false                                              # opt-in
 action = "block"                                             # "alert" | "block"
-ip_list_urls = []                                            # add C2 feed URLs
+ip_list_urls = []                                            # add C2 feed URLs (each at most 64 MiB)
 # Example feeds:
 # ip_list_urls = [
 #   "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
@@ -247,6 +254,9 @@ success_threshold = 2                   # Consecutive successes to mark a server
 # never for the domain itself, and an exact record always beats it. A query type
 # the wildcard does not carry — AAAA when only an A is defined — is answered as
 # an empty NOERROR rather than being forwarded upstream.
+#
+# `ip` must be an address literal of the family `record_type` names (IPv4 for A,
+# IPv6 for AAAA); a record that is not fails startup with an error naming it.
 
 [[dns.local_records]]
 hostname = "viudes"
@@ -336,7 +346,7 @@ level = "info"                          # Log verbosity: "error", "warn", "info"
 [database]
 path = "ferrous-dns.db"                 # Path to the SQLite database file
 log_queries = true                      # Store every DNS query in the database for analytics
-queries_log_stored = 30                 # Days to retain query log entries before automatic cleanup
+queries_log_stored = 30                 # Days to retain query log entries before the daily cleanup; 0 deletes them all at each run
 
 # Minimum seconds between consecutive last-seen DB writes for the same client IP.
 # Reduce to track clients more frequently; increase to lower SQLite write pressure.

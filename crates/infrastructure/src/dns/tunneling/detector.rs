@@ -1,10 +1,12 @@
 use super::client_stats::{
-    fx_hash_str, new_stats_map, subnet_key_from_ip, ClientApexStats, StatsMap, TrackingKey,
+    fx_hash_str, subnet_key_from_ip, ClientApexStats, StatsMap, TrackingKey,
 };
-use super::entropy::{extract_apex, extract_subdomain, shannon_entropy};
+use super::entropy::extract_subdomain;
+use super::signal::SignalScore;
 use dashmap::DashMap;
-use ferrous_dns_application::ports::TunnelingFlagStore;
+use ferrous_dns_application::ports::{TunnelingEvictionTarget, TunnelingFlagStore};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
+use ferrous_dns_application::use_cases::dns::domain_heuristics::{extract_apex, shannon_entropy};
 use ferrous_dns_application::use_cases::dns::TunnelingAnalysisEvent;
 use ferrous_dns_domain::{RecordType, TunnelingDetectionConfig};
 use rustc_hash::FxBuildHasher;
@@ -18,16 +20,6 @@ const WINDOW_DURATION_NS: u64 = 60_000_000_000; // 1 minute
 /// Flagged domains live this many times longer than stats entries before eviction.
 const FLAGGED_DOMAIN_TTL_MULTIPLIER: u64 = 2;
 
-/// Alert persisted when a domain is flagged as a tunneling endpoint.
-#[derive(Debug, Clone)]
-pub struct TunnelingAlert {
-    pub signal: String,
-    pub measured_value: f32,
-    pub threshold: f32,
-    pub confidence: f32,
-    pub timestamp_ns: u64,
-}
-
 /// Background DNS tunneling detector.
 ///
 /// Consumes `TunnelingAnalysisEvent`s from the hot path via an mpsc channel,
@@ -37,8 +29,9 @@ pub struct TunnelingDetector {
     config: TunnelingDetectionConfig,
     #[doc(hidden)]
     pub stats: StatsMap,
+    /// Flagged apex → when it was last flagged (coarse ns).
     #[doc(hidden)]
-    pub flagged_domains: DashMap<Arc<str>, TunnelingAlert, FxBuildHasher>,
+    pub flagged_domains: DashMap<Arc<str>, u64, FxBuildHasher>,
 }
 
 impl TunnelingDetector {
@@ -53,54 +46,16 @@ impl TunnelingDetector {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let detector = Self {
             config: config.clone(),
-            stats: new_stats_map(),
+            stats: DashMap::with_hasher(FxBuildHasher),
             flagged_domains: DashMap::with_hasher(FxBuildHasher),
         };
         (detector, tx, rx)
     }
 
-    /// Returns the number of currently tracked client/apex pairs.
-    pub fn tracked_count(&self) -> usize {
-        self.stats.len()
-    }
-
-    /// Returns the number of currently flagged domains.
-    pub fn flagged_count(&self) -> usize {
-        self.flagged_domains.len()
-    }
-
-    /// Removes stale entries older than `stale_entry_ttl_secs`.
-    pub fn evict_stale(&self) {
-        let now_ns = coarse_now_ns();
-        let ttl_ns = self.config.stale_entry_ttl_secs * 1_000_000_000;
-        let before = self.stats.len();
-        self.stats
-            .retain(|_, stats| now_ns - stats.last_seen_ns.load(Ordering::Relaxed) < ttl_ns);
-        let evicted = before.saturating_sub(self.stats.len());
-
-        let flagged_before = self.flagged_domains.len();
-        self.flagged_domains.retain(|_, alert| {
-            now_ns - alert.timestamp_ns < ttl_ns * FLAGGED_DOMAIN_TTL_MULTIPLIER
-        });
-        let flagged_evicted = flagged_before.saturating_sub(self.flagged_domains.len());
-
-        if evicted > 0 || flagged_evicted > 0 {
-            debug!(
-                evicted,
-                flagged_evicted,
-                remaining = self.stats.len(),
-                flagged = self.flagged_domains.len(),
-                "Tunneling detector stale eviction"
-            );
-        }
-    }
-
-    /// Returns the configured stale entry TTL in seconds.
     pub fn stale_entry_ttl_secs(&self) -> u64 {
         self.config.stale_entry_ttl_secs
     }
 
-    /// Runs the background analysis loop, consuming events from the channel.
     pub async fn run_analysis_loop(
         self: Arc<Self>,
         mut rx: mpsc::Receiver<TunnelingAnalysisEvent>,
@@ -115,9 +70,10 @@ impl TunnelingDetector {
     #[doc(hidden)]
     pub fn process_event(&self, event: &TunnelingAnalysisEvent) {
         let apex = extract_apex(&event.domain);
-        let apex_hash = fx_hash_str(apex);
-        let subnet = subnet_key_from_ip(event.client_ip, 24, 48);
-        let key = TrackingKey { subnet, apex_hash };
+        let key = TrackingKey {
+            subnet: subnet_key_from_ip(event.client_ip),
+            apex_hash: fx_hash_str(apex),
+        };
 
         let now_ns = coarse_now_ns();
 
@@ -127,7 +83,7 @@ impl TunnelingDetector {
             .or_insert_with(|| ClientApexStats::new(now_ns));
         let stats = entry.value();
 
-        // Reset window if expired — CAS to prevent double-reset race
+        // CAS so concurrent events cannot both reset the same window.
         let window_start = stats.window_start_ns.load(Ordering::Relaxed);
         if now_ns.saturating_sub(window_start) > WINDOW_DURATION_NS
             && stats
@@ -140,7 +96,6 @@ impl TunnelingDetector {
 
         stats.last_seen_ns.store(now_ns, Ordering::Relaxed);
         stats.query_count.fetch_add(1, Ordering::Relaxed);
-        stats.total_count.fetch_add(1, Ordering::Relaxed);
 
         if event.record_type == RecordType::TXT {
             stats.txt_query_count.fetch_add(1, Ordering::Relaxed);
@@ -151,143 +106,135 @@ impl TunnelingDetector {
         }
 
         if let Some(subdomain) = extract_subdomain(&event.domain) {
-            let sub_hash = fx_hash_str(subdomain);
-            if stats.bloom_add(sub_hash) {
+            if stats.bloom_add(fx_hash_str(subdomain)) {
                 stats.unique_subdomain_count.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        let (confidence, top_signal, measured, threshold) =
-            self.compute_confidence(stats, &event.domain);
+        let score = self.compute_confidence(stats, &event.domain);
 
-        if confidence >= self.config.confidence_threshold {
-            let apex_arc: Arc<str> = Arc::from(apex);
-            self.flagged_domains
-                .entry(apex_arc)
-                .and_modify(|alert| {
-                    alert.timestamp_ns = now_ns;
-                    alert.confidence = confidence;
-                    alert.measured_value = measured;
-                })
-                .or_insert_with(|| {
+        if score.confidence >= self.config.confidence_threshold {
+            match self.flagged_domains.get_mut(apex) {
+                Some(mut flagged_at) => *flagged_at = now_ns,
+                None => {
                     warn!(
                         domain = apex,
-                        signal = top_signal,
-                        confidence,
-                        measured,
-                        threshold,
+                        signal = score.top_signal,
+                        confidence = score.confidence,
+                        measured = score.top_measured,
+                        threshold = score.top_threshold,
                         "DNS tunneling detected — domain flagged"
                     );
-                    TunnelingAlert {
-                        signal: top_signal.to_string(),
-                        measured_value: measured,
-                        threshold,
-                        confidence,
-                        timestamp_ns: now_ns,
-                    }
-                });
+                    self.flagged_domains.insert(Arc::from(apex), now_ns);
+                }
+            }
         }
     }
 
-    #[doc(hidden)]
-    pub fn compute_confidence(
-        &self,
-        stats: &ClientApexStats,
-        domain: &str,
-    ) -> (f32, &'static str, f32, f32) {
-        let mut score: f32 = 0.0;
-        let mut top_weight: f32 = 0.0;
-        let mut top_signal = "none";
-        let mut top_measured: f32 = 0.0;
-        let mut top_threshold: f32 = 0.0;
-
-        // Macro to update top signal when a new signal fires with higher weight
-        macro_rules! add_signal {
-            ($weight:expr, $name:expr, $measured:expr, $threshold:expr) => {
-                score += $weight;
-                if $weight > top_weight {
-                    top_weight = $weight;
-                    top_signal = $name;
-                    top_measured = $measured;
-                    top_threshold = $threshold;
-                }
-            };
-        }
+    fn compute_confidence(&self, stats: &ClientApexStats, domain: &str) -> SignalScore {
+        let mut score = SignalScore::new();
 
         if let Some(subdomain) = extract_subdomain(domain) {
             let entropy = shannon_entropy(subdomain.as_bytes());
             if entropy > self.config.entropy_threshold {
-                add_signal!(0.30, "entropy", entropy, self.config.entropy_threshold);
+                score.add(0.30, "entropy", entropy, self.config.entropy_threshold);
             }
         }
 
         let query_count = stats.query_count.load(Ordering::Relaxed);
         if query_count > self.config.query_rate_per_apex {
-            add_signal!(
+            score.add(
                 0.25,
                 "query_rate",
                 query_count as f32,
-                self.config.query_rate_per_apex as f32
+                self.config.query_rate_per_apex as f32,
             );
         }
 
         let unique_count = stats.unique_subdomain_count.load(Ordering::Relaxed);
         if unique_count > self.config.unique_subdomain_threshold {
-            add_signal!(
+            score.add(
                 0.25,
                 "unique_subdomains",
                 unique_count as f32,
-                self.config.unique_subdomain_threshold as f32
+                self.config.unique_subdomain_threshold as f32,
             );
         }
 
-        let total = stats.total_count.load(Ordering::Relaxed);
-        if total > 0 {
+        if query_count > 0 {
             let txt_count = stats.txt_query_count.load(Ordering::Relaxed);
-            let txt_ratio = txt_count as f32 / total as f32;
+            let txt_ratio = txt_count as f32 / query_count as f32;
             if txt_ratio > self.config.txt_proportion_threshold {
-                add_signal!(
+                score.add(
                     0.10,
                     "txt_proportion",
                     txt_ratio,
-                    self.config.txt_proportion_threshold
+                    self.config.txt_proportion_threshold,
                 );
             }
 
             let nx_count = stats.nxdomain_count.load(Ordering::Relaxed);
-            let nx_ratio = nx_count as f32 / total as f32;
+            let nx_ratio = nx_count as f32 / query_count as f32;
             if nx_ratio > self.config.nxdomain_ratio_threshold {
-                add_signal!(
+                score.add(
                     0.10,
                     "nxdomain_ratio",
                     nx_ratio,
-                    self.config.nxdomain_ratio_threshold
+                    self.config.nxdomain_ratio_threshold,
                 );
             }
         }
 
-        let _ = top_weight;
-        (score, top_signal, top_measured, top_threshold)
+        score
     }
 }
 
-impl ferrous_dns_application::ports::TunnelingEvictionTarget for TunnelingDetector {
+impl TunnelingEvictionTarget for TunnelingDetector {
     fn evict_stale(&self) {
-        self.evict_stale();
+        let now_ns = coarse_now_ns();
+        let ttl_ns = self
+            .config
+            .stale_entry_ttl_secs
+            .saturating_mul(1_000_000_000);
+        let flagged_ttl_ns = ttl_ns.saturating_mul(FLAGGED_DOMAIN_TTL_MULTIPLIER);
+
+        // saturating_sub: the analysis loop can stamp an entry after `now_ns` was read.
+        let evicted = {
+            let before = self.stats.len();
+            self.stats.retain(|_, stats| {
+                now_ns.saturating_sub(stats.last_seen_ns.load(Ordering::Relaxed)) < ttl_ns
+            });
+            before.saturating_sub(self.stats.len())
+        };
+        let flagged_evicted = {
+            let before = self.flagged_domains.len();
+            self.flagged_domains
+                .retain(|_, flagged_at| now_ns.saturating_sub(*flagged_at) < flagged_ttl_ns);
+            before.saturating_sub(self.flagged_domains.len())
+        };
+
+        if evicted > 0 || flagged_evicted > 0 {
+            debug!(
+                evicted,
+                flagged_evicted,
+                remaining = self.stats.len(),
+                flagged = self.flagged_domains.len(),
+                "Tunneling detector stale eviction"
+            );
+        }
     }
 
     fn tracked_count(&self) -> usize {
-        self.tracked_count()
+        self.stats.len()
     }
 
     fn flagged_count(&self) -> usize {
-        self.flagged_count()
+        self.flagged_domains.len()
     }
 }
 
 impl TunnelingFlagStore for TunnelingDetector {
     fn is_flagged(&self, domain: &str) -> bool {
-        let apex = extract_apex(domain);
-        self.flagged_domains.contains_key(apex)
+        self.flagged_domains.contains_key(extract_apex(domain))
     }
 }

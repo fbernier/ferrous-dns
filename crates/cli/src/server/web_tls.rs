@@ -2,7 +2,7 @@ use axum::{extract::ConnectInfo, Router};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -101,7 +101,17 @@ async fn send_https_redirect(mut stream: TcpStream, peer_addr: SocketAddr, port:
 
     let request = String::from_utf8_lossy(&buf[..n]);
 
-    let host = extract_host(&request).unwrap_or_else(|| peer_addr.ip().to_string());
+    let host = match extract_host(&request) {
+        Some(host) => host.to_owned(),
+        // No usable Host header: name the address the client connected to.
+        None => match stream.local_addr() {
+            Ok(local) => match local.ip().to_canonical() {
+                IpAddr::V6(v6) => format!("[{v6}]"),
+                IpAddr::V4(v4) => v4.to_string(),
+            },
+            Err(_) => return,
+        },
+    };
     let path = extract_path(&request).unwrap_or("/");
 
     let location = if port == 443 {
@@ -130,20 +140,88 @@ fn extract_path(request: &str) -> Option<&str> {
     Some(path)
 }
 
-/// Extracts the `Host` header value from raw HTTP headers.
-fn extract_host(request: &str) -> Option<String> {
-    for line in request.lines().skip(1) {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(value) = line
-            .strip_prefix("Host:")
-            .or_else(|| line.strip_prefix("host:"))
-        {
-            let host = value.trim();
-            // Strip port from Host header (we'll add the HTTPS port ourselves)
-            return Some(host.split(':').next().unwrap_or(host).to_string());
-        }
+/// Extracts the host of the `Host` header, without its port (the caller adds
+/// the HTTPS one). `None` when absent or when the value holds characters no
+/// host can, since it is reflected into the `Location` header.
+fn extract_host(request: &str) -> Option<&str> {
+    let value = request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("host").then_some(value.trim())
+        })?;
+    let host = if value.starts_with('[') {
+        // A bracketed IPv6 literal: its colons are not the port separator.
+        &value[..=value.find(']')?]
+    } else {
+        value.split_once(':').map_or(value, |(host, _port)| host)
+    };
+    let well_formed = !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'%' | b'[' | b']')
+        });
+    well_formed.then_some(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn request_with_host(host_line: &str) -> String {
+        format!("GET /queries.html HTTP/1.1\r\n{host_line}\r\nAccept: */*\r\n\r\n")
     }
-    None
+
+    #[test]
+    fn extract_host_strips_the_port() {
+        let request = request_with_host("Host: dns.example:8080");
+        assert_eq!(extract_host(&request), Some("dns.example"));
+    }
+
+    #[test]
+    fn extract_host_keeps_bracketed_ipv6_literals_whole() {
+        let request = request_with_host("Host: [fe80::1]:8080");
+        assert_eq!(extract_host(&request), Some("[fe80::1]"));
+        let request = request_with_host("Host: [2001:db8::1]");
+        assert_eq!(extract_host(&request), Some("[2001:db8::1]"));
+    }
+
+    #[test]
+    fn extract_host_matches_the_header_name_case_insensitively() {
+        let request = request_with_host("HOST: dns.example");
+        assert_eq!(extract_host(&request), Some("dns.example"));
+    }
+
+    #[test]
+    fn extract_host_rejects_values_that_could_inject_headers() {
+        let request = request_with_host("Host: dns.example\rSet-Cookie: x=1");
+        assert_eq!(extract_host(&request), None);
+        let request = request_with_host("Host: [::1");
+        assert_eq!(extract_host(&request), None);
+    }
+
+    #[tokio::test]
+    async fn redirect_without_host_names_the_local_address_not_the_client() {
+        let Ok(listener) = TcpListener::bind("127.0.0.2:0").await else {
+            eprintln!("skipping: 127.0.0.2 is not routable here");
+            return;
+        };
+        let server = listener.local_addr().unwrap();
+        let client = tokio::net::TcpSocket::new_v4().unwrap();
+        client.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client = client.connect(server).await.unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+
+        client.write_all(b"GET /x HTTP/1.0\r\n\r\n").await.unwrap();
+        send_https_redirect(stream, peer, 8443).await;
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+
+        assert!(
+            response.contains("Location: https://127.0.0.2:8443/x\r\n"),
+            "{response}"
+        );
+    }
 }

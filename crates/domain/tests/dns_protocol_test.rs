@@ -47,11 +47,13 @@ fn test_parse_https_with_hostname() {
     if let DnsProtocol::Https {
         url,
         hostname,
+        port,
         resolved_addrs,
     } = protocol
     {
         assert_eq!(&*url, "https://dns.google/dns-query");
         assert_eq!(&*hostname, "dns.google");
+        assert_eq!(port, 443);
         assert!(resolved_addrs.is_empty());
     } else {
         panic!("Expected Https variant");
@@ -87,27 +89,6 @@ fn test_display_doq() {
     assert!(displayed.starts_with("doq://"));
     assert!(displayed.contains("dns.cloudflare.com"));
     assert!(displayed.contains("853"));
-}
-
-#[test]
-fn test_protocol_name() {
-    let udp: DnsProtocol = "udp://8.8.8.8:53".parse().unwrap();
-    assert_eq!(udp.protocol_name(), "UDP");
-
-    let tcp: DnsProtocol = "tcp://8.8.8.8:53".parse().unwrap();
-    assert_eq!(tcp.protocol_name(), "TCP");
-
-    let tls: DnsProtocol = "tls://1.1.1.1:853".parse().unwrap();
-    assert_eq!(tls.protocol_name(), "TLS");
-
-    let https: DnsProtocol = "https://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(https.protocol_name(), "HTTPS");
-
-    let quic: DnsProtocol = "doq://1.1.1.1:853".parse().unwrap();
-    assert_eq!(quic.protocol_name(), "QUIC");
-
-    let h3: DnsProtocol = "h3://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(h3.protocol_name(), "H3");
 }
 
 #[test]
@@ -147,18 +128,6 @@ fn test_hostname_extraction() {
 }
 
 #[test]
-fn test_url_extraction() {
-    let https: DnsProtocol = "https://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(https.url(), Some("https://1.1.1.1/dns-query"));
-
-    let h3: DnsProtocol = "h3://1.1.1.1/dns-query".parse().unwrap();
-    assert_eq!(h3.url(), Some("h3://1.1.1.1/dns-query"));
-
-    let udp: DnsProtocol = "udp://8.8.8.8:53".parse().unwrap();
-    assert_eq!(udp.url(), None);
-}
-
-#[test]
 fn test_display_formatting() {
     let udp: DnsProtocol = "udp://8.8.8.8:53".parse().unwrap();
     assert_eq!(format!("{}", udp), "udp://8.8.8.8:53");
@@ -183,11 +152,13 @@ fn test_parse_h3_with_hostname() {
     if let DnsProtocol::H3 {
         url,
         hostname,
+        port,
         resolved_addrs,
     } = protocol
     {
         assert_eq!(&*url, "h3://dns.google/dns-query");
         assert_eq!(&*hostname, "dns.google");
+        assert_eq!(port, 443);
         assert!(resolved_addrs.is_empty());
     } else {
         panic!("Expected H3 variant");
@@ -223,14 +194,12 @@ fn test_ipv6_parsing() {
     }
 }
 
-// ── UpstreamAddr + hostname resolution tests ──────────────────────────────────
-
 #[test]
 fn test_parse_udp_hostname() {
     let protocol: DnsProtocol = "udp://dns.google:53".parse().unwrap();
     if let DnsProtocol::Udp { addr } = &protocol {
         assert!(addr.is_unresolved());
-        assert_eq!(addr.hostname_str(), Some("dns.google"));
+        assert_eq!(addr.unresolved_parts(), Some(("dns.google", 53)));
         assert_eq!(addr.port(), 53);
         assert!(addr.socket_addr().is_none());
     } else {
@@ -243,7 +212,7 @@ fn test_parse_tcp_hostname() {
     let protocol: DnsProtocol = "tcp://dns.google:53".parse().unwrap();
     if let DnsProtocol::Tcp { addr } = &protocol {
         assert!(addr.is_unresolved());
-        assert_eq!(addr.hostname_str(), Some("dns.google"));
+        assert_eq!(addr.unresolved_parts(), Some(("dns.google", 53)));
         assert_eq!(addr.port(), 53);
     } else {
         panic!("Expected Tcp variant");
@@ -304,6 +273,22 @@ fn test_parse_doq_ipv6() {
         assert_eq!(sa.port(), 853);
     } else {
         panic!("Expected Quic variant");
+    }
+}
+
+#[test]
+fn ipv6_literal_tls_and_doq_use_the_bare_ip_as_hostname_and_round_trip() {
+    for s in [
+        "doq://[2606:4700:4700::1111]:853",
+        "tls://[2606:4700:4700::1111]:853",
+    ] {
+        let protocol: DnsProtocol = s.parse().unwrap();
+        assert_eq!(protocol.hostname(), Some("2606:4700:4700::1111"));
+        assert_eq!(protocol.to_string(), s);
+        assert_eq!(
+            protocol.to_string().parse::<DnsProtocol>().unwrap(),
+            protocol
+        );
     }
 }
 
@@ -428,8 +413,6 @@ fn test_with_resolved_addr_ipv6() {
     assert_eq!(format!("{}", resolved), "udp://[2001:4860:4860::8888]:53");
 }
 
-// ── HTTPS/H3 pre-resolved addresses tests ──────────────────────────────────
-
 #[test]
 fn test_parse_https_starts_with_empty_resolved_addrs() {
     let protocol: DnsProtocol = "https://cloudflare-dns.com/dns-query".parse().unwrap();
@@ -534,6 +517,63 @@ fn test_h3_ip_url_needs_no_resolution() {
         !protocol.needs_resolution(),
         "H3 with IP literal should not need resolution"
     );
+}
+
+#[test]
+fn https_and_h3_urls_split_into_bare_host_and_port() {
+    let cases = [
+        (
+            "https://[2606:4700::1111]/dns-query",
+            "2606:4700::1111",
+            443,
+        ),
+        ("https://[::1]:8443/dns-query", "::1", 8443),
+        ("h3://[::1]:8443/dns-query", "::1", 8443),
+        ("https://dns.example:8443/dns-query", "dns.example", 8443),
+        ("h3://dns.example?dns=AAAB", "dns.example", 443),
+    ];
+    for (url, expected_host, expected_port) in cases {
+        let protocol: DnsProtocol = url.parse().unwrap();
+        let (DnsProtocol::Https { hostname, port, .. } | DnsProtocol::H3 { hostname, port, .. }) =
+            &protocol
+        else {
+            panic!("{url}: expected an HTTPS or H3 variant");
+        };
+        assert_eq!(
+            (&**hostname, *port),
+            (expected_host, expected_port),
+            "{url}"
+        );
+        assert_eq!(protocol.to_string(), url);
+    }
+}
+
+#[test]
+fn https_and_h3_ipv6_literals_need_no_resolution() {
+    for url in [
+        "https://[2606:4700::1111]/dns-query",
+        "https://[::1]:8443/dns-query",
+        "h3://[::1]:8443/dns-query",
+    ] {
+        let protocol: DnsProtocol = url.parse().unwrap();
+        assert!(!protocol.needs_resolution(), "{url}");
+    }
+}
+
+#[test]
+fn malformed_https_and_h3_authorities_are_rejected() {
+    for url in [
+        "https://2606:4700::1111/dns-query",
+        "https://[2606:4700::1111/dns-query",
+        "https://[dns.example]/dns-query",
+        "https://[::1]x/dns-query",
+        "https://dns.example:notaport/dns-query",
+        "https://dns.example:70000/dns-query",
+        "https:///dns-query",
+        "h3://:443/dns-query",
+    ] {
+        assert!(url.parse::<DnsProtocol>().is_err(), "{url}");
+    }
 }
 
 #[test]

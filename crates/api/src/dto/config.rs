@@ -1,9 +1,11 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use ferrous_dns_domain::config::CacheEvictionStrategy;
+use ferrous_dns_domain::Config;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct ConfigResponse {
     pub server: ServerConfigResponse,
     pub dns: DnsConfigResponse,
@@ -18,7 +20,7 @@ pub struct ConfigResponse {
     pub restart_required: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct AuthConfigResponse {
     pub enabled: bool,
     pub session_ttl_hours: u32,
@@ -27,7 +29,7 @@ pub struct AuthConfigResponse {
     pub login_rate_limit_window_secs: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct ServerConfigResponse {
     pub dns_port: u16,
     pub web_port: u16,
@@ -36,14 +38,14 @@ pub struct ServerConfigResponse {
     pub web_tls: WebTlsConfigResponse,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct WebTlsConfigResponse {
     pub enabled: bool,
     pub tls_cert_path: String,
     pub tls_key_path: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct DnsConfigResponse {
     pub upstream_servers: Vec<String>,
     pub pools: Vec<UpstreamPoolResponse>,
@@ -56,7 +58,9 @@ pub struct DnsConfigResponse {
     /// Deprecated: derived from `dnssec_mode` (`true` when validating). Kept for
     /// backward-compatibility with older API clients.
     pub dnssec_enabled: bool,
-    pub cache_eviction_strategy: String,
+    /// "lru" | "hit_rate" | "lfu" | "lfu-k".
+    #[schema(value_type = String)]
+    pub cache_eviction_strategy: CacheEvictionStrategy,
     pub cache_max_entries: usize,
     pub cache_min_hit_rate: f64,
     pub cache_min_frequency: u64,
@@ -76,7 +80,7 @@ pub struct DnsConfigResponse {
     pub rate_limit: RateLimitConfigResponse,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct RateLimitConfigResponse {
     pub enabled: bool,
     pub queries_per_second: u32,
@@ -93,17 +97,16 @@ pub struct RateLimitConfigResponse {
     pub doq_max_connections_per_ip: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct UpstreamPoolResponse {
     pub name: String,
     pub strategy: String,
     pub priority: u8,
     pub servers: Vec<String>,
-    #[serde(default)]
     pub weight: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct HealthCheckResponse {
     pub enabled: bool,
     pub interval_seconds: u64,
@@ -112,7 +115,7 @@ pub struct HealthCheckResponse {
     pub success_threshold: u8,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct BlockingConfigResponse {
     pub enabled: bool,
     pub custom_blocked: Vec<String>,
@@ -127,33 +130,9 @@ pub struct BlockingConfigResponse {
     pub sinkhole_ipv6: String,
 }
 
-/// Converts the domain `BlockResponseMode` to its snake_case API string.
-pub fn block_mode_to_string(mode: ferrous_dns_domain::BlockResponseMode) -> String {
-    mode.as_str().to_string()
-}
-
-/// Parses an API block-mode string; unknown values fall back to the default
-/// (`NullIp`) rather than erroring, so a bad UI value can't break saving.
-pub fn block_mode_from_str(value: &str) -> ferrous_dns_domain::BlockResponseMode {
-    use ferrous_dns_domain::BlockResponseMode;
-    match value {
-        "nxdomain" => BlockResponseMode::NxDomain,
-        "nodata" => BlockResponseMode::NoData,
-        "refused" => BlockResponseMode::Refused,
-        _ => BlockResponseMode::NullIp,
-    }
-}
-
 /// Formats an optional sinkhole address as an API string (empty when unset).
 pub fn sinkhole_to_string(addr: Option<impl ToString>) -> String {
     addr.map(|a| a.to_string()).unwrap_or_default()
-}
-
-/// Parses an API DNSSEC-mode string ("off" | "permissive" | "strict",
-/// case-insensitive). Unknown values are rejected so a bad UI value can't
-/// silently change the enforcement posture.
-pub fn parse_dnssec_mode(value: &str) -> Result<ferrous_dns_domain::DnssecMode, String> {
-    value.parse::<ferrous_dns_domain::DnssecMode>()
 }
 
 /// Parses an API sinkhole IPv4 string. Empty/whitespace clears it (`Ok(None)`);
@@ -200,24 +179,24 @@ pub fn parse_dns64_prefix(value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct Dns64ConfigResponse {
     pub enabled: bool,
     pub prefix: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct LoggingConfigResponse {
     pub level: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, ToSchema)]
 pub struct DatabaseConfigResponse {
     pub path: String,
     pub log_queries: bool,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct UpdateConfigRequest {
     pub server: Option<ServerConfigUpdate>,
     pub dns: Option<DnsConfigUpdate>,
@@ -225,7 +204,7 @@ pub struct UpdateConfigRequest {
     pub auth: Option<AuthConfigUpdate>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct AuthConfigUpdate {
     pub enabled: Option<bool>,
     pub session_ttl_hours: Option<u32>,
@@ -234,20 +213,20 @@ pub struct AuthConfigUpdate {
     pub login_rate_limit_window_secs: Option<u64>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct ServerConfigUpdate {
     pub pihole_compat: Option<bool>,
     pub web_tls: Option<WebTlsConfigUpdate>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct WebTlsConfigUpdate {
     pub enabled: Option<bool>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct PoolUpdate {
     pub name: String,
     pub strategy: String,
@@ -259,7 +238,7 @@ pub struct PoolUpdate {
     pub weight: Option<u32>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct DnsConfigUpdate {
     pub pools: Option<Vec<PoolUpdate>>,
     pub upstream_servers: Option<Vec<String>>,
@@ -289,7 +268,7 @@ pub struct DnsConfigUpdate {
     pub rate_limit: Option<RateLimitConfigUpdate>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct RateLimitConfigUpdate {
     pub enabled: Option<bool>,
     pub queries_per_second: Option<u32>,
@@ -306,7 +285,7 @@ pub struct RateLimitConfigUpdate {
     pub doq_max_connections_per_ip: Option<u32>,
 }
 
-#[derive(Deserialize, Debug, ToSchema)]
+#[derive(Deserialize, Debug, Clone, ToSchema)]
 pub struct BlockingConfigUpdate {
     pub enabled: Option<bool>,
     pub custom_blocked: Option<Vec<String>>,
@@ -360,26 +339,66 @@ pub struct SettingsDto {
     pub nat64_prefix: String,
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct SettingsUpdateResponse {
-    pub success: bool,
-    pub message: String,
-    pub settings: SettingsDto,
-}
-
-impl From<ConfigResponse> for SettingsDto {
-    fn from(config: ConfigResponse) -> Self {
+impl From<&Config> for SettingsDto {
+    fn from(config: &Config) -> Self {
         SettingsDto {
             never_forward_non_fqdn: config.dns.block_non_fqdn,
             never_forward_reverse_lookups: config.dns.block_private_ptr,
-            local_domain: config.dns.local_domain.unwrap_or_default(),
-            local_dns_server: config.dns.local_dns_server.unwrap_or_default(),
-            block_mode: config.blocking.block_mode,
+            local_domain: config.dns.local_domain.clone().unwrap_or_default(),
+            local_dns_server: config.dns.local_dns_server.clone().unwrap_or_default(),
+            block_mode: config.blocking.block_mode.as_str().to_string(),
             block_ttl: config.blocking.block_ttl,
-            sinkhole_ipv4: config.blocking.sinkhole_ipv4,
-            sinkhole_ipv6: config.blocking.sinkhole_ipv6,
+            sinkhole_ipv4: sinkhole_to_string(config.blocking.sinkhole_ipv4),
+            sinkhole_ipv6: sinkhole_to_string(config.blocking.sinkhole_ipv6),
             dns64_enabled: config.dns64.enabled,
-            nat64_prefix: config.dns64.prefix,
+            nat64_prefix: config.dns64.prefix.clone(),
         }
+    }
+}
+
+/// Outcome of a config save or reload; built only through its constructors so
+/// `error` is set exactly when `success` is false.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConfigSaveResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reload_available: Option<bool>,
+}
+
+impl ConfigSaveResponse {
+    pub fn failure(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            message: None,
+            error: Some(error.into()),
+            restart_required: None,
+            reload_available: None,
+        }
+    }
+
+    pub fn success(message: &'static str) -> Self {
+        Self {
+            success: true,
+            message: Some(message),
+            error: None,
+            restart_required: None,
+            reload_available: None,
+        }
+    }
+
+    pub fn restart_required(mut self, restart_required: bool) -> Self {
+        self.restart_required = Some(restart_required);
+        self
+    }
+
+    pub fn reload_available(mut self) -> Self {
+        self.reload_available = Some(true);
+        self
     }
 }

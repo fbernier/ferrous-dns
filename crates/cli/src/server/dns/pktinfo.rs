@@ -1,123 +1,169 @@
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::RawFd;
 
 #[cfg(target_os = "linux")]
 use ferrous_dns_infrastructure::dns::wire_response;
 use socket2::Socket;
 
-// ── Batch constants (Linux only) ─────────────────────────────────────────────
-
 #[cfg(target_os = "linux")]
 pub(super) const BATCH_SIZE: usize = 64;
 #[cfg(target_os = "linux")]
 const RECV_BUF_SIZE: usize = 512;
-#[cfg(target_os = "linux")]
-const CMSG_BUF_SIZE: usize = 128;
+/// Receive-side control buffer, with room beyond IPV6_PKTINFO so other
+/// ancillary data cannot truncate it away (MSG_CTRUNC).
+const RECV_CMSG_BUF_SIZE: usize = 128;
 
-// ── IPV6_PKTINFO setup ───────────────────────────────────────────────────────
-//
-// The UDP path is unified on AF_INET6 dual-stack sockets (see mod.rs): IPv4
-// clients arrive as v4-mapped addresses (`::ffff:a.b.c.d`) and the kernel
-// delivers their destination via IPV6_PKTINFO, so only the IPv6 option is set.
+/// Offset of a control message's payload from its header.
+// SAFETY: CMSG_LEN is pure size arithmetic.
+const CMSG_HDR_LEN: usize = unsafe { libc::CMSG_LEN(0) } as usize;
+/// `msg_controllen` for a lone IPV6_PKTINFO: `CMSG_LEN`, not `CMSG_SPACE`.
+/// Linux copies control data up to 36 bytes into an on-stack buffer and
+/// kmallocs anything larger; CMSG_SPACE's 4 bytes of tail padding (40) would
+/// cost an allocation and free on every send.
+// SAFETY: CMSG_LEN is pure size arithmetic.
+const PKTINFO_CMSG_LEN: usize =
+    unsafe { libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) } as usize;
+// SAFETY: CMSG_SPACE is pure size arithmetic.
+const PKTINFO_CMSG_SPACE: usize =
+    unsafe { libc::CMSG_SPACE(size_of::<libc::in6_pktinfo>() as u32) } as usize;
 
-pub fn enable_pktinfo(socket: &Socket) {
-    let fd = socket.as_raw_fd();
-    let val: libc::c_int = 1;
-    // SAFETY: fd is valid for the lifetime of socket; val is a stack-allocated c_int.
-    unsafe {
+/// Asks the kernel to report each datagram's destination (IPV6_PKTINFO), so
+/// replies leave from the address the query reached. The listeners are
+/// AF_INET6 dual-stack sockets on which IPv4 destinations arrive v4-mapped,
+/// so the IPv6 option alone covers both families.
+pub(super) fn enable_pktinfo(socket: &Socket) -> io::Result<()> {
+    let on: libc::c_int = 1;
+    // SAFETY: the fd stays open for the lifetime of `socket`; `on` outlives
+    // the call and the length passed is its size.
+    let rc = unsafe {
         libc::setsockopt(
-            fd,
+            socket.as_raw_fd(),
             libc::IPPROTO_IPV6,
             libc::IPV6_RECVPKTINFO,
-            &val as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+            (&raw const on).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
-// ── RecvBatch — heap-allocated batch recv state (Linux only) ─────────────────
+/// Ancillary-data storage aligned for `cmsghdr`, so a header can be written
+/// in place; a bare `[u8; N]` only guarantees alignment 1.
+#[repr(C)]
+struct CmsgBuf<const N: usize> {
+    _align: [libc::cmsghdr; 0],
+    bytes: [u8; N],
+}
 
-/// Owns all heap storage for one `recvmmsg` call.
+impl<const N: usize> CmsgBuf<N> {
+    const fn zeroed() -> Self {
+        Self {
+            _align: [],
+            bytes: [0; N],
+        }
+    }
+
+    /// The first `len` bytes, as reported filled by the kernel, clamped to
+    /// the buffer.
+    fn filled(&self, len: usize) -> &[u8] {
+        &self.bytes[..len.min(N)]
+    }
+
+    /// Writes a lone IPV6_PKTINFO message that sends from `src` on interface
+    /// `ifindex`; it occupies the first `PKTINFO_CMSG_LEN` bytes.
+    fn write_pktinfo(&mut self, src: IpAddr, ifindex: u32) {
+        const { assert!(N >= PKTINFO_CMSG_LEN) };
+        // Also clears the padding musl's 64-bit `cmsghdr` keeps inside the
+        // kernel's `cmsg_len` word.
+        self.bytes.fill(0);
+        let cmsg = self.bytes.as_mut_ptr().cast::<libc::cmsghdr>();
+        // SAFETY: `bytes` sits at offset 0 of this cmsghdr-aligned struct and
+        // holds at least PKTINFO_CMSG_LEN bytes (asserted above), which covers
+        // the header and the in6_pktinfo at CMSG_HDR_LEN; the payload write is
+        // unaligned, so its own alignment is irrelevant.
+        unsafe {
+            (*cmsg).cmsg_len = PKTINFO_CMSG_LEN as _;
+            (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+            (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+            cmsg.cast::<u8>()
+                .add(CMSG_HDR_LEN)
+                .cast::<libc::in6_pktinfo>()
+                .write_unaligned(libc::in6_pktinfo {
+                    ipi6_addr: ip_to_in6_addr(src),
+                    ipi6_ifindex: ifindex,
+                });
+        }
+    }
+}
+
+/// Heap-allocates a zero-filled `T` without building it on the stack first.
 ///
-/// # Invariant
-/// The `Vec`s are allocated with their final capacity in `new()` and must
-/// **never reallocate** afterwards. `hdrs` contains raw pointers into
-/// `recv_bufs`, `cmsg_bufs`, `src_addrs`, and `iovecs` that become dangling
-/// if those Vecs reallocate. `rewire()` is the only place that writes those
-/// pointers and is called once from `new()`.
+/// # Safety
+/// The all-zero bit pattern must be a valid `T`.
+#[cfg(target_os = "linux")]
+unsafe fn zeroed_box<T>() -> Box<T> {
+    Box::<T>::new_zeroed().assume_init()
+}
+
+/// Storage and headers for one `recvmmsg` call.
+///
+/// `hdrs` and `iovecs` hold raw pointers into the other boxed arrays, wired
+/// once in `new`. The boxes are never replaced, and moving the batch moves
+/// only the box pointers, so the wiring stays valid for the batch's lifetime.
 #[cfg(target_os = "linux")]
 pub(super) struct RecvBatch {
-    /// Contiguous receive buffers: slot i occupies [i*RECV_BUF_SIZE .. (i+1)*RECV_BUF_SIZE].
-    recv_bufs: Vec<u8>,
-    /// Contiguous cmsg buffers: slot i occupies [i*CMSG_BUF_SIZE .. (i+1)*CMSG_BUF_SIZE].
-    cmsg_bufs: Vec<u8>,
-    src_addrs: Vec<libc::sockaddr_in6>,
-    iovecs: Vec<libc::iovec>,
-    /// The mmsghdr array passed directly to recvmmsg.
-    pub hdrs: Vec<libc::mmsghdr>,
-    /// Headers the last `recvmmsg` wrote; only those need their
+    recv_bufs: Box<[[u8; RECV_BUF_SIZE]; BATCH_SIZE]>,
+    cmsg_bufs: Box<[CmsgBuf<RECV_CMSG_BUF_SIZE>; BATCH_SIZE]>,
+    src_addrs: Box<[libc::sockaddr_in6; BATCH_SIZE]>,
+    iovecs: Box<[libc::iovec; BATCH_SIZE]>,
+    hdrs: Box<[libc::mmsghdr; BATCH_SIZE]>,
+    /// Headers the last `recv` wrote; only those need their
     /// `msg_controllen` restored.
     written: usize,
 }
 
-// SAFETY: RecvBatch owns all heap memory that the raw pointers inside
-// `iovecs` and `hdrs` reference. Moving a Vec does not relocate its heap
-// buffer — only the fat-pointer metadata moves — so the wired raw pointers
-// remain valid after a cross-thread move. RecvBatch is not Clone; exclusive
-// access is guaranteed by the worker task that owns it.
+// SAFETY: the raw pointers inside `hdrs` and `iovecs` point only into heap
+// arrays this batch owns, which a move does not relocate. The batch is not
+// Clone, so the worker that owns it has exclusive access.
 #[cfg(target_os = "linux")]
 unsafe impl Send for RecvBatch {}
 
 #[cfg(target_os = "linux")]
 impl RecvBatch {
-    pub(super) fn new(batch_size: usize) -> Self {
-        let mut b = Self {
-            recv_bufs: vec![0u8; batch_size * RECV_BUF_SIZE],
-            cmsg_bufs: vec![0u8; batch_size * CMSG_BUF_SIZE],
-            // SAFETY: sockaddr_in6 / iovec / mmsghdr are C structs; zero-init is correct.
-            src_addrs: (0..batch_size)
-                .map(|_| unsafe { std::mem::zeroed() })
-                .collect(),
-            iovecs: (0..batch_size)
-                .map(|_| unsafe { std::mem::zeroed() })
-                .collect(),
-            hdrs: (0..batch_size)
-                .map(|_| unsafe { std::mem::zeroed() })
-                .collect(),
-            written: 0,
+    pub(super) fn new() -> Self {
+        // SAFETY: byte arrays, `CmsgBuf`, and the libc C structs (integers and
+        // raw pointers only) are all valid when zeroed.
+        let mut batch = unsafe {
+            Self {
+                recv_bufs: zeroed_box(),
+                cmsg_bufs: zeroed_box(),
+                src_addrs: zeroed_box(),
+                iovecs: zeroed_box(),
+                hdrs: zeroed_box(),
+                written: 0,
+            }
         };
-        // SAFETY: rewire establishes all internal pointer relationships. The Vecs
-        // will not reallocate after this point (no push/extend is ever called).
-        unsafe { b.rewire(batch_size) };
-        b
-    }
-
-    /// Establishes raw pointer relationships between the mmsghdr array and the
-    /// backing storage Vecs. Must be called exactly once, immediately after
-    /// allocation, before any use of `hdrs`.
-    ///
-    /// # Safety
-    /// All Vecs must be fully allocated with their final capacity and must not
-    /// reallocate after this call. The caller (i.e. `new`) is responsible for
-    /// this invariant.
-    unsafe fn rewire(&mut self, batch_size: usize) {
-        for i in 0..batch_size {
-            let buf_ptr = self.recv_bufs.as_mut_ptr().add(i * RECV_BUF_SIZE);
-            self.iovecs[i] = libc::iovec {
-                iov_base: buf_ptr as *mut libc::c_void,
+        for i in 0..BATCH_SIZE {
+            batch.iovecs[i] = libc::iovec {
+                iov_base: batch.recv_bufs[i].as_mut_ptr().cast(),
                 iov_len: RECV_BUF_SIZE,
             };
-
-            let cmsg_ptr = self.cmsg_bufs.as_mut_ptr().add(i * CMSG_BUF_SIZE);
-            let hdr = &mut self.hdrs[i].msg_hdr;
-            hdr.msg_name = &mut self.src_addrs[i] as *mut libc::sockaddr_in6 as *mut libc::c_void;
-            hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-            hdr.msg_iov = &mut self.iovecs[i];
+            let hdr = &mut batch.hdrs[i].msg_hdr;
+            hdr.msg_name = (&raw mut batch.src_addrs[i]).cast();
+            hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            hdr.msg_iov = &raw mut batch.iovecs[i];
             hdr.msg_iovlen = 1;
-            hdr.msg_control = cmsg_ptr as *mut libc::c_void;
-            hdr.msg_controllen = CMSG_BUF_SIZE as _;
+            hdr.msg_control = batch.cmsg_bufs[i].bytes.as_mut_ptr().cast();
+            hdr.msg_controllen = RECV_CMSG_BUF_SIZE as _;
         }
+        batch
     }
 
     /// Restores `msg_controllen` to its original size before each `recvmmsg`
@@ -127,22 +173,46 @@ impl RecvBatch {
     /// resets one header, not the whole batch.
     fn reset_controllen(&mut self) {
         for hdr in &mut self.hdrs[..self.written] {
-            hdr.msg_hdr.msg_controllen = CMSG_BUF_SIZE as _;
+            hdr.msg_hdr.msg_controllen = RECV_CMSG_BUF_SIZE as _;
         }
         self.written = 0;
     }
 
-    /// Returns the parsed metadata and payload for slot `i`.
-    /// Valid only for indices `0 <= i < n` where `n` was returned by `recv_batch`.
+    /// Receives up to `BATCH_SIZE` datagrams in one syscall and returns how
+    /// many arrived; `Err(WouldBlock)` when none are pending.
+    pub(super) fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
+        self.reset_controllen();
+
+        // SAFETY: `hdrs` holds exactly BATCH_SIZE headers, each wired in `new`
+        // to buffers this batch owns, so the kernel writes only into our
+        // memory. MSG_DONTWAIT and the null timeout make the call non-blocking.
+        let n = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.hdrs.as_mut_ptr(),
+                BATCH_SIZE as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.written = n as usize;
+        Ok(self.written)
+    }
+
+    /// Payload and addressing of slot `i`, for `i` below the count the last
+    /// `recv` returned.
     pub(super) fn get_msg(&self, i: usize) -> ReceivedMsg<'_> {
-        let n = self.hdrs[i].msg_len as usize;
-        let data = &self.recv_bufs[i * RECV_BUF_SIZE..i * RECV_BUF_SIZE + n];
-        let src = sockaddr_in6_to_socket_addr(&self.src_addrs[i]);
-        let cmsg_slice = &self.cmsg_bufs[i * CMSG_BUF_SIZE..i * CMSG_BUF_SIZE + CMSG_BUF_SIZE];
-        #[allow(clippy::unnecessary_cast)]
-        let controllen = self.hdrs[i].msg_hdr.msg_controllen as usize;
-        let dst_ip = extract_pktinfo_dst(cmsg_slice, controllen);
-        ReceivedMsg { data, src, dst_ip }
+        let hdr = &self.hdrs[i];
+        let control = self.cmsg_bufs[i].filled(hdr.msg_hdr.msg_controllen as _);
+        ReceivedMsg {
+            data: &self.recv_bufs[i][..hdr.msg_len as usize],
+            src: sockaddr_in6_to_socket_addr(&self.src_addrs[i]),
+            dst_ip: extract_pktinfo_dst(control),
+        }
     }
 }
 
@@ -170,84 +240,49 @@ pub(super) struct PendingWireResponse {
     pub src_ip: IpAddr,
 }
 
-// ── SendBatch — heap-allocated batch send state (Linux only) ─────────────────
-
-/// Owns all heap storage for one `sendmmsg` call, including the response
-/// bytes, so a cache hit is encoded straight into the buffer the kernel reads.
-///
-/// # Invariant
-/// The `Vec`s are allocated with their final capacity in `new()` and must
-/// **never reallocate** afterwards. `hdrs` and `iovecs` contain raw pointers
-/// into `wires`, `cmsg_bufs` and `dst_addrs` that become dangling if those
-/// Vecs reallocate. Slots `[..staged]` hold the responses of the next flush.
+/// Storage and headers for one `sendmmsg` call, including the response
+/// bytes, so a cache hit is encoded straight into the buffer the kernel
+/// reads. Wired once in `new` like [`RecvBatch`]; slots `[..staged]` hold the
+/// responses of the next flush.
 #[cfg(target_os = "linux")]
 pub(super) struct SendBatch {
-    wires: Vec<ResponseBuf>,
-    /// Contiguous cmsg buffers: slot i occupies [i*cmsg_space .. (i+1)*cmsg_space].
-    cmsg_bufs: Vec<u8>,
-    dst_addrs: Vec<libc::sockaddr_in6>,
-    iovecs: Vec<libc::iovec>,
-    /// The mmsghdr array passed directly to sendmmsg.
-    hdrs: Vec<libc::mmsghdr>,
-    cmsg_space: usize,
+    wires: Box<[ResponseBuf; BATCH_SIZE]>,
+    cmsg_bufs: Box<[CmsgBuf<PKTINFO_CMSG_SPACE>; BATCH_SIZE]>,
+    dst_addrs: Box<[libc::sockaddr_in6; BATCH_SIZE]>,
+    iovecs: Box<[libc::iovec; BATCH_SIZE]>,
+    hdrs: Box<[libc::mmsghdr; BATCH_SIZE]>,
     staged: usize,
 }
 
-// SAFETY: SendBatch owns all heap memory that the raw pointers inside `hdrs`
-// and `iovecs` reference. Moving a Vec does not relocate its heap buffer, so
-// the wired raw pointers remain valid after a cross-thread move. SendBatch is
-// not Clone; exclusive access is guaranteed by the worker.
+// SAFETY: as for `RecvBatch`, the wired raw pointers target only heap arrays
+// this batch owns, and the owning worker has exclusive access.
 #[cfg(target_os = "linux")]
 unsafe impl Send for SendBatch {}
 
 #[cfg(target_os = "linux")]
 impl SendBatch {
-    pub(super) fn new(batch_size: usize) -> Self {
-        // SAFETY: CMSG_SPACE is a pure size computation; no pointer dereference.
-        let cmsg_space =
-            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize };
-
-        let mut b = Self {
-            wires: vec![[0u8; wire_response::RESPONSE_BUF_LEN]; batch_size],
-            cmsg_bufs: vec![0u8; batch_size * cmsg_space],
-            // SAFETY: sockaddr_in6 / iovec / mmsghdr are C structs; zero-init is correct.
-            dst_addrs: (0..batch_size)
-                .map(|_| unsafe { std::mem::zeroed() })
-                .collect(),
-            iovecs: (0..batch_size)
-                .map(|_| unsafe { std::mem::zeroed() })
-                .collect(),
-            hdrs: (0..batch_size)
-                .map(|_| unsafe { std::mem::zeroed() })
-                .collect(),
-            cmsg_space,
-            staged: 0,
+    pub(super) fn new() -> Self {
+        // SAFETY: as in `RecvBatch::new`, every field is valid when zeroed.
+        let mut batch = unsafe {
+            Self {
+                wires: zeroed_box(),
+                cmsg_bufs: zeroed_box(),
+                dst_addrs: zeroed_box(),
+                iovecs: zeroed_box(),
+                hdrs: zeroed_box(),
+                staged: 0,
+            }
         };
-        // SAFETY: rewire establishes stable pointer relationships into the
-        // owned Vecs. Those Vecs will not reallocate after this point.
-        unsafe { b.rewire(batch_size) };
-        b
-    }
-
-    /// Wires the pointers (msg_name, msg_iov, msg_control, iov_base) that do
-    /// not change between calls.
-    ///
-    /// # Safety
-    /// All Vecs must be fully allocated with their final capacity and must not
-    /// reallocate after this call. The caller (i.e. `new`) is responsible for
-    /// this invariant.
-    unsafe fn rewire(&mut self, batch_size: usize) {
-        for i in 0..batch_size {
-            self.iovecs[i].iov_base = self.wires[i].as_mut_ptr() as *mut libc::c_void;
-            let hdr = &mut self.hdrs[i].msg_hdr;
-            hdr.msg_name = &mut self.dst_addrs[i] as *mut libc::sockaddr_in6 as *mut libc::c_void;
-            hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-            hdr.msg_iov = &mut self.iovecs[i];
+        for i in 0..BATCH_SIZE {
+            batch.iovecs[i].iov_base = batch.wires[i].as_mut_ptr().cast();
+            let hdr = &mut batch.hdrs[i].msg_hdr;
+            hdr.msg_name = (&raw mut batch.dst_addrs[i]).cast();
+            hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            hdr.msg_iov = &raw mut batch.iovecs[i];
             hdr.msg_iovlen = 1;
-            hdr.msg_control =
-                self.cmsg_bufs.as_mut_ptr().add(i * self.cmsg_space) as *mut libc::c_void;
-            hdr.msg_controllen = self.cmsg_space as _;
+            hdr.msg_control = batch.cmsg_bufs[i].bytes.as_mut_ptr().cast();
         }
+        batch
     }
 
     /// Encodes a response into the next free slot with `encode`, which returns
@@ -275,26 +310,8 @@ impl SendBatch {
             // No captured destination: let the kernel pick the source address.
             hdr.msg_controllen = 0;
         } else {
-            let cmsg_slot = &mut self.cmsg_bufs[i * self.cmsg_space..(i + 1) * self.cmsg_space];
-            cmsg_slot.fill(0);
-            let pktinfo = libc::in6_pktinfo {
-                ipi6_addr: ip_to_in6_addr(src_ip),
-                ipi6_ifindex: dest_scope_id(to),
-            };
-            hdr.msg_controllen = pktinfo_cmsg_len() as _;
-
-            // SAFETY: msg_control points to a zeroed slot in cmsg_bufs of
-            // cmsg_space bytes. CMSG_FIRSTHDR/CMSG_DATA follow POSIX.
-            unsafe {
-                let cmsg = libc::CMSG_FIRSTHDR(hdr as *const _);
-                if !cmsg.is_null() {
-                    (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
-                    (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
-                    (*cmsg).cmsg_len = pktinfo_cmsg_len() as _;
-                    let data = libc::CMSG_DATA(cmsg) as *mut libc::in6_pktinfo;
-                    data.write(pktinfo);
-                }
-            }
+            self.cmsg_bufs[i].write_pktinfo(src_ip, dest_scope_id(to));
+            hdr.msg_controllen = PKTINFO_CMSG_LEN as _;
         }
         self.staged += 1;
         true
@@ -308,9 +325,9 @@ impl SendBatch {
             return Ok(());
         }
 
-        // SAFETY: fd is a valid non-blocking UDP socket. hdrs[0..count] were
-        // fully populated by `stage`; all pointers remain valid for the syscall
-        // duration. MSG_DONTWAIT avoids blocking when the send buffer is full.
+        // SAFETY: `count <= BATCH_SIZE`, and `stage` filled hdrs[..count],
+        // whose pointers target buffers this batch owns. MSG_DONTWAIT avoids
+        // blocking when the send buffer is full.
         let n = unsafe {
             libc::sendmmsg(
                 fd,
@@ -328,47 +345,6 @@ impl SendBatch {
     }
 }
 
-// ── recv_batch — recvmmsg wrapper ────────────────────────────────────────────
-
-/// Receives up to `BATCH_SIZE` UDP datagrams in a single syscall.
-///
-/// Returns `Ok(n)` where `n > 0` is the number of messages placed in
-/// `batch.hdrs[0..n]`. Returns `Err(WouldBlock)` when the socket has no
-/// more pending data.
-///
-/// # Safety contract for callers
-/// `batch` must have been constructed by `RecvBatch::new` and not moved or
-/// reallocated since. All internal pointers remain valid for the struct's
-/// lifetime.
-#[cfg(target_os = "linux")]
-pub(super) fn recv_batch(fd: RawFd, batch: &mut RecvBatch) -> io::Result<usize> {
-    // Restore msg_controllen so the kernel can write IPV6_PKTINFO again.
-    batch.reset_controllen();
-
-    // SAFETY: fd is a valid non-blocking UDP socket owned by the caller.
-    // batch.hdrs points to heap storage wired in RecvBatch::rewire(); the
-    // underlying Vecs will not reallocate. MSG_DONTWAIT returns EAGAIN
-    // immediately when no data is available. Null timeout means no blocking.
-    let n = unsafe {
-        libc::recvmmsg(
-            fd,
-            batch.hdrs.as_mut_ptr(),
-            BATCH_SIZE as libc::c_uint,
-            libc::MSG_DONTWAIT as _,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        batch.written = n as usize;
-        Ok(n as usize)
-    }
-}
-
-// ── Single-message fallback (non-Linux) ───────────────────────────────────────
-
 #[cfg(not(target_os = "linux"))]
 pub(super) fn try_recv_with_pktinfo(
     socket: &std::net::UdpSocket,
@@ -376,152 +352,99 @@ pub(super) fn try_recv_with_pktinfo(
 ) -> io::Result<(usize, SocketAddr, IpAddr)> {
     let fd = socket.as_raw_fd();
     let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
     };
     // SAFETY: sockaddr_in6 and msghdr are C structs; zeroing is the correct way to initialize them.
     let mut src_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-    let mut cmsg_buf = [0u8; 128];
+    let mut control = CmsgBuf::<RECV_CMSG_BUF_SIZE>::zeroed();
+    // SAFETY: as above.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = &mut src_addr as *mut libc::sockaddr_in6 as *mut libc::c_void;
-    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-    msg.msg_iov = &mut iov;
+    msg.msg_name = (&raw mut src_addr).cast();
+    msg.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    msg.msg_iov = &raw mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len() as _;
+    msg.msg_control = control.bytes.as_mut_ptr().cast();
+    msg.msg_controllen = RECV_CMSG_BUF_SIZE as _;
 
-    // SAFETY: fd is valid; msg points to properly initialized iov and cmsg_buf on the stack.
+    // SAFETY: fd is valid; msg points to iov, src_addr and control, all live on the stack.
     let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
 
     let from = sockaddr_in6_to_socket_addr(&src_addr);
-    let controllen: usize = msg.msg_controllen as _;
-    let dst = extract_pktinfo_dst(&cmsg_buf, controllen);
+    let dst = extract_pktinfo_dst(control.filled(msg.msg_controllen as _));
 
     Ok((n as usize, from, dst))
 }
 
+/// Sends `buf` to `to` from source address `src`, or from whatever address
+/// the kernel picks when `src` is unspecified (no destination was captured).
 pub(super) fn try_send_with_src_ip(
     socket: &std::net::UdpSocket,
     buf: &[u8],
     to: SocketAddr,
     src: IpAddr,
 ) -> io::Result<()> {
-    if is_unspecified(src) {
-        return socket_send_fallback(socket, buf, to);
-    }
-
-    let fd = socket.as_raw_fd();
     let dst_addr = socket_addr_to_sockaddr_in6(to);
-
-    let pktinfo = libc::in6_pktinfo {
-        ipi6_addr: ip_to_in6_addr(src),
-        ipi6_ifindex: dest_scope_id(to),
-    };
-
-    let mut cmsg_buf = [0u8; 64];
-
     let iov = libc::iovec {
-        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_base: buf.as_ptr().cast_mut().cast(),
         iov_len: buf.len(),
     };
+    let mut control = CmsgBuf::<PKTINFO_CMSG_SPACE>::zeroed();
     // SAFETY: msghdr is a C struct; zeroing is the correct initialization before setting fields.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = &dst_addr as *const libc::sockaddr_in6 as *mut libc::c_void;
-    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_name = (&raw const dst_addr).cast_mut().cast();
+    msg.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    msg.msg_iov = (&raw const iov).cast_mut();
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = pktinfo_cmsg_len() as _;
-
-    // SAFETY: msg is fully initialized above; CMSG_FIRSTHDR/CMSG_DATA follow POSIX ancillary data protocol.
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() {
-            return socket_send_fallback(socket, buf, to);
-        }
-        (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
-        (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as _;
-        let data = libc::CMSG_DATA(cmsg) as *mut libc::in6_pktinfo;
-        data.write(pktinfo);
+    if !is_unspecified(src) {
+        control.write_pktinfo(src, dest_scope_id(to));
+        msg.msg_control = control.bytes.as_mut_ptr().cast();
+        msg.msg_controllen = PKTINFO_CMSG_LEN as _;
     }
 
-    // SAFETY: fd is valid; msg points to properly initialized iov and cmsg_buf on the stack.
-    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) };
+    // SAFETY: fd is valid; msg points to dst_addr, iov and control, all live on
+    // the stack, and the kernel only reads through them.
+    let n = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_DONTWAIT) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
-
     Ok(())
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// `msg_controllen` for a lone IPV6_PKTINFO: `CMSG_LEN`, not `CMSG_SPACE`.
-/// Linux copies control data up to 36 bytes into an on-stack buffer and
-/// kmallocs anything larger; CMSG_SPACE's 4 bytes of tail padding (40) would
-/// cost an allocation and free on every send.
-#[inline]
-fn pktinfo_cmsg_len() -> usize {
-    // SAFETY: CMSG_LEN is a pure size computation; no pointer dereference.
-    unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize }
-}
-
-fn extract_pktinfo_dst(cmsg_buf: &[u8], controllen: usize) -> IpAddr {
-    let mut ptr = cmsg_buf.as_ptr() as *const libc::cmsghdr;
-    // SAFETY: controllen is bounded by cmsg_buf.len() as set by the caller.
-    let end = unsafe { cmsg_buf.as_ptr().add(controllen) };
-
-    while !ptr.is_null() && (ptr as *const u8) < end {
-        // SAFETY: ptr is within [cmsg_buf, end) which is valid memory from the kernel recvmsg call.
-        let cmsg = unsafe { &*ptr };
-        if cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == libc::IPV6_PKTINFO {
-            // SAFETY: CMSG_LEN(0) is the standard offset to the data payload; in6_pktinfo is aligned.
-            let pktinfo_ptr = unsafe {
-                (ptr as *const u8).add(libc::CMSG_LEN(0) as usize) as *const libc::in6_pktinfo
+/// Destination address carried by an IPV6_PKTINFO message in `control`, or
+/// `::` when there is none. Every read is bounds-checked against `control`,
+/// so arbitrary bytes are handled soundly.
+fn extract_pktinfo_dst(mut control: &[u8]) -> IpAddr {
+    while control.len() >= PKTINFO_CMSG_LEN {
+        // SAFETY: `control` holds at least a `cmsghdr`; the read is unaligned.
+        let hdr = unsafe { control.as_ptr().cast::<libc::cmsghdr>().read_unaligned() };
+        if hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_PKTINFO {
+            // SAFETY: `control.len() >= PKTINFO_CMSG_LEN` covers the
+            // in6_pktinfo at CMSG_HDR_LEN; the read is unaligned.
+            let pktinfo = unsafe {
+                control
+                    .as_ptr()
+                    .add(CMSG_HDR_LEN)
+                    .cast::<libc::in6_pktinfo>()
+                    .read_unaligned()
             };
-            // SAFETY: kernel wrote a valid in6_pktinfo at this location when IPV6_PKTINFO is set.
-            let pktinfo = unsafe { &*pktinfo_ptr };
-            let v6 = Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr);
-            return unmap_v4(v6);
+            return unmap_v4(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr));
         }
-        // SAFETY: CMSG_SPACE returns the aligned size; advancing by it keeps ptr within the buffer.
-        let next_len = unsafe { libc::CMSG_SPACE(cmsg.cmsg_len as u32 - libc::CMSG_LEN(0)) };
-        if next_len == 0 {
+        let cmsg_len: usize = hdr.cmsg_len as _;
+        let Some(payload) = cmsg_len.checked_sub(CMSG_HDR_LEN) else {
             break;
-        }
-        ptr = unsafe { (ptr as *const u8).add(next_len as usize) as *const libc::cmsghdr };
+        };
+        // CMSG_SPACE(payload) is the aligned stride to the next header; the
+        // clamp keeps the arithmetic in range, as no stride past the end matters.
+        // SAFETY: CMSG_SPACE is pure size arithmetic.
+        let stride = unsafe { libc::CMSG_SPACE(payload.min(control.len()) as u32) } as usize;
+        control = control.get(stride..).unwrap_or_default();
     }
 
     IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-}
-
-fn socket_send_fallback(
-    socket: &std::net::UdpSocket,
-    buf: &[u8],
-    to: SocketAddr,
-) -> io::Result<()> {
-    let fd = socket.as_raw_fd();
-    let dst_addr = socket_addr_to_sockaddr_in6(to);
-    let iov = libc::iovec {
-        iov_base: buf.as_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    // SAFETY: msghdr is a C struct; zeroing is the correct initialization before setting fields.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = &dst_addr as *const libc::sockaddr_in6 as *mut libc::c_void;
-    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
-    msg.msg_iovlen = 1;
-    // SAFETY: fd is valid; msg points to properly initialized iov on the stack.
-    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Normalises a (possibly v4-mapped) IPv6 address back to a real `IpAddr::V4`
@@ -693,5 +616,81 @@ mod tests {
     fn v6_mapped_bind_addr_keeps_ipv6_binds() {
         let wildcard: SocketAddr = "[::]:853".parse().unwrap();
         assert_eq!(v6_mapped_bind_addr(wildcard), wildcard);
+    }
+
+    fn put_cmsg_header(buf: &mut [u8], level: libc::c_int, ty: libc::c_int, len: usize) {
+        assert!(buf.len() >= size_of::<libc::cmsghdr>());
+        // SAFETY: cmsghdr is a C struct; zeroing is a valid initialization.
+        let mut hdr: libc::cmsghdr = unsafe { std::mem::zeroed() };
+        hdr.cmsg_len = len as _;
+        hdr.cmsg_level = level;
+        hdr.cmsg_type = ty;
+        // SAFETY: bounds asserted above; the write is unaligned.
+        unsafe {
+            buf.as_mut_ptr()
+                .cast::<libc::cmsghdr>()
+                .write_unaligned(hdr)
+        };
+    }
+
+    #[test]
+    fn written_pktinfo_is_read_back() {
+        let mut control = CmsgBuf::<PKTINFO_CMSG_SPACE>::zeroed();
+        control.write_pktinfo(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 3);
+        assert_eq!(
+            extract_pktinfo_dst(control.filled(PKTINFO_CMSG_LEN)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))
+        );
+    }
+
+    #[test]
+    fn pktinfo_after_another_control_message_is_found() {
+        // SAFETY: CMSG_LEN / CMSG_SPACE are pure size arithmetic.
+        let (other_len, other_space) = unsafe { (libc::CMSG_LEN(8), libc::CMSG_SPACE(8)) };
+        let offset = other_space as usize;
+        let mut control = [0u8; RECV_CMSG_BUF_SIZE];
+        put_cmsg_header(&mut control, libc::SOL_SOCKET, 99, other_len as usize);
+        let mut pktinfo = CmsgBuf::<PKTINFO_CMSG_SPACE>::zeroed();
+        pktinfo.write_pktinfo("2001:db8::53".parse().unwrap(), 0);
+        control[offset..offset + PKTINFO_CMSG_LEN]
+            .copy_from_slice(&pktinfo.bytes[..PKTINFO_CMSG_LEN]);
+
+        assert_eq!(
+            extract_pktinfo_dst(&control[..offset + PKTINFO_CMSG_LEN]),
+            "2001:db8::53".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_control_messages_yield_unspecified() {
+        let unspecified = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        let mut control = [0u8; RECV_CMSG_BUF_SIZE];
+
+        // A length shorter than the header itself must stop the walk.
+        put_cmsg_header(&mut control, libc::SOL_SOCKET, 99, 0);
+        assert_eq!(extract_pktinfo_dst(&control), unspecified);
+
+        // A length reaching past the buffer must not step out of it.
+        put_cmsg_header(&mut control, libc::SOL_SOCKET, 99, usize::MAX >> 1);
+        assert_eq!(extract_pktinfo_dst(&control), unspecified);
+
+        // A pktinfo header whose payload was cut off is not read.
+        let mut pktinfo = CmsgBuf::<PKTINFO_CMSG_SPACE>::zeroed();
+        pktinfo.write_pktinfo(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 0);
+        assert_eq!(
+            extract_pktinfo_dst(&pktinfo.bytes[..PKTINFO_CMSG_LEN - 1]),
+            unspecified
+        );
+    }
+
+    #[test]
+    fn enable_pktinfo_reports_setsockopt_failure() {
+        let v4_only = Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        assert!(enable_pktinfo(&v4_only).is_err());
     }
 }

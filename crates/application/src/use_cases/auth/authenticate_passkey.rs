@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
-use super::session_factory::build_session;
+use super::session_factory::{build_session, is_expired};
 use crate::ports::{MfaRepository, SessionRepository, UserProvider, WebauthnService};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, MfaChallenge, MfaMethod};
 
@@ -55,13 +55,7 @@ impl AuthenticatePasskeyUseCase {
         }
 
         let username = challenge.username.clone();
-        let passkeys: Vec<String> = self
-            .mfa_repo
-            .list_credentials(username.as_ref())
-            .await?
-            .into_iter()
-            .map(|c| c.passkey)
-            .collect();
+        let passkeys = self.stored_passkeys(&username).await?;
 
         if passkeys.is_empty() {
             return Err(DomainError::MfaNotConfigured);
@@ -111,10 +105,17 @@ impl AuthenticatePasskeyUseCase {
             .as_deref()
             .ok_or(DomainError::WebauthnError("missing ceremony state".into()))?;
 
-        let authenticated = self.webauthn.finish_authentication(response, state)?;
+        let passkeys = self.stored_passkeys(&challenge.username).await?;
+        let authenticated = self
+            .webauthn
+            .finish_authentication(response, state, &passkeys)?;
 
         self.mfa_repo
-            .update_credential_counter(&authenticated.credential_id, authenticated.sign_count)
+            .update_credential(
+                &authenticated.credential_id,
+                authenticated.sign_count,
+                &authenticated.passkey_json,
+            )
             .await?;
 
         let user = self
@@ -127,7 +128,7 @@ impl AuthenticatePasskeyUseCase {
 
         let session = build_session(
             user.username.clone(),
-            user.role.clone(),
+            user.role,
             challenge.remember_me,
             ip_address,
             user_agent,
@@ -138,10 +139,14 @@ impl AuthenticatePasskeyUseCase {
         info!(username = %user.username, "Passkey verified, user logged in");
         Ok(session)
     }
-}
 
-fn is_expired(expires_at: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S")
-        .map(|exp| chrono::Utc::now().naive_utc() > exp)
-        .unwrap_or(true)
+    async fn stored_passkeys(&self, username: &str) -> Result<Vec<String>, DomainError> {
+        Ok(self
+            .mfa_repo
+            .list_credentials(username)
+            .await?
+            .into_iter()
+            .map(|c| c.passkey)
+            .collect())
+    }
 }

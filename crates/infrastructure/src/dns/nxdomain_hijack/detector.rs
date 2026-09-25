@@ -1,6 +1,6 @@
 use crate::dns::forwarding::{MessageBuilder, ResponseParser};
 use crate::dns::transport;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use ferrous_dns_application::ports::{NxdomainHijackIpStore, NxdomainHijackProbeTarget};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
 use ferrous_dns_domain::{DnsProtocol, NxdomainHijackConfig, RecordType};
@@ -14,27 +14,22 @@ const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// Detects ISP NXDomain hijacking by probing upstreams with `.invalid` domains.
 ///
-/// Maintains a `DashSet` of known hijack IPs for O(1) hot-path lookups, and a
-/// `DashMap` with TTL metadata for background eviction. The probe loop runs as
-/// an async task, querying each upstream with random domains that must return
-/// NXDOMAIN per RFC 6761.
+/// Known hijack IPs are looked up on the hot path and aged out in the
+/// background. The probe loop runs as an async task, querying each upstream
+/// with random domains that must return NXDOMAIN per RFC 6761.
 pub struct NxdomainHijackDetector {
     config: NxdomainHijackConfig,
-    /// O(1) hot-path lookup set.
-    pub hijack_ips: DashSet<IpAddr, FxBuildHasher>,
-    /// Last confirmation timestamp (ns) per hijack IP, for TTL-based eviction.
-    pub hijack_ip_confirmed_at: DashMap<IpAddr, u64, FxBuildHasher>,
+    /// Hijack IP → last confirmation timestamp (coarse ns), for TTL eviction.
+    pub hijack_ips: DashMap<IpAddr, u64, FxBuildHasher>,
     /// Whether each upstream is currently hijacking (`true`) or clean (`false`).
     pub upstream_hijacking: DashMap<Arc<str>, bool, FxBuildHasher>,
 }
 
 impl NxdomainHijackDetector {
-    /// Creates a new detector with empty state.
     pub fn new(config: &NxdomainHijackConfig) -> Self {
         Self {
             config: config.clone(),
-            hijack_ips: DashSet::with_hasher(FxBuildHasher),
-            hijack_ip_confirmed_at: DashMap::with_hasher(FxBuildHasher),
+            hijack_ips: DashMap::with_hasher(FxBuildHasher),
             upstream_hijacking: DashMap::with_hasher(FxBuildHasher),
         }
     }
@@ -101,13 +96,13 @@ impl NxdomainHijackDetector {
                     Err(e) => {
                         debug!(server = %protocol, error = %e, "Hijack probe failed");
                     }
-                    Ok(resp) => match ResponseParser::parse_bytes(resp.bytes) {
+                    Ok(resp) => match ResponseParser::parse_bytes(resp) {
                         Ok(dns) if dns.is_nxdomain() => {}
                         Ok(dns) if !dns.addresses.is_empty() => {
                             found_hijack = true;
                             let now_ns = coarse_now_ns();
                             for ip in &dns.addresses {
-                                if self.hijack_ips.insert(*ip) {
+                                if self.hijack_ips.insert(*ip, now_ns).is_none() {
                                     warn!(
                                         server = %protocol,
                                         hijack_ip = %ip,
@@ -115,7 +110,6 @@ impl NxdomainHijackDetector {
                                         "NXDomain hijack detected: upstream returned IP for .invalid domain"
                                     );
                                 }
-                                self.hijack_ip_confirmed_at.insert(*ip, now_ns);
                             }
                         }
                         Ok(_) => {}
@@ -159,24 +153,21 @@ impl NxdomainHijackDetector {
 
 impl NxdomainHijackIpStore for NxdomainHijackDetector {
     fn is_hijack_ip(&self, ip: &IpAddr) -> bool {
-        self.hijack_ips.contains(ip)
+        self.hijack_ips.contains_key(ip)
     }
 }
 
 impl NxdomainHijackProbeTarget for NxdomainHijackDetector {
     fn evict_stale_ips(&self) {
         let now_ns = coarse_now_ns();
-        let ttl_ns = self.config.hijack_ip_ttl_secs * NS_PER_SEC;
+        let ttl_ns = self.config.hijack_ip_ttl_secs.saturating_mul(NS_PER_SEC);
 
-        self.hijack_ip_confirmed_at.retain(|ip, &mut confirmed_ns| {
-            let age_ns = now_ns.saturating_sub(confirmed_ns);
-            if age_ns > ttl_ns {
-                self.hijack_ips.remove(ip);
+        self.hijack_ips.retain(|ip, confirmed_ns| {
+            let keep = now_ns.saturating_sub(*confirmed_ns) <= ttl_ns;
+            if !keep {
                 debug!(ip = %ip, "Evicted stale hijack IP");
-                false
-            } else {
-                true
             }
+            keep
         });
     }
 

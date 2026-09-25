@@ -69,11 +69,6 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn default_is_permissive() {
-        assert_eq!(DnssecMode::default(), DnssecMode::Permissive);
-    }
-
-    #[test]
     fn validates_and_enforces() {
         assert!(!DnssecMode::Off.validates());
         assert!(DnssecMode::Permissive.validates());

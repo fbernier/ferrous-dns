@@ -1,23 +1,25 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use qrcode::{render::svg, QrCode};
+use subtle::ConstantTimeEq;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 use ferrous_dns_application::ports::TotpService;
 use ferrous_dns_domain::DomainError;
 
-/// TOTP service backed by `totp-rs` (RFC 6238, SHA1/6-digit/30s — the profile
-/// every authenticator app supports). QR codes are rendered as lightweight SVG
-/// via the `qrcode` crate to avoid pulling a PNG image stack.
+/// RFC 6238 SHA1/6-digit/30s (the profile every authenticator app supports); QR codes render as SVG.
 pub struct TotpRsService {
     issuer: String,
-    /// Skew: number of ±30s steps tolerated (1 ≈ ±30s clock drift).
-    skew: u8,
 }
+
+/// ±1 step (≈30s) of clock drift.
+const SKEW: u8 = 1;
+const STEP_SECS: u64 = 30;
 
 impl TotpRsService {
     pub fn new(issuer: impl Into<String>) -> Self {
         Self {
             issuer: issuer.into(),
-            skew: 1,
         }
     }
 
@@ -28,8 +30,8 @@ impl TotpRsService {
         TOTP::new(
             Algorithm::SHA1,
             6,
-            self.skew,
-            30,
+            SKEW,
+            STEP_SECS,
             bytes,
             Some(self.issuer.clone()),
             account.to_string(),
@@ -60,9 +62,27 @@ impl TotpService for TotpRsService {
             .build())
     }
 
-    fn verify(&self, secret: &str, code: &str) -> Result<bool, DomainError> {
+    fn verify(&self, secret: &str, code: &str) -> Result<Option<u64>, DomainError> {
         let totp = self.build(secret, "account")?;
-        totp.check_current(code.trim())
-            .map_err(|e| DomainError::ConfigError(format!("TOTP check failed: {e}")))
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| DomainError::ConfigError(format!("TOTP check failed: {e}")))?
+            .as_secs();
+        Ok(matching_step(&totp, code.trim(), now))
     }
+}
+
+/// Newest step first, so a code valid for two steps in the window is charged to the later one.
+fn matching_step(totp: &TOTP, code: &str, now: u64) -> Option<u64> {
+    let current = now / STEP_SECS;
+    let skew = u64::from(SKEW);
+    (current.saturating_sub(skew)..=current + skew)
+        .rev()
+        .find(|step| {
+            bool::from(
+                totp.generate(step * STEP_SECS)
+                    .as_bytes()
+                    .ct_eq(code.as_bytes()),
+            )
+        })
 }

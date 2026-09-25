@@ -29,7 +29,7 @@ local_dns_server = "10.0.0.1:53"
 | `block_private_ptr` | `true` | Block PTR lookups for private/RFC-1918 IP ranges |
 | `block_non_fqdn` | `false` | Block queries for non-fully-qualified domain names |
 | `local_domain` | — | Local domain suffix appended to short hostnames |
-| `local_dns_server` | — | Router/DHCP server used for PTR lookups and client hostname resolution |
+| `local_dns_server` | — | Router/DHCP server used for PTR lookups and client hostname resolution: `IP:port`, or a bare IP for port 53. A hostname in the file is ignored with a warning, leaving local forwarding off; the API rejects it |
 | `mdns_enabled` | `false` | Enable the passive mDNS/Bonjour listener (UDP 5353 multicast) for device discovery. In Docker this needs host networking — see [Installation](../getting-started/installation.md#docker) |
 | `rebinding_protection_enabled` | `true` | Block public domains that resolve to private/RFC-1918 (or IPv6 ULA/link-local) addresses — see [DNS Rebinding Protection](../features/malware-detection.md#dns-rebinding-protection) |
 | `rebinding_allowlist` | `[]` | Exact domain names exempt from rebinding protection regardless of resolved IP (split-horizon DNS) |
@@ -45,10 +45,12 @@ Ferrous DNS supports all major DNS transport protocols:
 |:---------|:-----------|:--------|
 | Plain UDP | `udp://host:port` | `udp://8.8.8.8:53` |
 | Plain TCP | `tcp://host:port` | `tcp://8.8.8.8:53` |
-| DNS-over-HTTPS | `https://host/path` | `https://cloudflare-dns.com/dns-query` |
+| DNS-over-HTTPS | `https://host[:port]/path` | `https://cloudflare-dns.com/dns-query` |
 | DNS-over-TLS | `tls://host:port` | `tls://1.1.1.1:853` |
 | DNS-over-QUIC | `doq://host:port` | `doq://dns.adguard-dns.com:853` |
-| HTTP/3 | `h3://host/path` | `h3://dns.google/dns-query` |
+| HTTP/3 | `h3://host[:port]/path` | `h3://dns.google/dns-query` |
+
+DoH and HTTP/3 URLs default to port 443; write an IPv6 literal in brackets (`https://[2606:4700:4700::1111]/dns-query`).
 
 You can also use DNS names directly (resolved at startup):
 
@@ -154,9 +156,19 @@ ttl = 300
 |:------|:------------|
 | `hostname` | Short hostname (without domain) |
 | `domain` | Domain suffix — full name is `hostname.domain` |
-| `ip` | IPv4 or IPv6 address |
-| `record_type` | `"A"` for IPv4, `"AAAA"` for IPv6 |
-| `ttl` | Time-to-live in seconds |
+| `ip` | IPv4 or IPv6 address literal |
+| `record_type` | `"A"` for IPv4, `"AAAA"` for IPv6 (case-insensitive) |
+| `ttl` | Time-to-live in seconds (default `300`) |
+
+Each record is checked when the file is loaded: a record whose `ip` is not an
+address literal, whose `record_type` is not `A`/`AAAA`, or whose address is of
+the wrong family (`A` with an IPv6 address, `AAAA` with an IPv4 one) is skipped
+with a warning naming it, and the other records still load. The API rejects the
+same mistakes with a `400`.
+
+Several records may share a name and type, or an address. The last one in the
+list answers, and deleting or editing one of them hands the name (or the PTR)
+to the next remaining record rather than dropping it.
 
 An exact local name stays local even when the requested record type is not
 configured. For example, an `AAAA` query for the A-only `router.local` above
@@ -206,9 +218,9 @@ record that would cover every query.
 
 ### Auto PTR Generation
 
-When you define a local A record, Ferrous DNS automatically creates a PTR record. For example, `server.local → 192.168.1.100` also creates `100.1.168.192.in-addr.arpa → server.local`.
+When you define a local A or AAAA record, Ferrous DNS automatically creates a PTR record. For example, `server.local → 192.168.1.100` also creates `100.1.168.192.in-addr.arpa → server.local`.
 
-This means reverse DNS lookups work without any extra configuration.
+This means reverse DNS lookups work without any extra configuration, including for records added from the dashboard while the server runs — even when none were configured at startup.
 
 ---
 
@@ -315,7 +327,7 @@ doq_max_connections_per_ip = 15
 | `ipv4_prefix_len` | `24` | IPv4 prefix length for subnet grouping (e.g. 24 = /24) |
 | `ipv6_prefix_len` | `48` | IPv6 prefix length for subnet grouping (e.g. 48 = /48) |
 | `whitelist` | `[]` | CIDRs that bypass rate limiting entirely |
-| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN responses per subnet |
+| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN answers per subnet; only an NXDOMAIN answer over it is limited, never the subnet's other queries. `local_dns_server` answers are not charged. 0 = no NXDOMAIN budget |
 | `slip_ratio` | `0` | Every Nth rate-limited UDP response sends TC=1 (forcing TCP retry). 0 = disabled |
 | `dry_run` | `false` | Log rate-limit events without refusing queries |
 | `stale_entry_ttl_secs` | `300` | Seconds before an idle subnet bucket is evicted from memory |
@@ -510,7 +522,7 @@ client_whitelist              = []
 | `confidence_threshold` | `0.65` | Minimum combined weighted score for Phase 2 background analysis to flag an SLD (0.0–1.0) |
 | `stale_entry_ttl_secs` | `300` | Seconds before idle tracking entries are evicted from memory |
 | `domain_whitelist` | `[]` | Domains that bypass DGA detection entirely |
-| `client_whitelist` | `[]` | Client CIDRs (e.g. `10.0.0.0/8`) that bypass DGA detection |
+| `client_whitelist` | `[]` | Client CIDRs (e.g. `10.0.0.0/8`) or bare IPs (a single host) that bypass DGA detection. Invalid entries are skipped with a warning |
 
 ---
 
@@ -540,7 +552,7 @@ DNS Cookies (RFC 7873) protect UDP-based DNS against two classes of attack: **so
 
 | Option | Type | Default | Description |
 |:-------|:-----|:--------|:------------|
-| `enabled` | `bool` | `true` | Master switch — enables DNS Cookie processing |
+| `enabled` | `bool` | `true` | Master switch — enables DNS Cookie processing. When `false` the server never sends a COOKIE option |
 | `server_secret` | `str` | `""` | Hex-encoded 32-byte HMAC secret (64 hex chars). Empty = auto-generate an ephemeral secret on startup (not suitable for production) |
 | `secret_rotation_secs` | `int` | `3600` | Seconds between secret rotations. The previous secret is still accepted for one full rotation window to allow in-flight clients to re-negotiate without errors |
 | `require_valid_cookie` | `bool` | `false` | Strict mode — reject queries with an absent or invalid server cookie with `REFUSED` + EDE 25. Default `false` = permissive mode (always respond, but echo a fresh server cookie) |
@@ -550,7 +562,7 @@ DNS Cookies (RFC 7873) protect UDP-based DNS against two classes of attack: **so
 
 ### Permissive mode (default)
 
-All queries are answered regardless of cookie status. The server always echoes a fresh HMAC-SHA256 server cookie in every response, so RFC-7873-capable clients learn and cache the cookie automatically.
+All queries are answered regardless of cookie status. The server always echoes a fresh HMAC-SHA256 server cookie in every response, so RFC-7873-capable clients learn and cache the cookie automatically. A malformed COOKIE option (not 8 or 16–40 bytes long) is answered with `FORMERR` in either mode (RFC 7873 §5.2.2).
 
 ```toml
 [dns.dns_cookies]

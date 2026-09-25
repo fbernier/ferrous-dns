@@ -1,9 +1,10 @@
-use super::{doh_response_too_large, DnsTransport, TransportResponse, MAX_DOH_MESSAGE_SIZE};
-use async_trait::async_trait;
+use super::{
+    doh_response_too_large, endpoint_for, quic_client_endpoint, resolver, MAX_DOH_MESSAGE_SIZE,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use ferrous_dns_domain::DomainError;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -20,45 +21,11 @@ fn stream_error(https_url: &str, error: h3::error::StreamError) -> DomainError {
     }
 }
 
-static H3_QUIC_CLIENT_CONFIG: LazyLock<quinn::ClientConfig> = LazyLock::new(|| {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    tls_config.alpn_protocols = vec![b"h3".to_vec()];
-    tls_config.resumption = rustls::client::Resumption::in_memory_sessions(64);
-    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_config))
-        .expect("valid QUIC TLS config for H3");
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(15)));
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
-    client_config.transport_config(Arc::new(transport_config));
-    client_config
-});
+static H3_QUIC_ENDPOINT_V4: LazyLock<Result<quinn::Endpoint, String>> =
+    LazyLock::new(|| quic_client_endpoint(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), b"h3"));
 
-static H3_QUIC_ENDPOINT_V4: LazyLock<quinn::Endpoint> = LazyLock::new(|| {
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-        .expect("H3 QUIC IPv4 client endpoint");
-    endpoint.set_default_client_config(H3_QUIC_CLIENT_CONFIG.clone());
-    endpoint
-});
-
-static H3_QUIC_ENDPOINT_V6: LazyLock<quinn::Endpoint> = LazyLock::new(|| {
-    let mut endpoint =
-        quinn::Endpoint::client("[::]:0".parse().unwrap()).expect("H3 QUIC IPv6 client endpoint");
-    endpoint.set_default_client_config(H3_QUIC_CLIENT_CONFIG.clone());
-    endpoint
-});
-
-fn h3_endpoint_for(addr: &SocketAddr) -> &'static quinn::Endpoint {
-    if addr.is_ipv4() {
-        &H3_QUIC_ENDPOINT_V4
-    } else {
-        &H3_QUIC_ENDPOINT_V6
-    }
-}
+static H3_QUIC_ENDPOINT_V6: LazyLock<Result<quinn::Endpoint, String>> =
+    LazyLock::new(|| quic_client_endpoint(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)), b"h3"));
 
 const H3_CONN_TTL: Duration = Duration::from_secs(300);
 
@@ -73,19 +40,13 @@ pub struct H3Transport {
 }
 
 impl H3Transport {
-    pub fn new(h3_url: String, resolved_addrs: Vec<SocketAddr>) -> Self {
-        let without_scheme = h3_url.strip_prefix("h3://").unwrap_or(&h3_url);
-        let host_part = without_scheme.split('/').next().unwrap_or(without_scheme);
-        let (hostname, port) = if let Some((h, p)) = host_part.rsplit_once(':') {
-            (h.to_string(), p.parse::<u16>().unwrap_or(443))
-        } else {
-            (host_part.to_string(), 443)
-        };
+    /// `hostname` is the URL host without port or brackets.
+    pub fn new(h3_url: &str, hostname: &str, port: u16, resolved_addrs: Vec<SocketAddr>) -> Self {
         let https_url = h3_url.replacen("h3://", "https://", 1);
-        let pool_key: Arc<str> = Arc::from(format!("{}:{}", hostname, port));
+        let pool_key: Arc<str> = Arc::from(format!("{hostname}:{port}"));
         Self {
             https_url,
-            hostname,
+            hostname: hostname.to_owned(),
             port,
             pool_key,
             resolved_addrs,
@@ -96,23 +57,18 @@ impl H3Transport {
         if let Some(addr) = self.resolved_addrs.first() {
             return Ok(*addr);
         }
-        let target = format!("{}:{}", self.hostname, self.port);
-        let mut addrs = tokio::time::timeout(timeout, tokio::net::lookup_host(target.clone()))
-            .await
-            .map_err(|_| DomainError::TransportTimeout {
-                server: target.clone(),
-            })?
-            .map_err(|e| {
-                DomainError::IoError(format!("DNS resolution failed for {}: {}", target, e))
-            })?;
-        addrs
-            .next()
-            .ok_or_else(|| DomainError::IoError(format!("No address found for {}", target)))
+        let addrs = resolver::resolve_all(&self.hostname, self.port, timeout).await?;
+        addrs.first().copied().ok_or_else(|| {
+            DomainError::IoError(format!(
+                "No address found for {}:{}",
+                self.hostname, self.port
+            ))
+        })
     }
 
     async fn connect_new(&self, timeout: Duration) -> Result<H3SendRequest, DomainError> {
         let addr = self.resolve_addr(timeout).await?;
-        let endpoint = h3_endpoint_for(&addr);
+        let endpoint = endpoint_for(&addr, &H3_QUIC_ENDPOINT_V4, &H3_QUIC_ENDPOINT_V6)?;
 
         let connecting = endpoint.connect(addr, &self.hostname).map_err(|e| {
             DomainError::IoError(format!(
@@ -255,15 +211,12 @@ impl H3Transport {
 
         Ok(body.freeze())
     }
-}
 
-#[async_trait]
-impl DnsTransport for H3Transport {
-    async fn send(
+    pub async fn send(
         &self,
         message_bytes: &[u8],
         timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
+    ) -> Result<Bytes, DomainError> {
         let deadline = Instant::now() + timeout;
         let mut send_request = self.get_or_connect(timeout).await?;
 
@@ -272,10 +225,7 @@ impl DnsTransport for H3Transport {
         {
             Ok(response_bytes) => {
                 debug!(url = %self.https_url, "DoH3 query via pooled connection");
-                return Ok(TransportResponse {
-                    bytes: response_bytes,
-                    protocol_used: "H3",
-                });
+                return Ok(response_bytes);
             }
             Err(error @ DomainError::TransportConnectionReset { .. }) => {
                 H3_POOL.remove(&self.pool_key);
@@ -312,20 +262,13 @@ impl DnsTransport for H3Transport {
             "DoH3 response received"
         );
 
-        Ok(TransportResponse {
-            bytes: response_bytes,
-            protocol_used: "H3",
-        })
-    }
-
-    fn protocol_name(&self) -> &'static str {
-        "H3"
+        Ok(response_bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DnsTransport, H3Transport, H3_POOL};
+    use super::{H3Transport, H3_POOL};
     use bytes::{Buf, Bytes};
     use ferrous_dns_domain::DomainError;
     use http::{header::CONTENT_LENGTH, Method, StatusCode};
@@ -378,7 +321,9 @@ mod tests {
             )));
             let addr = server.local_addr().unwrap();
             let transport = H3Transport::new(
-                format!("h3://localhost:{}/dns-query", addr.port()),
+                &format!("h3://localhost:{}/dns-query", addr.port()),
+                "localhost",
+                addr.port(),
                 vec![addr],
             );
             Self {
@@ -543,7 +488,7 @@ mod tests {
                     let result = peer.transport.send(&query, TIMEOUT).await;
                     match reply {
                         Reply::CompleteBody(expected) => {
-                            assert_eq!(result.unwrap().bytes, *expected)
+                            assert_eq!(result.unwrap(), *expected)
                         }
                         _ => assert!(matches!(result, Err(DomainError::IoError(_))), "{result:?}"),
                     }

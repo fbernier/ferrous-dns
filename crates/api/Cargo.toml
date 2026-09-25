@@ -15,8 +15,6 @@ serde_json.workspace = true
 tracing.workspace = true
 chrono = "0.4"
 hostname = "0.4"
-ring.workspace = true
-subtle = "2"
 utoipa.workspace = true
 utoipa-axum.workspace = true
 prometheus-client = "0.25"
@@ -27,3 +25,4 @@ async-trait.workspace = true
 sqlx.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+chrono-tz = "0.10"

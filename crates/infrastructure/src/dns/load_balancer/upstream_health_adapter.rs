@@ -1,4 +1,4 @@
-use super::{HealthChecker, PoolGroupEntry, PoolManager, ServerStatus};
+use super::{HealthChecker, PoolManager, ServerStatus};
 use ferrous_dns_application::ports::{
     AggregateStatus, IpFamily, ResolvedEndpointHealth, UpstreamGroupHealth, UpstreamHealthPort,
     UpstreamStatus,
@@ -31,65 +31,37 @@ impl UpstreamHealthPort for UpstreamHealthAdapter {
             .get_all_arc_protocols()
             .into_iter()
             .map(|protocol| {
-                let status = match checker.get_status(&protocol) {
-                    ServerStatus::Healthy => UpstreamStatus::Healthy,
-                    ServerStatus::Unhealthy => UpstreamStatus::Unhealthy,
-                    ServerStatus::Unknown => UpstreamStatus::Unknown,
-                };
+                let status = map_server_status(checker.get_status(&protocol));
                 (protocol.to_string(), status)
             })
             .collect()
     }
 
     fn get_grouped_upstream_health(&self) -> Vec<UpstreamGroupHealth> {
-        let Some(checker) = &self.health_checker else {
-            return self
-                .pool_manager
-                .get_pool_groups()
-                .into_iter()
-                .map(|e: PoolGroupEntry| {
-                    let resolved = e
-                        .protocols
-                        .iter()
-                        .flat_map(|p| {
-                            expand_endpoint_health(p, UpstreamStatus::Unknown, None, None, 0)
-                        })
-                        .collect();
-                    UpstreamGroupHealth {
-                        address: e.original.to_string(),
-                        status: AggregateStatus::Unknown,
-                        resolved,
-                        pool_name: e.pool_name.to_string(),
-                        strategy: e.strategy,
-                    }
-                })
-                .collect();
-        };
+        let checker: Option<&HealthChecker> = self.health_checker.as_deref();
 
         self.pool_manager
             .get_pool_groups()
             .into_iter()
-            .map(|e: PoolGroupEntry| {
+            .map(|e| {
                 let resolved: Vec<ResolvedEndpointHealth> = e
                     .protocols
                     .iter()
-                    .flat_map(|p| {
-                        let health = checker.get_health_info(p);
-                        let status = map_server_status(checker.get_status(p));
-                        expand_endpoint_health(
+                    .flat_map(|p| match checker.and_then(|c| c.get_health_info(p)) {
+                        Some(health) => expand_endpoint_health(
                             p,
-                            status,
-                            health.as_ref().and_then(|h| h.last_check_latency_ms),
-                            health.as_ref().and_then(|h| h.last_error.clone()),
-                            health.map(|h| h.consecutive_failures).unwrap_or(0),
-                        )
+                            map_server_status(health.status),
+                            health.last_check_latency_ms,
+                            health.last_error,
+                            health.consecutive_failures,
+                        ),
+                        None => expand_endpoint_health(p, UpstreamStatus::Unknown, None, None, 0),
                     })
                     .collect();
 
-                let status = aggregate_status(&resolved);
                 UpstreamGroupHealth {
                     address: e.original.to_string(),
-                    status,
+                    status: aggregate_status(&resolved),
                     resolved,
                     pool_name: e.pool_name.to_string(),
                     strategy: e.strategy,

@@ -30,12 +30,12 @@ impl CreateCustomServiceUseCase {
     ) -> Result<CustomService, DomainError> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            return Err(DomainError::CustomServiceAlreadyExists(
+            return Err(DomainError::InvalidInput(
                 "Name cannot be empty".to_string(),
             ));
         }
         if domains.is_empty() {
-            return Err(DomainError::CustomServiceAlreadyExists(
+            return Err(DomainError::InvalidInput(
                 "At least one domain is required".to_string(),
             ));
         }

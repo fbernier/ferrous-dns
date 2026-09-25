@@ -1,19 +1,19 @@
-use ferrous_dns_application::ports::{BlockFilterEnginePort, UpstreamHealthPort};
+use ferrous_dns_application::ports::BlockFilterEnginePort;
 use ferrous_dns_application::use_cases::{
-    AppPasswordLoginUseCase, AssignClientGroupUseCase, GetTopAllowedDomainsUseCase, LoginUseCase,
-    LogoutUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
+    AppPasswordLoginUseCase, GetTopAllowedDomainsUseCase, LoginUseCase, LogoutUseCase,
+    ValidateSessionUseCase, VerifyMfaUseCase,
 };
 use ferrous_dns_application::use_cases::{
     CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateGroupUseCase,
     CreateManagedDomainUseCase, CreateManualClientUseCase, CreateRegexFilterUseCase,
     CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase, DeleteClientUseCase,
     DeleteGroupUseCase, DeleteManagedDomainUseCase, DeleteRegexFilterUseCase,
-    DeleteWhitelistSourceUseCase, GetBlockFilterStatsUseCase, GetBlocklistSourcesUseCase,
-    GetCacheStatsUseCase, GetClientsUseCase, GetGroupsUseCase, GetManagedDomainsUseCase,
-    GetQueryStatsUseCase, GetRecentQueriesUseCase, GetRegexFiltersUseCase, GetTimelineUseCase,
-    GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetWhitelistSourcesUseCase,
-    UpdateBlocklistSourceUseCase, UpdateClientUseCase, UpdateGroupUseCase,
-    UpdateManagedDomainUseCase, UpdateRegexFilterUseCase, UpdateWhitelistSourceUseCase,
+    DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientsUseCase, GetGroupsUseCase,
+    GetManagedDomainsUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase,
+    GetRegexFiltersUseCase, GetTimelineUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase,
+    GetWhitelistSourcesUseCase, ReloadConfigUseCase, UpdateBlocklistSourceUseCase,
+    UpdateClientUseCase, UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
+    UpdateWhitelistSourceUseCase,
 };
 use ferrous_dns_domain::Config;
 use std::sync::Arc;
@@ -63,9 +63,6 @@ pub struct PiholeQueryState {
     pub get_top_allowed_domains: Arc<GetTopAllowedDomainsUseCase>,
     pub get_top_clients: Arc<GetTopClientsUseCase>,
     pub get_recent_queries: Arc<GetRecentQueriesUseCase>,
-    pub upstream_health: Arc<dyn UpstreamHealthPort>,
-    pub get_block_filter_stats: Arc<GetBlockFilterStatsUseCase>,
-    pub get_cache_stats: Arc<GetCacheStatsUseCase>,
 }
 
 #[derive(Clone)]
@@ -79,8 +76,14 @@ pub struct PiholeBlockingState {
     pub create_regex_filter: Arc<CreateRegexFilterUseCase>,
     pub update_regex_filter: Arc<UpdateRegexFilterUseCase>,
     pub delete_regex_filter: Arc<DeleteRegexFilterUseCase>,
-    /// Blocking pause timer handle — only one active at a time per instance.
-    pub blocking_timer: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Blocking-mode flip scheduled by `POST /dns/blocking {timer}`; at most one per instance.
+    pub blocking_timer: Arc<tokio::sync::Mutex<Option<BlockingTimer>>>,
+}
+
+/// A pending revert of the blocking mode, due at `deadline`.
+pub struct BlockingTimer {
+    pub deadline: tokio::time::Instant,
+    pub task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -109,13 +112,13 @@ pub struct PiholeClientState {
     pub create_manual_client: Arc<CreateManualClientUseCase>,
     pub update_client: Arc<UpdateClientUseCase>,
     pub delete_client: Arc<DeleteClientUseCase>,
-    pub assign_client_group: Arc<AssignClientGroupUseCase>,
 }
 
 #[derive(Clone)]
 pub struct PiholeSystemState {
     pub cleanup_query_logs: Arc<CleanupOldQueryLogsUseCase>,
     pub config: Arc<RwLock<Config>>,
-    pub config_path: Option<Arc<str>>,
+    /// Absent when the server runs without a config file.
+    pub reload_config: Option<Arc<ReloadConfigUseCase>>,
     pub process_start: std::time::Instant,
 }

@@ -1,6 +1,8 @@
+use crate::dns::wire_response;
 use bytes::Bytes;
+use ferrous_dns_domain::DnssecStatus;
 use std::net::IpAddr;
-use std::str::FromStr;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 #[repr(u8)]
@@ -13,33 +15,27 @@ pub enum CachedDnssecStatus {
     Indeterminate = 4,
 }
 
-impl FromStr for CachedDnssecStatus {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "Secure" => Self::Secure,
-            "Insecure" => Self::Insecure,
-            "Bogus" => Self::Bogus,
-            "Indeterminate" => Self::Indeterminate,
-            _ => Self::Unknown,
-        })
+impl From<DnssecStatus> for CachedDnssecStatus {
+    fn from(status: DnssecStatus) -> Self {
+        match status {
+            DnssecStatus::Secure => Self::Secure,
+            DnssecStatus::Insecure => Self::Insecure,
+            DnssecStatus::Bogus => Self::Bogus,
+            DnssecStatus::Indeterminate => Self::Indeterminate,
+        }
     }
 }
 
 impl CachedDnssecStatus {
-    pub fn as_str(&self) -> &'static str {
+    /// `Unknown` is an entry cached without a DNSSEC determination.
+    pub fn to_domain(self) -> Option<DnssecStatus> {
         match self {
-            Self::Unknown => "Unknown",
-            Self::Secure => "Secure",
-            Self::Insecure => "Insecure",
-            Self::Bogus => "Bogus",
-            Self::Indeterminate => "Indeterminate",
+            Self::Unknown => None,
+            Self::Secure => Some(DnssecStatus::Secure),
+            Self::Insecure => Some(DnssecStatus::Insecure),
+            Self::Bogus => Some(DnssecStatus::Bogus),
+            Self::Indeterminate => Some(DnssecStatus::Indeterminate),
         }
-    }
-
-    pub fn from_option_string(opt: Option<String>) -> Self {
-        opt.and_then(|s| s.parse().ok()).unwrap_or(Self::Unknown)
     }
 }
 
@@ -54,19 +50,25 @@ pub enum CachedData {
 
     CanonicalName(Arc<str>),
 
-    /// Raw upstream DNS wire bytes for non-A/AAAA record types (HTTPS, MX, TXT, etc.).
+    /// An upstream DNS response for a non-A/AAAA record type (HTTPS, MX, TXT,
+    /// etc.), in [`wire_response::cache_form`].
     WireData(Bytes),
 
     NegativeResponse,
 }
 
 impl CachedData {
-    pub fn is_empty(&self) -> bool {
+    /// The form the cache stores for an entry of `ttl` seconds: a wire answer
+    /// re-sectioned by [`wire_response::cache_form`], its record TTLs clamped
+    /// into `ttls`, anything else as is. `None` for a wire answer that does
+    /// not re-section.
+    pub(super) fn into_stored(self, ttl: u32, ttls: RangeInclusive<u32>) -> Option<Self> {
         match self {
-            CachedData::IpAddresses(entry) => entry.addresses.is_empty(),
-            CachedData::CanonicalName(name) => name.is_empty(),
-            CachedData::WireData(bytes) => bytes.is_empty(),
-            CachedData::NegativeResponse => false,
+            Self::WireData(wire) => wire_response::cache_form(&wire, ttl, ttls)
+                .map(|wire| Self::WireData(Bytes::from(wire))),
+            data @ (Self::IpAddresses(_) | Self::CanonicalName(_) | Self::NegativeResponse) => {
+                Some(data)
+            }
         }
     }
 
@@ -77,21 +79,18 @@ impl CachedData {
     pub fn as_ip_addresses(&self) -> Option<&Arc<Vec<IpAddr>>> {
         match self {
             CachedData::IpAddresses(entry) => Some(&entry.addresses),
-            _ => None,
+            CachedData::CanonicalName(_)
+            | CachedData::WireData(_)
+            | CachedData::NegativeResponse => None,
         }
     }
 
     pub fn as_canonical_name(&self) -> Option<&Arc<str>> {
         match self {
             CachedData::CanonicalName(name) => Some(name),
-            _ => None,
-        }
-    }
-
-    pub fn as_wire_data(&self) -> Option<&Bytes> {
-        match self {
-            CachedData::WireData(bytes) => Some(bytes),
-            _ => None,
+            CachedData::IpAddresses(_) | CachedData::WireData(_) | CachedData::NegativeResponse => {
+                None
+            }
         }
     }
 }

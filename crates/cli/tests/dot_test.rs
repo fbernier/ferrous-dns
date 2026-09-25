@@ -16,7 +16,7 @@ use common::{
     SkipServerVerification,
 };
 use ferrous_dns::server::{
-    bind_dot_listener, load_server_tls_config, serve_dot, ConnectionLimiter,
+    bind_tcp_listener, load_server_tls_config, serve_dot, ConnectionLimiter,
 };
 use ferrous_dns_application::ports::TlsCertificatePort;
 use ferrous_dns_infrastructure::tls::TlsCertificateService;
@@ -54,7 +54,7 @@ async fn start_test_dot_server_on(bind: &str, conn_limiter: ConnectionLimiter) -
     .unwrap()
     .unwrap();
 
-    let listener = Arc::new(bind_dot_listener(bind).unwrap());
+    let listener = Arc::new(bind_tcp_listener(bind.parse().unwrap()).unwrap());
     let addr = common::unmap_addr(listener.local_addr().unwrap());
     let handler =
         handler_with_canned_addresses(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))], 300);

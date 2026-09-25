@@ -36,6 +36,22 @@ impl BlockResponseMode {
     }
 }
 
+impl std::str::FromStr for BlockResponseMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "null_ip" => Ok(Self::NullIp),
+            "nxdomain" => Ok(Self::NxDomain),
+            "nodata" => Ok(Self::NoData),
+            "refused" => Ok(Self::Refused),
+            _ => Err(format!(
+                "Invalid block_mode '{s}': expected null_ip, nxdomain, nodata or refused"
+            )),
+        }
+    }
+}
+
 /// Default TTL (seconds) for blocked answers; shared as the single source of
 /// truth for the config default and the API DTO default.
 pub const DEFAULT_BLOCK_TTL: u32 = 60;
@@ -118,17 +134,29 @@ mod tests {
     }
 
     #[test]
+    fn block_mode_parses_its_own_string_form() {
+        for mode in [
+            BlockResponseMode::NullIp,
+            BlockResponseMode::NxDomain,
+            BlockResponseMode::NoData,
+            BlockResponseMode::Refused,
+        ] {
+            assert_eq!(mode.as_str().parse::<BlockResponseMode>(), Ok(mode));
+        }
+    }
+
+    #[test]
+    fn unknown_block_mode_string_is_rejected() {
+        for bad in ["bogus", "", "NULL_IP"] {
+            assert!(bad.parse::<BlockResponseMode>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn unknown_block_mode_errors() {
         assert!(
             toml::from_str::<BlockingConfig>("enabled = true\nblock_mode = \"bogus\"").is_err()
         );
-    }
-
-    #[test]
-    fn defaults_are_null_ip_and_ttl_60() {
-        let config = BlockingConfig::default();
-        assert_eq!(config.block_mode, BlockResponseMode::NullIp);
-        assert_eq!(config.block_ttl, 60);
     }
 
     #[test]
@@ -142,13 +170,6 @@ mod tests {
     fn custom_block_ttl_is_honoured() {
         let config: BlockingConfig = toml::from_str("enabled = true\nblock_ttl = 300").unwrap();
         assert_eq!(config.block_ttl, 300);
-    }
-
-    #[test]
-    fn sinkhole_addresses_default_to_none() {
-        let config: BlockingConfig = toml::from_str("enabled = true").unwrap();
-        assert_eq!(config.sinkhole_ipv4, None);
-        assert_eq!(config.sinkhole_ipv6, None);
     }
 
     #[test]

@@ -29,16 +29,14 @@ ferrous-dns/
 
 ## `crates/domain`
 
-**Pure business logic. Zero external dependencies** (except `thiserror`).
+**Pure business logic.** Depends only on `thiserror`, `serde`, `toml` and `ipnetwork`.
 
 Contains:
-- DNS record entities (`DnsRecord`, `DnsQuery`, `DnsResolution`)
-- Value objects (`DomainName`, `RecordType`, `ClientGroup`)
+- Entities (`QueryLog`, `Group`, `BlocklistSource`, `ManagedDomain`, `User`, …)
+- Value objects (`RecordType`, `DnsQuery`, `DnsRequest`, `DnsProtocol`, `PrivateIpFilter`)
 - Domain configuration types
 - `DomainError` — the single error type used across all layers
 - Business rules that don't depend on any I/O
-
-Entities like `DnsRecord`, `DnsQuery`, and `DnsResolution` live here with no external dependencies.
 
 **Rule**: no I/O, no frameworks, no database access. If you need I/O, it belongs in `infrastructure`.
 
@@ -138,12 +136,10 @@ A thin layer that exposes the Pi-hole v6 REST API format at `/api/*`, reusing th
 
 Contains:
 - `BlocklistSyncJob` — downloads and indexes blocklists periodically
-- `CacheMaintenanceJob` — compaction, expiry cleanup, WAL checkpoint
-- `ClientSyncJob` — resolves client hostnames, updates last-seen
+- `CacheMaintenanceJob` — eviction and compaction cycles whenever the cache is enabled, plus optimistic refresh when `cache_optimistic_refresh` is on
+- `WalCheckpointJob` — periodic SQLite WAL PASSIVE checkpoint
+- `ClientSyncJob` — syncs client MAC addresses from ARP and resolves client hostnames
 - `ScheduleEvaluatorJob` — activates/deactivates time-based blocking rules
-- `JobRunner` — assembles and starts all jobs with `CancellationToken` for graceful shutdown
-
-All jobs support graceful shutdown via cancellation tokens.
 
 **Rule**: jobs use ports from `application` only. They never import `infrastructure` directly.
 

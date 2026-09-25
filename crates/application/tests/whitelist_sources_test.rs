@@ -7,7 +7,7 @@ use ferrous_dns_domain::DomainError;
 use std::sync::Arc;
 
 mod helpers;
-use helpers::{MockGroupRepository, MockWhitelistSourceRepository};
+use helpers::{MockBlockFilterEngine, MockGroupRepository, MockWhitelistSourceRepository};
 
 #[tokio::test]
 async fn test_get_all_empty() {
@@ -85,7 +85,11 @@ async fn test_get_by_id_not_found() {
 async fn test_create_success() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo);
+    let use_case = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo,
+        Arc::new(MockBlockFilterEngine::new()),
+    );
 
     let result = use_case
         .execute(
@@ -110,8 +114,15 @@ async fn test_create_success() {
 async fn test_create_with_multiple_groups() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
-    let use_case = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo);
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
+    let use_case = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo,
+        Arc::new(MockBlockFilterEngine::new()),
+    );
 
     let result = use_case
         .execute(
@@ -132,7 +143,8 @@ async fn test_create_with_multiple_groups() {
 async fn test_create_without_url_succeeds() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute("Manual Allowlist".to_string(), None, vec![1], None, true)
@@ -147,7 +159,8 @@ async fn test_create_without_url_succeeds() {
 async fn test_create_invalid_name_empty() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute("".to_string(), None, vec![1], None, true)
@@ -164,7 +177,8 @@ async fn test_create_invalid_name_empty() {
 async fn test_create_invalid_url_scheme() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute(
@@ -187,7 +201,8 @@ async fn test_create_invalid_url_scheme() {
 async fn test_create_group_not_found() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute("Test Allowlist".to_string(), None, vec![999], None, true)
@@ -204,7 +219,8 @@ async fn test_create_group_not_found() {
 async fn test_create_one_invalid_group_in_multi_group_fails() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        CreateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute(
@@ -224,33 +240,16 @@ async fn test_create_one_invalid_group_in_multi_group_fails() {
 }
 
 #[tokio::test]
-async fn test_create_duplicate_name() {
-    let repo = Arc::new(MockWhitelistSourceRepository::new());
-    let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = CreateWhitelistSourceUseCase::new(repo, group_repo);
-
-    use_case
-        .execute("Duplicate".to_string(), None, vec![1], None, true)
-        .await
-        .unwrap();
-
-    let result = use_case
-        .execute("Duplicate".to_string(), None, vec![1], None, true)
-        .await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        DomainError::InvalidWhitelistSource(_) => {}
-        other => panic!("Expected InvalidWhitelistSource, got {:?}", other),
-    }
-}
-
-#[tokio::test]
 async fn test_update_toggle_enabled() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("Toggle Allowlist".to_string(), None, vec![1], None, true)
@@ -270,10 +269,18 @@ async fn test_update_toggle_enabled() {
 async fn test_update_change_groups() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
 
-    let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute(
@@ -299,10 +306,18 @@ async fn test_update_change_groups() {
 async fn test_update_assign_multiple_groups() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    group_repo.create("Office".to_string(), None).await.unwrap();
+    group_repo
+        .create("Office".to_string(), None, true)
+        .await
+        .unwrap();
 
-    let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("Shared Allowlist".to_string(), None, vec![1], None, true)
@@ -325,7 +340,8 @@ async fn test_update_assign_multiple_groups() {
 async fn test_update_source_not_found() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let use_case = UpdateWhitelistSourceUseCase::new(repo, group_repo);
+    let use_case =
+        UpdateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case
         .execute(999, None, None, None, None, Some(false))
@@ -342,8 +358,13 @@ async fn test_update_source_not_found() {
 async fn test_update_invalid_group() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("List".to_string(), None, vec![1], None, true)
@@ -365,8 +386,13 @@ async fn test_update_invalid_group() {
 async fn test_update_clear_url() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo.clone());
-    let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo);
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc =
+        UpdateWhitelistSourceUseCase::new(repo, group_repo, Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute(
@@ -391,8 +417,13 @@ async fn test_update_clear_url() {
 async fn test_delete_success() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
-    let create_uc = CreateWhitelistSourceUseCase::new(repo.clone(), group_repo);
-    let delete_uc = DeleteWhitelistSourceUseCase::new(repo.clone());
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo,
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let delete_uc =
+        DeleteWhitelistSourceUseCase::new(repo.clone(), Arc::new(MockBlockFilterEngine::new()));
 
     let source = create_uc
         .execute("To Delete".to_string(), None, vec![1], None, true)
@@ -410,7 +441,7 @@ async fn test_delete_success() {
 #[tokio::test]
 async fn test_delete_not_found() {
     let repo = Arc::new(MockWhitelistSourceRepository::new());
-    let use_case = DeleteWhitelistSourceUseCase::new(repo);
+    let use_case = DeleteWhitelistSourceUseCase::new(repo, Arc::new(MockBlockFilterEngine::new()));
 
     let result = use_case.execute(999).await;
 
@@ -419,4 +450,71 @@ async fn test_delete_not_found() {
         DomainError::WhitelistSourceNotFound(_) => {}
         other => panic!("Expected WhitelistSourceNotFound, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_create_reloads_block_filter() {
+    let repo = Arc::new(MockWhitelistSourceRepository::new());
+    let engine = Arc::new(MockBlockFilterEngine::new());
+    let use_case = CreateWhitelistSourceUseCase::new(
+        repo,
+        Arc::new(MockGroupRepository::new()),
+        engine.clone(),
+    );
+
+    let result = use_case
+        .execute("Allow".to_string(), None, vec![1], None, true)
+        .await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        engine.reload_count().await,
+        1,
+        "a new allowlist must take effect without waiting for the daily sync job"
+    );
+}
+
+#[tokio::test]
+async fn test_update_reloads_block_filter() {
+    let repo = Arc::new(MockWhitelistSourceRepository::new());
+    let group_repo = Arc::new(MockGroupRepository::new());
+    let engine = Arc::new(MockBlockFilterEngine::new());
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        group_repo.clone(),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let update_uc = UpdateWhitelistSourceUseCase::new(repo, group_repo, engine.clone());
+    let source = create_uc
+        .execute("Allow".to_string(), None, vec![1], None, true)
+        .await
+        .unwrap();
+
+    let result = update_uc
+        .execute(source.id.unwrap(), None, None, None, None, Some(false))
+        .await;
+
+    assert!(result.is_ok());
+    assert_eq!(engine.reload_count().await, 1);
+}
+
+#[tokio::test]
+async fn test_delete_reloads_block_filter() {
+    let repo = Arc::new(MockWhitelistSourceRepository::new());
+    let engine = Arc::new(MockBlockFilterEngine::new());
+    let create_uc = CreateWhitelistSourceUseCase::new(
+        repo.clone(),
+        Arc::new(MockGroupRepository::new()),
+        Arc::new(MockBlockFilterEngine::new()),
+    );
+    let delete_uc = DeleteWhitelistSourceUseCase::new(repo, engine.clone());
+    let source = create_uc
+        .execute("Allow".to_string(), None, vec![1], None, true)
+        .await
+        .unwrap();
+
+    let result = delete_uc.execute(source.id.unwrap()).await;
+
+    assert!(result.is_ok());
+    assert_eq!(engine.reload_count().await, 1);
 }

@@ -2,7 +2,7 @@
 //! socket (`crates/cli/src/server/dns/udp.rs`), reachable by anyone who can
 //! send a packet.
 //!
-//! Two properties are checked:
+//! Three properties are checked:
 //!
 //! 1. **No panic / no out-of-bounds.** `build_cache_hit_response` writes into a
 //!    fixed 523-byte buffer and has already had an overflow bug (see the
@@ -11,6 +11,10 @@
 //!    keyed on `FastPathQuery::domain()`, while the slow path keys on
 //!    hickory's `Name::to_utf8()` (`server.rs::handle_raw_udp_fallback`). If
 //!    the two disagree, two different wire names share one cache entry.
+//! 3. **The slow-path encoders answer it.** After the `edns_cookie` walk,
+//!    `encode_response` for every `ResponseBody`, with and without an OPT
+//!    carrying that cookie and an EDE, and `encode_truncated` must each decode
+//!    with hickory and echo the client's question, with an OPT only if asked.
 //!
 //! The answer-set size is derived from the query ID so that a corpus entry is
 //! a plain DNS packet: the fuzzer still steers it, but seeds stay readable and
@@ -19,7 +23,11 @@
 
 use ferrous_dns_infrastructure::dns::fast_path;
 use ferrous_dns_infrastructure::dns::forwarding::record_type_map::RecordTypeMapper;
-use ferrous_dns_infrastructure::dns::wire_response;
+use ferrous_dns_infrastructure::dns::ede::ExtendedDnsError;
+use ferrous_dns_infrastructure::dns::wire_response::{
+    self, EdnsReply, Rcode, ResponseBody, ResponseHead,
+};
+use hickory_proto::op::Message;
 use hickory_proto::op::Query;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use libfuzzer_sys::fuzz_target;
@@ -96,5 +104,43 @@ fuzz_target!(|packet: &[u8]| {
             wire_response::wire_fits_udp_buffer(len, query.client_max_size),
             "response exceeds the buffer the client advertised"
         );
+    }
+
+    // A parsed query's options are well formed and its COOKIE has an allowed length.
+    let cookie = query.edns_cookie(packet);
+    assert!(
+        cookie.is_none_or(|c| matches!(c.len(), 8 | 16..=40)),
+        "the wire parser admitted a COOKIE RFC 7873 rejects"
+    );
+    let question = query.question(packet);
+    let head = ResponseHead {
+        id: query.id,
+        recursion_desired: query.recursion_desired,
+        authentic_data: false,
+        rcode: Rcode::NoError,
+    };
+    let ede = ExtendedDnsError { info_code: 15, extra_text: "blocked" };
+    let reply = EdnsReply { dnssec_ok: query.wants_dnssec, cookie, ede: Some(&ede) };
+    let bodies = [
+        ResponseBody::Empty,
+        ResponseBody::Addresses { addresses: &addresses, ttl: 300 },
+        ResponseBody::NegativeSoa { ttl: 300 },
+    ];
+    let mut answers: Vec<(Vec<u8>, bool)> = bodies
+        .into_iter()
+        .flat_map(|body| [None, Some(&reply)].map(|edns| {
+            (wire_response::encode_response(&head, question, 1, body, edns), edns.is_some())
+        }))
+        .collect();
+    answers.push((wire_response::encode_truncated(query.id, query.recursion_desired, question, 1), false));
+    for (wire, has_opt) in answers {
+        let msg = Message::from_vec(&wire).expect("encoded answer does not decode");
+        let [echoed] = msg.queries.as_slice() else {
+            panic!("answer echoes {} questions", msg.queries.len());
+        };
+        let echoed_name = echoed.name().to_utf8();
+        assert_eq!(echoed_name.trim_end_matches('.').to_ascii_lowercase(), query.domain());
+        assert_eq!(msg.metadata.id, query.id);
+        assert_eq!(msg.edns.is_some(), has_opt, "OPT presence");
     }
 });

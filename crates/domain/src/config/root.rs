@@ -1,15 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
-use super::auth::AuthConfig;
+use super::auth::{expiry_from_now, AuthConfig, MAX_STORED_EXPIRY_YEAR};
 use super::blocking::BlockingConfig;
 use super::database::DatabaseConfig;
 use super::dns::DnsConfig;
 use super::dns64::Dns64Config;
-use super::errors::ConfigError;
+use super::legacy;
 use super::logging::LoggingConfig;
 use super::server::ServerConfig;
 use super::upstream::UpstreamPool;
+use crate::errors::domain_error::DomainError;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
@@ -31,44 +31,25 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load(path: Option<&str>, cli_overrides: CliOverrides) -> Result<Self, ConfigError> {
-        let mut config = if let Some(path) = path {
-            Self::from_file(path)?
-        } else if std::path::Path::new("ferrous-dns.toml").exists() {
-            Self::from_file("ferrous-dns.toml")?
-        } else if std::path::Path::new("/etc/ferrous-dns/config.toml").exists() {
-            Self::from_file("/etc/ferrous-dns/config.toml")?
-        } else {
-            Self::default()
-        };
-
-        config.apply_cli_overrides(cli_overrides);
+    /// Parses a `ferrous-dns.toml` document, rewriting with a warning each
+    /// value earlier releases ran with but this one rejects. Call
+    /// [`Config::validate`] once every override is applied.
+    pub fn from_toml_str(contents: &str) -> Result<Self, DomainError> {
+        let parse_error =
+            |e: toml::de::Error| DomainError::ConfigError(format!("Failed to parse config: {e}"));
+        let mut doc: toml::Table = toml::from_str(contents).map_err(parse_error)?;
+        legacy::normalize_document(&mut doc);
+        let mut config = Self::deserialize(doc).map_err(parse_error)?;
+        legacy::normalize_values(&mut config);
         config.normalize_pools();
         Ok(config)
     }
 
-    fn from_file(path: &str) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::FileRead(path.to_string(), e.to_string()))?;
-        toml::from_str(&contents).map_err(|e| ConfigError::Parse(e.to_string()))
-    }
-
-    fn apply_cli_overrides(&mut self, overrides: CliOverrides) {
-        if let Some(port) = overrides.dns_port {
-            self.server.dns_port = port;
-        }
-        if let Some(port) = overrides.web_port {
-            self.server.web_port = port;
-        }
-        if let Some(bind) = overrides.bind_address {
-            self.server.bind_address = bind;
-        }
-        if let Some(db) = overrides.database_path {
-            self.database.path = db;
-        }
-        if let Some(level) = overrides.log_level {
-            self.logging.level = level;
-        }
+    /// The configuration used when no config file exists.
+    pub fn builtin() -> Self {
+        let mut config = Self::default();
+        config.normalize_pools();
+        config
     }
 
     fn normalize_pools(&mut self) {
@@ -83,46 +64,25 @@ impl Config {
         }
     }
 
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), DomainError> {
         if self.server.dns_port == 0 {
-            return Err(ConfigError::Validation("DNS port cannot be 0".to_string()));
+            return Err(DomainError::ConfigError("DNS port cannot be 0".to_string()));
         }
 
-        // Every listener parses its address only when it binds, and the
-        // encrypted ones bind inside a spawned task — so without this an
-        // unparseable address takes a listener down with a single log line
-        // while the process stays up. Check them all up front instead. A
-        // listener that falls back to `bind_address` is already covered by
-        // the first check, so only an explicit override is named separately.
-        check_listen_address("server.bind_address", &self.server.dns_listen_address())?;
-        let encrypted = &self.server.encrypted_dns;
-        if encrypted.dot_enabled && encrypted.dot_bind_address.is_some() {
-            check_listen_address(
-                "server.encrypted_dns.dot_bind_address",
-                &self.server.dot_listen_address(),
-            )?;
-        }
-        if encrypted.doq_enabled && encrypted.doq_bind_address.is_some() {
-            check_listen_address(
-                "server.encrypted_dns.doq_bind_address",
-                &self.server.doq_listen_address(),
-            )?;
-        }
-        if encrypted.doh_enabled && encrypted.doh_bind_address.is_some() {
-            if let Some(addr) = self.server.doh_listen_address() {
-                check_listen_address("server.encrypted_dns.doh_bind_address", &addr)?;
-            }
-        }
+        self.validate_non_zero()?;
+        self.validate_derived_durations()?;
+
+        self.dns.local_dns_server_addr()?;
 
         if self.dns.pools.is_empty() && self.dns.upstream_servers.is_empty() {
-            return Err(ConfigError::Validation(
+            return Err(DomainError::ConfigError(
                 "No upstream servers configured".to_string(),
             ));
         }
 
         for pool in &self.dns.pools {
             if pool.servers.is_empty() {
-                return Err(ConfigError::Validation(format!(
+                return Err(DomainError::ConfigError(format!(
                     "Pool '{}' has no servers",
                     pool.name
                 )));
@@ -132,33 +92,167 @@ impl Config {
         Ok(())
     }
 
-    pub fn get_config_path() -> Option<String> {
-        if std::path::Path::new("ferrous-dns.toml").exists() {
-            Some("ferrous-dns.toml".to_string())
-        } else if std::path::Path::new("/etc/ferrous-dns/config.toml").exists() {
-            Some("/etc/ferrous-dns/config.toml".to_string())
-        } else {
-            None
+    /// Rejects values the runtime cannot honour: a zero interval, timeout,
+    /// TTL or capacity panics (zero-period timer, zero-capacity channel or
+    /// pool), spins, or silently disables the component it sizes.
+    fn validate_non_zero(&self) -> Result<(), DomainError> {
+        let dns = &self.dns;
+        let database = &self.database;
+        let auth = &self.auth;
+        let zero_checks = [
+            ("dns.query_timeout", dns.query_timeout == 0),
+            ("dns.cache_max_entries", dns.cache_max_entries == 0),
+            (
+                "dns.cache_compaction_interval",
+                dns.cache_compaction_interval == 0,
+            ),
+            (
+                "dns.cache_eviction_sample_size",
+                dns.cache_eviction_sample_size == 0,
+            ),
+            ("dns.health_check.interval", dns.health_check.interval == 0),
+            ("dns.health_check.timeout", dns.health_check.timeout == 0),
+            (
+                "dns.rate_limit.queries_per_second",
+                dns.rate_limit.queries_per_second == 0,
+            ),
+            ("dns.rate_limit.burst_size", dns.rate_limit.burst_size == 0),
+            (
+                "dns.rate_limit.stale_entry_ttl_secs",
+                dns.rate_limit.stale_entry_ttl_secs == 0,
+            ),
+            (
+                "dns.tunneling_detection.stale_entry_ttl_secs",
+                dns.tunneling_detection.stale_entry_ttl_secs == 0,
+            ),
+            (
+                "dns.nxdomain_hijack.probe_interval_secs",
+                dns.nxdomain_hijack.probe_interval_secs == 0,
+            ),
+            (
+                "dns.nxdomain_hijack.probe_timeout_ms",
+                dns.nxdomain_hijack.probe_timeout_ms == 0,
+            ),
+            (
+                "dns.nxdomain_hijack.hijack_ip_ttl_secs",
+                dns.nxdomain_hijack.hijack_ip_ttl_secs == 0,
+            ),
+            (
+                "dns.response_ip_filter.refresh_interval_secs",
+                dns.response_ip_filter.refresh_interval_secs == 0,
+            ),
+            (
+                "dns.response_ip_filter.ip_ttl_secs",
+                dns.response_ip_filter.ip_ttl_secs == 0,
+            ),
+            (
+                "dns.dga_detection.stale_entry_ttl_secs",
+                dns.dga_detection.stale_entry_ttl_secs == 0,
+            ),
+            (
+                "database.query_log_channel_capacity",
+                database.query_log_channel_capacity == 0,
+            ),
+            (
+                "database.query_log_max_batch_size",
+                database.query_log_max_batch_size == 0,
+            ),
+            (
+                "database.query_log_flush_interval_ms",
+                database.query_log_flush_interval_ms == 0,
+            ),
+            (
+                "database.client_channel_capacity",
+                database.client_channel_capacity == 0,
+            ),
+            (
+                "database.write_pool_max_connections",
+                database.write_pool_max_connections == 0,
+            ),
+            (
+                "database.query_log_pool_max_connections",
+                database.query_log_pool_max_connections == 0,
+            ),
+            (
+                "database.read_pool_max_connections",
+                database.read_pool_max_connections == 0,
+            ),
+            (
+                "database.write_busy_timeout_secs",
+                database.write_busy_timeout_secs == 0,
+            ),
+            (
+                "database.read_acquire_timeout_secs",
+                database.read_acquire_timeout_secs == 0,
+            ),
+            (
+                "database.wal_checkpoint_interval_secs",
+                database.wal_checkpoint_interval_secs == 0,
+            ),
+            ("auth.session_ttl_hours", auth.session_ttl_hours == 0),
+            ("auth.remember_me_days", auth.remember_me_days == 0),
+            (
+                "auth.login_rate_limit_window_secs",
+                auth.login_rate_limit_window_secs == 0,
+            ),
+            (
+                "auth.mfa_challenge_ttl_secs",
+                auth.mfa_challenge_ttl_secs <= 0,
+            ),
+        ];
+        if let Some((field, _)) = zero_checks.into_iter().find(|&(_, is_zero)| is_zero) {
+            return Err(DomainError::ConfigError(format!(
+                "{field} must be greater than 0"
+            )));
         }
-    }
-}
 
-#[derive(Debug, Default)]
-pub struct CliOverrides {
-    pub dns_port: Option<u16>,
-    pub web_port: Option<u16>,
-    pub bind_address: Option<String>,
-    pub database_path: Option<String>,
-    pub log_level: Option<String>,
-}
+        // DashMap asserts a power-of-two shard count above 1.
+        for (field, shards) in [
+            ("dns.cache_shard_amount", dns.cache_shard_amount),
+            ("dns.cache_inflight_shards", dns.cache_inflight_shards),
+        ] {
+            if shards < 2 || !shards.is_power_of_two() {
+                return Err(DomainError::ConfigError(format!(
+                    "{field} must be a power of two of at least 2, got {shards}"
+                )));
+            }
+        }
 
-/// Rejects a listen address the listeners could not bind. `field` names the
-/// configuration key so the operator knows which one to fix.
-fn check_listen_address(field: &str, addr: &str) -> Result<(), ConfigError> {
-    if addr.parse::<SocketAddr>().is_ok() {
-        return Ok(());
+        // Every cached TTL is clamped to this range, which must not be inverted.
+        if dns.cache_min_ttl > dns.cache_max_ttl {
+            return Err(DomainError::ConfigError(format!(
+                "dns.cache_min_ttl ({}) must not exceed dns.cache_max_ttl ({})",
+                dns.cache_min_ttl, dns.cache_max_ttl
+            )));
+        }
+
+        Ok(())
     }
-    Err(ConfigError::Validation(format!(
-        "{field} yields the invalid listen address '{addr}'; it must be an IPv4 or IPv6 literal, not a hostname"
-    )))
+
+    /// Rejects values whose derived duration overflows where it is used:
+    /// session and MFA-challenge expiries are `now + ttl` and must be storable
+    /// with a four-digit year, and the upstream timeout is taken in milliseconds.
+    fn validate_derived_durations(&self) -> Result<(), DomainError> {
+        let auth = &self.auth;
+        for (field, ttl_secs) in [
+            ("auth.session_ttl_hours", auth.session_ttl_secs(false)),
+            ("auth.remember_me_days", auth.session_ttl_secs(true)),
+            ("auth.mfa_challenge_ttl_secs", auth.mfa_challenge_ttl_secs),
+        ] {
+            if expiry_from_now(ttl_secs).is_none() {
+                return Err(DomainError::ConfigError(format!(
+                    "{field} is too large: an expiry {ttl_secs}s from now is past year {MAX_STORED_EXPIRY_YEAR}"
+                )));
+            }
+        }
+
+        if self.dns.query_timeout.checked_mul(1000).is_none() {
+            return Err(DomainError::ConfigError(format!(
+                "dns.query_timeout is too large: {} seconds overflow when converted to milliseconds",
+                self.dns.query_timeout
+            )));
+        }
+
+        Ok(())
+    }
 }

@@ -3,28 +3,70 @@ use ferrous_dns_api::{
     GroupUseCases, QueryUseCases, SafeSearchUseCases, ScheduleUseCases, ServiceUseCases,
 };
 use ferrous_dns_application::ports::{
-    BlocklistSourceCreator, ConfigFilePersistence, GroupCreator, LocalRecordCreator,
+    BlocklistSourceCreator, ConfigFilePersistence, ConfigRepository, DnsCachePort, GroupCreator,
+    LocalRecordCreator, UpstreamReloadPort,
 };
 use ferrous_dns_application::use_cases::{
-    CreateLocalRecordUseCase, DeleteLocalRecordUseCase, ExportConfigUseCase, ImportConfigUseCase,
-    UpdateLocalRecordUseCase,
+    ConfigDestination, ConfigOverrides, CreateLocalRecordUseCase, DeleteLocalRecordUseCase,
+    ExportConfigUseCase, ImportConfigUseCase, ReloadConfigUseCase, UpdateLocalRecordUseCase,
 };
 use ferrous_dns_domain::Config;
 use ferrous_dns_infrastructure::dns::{UpstreamHealthAdapter, UpstreamReloadAdapter};
 use ferrous_dns_infrastructure::repositories::{TomlConfigFilePersistence, TomlConfigRepository};
 use ferrous_dns_infrastructure::tls::TlsCertificateService;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::{DnsServices, Repositories, UseCases};
 
-/// The config file the server reads and rewrites: the path it was started with,
-/// else the one `Config` discovers, else `ferrous-dns.toml` in the working dir.
+/// The config file the server rewrites: the one it was started with, else
+/// `ferrous-dns.toml` in the working dir.
 pub(super) fn resolve_config_file(config_path: Option<&str>) -> String {
-    config_path
-        .map(String::from)
-        .or_else(Config::get_config_path)
-        .unwrap_or_else(|| "ferrous-dns.toml".to_string())
+    config_path.unwrap_or("ferrous-dns.toml").to_string()
+}
+
+/// The live config and its writers, shared by both web APIs, so a save,
+/// import or reload from either serializes with the others and hot-reloads
+/// the same pools.
+pub struct ConfigServices {
+    pub config: Arc<RwLock<Config>>,
+    pub path: Option<Arc<str>>,
+    pub writer: Arc<Mutex<()>>,
+    pub reload_upstream: Arc<dyn UpstreamReloadPort>,
+    /// Absent when the server runs without a config file.
+    pub reload: Option<Arc<ReloadConfigUseCase>>,
+}
+
+pub fn build_config_services(
+    dns_services: &DnsServices,
+    config: Arc<RwLock<Config>>,
+    path: Option<Arc<str>>,
+    overrides: ConfigOverrides,
+) -> ConfigServices {
+    let writer: Arc<Mutex<()>> = Arc::default();
+    let reload_upstream: Arc<dyn UpstreamReloadPort> = Arc::new(UpstreamReloadAdapter::new(
+        std::iter::once(dns_services.pool_manager.clone())
+            .chain(dns_services.dnssec_pool_manager.clone())
+            .chain(dns_services.maintenance_pool_manager.clone())
+            .collect(),
+    ));
+    let reload = path.clone().map(|path| {
+        Arc::new(ReloadConfigUseCase::new(
+            config.clone(),
+            writer.clone(),
+            Arc::new(TomlConfigFilePersistence),
+            path,
+            reload_upstream.clone(),
+            overrides,
+        ))
+    });
+    ConfigServices {
+        config,
+        path,
+        writer,
+        reload_upstream,
+        reload,
+    }
 }
 
 /// Builds the shared API state.
@@ -37,51 +79,50 @@ pub async fn build_app_state(
     auth: AuthUseCases,
     repos: &Repositories,
     dns_services: &DnsServices,
-    config: Arc<RwLock<Config>>,
-    config_path: Option<Arc<str>>,
+    config_services: &ConfigServices,
     https_active: bool,
 ) -> AppState {
-    let config_repo: Arc<dyn ferrous_dns_application::ports::ConfigRepository> = Arc::new(
-        TomlConfigRepository::new(resolve_config_file(config_path.as_deref())),
-    );
+    let config = config_services.config.clone();
+    let config_path = config_services.path.clone();
+    let config_repo: Arc<dyn ConfigRepository> = Arc::new(TomlConfigRepository::new(
+        resolve_config_file(config_path.as_deref()),
+    ));
 
     let webauthn_configured = config.read().await.auth.webauthn.is_configured();
 
     let config_persistence: Arc<dyn ConfigFilePersistence> = Arc::new(TomlConfigFilePersistence);
 
+    let dns_cache: Arc<dyn DnsCachePort> = dns_services.cache.clone();
+    let create_local_record = Arc::new(
+        CreateLocalRecordUseCase::new(config.clone(), config_repo.clone())
+            .with_ptr_registry(dns_services.ptr_registry.clone())
+            .with_wildcard_registry(dns_services.wildcard_registry.clone())
+            .with_dns_cache(dns_cache.clone()),
+    );
+
     let backup = {
         let group_creator: Arc<dyn GroupCreator> = use_cases.create_group.clone();
         let blocklist_source_creator: Arc<dyn BlocklistSourceCreator> =
             use_cases.create_blocklist_source.clone();
-        let local_record_creator_for_import = Arc::new(
-            CreateLocalRecordUseCase::new(config.clone(), config_repo.clone())
-                .with_ptr_registry(dns_services.ptr_registry.clone())
-                .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                .with_dns_cache(Some(dns_services.cache.clone()
-                    as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
-        );
-        let local_record_creator: Arc<dyn LocalRecordCreator> = local_record_creator_for_import;
-        let resolved_path = config_path
-            .as_deref()
-            .map(String::from)
-            .or_else(Config::get_config_path);
+        let local_record_creator: Arc<dyn LocalRecordCreator> = create_local_record.clone();
         BackupUseCases {
             export: Arc::new(ExportConfigUseCase::new(
                 config.clone(),
                 repos.group.clone(),
                 repos.blocklist_source.clone(),
             )),
-            import: Arc::new(
-                ImportConfigUseCase::new(
-                    config.clone(),
-                    config_persistence.clone(),
-                    resolved_path,
-                    group_creator,
-                    blocklist_source_creator,
-                    local_record_creator,
-                )
-                .with_block_filter(repos.block_filter_engine.clone()),
-            ),
+            import: Arc::new(ImportConfigUseCase::new(
+                ConfigDestination {
+                    config: config.clone(),
+                    writer: config_services.writer.clone(),
+                    persistence: config_persistence.clone(),
+                    path: config_path.as_deref().map(String::from),
+                },
+                group_creator,
+                blocklist_source_creator,
+                local_record_creator,
+                repos.block_filter_engine.clone(),
+            )),
         }
     };
 
@@ -96,44 +137,26 @@ pub async fn build_app_state(
             get_top_clients: use_cases.get_top_clients,
         },
         dns: DnsUseCases {
-            cache: dns_services.cache.clone()
-                as Arc<dyn ferrous_dns_application::ports::DnsCachePort>,
-            create_local_record: Arc::new(
-                CreateLocalRecordUseCase::new(config.clone(), config_repo.clone())
-                    .with_ptr_registry(dns_services.ptr_registry.clone())
-                    .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_services.cache.clone()
-                        as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
-            ),
+            cache: dns_cache.clone(),
+            create_local_record,
             update_local_record: Arc::new(
                 UpdateLocalRecordUseCase::new(config.clone(), config_repo.clone())
                     .with_ptr_registry(dns_services.ptr_registry.clone())
-                    .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_services.cache.clone()
-                        as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
+                    .with_wildcard_registry(dns_services.wildcard_registry.clone())
+                    .with_dns_cache(dns_cache.clone()),
             ),
             delete_local_record: Arc::new(
                 DeleteLocalRecordUseCase::new(config.clone(), config_repo)
                     .with_ptr_registry(dns_services.ptr_registry.clone())
-                    .with_wildcard_registry(Some(dns_services.wildcard_registry.clone()))
-                    .with_dns_cache(Some(dns_services.cache.clone()
-                        as Arc<dyn ferrous_dns_application::ports::DnsCachePort>)),
+                    .with_wildcard_registry(dns_services.wildcard_registry.clone())
+                    .with_dns_cache(dns_cache),
             ),
             upstream_health: Arc::new(UpstreamHealthAdapter::new(
                 dns_services.pool_manager.clone(),
-                dns_services.health_checker.clone(),
+                Some(dns_services.health_checker.clone()),
             )),
             dnssec_stats: dns_services.dnssec_stats.clone(),
-            reload_upstream: Arc::new(UpstreamReloadAdapter::new({
-                let mut managers = vec![
-                    dns_services.pool_manager.clone(),
-                    dns_services.dnssec_pool_manager.clone(),
-                ];
-                if let Some(maintenance) = dns_services.maintenance_pool_manager.clone() {
-                    managers.push(maintenance);
-                }
-                managers
-            })),
+            reload_upstream: config_services.reload_upstream.clone(),
         },
         groups: GroupUseCases {
             get_groups: use_cases.get_groups,
@@ -150,7 +173,6 @@ pub async fn build_app_state(
             get_client_subnets: use_cases.get_client_subnets,
             create_client_subnet: use_cases.create_client_subnet,
             delete_client_subnet: use_cases.delete_client_subnet,
-            subnet_matcher: use_cases.subnet_matcher.clone(),
         },
         blocking: BlockingUseCases {
             get_blocklist: use_cases.get_blocklist,
@@ -204,8 +226,10 @@ pub async fn build_app_state(
         tls_enabled: https_active,
         restart_pending: Default::default(),
         config,
+        config_writer: config_services.writer.clone(),
         config_file_persistence: config_persistence,
         config_path,
+        reload_config: config_services.reload.clone(),
         tls_cert: Arc::new(TlsCertificateService),
         webauthn_configured,
     }

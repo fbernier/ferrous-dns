@@ -1,5 +1,6 @@
 use axum::extract::{Query, State};
 use axum::Json;
+use ferrous_dns_application::ports::PageAt;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
@@ -86,9 +87,8 @@ pub async fn get_queries(
 
     let input = ferrous_dns_application::use_cases::PagedQueryInput {
         limit,
-        offset,
+        page: params.cursor.map_or(PageAt::Offset(offset), PageAt::Cursor),
         period_hours: STATS_PERIOD_HOURS,
-        cursor: params.cursor,
         domain: params.domain.as_deref(),
         category,
         client: params.client.as_deref(),
@@ -118,10 +118,10 @@ pub async fn get_queries(
                     .map(|h| h.to_string())
                     .filter(|h| !h.is_empty()),
             },
-            status: map_query_status(q.blocked, q.cache_hit, q.block_source.as_ref()),
+            status: map_query_status(&q),
             dnssec: q
                 .dnssec_status
-                .map(|s| s.to_uppercase())
+                .map(|s| s.as_str().to_uppercase())
                 .unwrap_or_else(|| "UNKNOWN".to_string()),
             reply: PiholeReply {
                 r#type: q
@@ -156,9 +156,6 @@ pub async fn get_queries(
 /// Pi-hole v6 GET /api/queries/suggestions
 ///
 /// Returns categorised suggestions based on recent queries.
-///
-// TODO: extract aggregation into a dedicated use case (GetQuerySuggestionsUseCase)
-// with DISTINCT SQL queries instead of in-memory dedup
 #[utoipa::path(
     get,
     path = "/queries/suggestions",
@@ -202,13 +199,12 @@ pub async fn get_suggestions(
             upstreams.insert(u.to_string());
         }
         types.insert(q.record_type.to_string());
-        statuses
-            .insert(map_query_status(q.blocked, q.cache_hit, q.block_source.as_ref()).to_string());
+        statuses.insert(map_query_status(q).to_string());
         if let Some(r) = q.response_status {
             replies.insert(r.to_string());
         }
         if let Some(d) = q.dnssec_status {
-            dnssecs.insert(d.to_uppercase());
+            dnssecs.insert(d.as_str().to_uppercase());
         }
     }
 

@@ -3,12 +3,11 @@ use ferrous_dns_application::ports::{ConfigRepository, PtrRecordRegistry};
 use ferrous_dns_application::use_cases::{
     CreateLocalRecordUseCase, DeleteLocalRecordUseCase, UpdateLocalRecordUseCase,
 };
-use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord};
+use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord, LocalRecordType};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
-
-// ── Mock ConfigRepository ────────────────────────────────────────────────────
 
 struct MockConfigRepository {
     should_fail: bool,
@@ -35,155 +34,134 @@ impl ConfigRepository for MockConfigRepository {
     }
 }
 
-// ── Mock PtrRecordRegistry ───────────────────────────────────────────────────
-
+/// Holds the live mapping the way the real registry does, so tests assert
+/// what a PTR query would see rather than which calls were made.
 #[derive(Default)]
 struct MockPtrRegistry {
-    registered: Mutex<Vec<(IpAddr, String, u32)>>,
-    unregistered: Mutex<Vec<IpAddr>>,
+    entries: Mutex<HashMap<IpAddr, (String, u32)>>,
 }
 
 impl MockPtrRegistry {
     fn new_arc() -> Arc<Self> {
         Arc::new(Self::default())
     }
+
+    fn preloaded(records: &[LocalDnsRecord]) -> Arc<Self> {
+        let registry = Self::new_arc();
+        for record in records {
+            registry.register(
+                record.ip,
+                Arc::from(record.fqdn(None)),
+                record.ttl_or_default(),
+            );
+        }
+        registry
+    }
+
+    fn lookup(&self, ip: &str) -> Option<(String, u32)> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(&ip.parse::<IpAddr>().unwrap())
+            .cloned()
+    }
 }
 
 impl PtrRecordRegistry for MockPtrRegistry {
     fn register(&self, ip: IpAddr, fqdn: Arc<str>, ttl: u32) {
-        self.registered
+        self.entries
             .lock()
             .unwrap()
-            .push((ip, fqdn.to_string(), ttl));
+            .insert(ip, (fqdn.to_string(), ttl));
     }
 
     fn unregister(&self, ip: IpAddr) {
-        self.unregistered.lock().unwrap().push(ip);
+        self.entries.lock().unwrap().remove(&ip);
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn default_config() -> Arc<RwLock<Config>> {
-    Arc::new(RwLock::new(Config::default()))
+fn record(hostname: &str, ip: &str) -> LocalDnsRecord {
+    LocalDnsRecord {
+        hostname: hostname.to_string(),
+        domain: Some("local".to_string()),
+        ip: ip.parse().unwrap(),
+        record_type: LocalRecordType::A,
+        ttl: Some(300),
+    }
 }
 
-fn config_with_record(ip: &str) -> Arc<RwLock<Config>> {
+fn config_with(records: &[LocalDnsRecord]) -> Arc<RwLock<Config>> {
     let mut config = Config::default();
-    config.dns.local_records.push(LocalDnsRecord {
-        hostname: "host".to_string(),
-        domain: Some("local".to_string()),
-        ip: ip.to_string(),
-        record_type: "A".to_string(),
-        ttl: Some(300),
-    });
+    config.dns.local_records = records.to_vec();
     Arc::new(RwLock::new(config))
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_create_local_record_registers_ptr_in_registry() {
     let registry = MockPtrRegistry::new_arc();
-    let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok())
-        .with_ptr_registry(Some(registry.clone() as Arc<dyn PtrRecordRegistry>));
+    let use_case = CreateLocalRecordUseCase::new(config_with(&[]), MockConfigRepository::ok())
+        .with_ptr_registry(registry.clone());
 
-    let result = use_case
-        .execute(
-            "nas".to_string(),
-            Some("local".to_string()),
-            "10.0.10.5".to_string(),
-            "A".to_string(),
-            Some(300),
-        )
-        .await;
+    let result = use_case.execute(record("nas", "10.0.10.5")).await;
 
     assert!(result.is_ok());
-    let registered = registry.registered.lock().unwrap();
-    assert_eq!(registered.len(), 1);
-    assert_eq!(registered[0].0, "10.0.10.5".parse::<IpAddr>().unwrap());
-    assert_eq!(registered[0].1, "nas.local");
-    assert_eq!(registered[0].2, 300);
-}
-
-#[tokio::test]
-async fn test_create_local_record_without_registry_succeeds() {
-    let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::ok());
-
-    let result = use_case
-        .execute(
-            "host".to_string(),
-            None,
-            "10.0.10.1".to_string(),
-            "A".to_string(),
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok());
+    assert_eq!(
+        registry.lookup("10.0.10.5"),
+        Some(("nas.local".to_string(), 300))
+    );
 }
 
 #[tokio::test]
 async fn test_delete_local_record_unregisters_ptr_in_registry() {
-    let registry = MockPtrRegistry::new_arc();
-    let use_case =
-        DeleteLocalRecordUseCase::new(config_with_record("10.0.10.1"), MockConfigRepository::ok())
-            .with_ptr_registry(Some(registry.clone() as Arc<dyn PtrRecordRegistry>));
+    let records = [record("host", "10.0.10.1")];
+    let registry = MockPtrRegistry::preloaded(&records);
+    let use_case = DeleteLocalRecordUseCase::new(config_with(&records), MockConfigRepository::ok())
+        .with_ptr_registry(registry.clone());
 
     let result = use_case.execute(0).await;
 
     assert!(result.is_ok());
-    let unregistered = registry.unregistered.lock().unwrap();
-    assert_eq!(unregistered.len(), 1);
-    assert_eq!(unregistered[0], "10.0.10.1".parse::<IpAddr>().unwrap());
+    assert_eq!(registry.lookup("10.0.10.1"), None);
 }
 
 #[tokio::test]
 async fn test_update_local_record_swaps_ptr_in_registry() {
-    let registry = MockPtrRegistry::new_arc();
-    let use_case =
-        UpdateLocalRecordUseCase::new(config_with_record("10.0.10.1"), MockConfigRepository::ok())
-            .with_ptr_registry(Some(registry.clone() as Arc<dyn PtrRecordRegistry>));
+    let records = [record("host", "10.0.10.1")];
+    let registry = MockPtrRegistry::preloaded(&records);
+    let use_case = UpdateLocalRecordUseCase::new(config_with(&records), MockConfigRepository::ok())
+        .with_ptr_registry(registry.clone());
 
-    let result = use_case
-        .execute(
-            0,
-            "newhost".to_string(),
-            Some("local".to_string()),
-            "10.0.10.9".to_string(),
-            "A".to_string(),
-            Some(600),
-        )
-        .await;
+    let result = use_case.execute(0, record("newhost", "10.0.10.9")).await;
 
     assert!(result.is_ok());
-    let unregistered = registry.unregistered.lock().unwrap();
-    let registered = registry.registered.lock().unwrap();
-    assert_eq!(unregistered[0], "10.0.10.1".parse::<IpAddr>().unwrap());
-    assert_eq!(registered[0].0, "10.0.10.9".parse::<IpAddr>().unwrap());
-    assert_eq!(registered[0].1, "newhost.local");
+    assert_eq!(registry.lookup("10.0.10.1"), None);
+    assert_eq!(
+        registry.lookup("10.0.10.9"),
+        Some(("newhost.local".to_string(), 300))
+    );
 }
 
 #[tokio::test]
 async fn test_create_local_record_does_not_register_on_save_failure() {
     let registry = MockPtrRegistry::new_arc();
-    let use_case = CreateLocalRecordUseCase::new(default_config(), MockConfigRepository::failing())
-        .with_ptr_registry(Some(registry.clone() as Arc<dyn PtrRecordRegistry>));
+    let use_case = CreateLocalRecordUseCase::new(config_with(&[]), MockConfigRepository::failing())
+        .with_ptr_registry(registry.clone());
 
-    let result = use_case
-        .execute(
-            "nas".to_string(),
-            Some("local".to_string()),
-            "10.0.10.5".to_string(),
-            "A".to_string(),
-            Some(300),
-        )
-        .await;
+    let result = use_case.execute(record("nas", "10.0.10.5")).await;
 
     assert!(result.is_err());
-    let registered = registry.registered.lock().unwrap();
-    assert!(
-        registered.is_empty(),
-        "register must NOT be called on rollback path"
-    );
+    assert_eq!(registry.lookup("10.0.10.5"), None);
+}
+
+#[tokio::test]
+async fn test_create_rejects_an_address_of_the_wrong_family() {
+    let registry = MockPtrRegistry::new_arc();
+    let use_case = CreateLocalRecordUseCase::new(config_with(&[]), MockConfigRepository::ok())
+        .with_ptr_registry(registry.clone());
+
+    // `record` builds an A record, so this pairs A with an IPv6 address.
+    let result = use_case.execute(record("nas", "fd00::5")).await;
+
+    assert!(matches!(result, Err(DomainError::InvalidIpAddress(_))));
+    assert_eq!(registry.lookup("fd00::5"), None);
 }

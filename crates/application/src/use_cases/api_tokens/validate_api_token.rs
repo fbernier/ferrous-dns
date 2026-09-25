@@ -20,6 +20,10 @@ impl ValidateApiTokenUseCase {
     /// Returns `Ok(token_id)` on match, `Err(InvalidCredentials)` otherwise.
     #[instrument(skip(self, raw_token))]
     pub async fn execute(&self, raw_token: &str) -> Result<i64, DomainError> {
+        // An empty `X-Api-Key` must never match, even if an empty key was stored.
+        if raw_token.is_empty() {
+            return Err(DomainError::InvalidCredentials);
+        }
         let incoming_hash = super::hash_token(raw_token);
 
         match self.repo.get_id_by_hash(&incoming_hash).await? {

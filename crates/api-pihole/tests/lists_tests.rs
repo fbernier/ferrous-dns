@@ -3,482 +3,289 @@ mod helpers;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
+    Router,
 };
 use http_body_util::BodyExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// GET /lists
-// ---------------------------------------------------------------------------
+const SHARED: &str = "https://shared.list/hosts";
+const SHARED_ENCODED: &str = "https%3A%2F%2Fshared.list%2Fhosts";
+
+async fn send(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let builder = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => builder.body(Body::empty()),
+    }
+    .expect("failed to build request");
+
+    let response = app.clone().oneshot(request).await.expect("request failed");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to read body")
+        .to_bytes();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("invalid JSON")
+    };
+    (status, json)
+}
+
+async fn create(app: &Router, list_type: &str, address: &str) -> Value {
+    let (status, json) = send(
+        app,
+        "POST",
+        &format!("/lists?type={list_type}"),
+        Some(json!({ "address": address })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    json
+}
+
+/// Creates a blocklist and an allowlist that share both address and id.
+async fn app_with_colliding_lists() -> (Router, i64) {
+    let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
+    let block = create(&app, "block", SHARED).await;
+    let allow = create(&app, "allow", SHARED).await;
+    assert_eq!(block["id"], allow["id"], "fixture relies on colliding ids");
+    let id = block["id"].as_i64().expect("created list must have an id");
+    (app, id)
+}
+
+fn types_of(json: &Value) -> Vec<&str> {
+    json["lists"]
+        .as_array()
+        .expect("lists must be an array")
+        .iter()
+        .map(|l| l["type"].as_str().expect("type must be a string"))
+        .collect()
+}
 
 #[tokio::test]
 async fn list_all_returns_empty_array_on_fresh_database() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/lists")
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let (status, json) = send(&app, "GET", "/lists", None).await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    let lists = json["lists"].as_array().expect("lists must be an array");
-    assert!(lists.is_empty(), "lists must be empty on a fresh database");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["lists"], json!([]));
 }
 
 #[tokio::test]
-async fn list_all_includes_created_list() {
+async fn create_list_takes_its_type_from_the_query() {
     let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
-    // Create a blocklist.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
-    let body = serde_json::json!({ "address": "https://block.list/hosts" }).to_string();
-    let create_response = app1
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-    assert_eq!(create_response.status(), StatusCode::CREATED);
+    assert_eq!(
+        create(&app, "block", "https://block.list/hosts").await["type"],
+        "block"
+    );
+    assert_eq!(
+        create(&app, "ALLOW", "https://allow.list/hosts").await["type"],
+        "allow"
+    );
 
-    // List all and verify the created one appears.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
-    let response = app2
-        .oneshot(
-            Request::builder()
-                .uri("/lists")
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    let lists = json["lists"].as_array().expect("lists must be an array");
-    assert!(!lists.is_empty(), "lists must not be empty after creation");
-
-    let found = lists
-        .iter()
-        .any(|l| l["address"].as_str() == Some("https://block.list/hosts"));
-    assert!(found, "https://block.list/hosts must appear in the lists");
-}
-
-// ---------------------------------------------------------------------------
-// POST /lists
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn create_blocklist_returns_created() {
-    let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
-
-    let body = serde_json::json!({ "address": "https://block.list/hosts" }).to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    assert_eq!(json["address"], "https://block.list/hosts");
-    assert_eq!(json["type"], 0);
+    let (_, all) = send(&app, "GET", "/lists", None).await;
+    assert_eq!(types_of(&all), ["block", "allow"]);
+    let (_, allow_only) = send(&app, "GET", "/lists?type=allow", None).await;
+    assert_eq!(
+        allow_only["lists"][0]["address"],
+        "https://allow.list/hosts"
+    );
+    assert_eq!(types_of(&allow_only), ["allow"]);
 }
 
 #[tokio::test]
-async fn create_whitelist_returns_created() {
+async fn create_list_keeps_its_comment() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
-    let body = serde_json::json!({ "address": "https://white.list/hosts", "type": 1 }).to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let (status, json) = send(
+        &app,
+        "POST",
+        "/lists?type=block",
+        Some(json!({ "address": "https://commented.list", "comment": "my list" })),
+    )
+    .await;
 
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    assert_eq!(json["type"], 1);
-}
-
-#[tokio::test]
-async fn create_list_with_comment() {
-    let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
-
-    let body = serde_json::json!({
-        "address": "https://commented.list",
-        "comment": "my list"
-    })
-    .to_string();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
+    assert_eq!(status, StatusCode::CREATED);
     assert_eq!(json["comment"], "my list");
 }
 
-// ---------------------------------------------------------------------------
-// GET /lists/:id
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn get_list_by_id_returns_matching_list() {
-    let pool = helpers::create_test_db().await;
+async fn a_missing_or_unknown_list_type_is_rejected_without_side_effects() {
+    let (app, id) = app_with_colliding_lists().await;
+    let body = || Some(json!({ "address": "https://new.list" }));
 
-    // Create a list and capture its id.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
-    let body = serde_json::json!({ "address": "https://by-id.list/hosts" }).to_string();
-    let create_response = app1
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-    assert_eq!(create_response.status(), StatusCode::CREATED);
+    for (method, uri, body) in [
+        ("POST", "/lists".to_string(), body()),
+        ("POST", "/lists?type=deny".to_string(), body()),
+        (
+            "PUT",
+            format!("/lists/{id}"),
+            Some(json!({ "enabled": false })),
+        ),
+        ("DELETE", format!("/lists/{SHARED_ENCODED}"), None),
+        ("DELETE", format!("/lists/{id}?type=both"), None),
+        ("GET", format!("/lists/{id}?type=both"), None),
+        ("GET", "/lists?type=both".to_string(), None),
+    ] {
+        let (status, json) = send(&app, method, &uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+        assert_eq!(json["error"]["key"], "bad_request", "{method} {uri}");
+    }
 
-    let create_bytes = create_response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let created: Value = serde_json::from_slice(&create_bytes).expect("invalid JSON");
-    let id = created["id"]
-        .as_i64()
-        .expect("created list must have an id");
-
-    // Fetch by id.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
-    let response = app2
-        .oneshot(
-            Request::builder()
-                .uri(format!("/lists/{id}"))
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    assert_eq!(json["id"], id);
-    assert_eq!(json["address"], "https://by-id.list/hosts");
+    let (_, all) = send(&app, "GET", "/lists", None).await;
+    assert_eq!(types_of(&all), ["block", "allow"]);
+    assert!(all["lists"]
+        .as_array()
+        .expect("lists must be an array")
+        .iter()
+        .all(|l| l["enabled"] == true && l["address"] == SHARED));
 }
 
 #[tokio::test]
-async fn get_nonexistent_list_returns_not_found() {
-    let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+async fn get_resolves_colliding_lists_by_type() {
+    let (app, id) = app_with_colliding_lists().await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/lists/99999")
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-}
-
-// ---------------------------------------------------------------------------
-// PUT /lists/:id
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn update_list_changes_address() {
-    let pool = helpers::create_test_db().await;
-
-    // Create a list.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
-    let body = serde_json::json!({ "address": "https://original.list" }).to_string();
-    let create_response = app1
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-    assert_eq!(create_response.status(), StatusCode::CREATED);
-
-    let create_bytes = create_response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let created: Value = serde_json::from_slice(&create_bytes).expect("invalid JSON");
-    let id = created["id"]
-        .as_i64()
-        .expect("created list must have an id");
-
-    // Update the list address.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
-    let update_body = serde_json::json!({ "address": "https://updated.list" }).to_string();
-    let response = app2
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/lists/{id}"))
-                .header("content-type", "application/json")
-                .body(Body::from(update_body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
-
-    assert_eq!(json["address"], "https://updated.list");
-}
-
-// ---------------------------------------------------------------------------
-// DELETE /lists/:id
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn delete_list_returns_no_content() {
-    let pool = helpers::create_test_db().await;
-
-    // Create a list.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
-    let body = serde_json::json!({ "address": "https://delete-me.list" }).to_string();
-    let create_response = app1
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-    assert_eq!(create_response.status(), StatusCode::CREATED);
-
-    let create_bytes = create_response
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let created: Value = serde_json::from_slice(&create_bytes).expect("invalid JSON");
-    let id = created["id"]
-        .as_i64()
-        .expect("created list must have an id");
-
-    // Delete the list.
-    let app2 = helpers::create_pihole_test_app(pool, None).await;
-    let response = app2
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/lists/{id}"))
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for (uri, expected) in [
+        (format!("/lists/{id}?type=block"), vec!["block"]),
+        (format!("/lists/{id}?type=allow"), vec!["allow"]),
+        (format!("/lists/{SHARED_ENCODED}?type=allow"), vec!["allow"]),
+        (format!("/lists/{SHARED_ENCODED}"), vec!["block", "allow"]),
+    ] {
+        let (status, json) = send(&app, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(types_of(&json), expected, "{uri}");
+        assert_eq!(json["lists"][0]["address"], SHARED, "{uri}");
+    }
 }
 
 #[tokio::test]
-async fn delete_nonexistent_list_returns_not_found() {
-    let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+async fn put_updates_only_the_list_of_the_given_type() {
+    let (app, id) = app_with_colliding_lists().await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/lists/99999")
-                .body(Body::empty())
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let (status, json) = send(
+        &app,
+        "PUT",
+        &format!("/lists/{id}?type=allow"),
+        Some(json!({ "comment": "allow side", "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(types_of(&json), ["allow"]);
+    assert_eq!(json["lists"][0]["comment"], "allow side");
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let (_, block) = send(&app, "GET", &format!("/lists/{id}?type=block"), None).await;
+    assert_eq!(block["lists"][0]["enabled"], true);
+    assert!(block["lists"][0].get("comment").is_none());
+
+    let (_, allow) = send(
+        &app,
+        "GET",
+        &format!("/lists/{SHARED_ENCODED}?type=allow"),
+        None,
+    )
+    .await;
+    assert_eq!(allow["lists"][0]["enabled"], false);
 }
 
-// ---------------------------------------------------------------------------
-// POST /lists:batchDelete
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn delete_removes_only_the_list_of_the_given_type() {
+    let (app, id) = app_with_colliding_lists().await;
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/lists/{SHARED_ENCODED}?type=block"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(&app, "GET", &format!("/lists/{id}?type=block"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, json) = send(&app, "GET", &format!("/lists/{id}?type=allow"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(types_of(&json), ["allow"]);
+
+    let (status, _) = send(&app, "DELETE", &format!("/lists/{id}?type=allow"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, all) = send(&app, "GET", "/lists", None).await;
+    assert_eq!(all["lists"], json!([]));
+}
 
 #[tokio::test]
-async fn batch_delete_lists_removes_specified() {
+async fn unknown_lists_are_not_found() {
     let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
-    // Create first list.
-    let app1 = helpers::create_pihole_test_app(pool.clone(), None).await;
-    let body = serde_json::json!({ "address": "https://batch1.list" }).to_string();
-    let resp1 = app1
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-    assert_eq!(resp1.status(), StatusCode::CREATED);
-    let bytes1 = resp1
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let created1: Value = serde_json::from_slice(&bytes1).expect("invalid JSON");
-    let id1 = created1["id"].as_i64().expect("first list must have an id");
+    for (method, uri) in [
+        ("GET", "/lists/99999"),
+        ("GET", "/lists/https%3A%2F%2Fmissing.list?type=block"),
+        ("DELETE", "/lists/99999?type=block"),
+    ] {
+        let (status, _) = send(&app, method, uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/lists/99999?type=allow",
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
 
-    // Create second list.
-    let app2 = helpers::create_pihole_test_app(pool.clone(), None).await;
-    let body = serde_json::json!({ "address": "https://batch2.list" }).to_string();
-    let resp2 = app2
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
-    assert_eq!(resp2.status(), StatusCode::CREATED);
-    let bytes2 = resp2
-        .into_body()
-        .collect()
-        .await
-        .expect("failed to read body")
-        .to_bytes();
-    let created2: Value = serde_json::from_slice(&bytes2).expect("invalid JSON");
-    let id2 = created2["id"]
-        .as_i64()
-        .expect("second list must have an id");
+#[tokio::test]
+async fn batch_delete_removes_only_the_named_type() {
+    let (app, _) = app_with_colliding_lists().await;
+    create(&app, "block", "https://other.list/hosts").await;
 
-    // Batch delete both (IDs as strings per Pi-hole v6 API).
-    let app3 = helpers::create_pihole_test_app(pool, None).await;
-    let delete_body =
-        serde_json::json!({ "items": [id1.to_string(), id2.to_string()] }).to_string();
-    let response = app3
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/lists:batchDelete")
-                .header("content-type", "application/json")
-                .body(Body::from(delete_body))
-                .expect("failed to build request"),
-        )
-        .await
-        .expect("request failed");
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/lists:batchDelete",
+        Some(json!([
+            { "item": SHARED, "type": "block" },
+            { "item": "https://other.list/hosts", "type": "block" }
+        ])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (_, all) = send(&app, "GET", "/lists", None).await;
+    assert_eq!(types_of(&all), ["allow"]);
+    assert_eq!(all["lists"][0]["address"], SHARED);
+}
+
+#[tokio::test]
+async fn batch_delete_with_an_unknown_type_deletes_nothing() {
+    let (app, _) = app_with_colliding_lists().await;
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/lists:batchDelete",
+        Some(json!([
+            { "item": SHARED, "type": "block" },
+            { "item": SHARED, "type": "deny" }
+        ])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, all) = send(&app, "GET", "/lists", None).await;
+    assert_eq!(types_of(&all), ["block", "allow"]);
 }

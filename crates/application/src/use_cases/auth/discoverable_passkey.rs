@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
-use super::session_factory::{build_session, generate_session_id};
+use super::session_factory::{build_session, expires_in, is_expired, random_hex_256};
 use crate::ports::{MfaRepository, SessionRepository, UserProvider, WebauthnService};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, MfaChallenge, MfaMethod};
 
@@ -53,7 +53,7 @@ impl DiscoverablePasskeyLoginUseCase {
     pub async fn start(&self) -> Result<DiscoverableStart, DomainError> {
         let (challenge, state_json) = self.webauthn.start_discoverable()?;
 
-        let challenge_token = generate_session_id()?;
+        let challenge_token = random_hex_256()?;
         self.mfa_repo
             .create_challenge(&MfaChallenge {
                 token: Arc::from(challenge_token.as_str()),
@@ -62,7 +62,7 @@ impl DiscoverablePasskeyLoginUseCase {
                 remember_me: false,
                 kind: MfaMethod::Webauthn,
                 state: Some(state_json),
-                expires_at: expiry(self.challenge_ttl_secs),
+                expires_at: expires_in(self.challenge_ttl_secs)?,
             })
             .await?;
 
@@ -111,7 +111,11 @@ impl DiscoverablePasskeyLoginUseCase {
                 .finish_discoverable(response, state, &credential.passkey)?;
 
         self.mfa_repo
-            .update_credential_counter(&authenticated.credential_id, authenticated.sign_count)
+            .update_credential(
+                &authenticated.credential_id,
+                authenticated.sign_count,
+                &authenticated.passkey_json,
+            )
             .await?;
 
         let user = self
@@ -130,7 +134,7 @@ impl DiscoverablePasskeyLoginUseCase {
 
         let session = build_session(
             user.username.clone(),
-            user.role.clone(),
+            user.role,
             remember_me,
             ip_address,
             user_agent,
@@ -141,16 +145,4 @@ impl DiscoverablePasskeyLoginUseCase {
         info!(username = %user.username, "Passwordless passkey login");
         Ok(session)
     }
-}
-
-fn expiry(secs: i64) -> String {
-    (chrono::Utc::now() + chrono::Duration::seconds(secs))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
-fn is_expired(expires_at: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S")
-        .map(|exp| chrono::Utc::now().naive_utc() > exp)
-        .unwrap_or(true)
 }

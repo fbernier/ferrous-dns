@@ -1,22 +1,4 @@
 use ferrous_dns_domain::ApiToken;
-use std::sync::Arc;
-
-#[test]
-fn new_creates_token_with_defaults() {
-    let token = ApiToken::new(
-        Arc::from("test-token"),
-        Arc::from("abc12345"),
-        Arc::from("sha256hash"),
-    );
-
-    assert!(token.id.is_none());
-    assert_eq!(token.name.as_ref(), "test-token");
-    assert_eq!(token.key_prefix.as_ref(), "abc12345");
-    assert_eq!(token.key_hash.as_ref(), "sha256hash");
-    assert!(token.key_raw.is_none());
-    assert!(token.created_at.is_none());
-    assert!(token.last_used_at.is_none());
-}
 
 #[test]
 fn validate_name_accepts_alphanumeric() {
@@ -56,7 +38,7 @@ fn validate_name_rejects_special_characters() {
 fn validate_name_returns_domain_error() {
     let err = ApiToken::validate_name("").unwrap_err();
     assert!(
-        matches!(err, ferrous_dns_domain::DomainError::ConfigError(_)),
-        "expected ConfigError, got: {err:?}"
+        matches!(err, ferrous_dns_domain::DomainError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
     );
 }

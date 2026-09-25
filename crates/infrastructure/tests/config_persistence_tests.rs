@@ -96,10 +96,7 @@ username = "admin"
 }
 
 fn load_config(input: &str) -> Config {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("load.toml");
-    std::fs::write(&path, input).unwrap();
-    Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap()
+    Config::from_toml_str(input).unwrap()
 }
 
 fn save_and_reparse(config: &Config, input: &str) -> toml_edit::DocumentMut {
@@ -112,8 +109,6 @@ fn save_and_reparse(config: &Config, input: &str) -> toml_edit::DocumentMut {
     let output = std::fs::read_to_string(&path).unwrap();
     output.parse::<toml_edit::DocumentMut>().unwrap()
 }
-
-// ── Chave removida: cache_max_refresh_per_sec ────────────────────────────
 
 /// `default_config_toml()` com a chave já removida do produto ainda presente,
 /// simulando um arquivo escrito por uma versão anterior.
@@ -146,8 +141,6 @@ fn test_save_drops_legacy_refresh_rate_key_from_file() {
         "a chave removida deve sair do arquivo no primeiro save"
     );
 }
-
-// ── Pool serialization ───────────────────────────────────────────────────
 
 #[test]
 fn test_save_pools_writes_all_fields() {
@@ -263,8 +256,6 @@ fn test_save_empty_pools_removes_section() {
     assert!(dns.get("pools").is_none());
 }
 
-// ── Pool strategy roundtrip ──────────────────────────────────────────────
-
 #[test]
 fn test_pool_strategy_parallel_roundtrips() {
     let mut config = load_config(default_config_toml());
@@ -349,8 +340,6 @@ fn test_pool_strategy_balanced_roundtrips() {
     assert_eq!(pool.get("strategy").unwrap().as_str().unwrap(), "Balanced");
 }
 
-// ── Adjacent sections preserved ──────────────────────────────────────────
-
 #[test]
 fn test_save_pools_preserves_health_check() {
     let mut config = load_config(default_config_toml());
@@ -404,8 +393,6 @@ fn test_save_pools_preserves_upstream_servers() {
     );
 }
 
-// ── Full config roundtrip ────────────────────────────────────────────────
-
 #[test]
 fn test_full_config_save_and_reload_preserves_pools() {
     let original = load_config(default_config_toml());
@@ -416,7 +403,7 @@ fn test_full_config_save_and_reload_preserves_pools() {
 
     save_config_to_file(&original, path.to_str().unwrap()).unwrap();
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
     assert_eq!(reloaded.dns.pools.len(), original.dns.pools.len());
     for (orig, saved) in original.dns.pools.iter().zip(reloaded.dns.pools.iter()) {
@@ -426,8 +413,6 @@ fn test_full_config_save_and_reload_preserves_pools() {
         assert_eq!(orig.servers, saved.servers);
     }
 }
-
-// ── Weight roundtrip ─────────────────────────────────────────────────────
 
 #[test]
 fn test_full_config_save_and_reload_preserves_weight() {
@@ -446,14 +431,12 @@ fn test_full_config_save_and_reload_preserves_weight() {
 
     save_config_to_file(&config, path.to_str().unwrap()).unwrap();
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
     assert_eq!(reloaded.dns.pools.len(), 1);
     assert_eq!(reloaded.dns.pools[0].weight, Some(10));
     assert_eq!(reloaded.dns.pools[0].strategy, UpstreamStrategy::Balanced);
 }
-
-// ── Inline comment preservation ──────────────────────────────────────────
 
 #[test]
 fn test_save_preserves_inline_comments() {
@@ -473,8 +456,6 @@ fn test_save_preserves_inline_comments() {
         "inline comment should be preserved after save"
     );
 }
-
-// ── Block response mode roundtrip ────────────────────────────────────────
 
 #[test]
 fn test_save_and_reload_preserves_block_mode_and_ttl() {
@@ -498,7 +479,7 @@ fn test_save_and_reload_preserves_block_mode_and_ttl() {
         "block_mode should be written to the TOML, got:\n{written}"
     );
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(reloaded.blocking.block_mode, BlockResponseMode::NxDomain);
     assert_eq!(reloaded.blocking.block_ttl, 300);
 }
@@ -527,7 +508,7 @@ fn test_save_and_reload_preserves_sinkhole_addresses() {
         "sinkhole_ipv6 should be written, got:\n{written}"
     );
 
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
         reloaded.blocking.sinkhole_ipv4,
         Some(Ipv4Addr::new(192, 168, 1, 2))
@@ -557,11 +538,9 @@ fn test_clearing_sinkhole_removes_keys_from_toml() {
         !written.contains("sinkhole_ipv4"),
         "cleared sinkhole_ipv4 key should be removed, got:\n{written}"
     );
-    let reloaded = Config::load(Some(path.to_str().unwrap()), Default::default()).unwrap();
+    let reloaded = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(reloaded.blocking.sinkhole_ipv4, None);
 }
-
-// ── Error handling ───────────────────────────────────────────────────────
 
 #[test]
 fn test_save_config_to_nonexistent_path_returns_error() {
@@ -579,4 +558,79 @@ fn test_save_config_to_invalid_toml_returns_parse_error() {
     let config = load_config(default_config_toml());
     let result = save_config_to_file(&config, path.to_str().unwrap());
     assert!(result.is_err());
+}
+
+/// Entries in `dir` other than `keep`, i.e. leftover temp files.
+fn stray_files(dir: &std::path::Path, keep: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != keep)
+        .collect()
+}
+
+#[test]
+fn test_save_replaces_the_file_instead_of_truncating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, default_config_toml()).unwrap();
+    // A reader holding the old file must keep seeing a complete document:
+    // an in-place truncate + write would show it the new (or a torn) one.
+    let mut before = std::fs::File::open(&path).unwrap();
+
+    let mut config = load_config(default_config_toml());
+    config.server.web_port = 9090;
+    save_config_to_file(&config, path.to_str().unwrap()).unwrap();
+
+    let mut old_view = String::new();
+    std::io::Read::read_to_string(&mut before, &mut old_view).unwrap();
+    assert_eq!(old_view, default_config_toml());
+    assert_eq!(
+        load_config(&std::fs::read_to_string(&path).unwrap())
+            .server
+            .web_port,
+        9090
+    );
+    assert!(stray_files(dir.path(), "config.toml").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_save_keeps_the_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, default_config_toml()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    save_config_to_file(&load_config(default_config_toml()), path.to_str().unwrap()).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_save_through_a_symlink_rewrites_the_target_and_keeps_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real.toml");
+    let link = dir.path().join("config.toml");
+    std::fs::write(&target, default_config_toml()).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let mut config = load_config(default_config_toml());
+    config.server.web_port = 9090;
+    save_config_to_file(&config, link.to_str().unwrap()).unwrap();
+
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        load_config(&std::fs::read_to_string(&target).unwrap())
+            .server
+            .web_port,
+        9090
+    );
 }

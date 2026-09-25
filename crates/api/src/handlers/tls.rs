@@ -7,9 +7,14 @@ use axum::{
     extract::{Multipart, Query, State},
     Json,
 };
-use ferrous_dns_domain::DomainError;
+use ferrous_dns_domain::{config::WebTlsConfig, DomainError};
 use std::path::Path;
 use tracing::info;
+
+/// Copies the web TLS settings so no config lock is held across file I/O.
+async fn web_tls_config(state: &AppState) -> WebTlsConfig {
+    state.config.read().await.server.web_tls.clone()
+}
 
 /// GET /tls/status — returns certificate status information.
 #[utoipa::path(
@@ -22,8 +27,7 @@ use tracing::info;
     security(("session_cookie" = []), ("api_key" = [])),
 )]
 pub async fn get_tls_status(State(state): State<AppState>) -> Json<TlsStatusResponse> {
-    let config = state.config.read().await;
-    let web_tls = &config.server.web_tls;
+    let web_tls = web_tls_config(&state).await;
 
     let status = state
         .tls_cert
@@ -56,15 +60,16 @@ pub async fn upload_tls_certs(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<TlsUploadResponse>, ApiError> {
-    let config = state.config.read().await;
-    let cert_path = config.server.web_tls.tls_cert_path.clone();
-    let key_path = config.server.web_tls.tls_key_path.clone();
-    drop(config);
+    let web_tls = web_tls_config(&state).await;
 
     let mut cert_data: Option<Vec<u8>> = None;
     let mut key_data: Option<Vec<u8>> = None;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        ApiError(DomainError::InvalidInput(format!(
+            "Invalid multipart body: {e}"
+        )))
+    })? {
         let name = field.name().unwrap_or("").to_string();
         match field.bytes().await {
             Ok(bytes) => match name.as_str() {
@@ -95,7 +100,12 @@ pub async fn upload_tls_certs(
 
     state
         .tls_cert
-        .save_certificates(&cert_bytes, &key_bytes, &cert_path, &key_path)
+        .save_certificates(
+            &cert_bytes,
+            &key_bytes,
+            &web_tls.tls_cert_path,
+            &web_tls.tls_key_path,
+        )
         .await?;
 
     state.mark_restart_pending();
@@ -124,12 +134,13 @@ pub async fn generate_self_signed(
     State(state): State<AppState>,
     Query(query): Query<GenerateQuery>,
 ) -> Result<Json<TlsUploadResponse>, ApiError> {
-    let config = state.config.read().await;
-    let cert_path = config.server.web_tls.tls_cert_path.clone();
-    let key_path = config.server.web_tls.tls_key_path.clone();
-    drop(config);
+    let WebTlsConfig {
+        tls_cert_path,
+        tls_key_path,
+        ..
+    } = web_tls_config(&state).await;
 
-    if !query.force && Path::new(&cert_path).exists() && Path::new(&key_path).exists() {
+    if !query.force && Path::new(&tls_cert_path).exists() && Path::new(&tls_key_path).exists() {
         return Err(ApiError(DomainError::InvalidInput(
             "Certificate files already exist. Use ?force=true to overwrite.".into(),
         )));
@@ -137,7 +148,7 @@ pub async fn generate_self_signed(
 
     state
         .tls_cert
-        .generate_self_signed(&cert_path, &key_path)
+        .generate_self_signed(&tls_cert_path, &tls_key_path)
         .await?;
 
     state.mark_restart_pending();

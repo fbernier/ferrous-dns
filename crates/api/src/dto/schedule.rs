@@ -49,7 +49,7 @@ impl ScheduleProfileResponse {
         Self {
             id: p.id.unwrap_or(0),
             name: p.name.to_string(),
-            timezone: p.timezone.to_string(),
+            timezone: p.timezone.name().to_string(),
             comment: p.comment.map(|c| c.to_string()),
             created_at: p.created_at.as_deref().map(String::from),
             updated_at: p.updated_at.as_deref().map(String::from),
@@ -64,7 +64,8 @@ pub struct TimeSlotResponse {
     pub days: u8,
     pub start_time: String,
     pub end_time: String,
-    pub action: String,
+    #[schema(value_type = String)]
+    pub action: &'static str,
     pub created_at: Option<String>,
 }
 
@@ -74,9 +75,9 @@ impl TimeSlotResponse {
             id: s.id.unwrap_or(0),
             profile_id: s.profile_id,
             days: s.days,
-            start_time: s.start_time.to_string(),
-            end_time: s.end_time.to_string(),
-            action: s.action.to_str().to_string(),
+            start_time: s.start_time.format(TimeSlot::TIME_FORMAT).to_string(),
+            end_time: s.end_time.format(TimeSlot::TIME_FORMAT).to_string(),
+            action: s.action.to_str(),
             created_at: s.created_at.as_deref().map(String::from),
         }
     }

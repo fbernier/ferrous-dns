@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use super::login_rate_limiter::LoginRateLimiter;
-use super::session_factory::build_session;
+use super::session_factory::{build_session, is_expired};
 use crate::ports::{MfaRepository, PasswordHasher, SessionRepository, TotpService, UserProvider};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError};
 
@@ -87,7 +87,8 @@ impl VerifyMfaUseCase {
             .ok_or(DomainError::MfaNotConfigured)?;
 
         // Try TOTP first, then fall back to a recovery code.
-        let mut verified = mfa.totp_enabled && self.totp.verify(&mfa.totp_secret, code)?;
+        let mut verified =
+            mfa.totp_enabled && self.accept_totp(username, &mfa.totp_secret, code).await?;
 
         if !verified {
             verified = self.consume_recovery_code(username, code).await?;
@@ -103,7 +104,7 @@ impl VerifyMfaUseCase {
 
         let session = build_session(
             user.username.clone(),
-            user.role.clone(),
+            user.role,
             challenge.remember_me,
             ip_address,
             user_agent,
@@ -119,6 +120,19 @@ impl VerifyMfaUseCase {
         Ok(session)
     }
 
+    /// A code is spent with its time step: RFC 6238 §5.2 forbids accepting the same OTP twice.
+    async fn accept_totp(
+        &self,
+        username: &str,
+        secret: &str,
+        code: &str,
+    ) -> Result<bool, DomainError> {
+        match self.totp.verify(secret, code)? {
+            Some(step) => self.mfa_repo.advance_totp_step(username, step).await,
+            None => Ok(false),
+        }
+    }
+
     /// Matches `code` against the user's unused recovery codes; marks it used
     /// on a hit.
     async fn consume_recovery_code(&self, username: &str, code: &str) -> Result<bool, DomainError> {
@@ -132,11 +146,4 @@ impl VerifyMfaUseCase {
         }
         Ok(false)
     }
-}
-
-/// Checks if a timestamp has passed; fail-closed on parse error.
-fn is_expired(expires_at: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S")
-        .map(|exp| chrono::Utc::now().naive_utc() > exp)
-        .unwrap_or(true)
 }

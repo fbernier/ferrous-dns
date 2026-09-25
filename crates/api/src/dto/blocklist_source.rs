@@ -2,7 +2,7 @@ use ferrous_dns_domain::BlocklistSource;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BlocklistSourceResponse {
     pub id: i64,
     pub name: String,
@@ -42,59 +42,14 @@ pub struct CreateBlocklistSourceRequest {
     pub enabled: Option<bool>,
 }
 
-impl CreateBlocklistSourceRequest {
-    /// Resolve the effective group_ids, preferring group_ids over legacy group_id.
-    /// Falls back to default_group_id if neither is provided.
-    pub fn resolved_group_ids(&self, default_group_id: i64) -> Vec<i64> {
-        if let Some(ref ids) = self.group_ids {
-            if !ids.is_empty() {
-                return ids.clone();
-            }
-        }
-        if let Some(gid) = self.group_id {
-            return vec![gid];
-        }
-        vec![default_group_id]
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateBlocklistSourceRequest {
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    #[serde(default, deserialize_with = "crate::dto::source_common::double_option")]
     pub url: Option<Option<String>>,
     /// Legacy: single group_id. If group_ids is also present, group_ids takes precedence.
     pub group_id: Option<i64>,
     pub group_ids: Option<Vec<i64>>,
     pub comment: Option<String>,
     pub enabled: Option<bool>,
-}
-
-impl UpdateBlocklistSourceRequest {
-    /// Resolve the effective group_ids update, preferring group_ids over legacy group_id.
-    pub fn resolved_group_ids(&self) -> Option<Vec<i64>> {
-        if let Some(ref ids) = self.group_ids {
-            return Some(ids.clone());
-        }
-        self.group_id.map(|gid| vec![gid])
-    }
-}
-
-fn deserialize_optional_nullable_string<'de, D>(
-    deserializer: D,
-) -> Result<Option<Option<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let val: Option<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
-
-    match val {
-        None => Ok(None),
-        Some(serde_json::Value::Null) => Ok(Some(None)),
-        Some(serde_json::Value::String(s)) => Ok(Some(Some(s))),
-        Some(other) => Err(serde::de::Error::invalid_type(
-            serde::de::Unexpected::Other(&format!("{}", other)),
-            &"string or null",
-        )),
-    }
 }

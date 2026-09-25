@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use super::login_rate_limiter::LoginRateLimiter;
-use super::session_factory::{build_session, generate_session_id, session_max_age};
+use super::session_factory::{build_session, expires_in, random_hex_256};
 use crate::ports::{MfaRepository, PasswordHasher, SessionRepository, UserProvider};
 use ferrous_dns_domain::{AuthConfig, AuthSession, DomainError, MfaChallenge, MfaMethod};
 
@@ -17,9 +17,8 @@ pub enum LoginOutcome {
     MfaRequired {
         /// Opaque challenge token the client echoes back to `/auth/2fa/verify`.
         challenge_token: String,
-        /// Which second-factor methods this account has enrolled
-        /// (`"totp"` and/or `"webauthn"`).
-        methods: Vec<&'static str>,
+        /// Second-factor methods this account has enrolled.
+        methods: Vec<MfaMethod>,
     },
 }
 
@@ -109,11 +108,8 @@ impl LoginUseCase {
         let has_passkeys = self.mfa_repo.has_credentials(username).await?;
 
         if totp_enabled || has_passkeys {
-            let challenge_token = generate_session_id()?;
-            let expires_at = (chrono::Utc::now()
-                + chrono::Duration::seconds(self.auth_config.mfa_challenge_ttl_secs))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+            let challenge_token = random_hex_256()?;
+            let expires_at = expires_in(self.auth_config.mfa_challenge_ttl_secs)?;
 
             self.mfa_repo
                 .create_challenge(&MfaChallenge {
@@ -130,10 +126,10 @@ impl LoginUseCase {
 
             let mut methods = Vec::new();
             if totp_enabled {
-                methods.push("totp");
+                methods.push(MfaMethod::Totp);
             }
             if has_passkeys {
-                methods.push("webauthn");
+                methods.push(MfaMethod::Webauthn);
             }
 
             info!(username = username, "Password OK, second factor required");
@@ -145,7 +141,7 @@ impl LoginUseCase {
 
         let session = build_session(
             user.username.clone(),
-            user.role.clone(),
+            user.role,
             remember_me,
             ip_address,
             user_agent,
@@ -165,6 +161,6 @@ impl LoginUseCase {
 
     /// Returns the `max_age` in seconds for the session cookie.
     pub fn session_max_age(&self, remember_me: bool) -> i64 {
-        session_max_age(remember_me, &self.auth_config)
+        self.auth_config.session_ttl_secs(remember_me)
     }
 }

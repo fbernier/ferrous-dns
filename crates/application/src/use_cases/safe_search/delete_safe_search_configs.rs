@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::DomainError;
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -31,10 +32,7 @@ impl DeleteSafeSearchConfigsUseCase {
     /// Deletes all Safe Search configurations for the given group and reloads the index.
     #[instrument(skip(self))]
     pub async fn execute(&self, group_id: i64) -> Result<(), DomainError> {
-        self.group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        require_group(self.group_repo.as_ref(), group_id).await?;
 
         self.repo.delete_by_group(group_id).await?;
 

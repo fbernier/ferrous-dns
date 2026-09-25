@@ -11,7 +11,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn get_queries_returns_required_fields() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -47,7 +47,7 @@ async fn get_queries_returns_inserted_queries() {
     helpers::insert_query(&pool, "beta.com", "10.0.0.2", true, false, Some("Exact")).await;
     helpers::insert_query(&pool, "gamma.com", "10.0.0.3", false, true, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -77,7 +77,7 @@ async fn get_queries_entries_have_required_fields() {
 
     helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -139,7 +139,7 @@ async fn get_queries_with_length_param_limits_results() {
         .await;
     }
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -167,7 +167,7 @@ async fn get_queries_with_length_param_limits_results() {
 #[tokio::test]
 async fn suggestions_response_has_all_category_fields_at_root() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -205,7 +205,7 @@ async fn suggestions_includes_queried_domains() {
     helpers::insert_query(&pool, "a.com", "10.0.0.1", false, false, None).await;
     helpers::insert_query(&pool, "b.com", "10.0.0.1", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -243,7 +243,7 @@ async fn suggestions_are_deduplicated() {
     helpers::insert_query(&pool, "dup.com", "10.0.0.2", false, false, None).await;
     helpers::insert_query(&pool, "dup.com", "10.0.0.3", true, false, Some("Exact")).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -272,10 +272,6 @@ async fn suggestions_are_deduplicated() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /api/queries — v6 format validation
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn query_status_is_v6_string_not_numeric() {
     let pool = helpers::create_test_db().await;
@@ -292,7 +288,7 @@ async fn query_status_is_v6_string_not_numeric() {
     .await;
     helpers::insert_query(&pool, "cached.com", "10.0.0.1", false, true, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -345,7 +341,7 @@ async fn query_reply_is_object_with_type_and_time() {
     let pool = helpers::create_test_db().await;
     helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -376,7 +372,7 @@ async fn query_client_name_is_null_when_no_hostname() {
     let pool = helpers::create_test_db().await;
     helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -400,7 +396,7 @@ async fn query_client_name_is_null_when_no_hostname() {
 #[tokio::test]
 async fn query_cursor_is_present_as_null_when_not_paginating() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -424,7 +420,7 @@ async fn query_cursor_is_present_as_null_when_not_paginating() {
 #[tokio::test]
 async fn query_draw_echoed_when_provided() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -447,7 +443,7 @@ async fn query_ede_has_default_values() {
     let pool = helpers::create_test_db().await;
     helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -481,7 +477,7 @@ async fn query_status_filter_accepts_v6_string_gravity() {
     )
     .await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -507,10 +503,6 @@ async fn query_status_filter_accepts_v6_string_gravity() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GET /api/queries/suggestions — category content
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn suggestions_populates_all_categories() {
     let pool = helpers::create_test_db().await;
@@ -526,7 +518,7 @@ async fn suggestions_populates_all_categories() {
     )
     .await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let resp = app
         .oneshot(
             Request::builder()

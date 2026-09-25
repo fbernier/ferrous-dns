@@ -6,6 +6,17 @@ use std::str::FromStr;
 use tokio::fs;
 use tracing::{debug, warn};
 
+/// `ATF_COM` from `<linux/if_arp.h>`: the entry has a resolved hardware address.
+/// Other bits (e.g. `ATF_PERM` for static entries) may be set alongside it.
+const ATF_COM: u32 = 0x2;
+
+fn is_complete(flags: &str) -> bool {
+    flags
+        .strip_prefix("0x")
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .is_some_and(|f| f & ATF_COM != 0)
+}
+
 fn is_valid_mac(mac: &str) -> bool {
     if mac.len() != 17 {
         return false;
@@ -60,21 +71,15 @@ impl ArpReader for LinuxArpReader {
 
         let mut arp_table = ArpTable::new();
 
-        for (line_num, line) in content.lines().enumerate() {
-            if line_num == 0 {
+        for line in content.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            let (Some(ip_str), Some(_hw_type), Some(flags), Some(mac)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
                 continue;
-            }
+            };
 
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 4 {
-                continue;
-            }
-
-            let ip_str = fields[0];
-            let flags = fields[2];
-            let mac = fields[3];
-
-            if flags != "0x2" || mac == "00:00:00:00:00:00" {
+            if !is_complete(flags) || mac == "00:00:00:00:00:00" {
                 continue;
             }
 

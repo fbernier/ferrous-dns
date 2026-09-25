@@ -2,13 +2,20 @@ use super::client_row_mapper::{
     row_to_client, ClientRow, CLIENT_SELECT_ACTIVE, CLIENT_SELECT_ALL, CLIENT_SELECT_BY_ID,
     CLIENT_SELECT_BY_IP, CLIENT_SELECT_NEEDS_HOSTNAME_UPDATE, CLIENT_SELECT_NEEDS_MAC_UPDATE,
 };
+use crate::repositories::{db_err, hours_ago_cutoff, is_fk_violation, sql_now};
 use async_trait::async_trait;
 use ferrous_dns_application::ports::ClientRepository;
 use ferrous_dns_domain::{config::DatabaseConfig, Client, ClientStats, DomainError};
 use sqlx::SqlitePool;
 use std::net::IpAddr;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, instrument, warn};
+use tracing::{instrument, warn};
+
+const UPDATE_MAC_SQL: &str = "UPDATE clients SET
+                 mac_address = ?,
+                 last_mac_update = ?,
+                 updated_at = ?
+             WHERE ip_address = ?";
 
 enum ClientMsg {
     IpSeen(IpAddr),
@@ -34,20 +41,17 @@ impl SqliteClientRepository {
         while let Some(msg) = receiver.recv().await {
             match msg {
                 ClientMsg::IpSeen(ip) => {
-                    let ip_str = ip.to_string();
-                    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    let timestamp = sql_now();
 
                     if let Err(e) = sqlx::query(
                         "INSERT INTO clients (ip_address, first_seen, last_seen, query_count)
                          VALUES (?, ?, ?, 1)
                          ON CONFLICT(ip_address) DO UPDATE SET
-                             last_seen = ?,
+                             last_seen = excluded.last_seen,
                              query_count = query_count + 1,
-                             updated_at = ?",
+                             updated_at = excluded.last_seen",
                     )
-                    .bind(&ip_str)
-                    .bind(&timestamp)
-                    .bind(&timestamp)
+                    .bind(ip.to_string())
                     .bind(&timestamp)
                     .bind(&timestamp)
                     .execute(&pool)
@@ -76,7 +80,7 @@ impl ClientRepository for SqliteClientRepository {
     #[instrument(skip(self))]
     async fn get_or_create(&self, ip_address: IpAddr) -> Result<Client, DomainError> {
         let ip_str = ip_address.to_string();
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
         sqlx::query(
             "INSERT INTO clients (ip_address, first_seen, last_seen, query_count)
@@ -88,19 +92,13 @@ impl ClientRepository for SqliteClientRepository {
         .bind(&now)
         .execute(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to upsert client");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to upsert client"))?;
 
         let row: ClientRow = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_BY_IP)
             .bind(&ip_str)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to fetch client after upsert");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to fetch client after upsert"))?;
 
         row_to_client(row)
             .ok_or_else(|| DomainError::DatabaseError("Invalid client data".to_string()))
@@ -113,26 +111,16 @@ impl ClientRepository for SqliteClientRepository {
 
     #[instrument(skip(self))]
     async fn update_mac_address(&self, ip_address: IpAddr, mac: String) -> Result<(), DomainError> {
-        let ip_str = ip_address.to_string();
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
-        sqlx::query(
-            "UPDATE clients SET
-                 mac_address = ?,
-                 last_mac_update = ?,
-                 updated_at = ?
-             WHERE ip_address = ?",
-        )
-        .bind(&mac)
-        .bind(&now)
-        .bind(&now)
-        .bind(&ip_str)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to update MAC address");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        sqlx::query(UPDATE_MAC_SQL)
+            .bind(&mac)
+            .bind(&now)
+            .bind(&now)
+            .bind(ip_address.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err("Failed to update MAC address"))?;
 
         Ok(())
     }
@@ -146,42 +134,31 @@ impl ClientRepository for SqliteClientRepository {
             return Ok(0);
         }
 
-        let mut tx = self.pool.begin().await.map_err(|e| {
-            error!(error = %e, "Failed to begin transaction");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(db_err("Failed to begin transaction"))?;
 
         let mut updated_count = 0u64;
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
         for (ip_address, mac) in updates {
-            let ip_str = ip_address.to_string();
-
-            let result = sqlx::query(
-                "UPDATE clients SET
-                     mac_address = ?,
-                     last_mac_update = ?,
-                     updated_at = ?
-                 WHERE ip_address = ?",
-            )
-            .bind(&mac)
-            .bind(&now)
-            .bind(&now)
-            .bind(&ip_str)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!(error = %e, ip = %ip_address, "Failed to update MAC in batch");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            let result = sqlx::query(UPDATE_MAC_SQL)
+                .bind(&mac)
+                .bind(&now)
+                .bind(&now)
+                .bind(ip_address.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("Failed to update MAC in batch"))?;
 
             updated_count += result.rows_affected();
         }
 
-        tx.commit().await.map_err(|e| {
-            error!(error = %e, "Failed to commit batch MAC update");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        tx.commit()
+            .await
+            .map_err(db_err("Failed to commit batch MAC update"))?;
 
         Ok(updated_count)
     }
@@ -192,8 +169,7 @@ impl ClientRepository for SqliteClientRepository {
         ip_address: IpAddr,
         hostname: String,
     ) -> Result<(), DomainError> {
-        let ip_str = ip_address.to_string();
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
         sqlx::query(
             "UPDATE clients SET
@@ -205,13 +181,10 @@ impl ClientRepository for SqliteClientRepository {
         .bind(&hostname)
         .bind(&now)
         .bind(&now)
-        .bind(&ip_str)
+        .bind(ip_address.to_string())
         .execute(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to update hostname");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to update hostname"))?;
 
         Ok(())
     }
@@ -219,14 +192,11 @@ impl ClientRepository for SqliteClientRepository {
     #[instrument(skip(self))]
     async fn get_all(&self, limit: u32, offset: u32) -> Result<Vec<Client>, DomainError> {
         let rows = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_ALL)
-            .bind(limit as i64)
-            .bind(offset as i64)
+            .bind(i64::from(limit))
+            .bind(i64::from(offset))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to fetch clients");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to fetch clients"))?;
 
         Ok(rows.into_iter().filter_map(row_to_client).collect())
     }
@@ -234,14 +204,11 @@ impl ClientRepository for SqliteClientRepository {
     #[instrument(skip(self))]
     async fn get_active(&self, days: u32, limit: u32) -> Result<Vec<Client>, DomainError> {
         let rows = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_ACTIVE)
-            .bind(format!("-{} days", days))
-            .bind(limit as i64)
+            .bind(format!("-{days} days"))
+            .bind(i64::from(limit))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to fetch active clients");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to fetch active clients"))?;
 
         Ok(rows.into_iter().filter_map(row_to_client).collect())
     }
@@ -259,10 +226,7 @@ impl ClientRepository for SqliteClientRepository {
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to fetch client stats");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to fetch client stats"))?;
 
         Ok(ClientStats {
             total_clients: row.0 as u64,
@@ -275,19 +239,11 @@ impl ClientRepository for SqliteClientRepository {
 
     #[instrument(skip(self))]
     async fn count_active_since(&self, hours: f32) -> Result<u64, DomainError> {
-        let ms = (hours * 3_600_000.0) as i64;
-        let cutoff = (chrono::Utc::now() - chrono::Duration::milliseconds(ms))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
         let row = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM clients WHERE last_seen >= ?")
-            .bind(&cutoff)
+            .bind(hours_ago_cutoff(hours))
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to count active clients");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to count active clients"))?;
 
         Ok(row.0 as u64)
     }
@@ -295,13 +251,10 @@ impl ClientRepository for SqliteClientRepository {
     #[instrument(skip(self))]
     async fn delete_older_than(&self, days: u32) -> Result<u64, DomainError> {
         let result = sqlx::query("DELETE FROM clients WHERE last_seen < datetime('now', ?)")
-            .bind(format!("-{} days", days))
+            .bind(format!("-{days} days"))
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to delete old clients");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to delete old clients"))?;
 
         Ok(result.rows_affected())
     }
@@ -309,13 +262,10 @@ impl ClientRepository for SqliteClientRepository {
     #[instrument(skip(self))]
     async fn get_needs_mac_update(&self, limit: u32) -> Result<Vec<Client>, DomainError> {
         let rows = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_NEEDS_MAC_UPDATE)
-            .bind(limit as i64)
+            .bind(i64::from(limit))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to fetch clients needing MAC update");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to fetch clients needing MAC update"))?;
 
         Ok(rows.into_iter().filter_map(row_to_client).collect())
     }
@@ -323,13 +273,10 @@ impl ClientRepository for SqliteClientRepository {
     #[instrument(skip(self))]
     async fn get_needs_hostname_update(&self, limit: u32) -> Result<Vec<Client>, DomainError> {
         let rows = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_NEEDS_HOSTNAME_UPDATE)
-            .bind(limit as i64)
+            .bind(i64::from(limit))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to fetch clients needing hostname update");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to fetch clients needing hostname update"))?;
 
         Ok(rows.into_iter().filter_map(row_to_client).collect())
     }
@@ -340,36 +287,44 @@ impl ClientRepository for SqliteClientRepository {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to fetch client by id");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to fetch client by id"))?;
+
+        Ok(row.and_then(row_to_client))
+    }
+
+    #[instrument(skip(self))]
+    async fn get_by_ip(&self, ip_address: IpAddr) -> Result<Option<Client>, DomainError> {
+        let row = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_BY_IP)
+            .bind(ip_address.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err("Failed to fetch client by ip"))?;
 
         Ok(row.and_then(row_to_client))
     }
 
     #[instrument(skip(self))]
     async fn assign_group(&self, client_id: i64, group_id: i64) -> Result<(), DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
         let result = sqlx::query(
             "UPDATE clients SET group_id = ?, updated_at = ?
              WHERE id = ?",
         )
         .bind(group_id)
-        .bind(&now)
+        .bind(sql_now())
         .bind(client_id)
         .execute(&self.pool)
         .await
         .map_err(|e| {
-            error!(error = %e, "Failed to assign client to group");
-            DomainError::DatabaseError(e.to_string())
+            if is_fk_violation(&e) {
+                DomainError::GroupNotFound(group_id)
+            } else {
+                db_err("Failed to assign client to group")(e)
+            }
         })?;
 
         if result.rows_affected() == 0 {
             return Err(DomainError::NotFound(format!(
-                "Client {} not found",
-                client_id
+                "Client {client_id} not found"
             )));
         }
 
@@ -382,13 +337,10 @@ impl ClientRepository for SqliteClientRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to delete client");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to delete client"))?;
 
         if result.rows_affected() == 0 {
-            return Err(DomainError::NotFound(format!("Client {} not found", id)));
+            return Err(DomainError::NotFound(format!("Client {id} not found")));
         }
 
         Ok(())

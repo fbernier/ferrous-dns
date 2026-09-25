@@ -3,6 +3,7 @@ use crate::dns::load_balancer::PoolManager;
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver, EMPTY_CNAME_CHAIN};
 use ferrous_dns_domain::{DnsQuery, DomainError, PrivateIpFilter};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -11,7 +12,8 @@ pub struct CoreResolver {
     query_timeout_ms: u64,
     dnssec_enabled: bool,
     local_domain_suffix: Option<(Arc<str>, Arc<str>)>,
-    local_dns_server: Option<Arc<str>>,
+    /// The router's address and its display form, reported as the upstream.
+    local_dns_server: Option<(SocketAddr, Arc<str>)>,
 }
 
 impl CoreResolver {
@@ -44,8 +46,8 @@ impl CoreResolver {
         self
     }
 
-    pub fn with_local_dns_server(mut self, server: Option<String>) -> Self {
-        self.local_dns_server = server.map(|s| Arc::from(s.as_str()));
+    pub fn with_local_dns_server(mut self, server: Option<SocketAddr>) -> Self {
+        self.local_dns_server = server.map(|addr| (addr, Arc::from(addr.to_string())));
         self
     }
 
@@ -53,17 +55,19 @@ impl CoreResolver {
         let Some((suffix, exact)) = &self.local_domain_suffix else {
             return false;
         };
-        domain.eq_ignore_ascii_case(exact.as_ref())
+        // Compare bytes: a `str` slice at this offset may split a multi-byte character.
+        let domain = domain.as_bytes();
+        domain.eq_ignore_ascii_case(exact.as_bytes())
             || (domain.len() > suffix.len()
-                && domain[domain.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_ref()))
+                && domain[domain.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes()))
     }
 
     async fn resolve_local_tld(&self, query: &DnsQuery) -> Result<DnsResolution, DomainError> {
-        if let Some(ref server) = self.local_dns_server {
-            let forwarder = DnsForwarder::new().with_hardening(self.pool_manager.hardening());
+        if let Some((server, display)) = &self.local_dns_server {
+            let forwarder = DnsForwarder::new(self.pool_manager.hardening());
             match forwarder
                 .query(
-                    server,
+                    *server,
                     &query.domain,
                     &query.record_type,
                     self.query_timeout_ms,
@@ -80,16 +84,15 @@ impl CoreResolver {
                         addresses: Arc::new(response.addresses),
                         cache_hit: false,
                         local_dns: true,
+                        local_nxdomain: false,
                         dnssec_status: None,
                         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
-                        upstream_server: Some(Arc::clone(server)),
+                        upstream_server: Some(Arc::clone(display)),
                         upstream_pool: None,
                         min_ttl: response.min_ttl,
                         negative_soa_ttl: response.negative_soa_ttl,
-                        // Relay the local server's full answer, exactly as the pool path
-                        // does. Without this, non-address answers (PTR for LAN clients,
-                        // SRV/TXT/MX under the local domain) were parsed into an empty
-                        // `addresses` and reached the client as an empty response.
+                        // Relay the full answer, as the pool path does, so non-address
+                        // records (PTR, SRV, TXT, MX) reach the client.
                         upstream_wire_data: Some(response.raw_bytes),
                     });
                 }
@@ -165,6 +168,7 @@ impl DnsResolver for CoreResolver {
             addresses,
             cache_hit: false,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: None,
             cname_chain: if cname_chain.is_empty() {
                 Arc::clone(&EMPTY_CNAME_CHAIN)

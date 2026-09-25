@@ -1,4 +1,12 @@
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::net::IpAddr;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tracing::warn;
+
+use crate::dns_record::RecordType;
+use crate::errors::domain_error::DomainError;
 
 /// Longest a DNS name may be, in bytes (RFC 1035 §2.3.4).
 const MAX_NAME_LEN: usize = 253;
@@ -6,29 +14,173 @@ const MAX_NAME_LEN: usize = 253;
 /// Longest a single DNS label may be, in bytes (RFC 1035 §2.3.4).
 const MAX_LABEL_LEN: usize = 63;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Record types a local record can carry: the address records the permanent
+/// cache serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalRecordType {
+    A,
+    AAAA,
+}
+
+impl LocalRecordType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::AAAA => "AAAA",
+        }
+    }
+}
+
+impl From<LocalRecordType> for RecordType {
+    fn from(record_type: LocalRecordType) -> Self {
+        match record_type {
+            LocalRecordType::A => RecordType::A,
+            LocalRecordType::AAAA => RecordType::AAAA,
+        }
+    }
+}
+
+impl fmt::Display for LocalRecordType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LocalRecordType {
+    type Err = DomainError;
+
+    /// Case-insensitive, because hand-written configs use `a` as often as `A`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("A") {
+            Ok(Self::A)
+        } else if s.eq_ignore_ascii_case("AAAA") {
+            Ok(Self::AAAA)
+        } else {
+            Err(DomainError::InvalidInput(format!(
+                "Invalid record type '{s}' (must be A or AAAA)"
+            )))
+        }
+    }
+}
+
+impl Serialize for LocalRecordType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalDnsRecord {
     pub hostname: String,
-
-    #[serde(default)]
     pub domain: Option<String>,
-
-    pub ip: String,
-
-    pub record_type: String,
-
-    #[serde(default)]
+    pub ip: IpAddr,
+    pub record_type: LocalRecordType,
     pub ttl: Option<u32>,
 }
 
+/// The config-file shape of a record. Address and type stay text so that one
+/// entry the resolver cannot serve is dropped instead of failing the load.
+#[derive(Deserialize)]
+struct LocalDnsRecordFields {
+    hostname: String,
+    #[serde(default)]
+    domain: Option<String>,
+    ip: String,
+    record_type: String,
+    #[serde(default)]
+    ttl: Option<u32>,
+}
+
+impl LocalDnsRecordFields {
+    /// The typed address and type, or why the entry cannot be served.
+    fn address(&self) -> Result<(IpAddr, LocalRecordType), DomainError> {
+        let (ip, record_type) = parse_address(&self.ip, &self.record_type)?;
+        LocalDnsRecord::validate_address(record_type, ip).map_err(DomainError::InvalidIpAddress)?;
+        Ok((ip, record_type))
+    }
+}
+
+/// Deserializes `dns.local_records`, dropping with a warning each entry with
+/// an unparseable address, an unsupported type or an address of the wrong
+/// family. Older builds saved such entries and ran with them, so rejecting
+/// the file would stop an upgraded server from starting.
+pub(super) fn deserialize_lenient<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<LocalDnsRecord>, D::Error> {
+    let entries = Vec::<LocalDnsRecordFields>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|fields| match fields.address() {
+            Ok((ip, record_type)) => Some(LocalDnsRecord {
+                hostname: fields.hostname,
+                domain: fields.domain,
+                ip,
+                record_type,
+                ttl: fields.ttl,
+            }),
+            Err(e) => {
+                warn!(
+                    hostname = %fields.hostname,
+                    ip = %fields.ip,
+                    record_type = %fields.record_type,
+                    error = %e,
+                    "Skipping a dns.local_records entry that cannot be served; \
+                     the next local-record save removes it from the config file"
+                );
+                None
+            }
+        })
+        .collect())
+}
+
+fn parse_address(ip: &str, record_type: &str) -> Result<(IpAddr, LocalRecordType), DomainError> {
+    let ip = ip
+        .parse()
+        .map_err(|_| DomainError::InvalidIpAddress(ip.to_string()))?;
+    Ok((ip, record_type.parse()?))
+}
+
 impl LocalDnsRecord {
-    pub fn fqdn(&self, default_domain: &Option<String>) -> String {
-        if let Some(ref domain) = self.domain {
-            format!("{}.{}", self.hostname, domain)
-        } else if let Some(ref default) = default_domain {
-            format!("{}.{}", self.hostname, default)
-        } else {
-            self.hostname.clone()
+    /// Builds a record from the text fields the API and backups carry.
+    pub fn parse(
+        hostname: String,
+        domain: Option<String>,
+        ip: &str,
+        record_type: &str,
+        ttl: Option<u32>,
+    ) -> Result<Self, DomainError> {
+        let (ip, record_type) = parse_address(ip, record_type)?;
+        Ok(Self {
+            hostname,
+            domain,
+            ip,
+            record_type,
+            ttl,
+        })
+    }
+
+    pub fn fqdn(&self, default_domain: Option<&str>) -> String {
+        match self.domain.as_deref().or(default_domain) {
+            Some(domain) => format!("{}.{}", self.hostname, domain),
+            None => self.hostname.clone(),
+        }
+    }
+
+    /// Whether this record is named `fqdn`, compared ASCII case-insensitively
+    /// as DNS compares names, without building the record's own name.
+    pub fn has_fqdn(&self, fqdn: &str, default_domain: Option<&str>) -> bool {
+        let host = self.hostname.as_bytes();
+        let fqdn = fqdn.as_bytes();
+        match self.domain.as_deref().or(default_domain) {
+            Some(domain) => {
+                fqdn.get(..host.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(host))
+                    && fqdn.get(host.len()) == Some(&b'.')
+                    && fqdn
+                        .get(host.len() + 1..)
+                        .is_some_and(|tail| tail.eq_ignore_ascii_case(domain.as_bytes()))
+            }
+            None => fqdn.eq_ignore_ascii_case(host),
         }
     }
 
@@ -47,7 +199,7 @@ impl LocalDnsRecord {
     ///
     /// `None` for an exact record, and for a wildcard with no domain to anchor
     /// it — a bare `*` would otherwise cover every query in existence.
-    pub fn wildcard_suffix(&self, default_domain: &Option<String>) -> Option<String> {
+    pub fn wildcard_suffix(&self, default_domain: Option<&str>) -> Option<String> {
         if !self.is_wildcard() {
             return None;
         }
@@ -55,6 +207,20 @@ impl LocalDnsRecord {
         self.fqdn(default_domain)
             .strip_prefix("*.")
             .map(str::to_ascii_lowercase)
+    }
+
+    /// Rejects an address of the wrong family for its type: an A record with
+    /// an IPv6 address would be served as a malformed answer.
+    pub fn validate_address(record_type: LocalRecordType, ip: IpAddr) -> Result<(), String> {
+        match (record_type, ip) {
+            (LocalRecordType::A, IpAddr::V4(_)) | (LocalRecordType::AAAA, IpAddr::V6(_)) => Ok(()),
+            (LocalRecordType::A, IpAddr::V6(_)) => {
+                Err(format!("an A record needs an IPv4 address, got {ip}"))
+            }
+            (LocalRecordType::AAAA, IpAddr::V4(_)) => {
+                Err(format!("an AAAA record needs an IPv6 address, got {ip}"))
+            }
+        }
     }
 
     /// Validates the `hostname` field. A wildcard is accepted only as the

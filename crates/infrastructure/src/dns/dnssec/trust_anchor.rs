@@ -1,8 +1,9 @@
-use super::crypto::SignatureVerifier;
+use super::crypto;
 use super::types::{DnskeyRecord, DsRecord};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use data_encoding::HEXLOWER_PERMISSIVE;
 use ferrous_dns_domain::DomainError;
+use std::fmt::Display;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -69,9 +70,7 @@ impl TrustAnchor {
                     && anchor_key.public_key == dnskey.public_key
                     && anchor_key.calculate_key_tag() == dnskey.calculate_key_tag()
             }
-            TrustAnchorKey::Ds(ds) => SignatureVerifier
-                .verify_ds(ds, dnskey, &self.domain)
-                .unwrap_or(false),
+            TrustAnchorKey::Ds(ds) => crypto::verify_ds(ds, dnskey, &self.domain).unwrap_or(false),
         }
     }
 }
@@ -92,10 +91,6 @@ impl TrustAnchorStore {
         Self {
             anchors: Vec::new(),
         }
-    }
-
-    pub fn from_anchors(anchors: Vec<TrustAnchor>) -> Self {
-        Self { anchors }
     }
 
     /// Loads anchors from a file in DNS presentation format, replacing (not
@@ -124,16 +119,8 @@ impl TrustAnchorStore {
     /// passed in 2019.
     pub fn default_root_anchors() -> Vec<TrustAnchor> {
         vec![
-            embedded_root_anchor(
-                20326,
-                "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
-                "Root KSK-2017 (20326)",
-            ),
-            embedded_root_anchor(
-                38696,
-                "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16",
-                "Root KSK-2024 (38696)",
-            ),
+            embedded_root_anchor(20326, KSK_2017_DIGEST, "Root KSK-2017 (20326)"),
+            embedded_root_anchor(38696, KSK_2024_DIGEST, "Root KSK-2024 (38696)"),
         ]
     }
 
@@ -215,10 +202,7 @@ impl FromStr for TrustAnchorStore {
                 continue;
             }
 
-            let anchor = parse_anchor_line(line).map_err(|e| {
-                DomainError::ConfigError(format!("trust anchor line {}: {e}", index + 1))
-            })?;
-            anchors.push(anchor);
+            anchors.push(parse_anchor_line(line, index + 1)?);
         }
 
         if anchors.is_empty() {
@@ -245,21 +229,43 @@ fn normalize_domain(domain: &str) -> String {
     }
 }
 
-fn embedded_root_anchor(key_tag: u16, digest_hex: &str, description: &str) -> TrustAnchor {
+/// SHA-256 DS digests of the root KSKs, as published in `root-anchors.xml`.
+const KSK_2017_DIGEST: [u8; 32] = [
+    0xe0, 0x6d, 0x44, 0xb8, 0x0b, 0x8f, 0x1d, 0x39, 0xa9, 0x5c, 0x0b, 0x0d, 0x7c, 0x65, 0xd0, 0x84,
+    0x58, 0xe8, 0x80, 0x40, 0x9b, 0xbc, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xc7, 0xf8, 0xec, 0x8d,
+];
+const KSK_2024_DIGEST: [u8; 32] = [
+    0x68, 0x3d, 0x2d, 0x0a, 0xcb, 0x8c, 0x9b, 0x71, 0x2a, 0x19, 0x48, 0xb2, 0x7f, 0x74, 0x12, 0x19,
+    0x29, 0x8d, 0x0a, 0x45, 0x0d, 0x61, 0x2c, 0x48, 0x3a, 0xf4, 0x44, 0xa4, 0xc0, 0xfb, 0x2b, 0x16,
+];
+
+fn embedded_root_anchor(key_tag: u16, digest: [u8; 32], description: &str) -> TrustAnchor {
     const ALGORITHM_RSASHA256: u8 = 8;
     const DIGEST_SHA256: u8 = 2;
 
-    let digest = HEXLOWER_PERMISSIVE
-        .decode(digest_hex.as_bytes())
-        .expect("embedded root trust anchor digest must be valid hex");
-
-    let ds = ds_from_parts(key_tag, ALGORITHM_RSASHA256, DIGEST_SHA256, digest)
-        .expect("embedded root trust anchor must be a valid DS record");
-
+    let ds = DsRecord {
+        key_tag,
+        algorithm: ALGORITHM_RSASHA256,
+        digest_type: DIGEST_SHA256,
+        digest: digest.to_vec(),
+    };
     TrustAnchor::new(".", TrustAnchorKey::Ds(ds), description.to_string())
 }
 
-fn parse_anchor_line(line: &str) -> Result<TrustAnchor, String> {
+fn anchor_error(line_no: usize, detail: impl Display) -> DomainError {
+    DomainError::ConfigError(format!("trust anchor line {line_no}: {detail}"))
+}
+
+/// Reports a record-parser rejection against the file line, so a malformed file
+/// is not described to the operator as an "Invalid DNS response".
+fn record_error(line_no: usize, error: DomainError) -> DomainError {
+    match error {
+        DomainError::InvalidDnsResponse(message) => anchor_error(line_no, message),
+        other => anchor_error(line_no, other),
+    }
+}
+
+fn parse_anchor_line(line: &str, line_no: usize) -> Result<TrustAnchor, DomainError> {
     let tokens: Vec<&str> = line
         .split_whitespace()
         .filter(|token| *token != "(" && *token != ")")
@@ -272,30 +278,31 @@ fn parse_anchor_line(line: &str) -> Result<TrustAnchor, String> {
         .skip(1)
         .position(|token| token.eq_ignore_ascii_case("DS") || token.eq_ignore_ascii_case("DNSKEY"))
         .map(|index| index + 1)
-        .ok_or_else(|| "expected a DS or DNSKEY record".to_string())?;
+        .ok_or_else(|| anchor_error(line_no, "expected a DS or DNSKEY record"))?;
 
     let owner = tokens[0];
     let record_type = tokens[type_index];
     let rdata = &tokens[type_index + 1..];
 
     if record_type.eq_ignore_ascii_case("DS") {
-        let (key_tag, algorithm, digest_type) = parse_leading_fields(rdata, "DS")?;
+        let (key_tag, algorithm, digest_type) = parse_leading_fields(rdata, "DS", line_no)?;
         let digest = HEXLOWER_PERMISSIVE
             .decode(rdata[3..].concat().as_bytes())
-            .map_err(|e| format!("invalid DS digest: {e}"))?;
+            .map_err(|e| anchor_error(line_no, format_args!("invalid DS digest: {e}")))?;
 
-        let ds = ds_from_parts(key_tag, algorithm, digest_type, digest).map_err(record_error)?;
+        let ds = ds_from_parts(key_tag, algorithm, digest_type, digest)
+            .map_err(|e| record_error(line_no, e))?;
         let description = format!("{owner} DS {key_tag}");
 
         Ok(TrustAnchor::new(owner, TrustAnchorKey::Ds(ds), description))
     } else {
-        let (flags, protocol, algorithm) = parse_leading_fields(rdata, "DNSKEY")?;
+        let (flags, protocol, algorithm) = parse_leading_fields(rdata, "DNSKEY", line_no)?;
         let public_key = STANDARD
             .decode(rdata[3..].concat())
-            .map_err(|e| format!("invalid DNSKEY public key: {e}"))?;
+            .map_err(|e| anchor_error(line_no, format_args!("invalid DNSKEY public key: {e}")))?;
 
-        let dnskey =
-            dnskey_from_parts(flags, protocol, algorithm, public_key).map_err(record_error)?;
+        let dnskey = dnskey_from_parts(flags, protocol, algorithm, public_key)
+            .map_err(|e| record_error(line_no, e))?;
         let description = format!("{owner} DNSKEY {}", dnskey.calculate_key_tag());
 
         Ok(TrustAnchor::new(
@@ -306,35 +313,33 @@ fn parse_anchor_line(line: &str) -> Result<TrustAnchor, String> {
     }
 }
 
-/// Unwraps the record parser's own message, so a malformed file is not reported
-/// to the operator as an "Invalid DNS response".
-fn record_error(error: DomainError) -> String {
-    match error {
-        DomainError::InvalidDnsResponse(message) => message,
-        other => other.to_string(),
-    }
-}
-
 /// Both record types start with a `u16` followed by two `u8`s (DS: key tag,
 /// algorithm, digest type — DNSKEY: flags, protocol, algorithm), then a single
 /// encoded blob that presentation format may split across whitespace.
-fn parse_leading_fields(rdata: &[&str], record_type: &str) -> Result<(u16, u8, u8), String> {
+fn parse_leading_fields(
+    rdata: &[&str],
+    record_type: &str,
+    line_no: usize,
+) -> Result<(u16, u8, u8), DomainError> {
     if rdata.len() < 4 {
-        return Err(format!(
-            "{record_type} record has {} fields, expected at least 4",
-            rdata.len()
+        return Err(anchor_error(
+            line_no,
+            format_args!(
+                "{record_type} record has {} fields, expected at least 4",
+                rdata.len()
+            ),
         ));
     }
 
-    let first = rdata[0]
-        .parse::<u16>()
-        .map_err(|e| format!("invalid {record_type} field 1: {e}"))?;
-    let second = rdata[1]
-        .parse::<u8>()
-        .map_err(|e| format!("invalid {record_type} field 2: {e}"))?;
-    let third = rdata[2]
-        .parse::<u8>()
-        .map_err(|e| format!("invalid {record_type} field 3: {e}"))?;
+    let field_error = |field: u8, e: std::num::ParseIntError| {
+        anchor_error(
+            line_no,
+            format_args!("invalid {record_type} field {field}: {e}"),
+        )
+    };
+    let first = rdata[0].parse::<u16>().map_err(|e| field_error(1, e))?;
+    let second = rdata[1].parse::<u8>().map_err(|e| field_error(2, e))?;
+    let third = rdata[2].parse::<u8>().map_err(|e| field_error(3, e))?;
 
     Ok((first, second, third))
 }

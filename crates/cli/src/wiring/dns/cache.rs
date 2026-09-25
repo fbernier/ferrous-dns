@@ -1,34 +1,33 @@
+use ferrous_dns_domain::config::CacheEvictionStrategy;
 use ferrous_dns_domain::Config;
 use ferrous_dns_infrastructure::dns::{
     cache::{DnsCache, DnsCacheConfig, EvictionStrategy},
     CachedAddresses, CachedData,
 };
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
+
+fn eviction_strategy(strategy: CacheEvictionStrategy) -> EvictionStrategy {
+    match strategy {
+        CacheEvictionStrategy::Lru => EvictionStrategy::LRU,
+        CacheEvictionStrategy::HitRate => EvictionStrategy::HitRate,
+        CacheEvictionStrategy::Lfu => EvictionStrategy::LFU,
+        CacheEvictionStrategy::LfuK => EvictionStrategy::LFUK,
+    }
+}
 
 pub(super) fn build_cache(config: &Config) -> Arc<DnsCache> {
     if config.dns.cache_enabled {
-        let eviction_strategy = match config.dns.cache_eviction_strategy.as_str() {
-            "lfu" => EvictionStrategy::LFU,
-            "lfu-k" => EvictionStrategy::LFUK,
-            _ => EvictionStrategy::HitRate,
-        };
         info!(
-            strategy = config.dns.cache_eviction_strategy.as_str(),
+            strategy = %config.dns.cache_eviction_strategy,
             max_entries = config.dns.cache_max_entries,
             "Cache enabled"
         );
         Arc::new(DnsCache::new(DnsCacheConfig {
             max_entries: config.dns.cache_max_entries,
-            eviction_strategy,
-            // Seeded neutral, not from `cache_min_hit_rate`: this feeds the
-            // adaptive EWMA, which blends it with an eviction score bounded by
-            // 1.0, while `cache_min_hit_rate` is a hits-per-minute figure. The
-            // EWMA converges on the observed worst score on its own.
-            min_threshold: 0.0,
+            eviction_strategy: eviction_strategy(config.dns.cache_eviction_strategy),
             refresh_threshold: config.dns.cache_refresh_threshold,
             batch_eviction_percentage: config.dns.cache_batch_eviction_percentage,
-            adaptive_thresholds: config.dns.cache_adaptive_thresholds,
             min_frequency: config.dns.cache_min_frequency,
             min_lfuk_score: config.dns.cache_min_lfuk_score,
             shard_amount: config.dns.cache_shard_amount,
@@ -43,10 +42,8 @@ pub(super) fn build_cache(config: &Config) -> Arc<DnsCache> {
         Arc::new(DnsCache::new(DnsCacheConfig {
             max_entries: 0,
             eviction_strategy: EvictionStrategy::HitRate,
-            min_threshold: 0.0,
             refresh_threshold: 0.0,
             batch_eviction_percentage: 0.0,
-            adaptive_thresholds: false,
             min_frequency: 0,
             min_lfuk_score: 0.0,
             shard_amount: 4,
@@ -63,101 +60,37 @@ pub(super) fn build_cache(config: &Config) -> Arc<DnsCache> {
 pub(super) fn preload_local_records_into_cache(
     cache: &Arc<DnsCache>,
     records: &[ferrous_dns_domain::LocalDnsRecord],
-    default_domain: &Option<String>,
+    default_domain: Option<&str>,
 ) {
-    use ferrous_dns_domain::RecordType;
-
-    let mut success_count = 0;
-    let mut error_count = 0;
-    let mut wildcard_count = 0;
-
-    for record in records {
-        // Wildcards are served by `LocalWildcardResolver` above the cache: a
-        // cache key is matched exactly, so `*.home.lan` here would be an entry
-        // no query could ever reach.
-        if record.is_wildcard() {
-            wildcard_count += 1;
-            continue;
-        }
-
+    // Wildcards are served by `LocalWildcardResolver` above the cache: a cache
+    // key is matched exactly, so `*.home.lan` here would be an entry no query
+    // could ever reach.
+    let mut count = 0usize;
+    for record in records.iter().filter(|r| !r.is_wildcard()) {
         let fqdn = record.fqdn(default_domain);
-
-        let ip: std::net::IpAddr = match record.ip.parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                warn!(
-                    hostname = %record.hostname,
-                    ip = %record.ip,
-                    "Invalid IP address for local DNS record, skipping"
-                );
-                error_count += 1;
-                continue;
-            }
-        };
-
-        let record_type = match record.record_type.to_uppercase().as_str() {
-            "A" => RecordType::A,
-            "AAAA" => RecordType::AAAA,
-            _ => {
-                warn!(
-                    hostname = %record.hostname,
-                    record_type = %record.record_type,
-                    "Invalid record type for local DNS record (must be A or AAAA), skipping"
-                );
-                error_count += 1;
-                continue;
-            }
-        };
-
-        let ip_type_valid = matches!(
-            (&record_type, &ip),
-            (RecordType::A, std::net::IpAddr::V4(_)) | (RecordType::AAAA, std::net::IpAddr::V6(_))
-        );
-
-        if !ip_type_valid {
-            warn!(
-                hostname = %record.hostname,
-                ip = %record.ip,
-                record_type = %record.record_type,
-                "IP type mismatch (A record needs IPv4, AAAA needs IPv6), skipping"
-            );
-            error_count += 1;
-            continue;
-        }
-
         let data = CachedData::IpAddresses(CachedAddresses {
-            addresses: Arc::new(vec![ip]),
+            addresses: Arc::new(vec![record.ip]),
         });
+        let ttl = record.ttl_or_default();
 
-        let ttl = record.ttl.unwrap_or(300);
-
-        cache.insert_permanent(&fqdn, record_type, data, ttl, None);
+        cache.insert_permanent(&fqdn, record.record_type.into(), data, ttl);
 
         info!(
             fqdn = %fqdn,
-            ip = %ip,
-            record_type = %record_type,
+            ip = %record.ip,
+            record_type = %record.record_type,
             ttl = %ttl,
             "Preloaded local DNS record into permanent cache"
         );
-
-        success_count += 1;
+        count += 1;
     }
 
-    if success_count > 0 {
+    if count > 0 {
         info!(
-            count = success_count,
-            errors = error_count,
-            wildcards = wildcard_count,
+            count,
+            wildcards = records.len() - count,
             "✓ Preloaded {} local DNS record(s) into permanent cache",
-            success_count
-        );
-    }
-
-    if error_count > 0 {
-        warn!(
-            count = error_count,
-            "× Failed to preload {} local DNS record(s)", error_count
+            count
         );
     }
 }

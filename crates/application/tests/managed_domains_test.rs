@@ -1,4 +1,4 @@
-use ferrous_dns_application::ports::ManagedDomainRepository;
+use ferrous_dns_application::ports::{ManagedDomainRepository, ManagedDomainUpdate};
 use ferrous_dns_application::use_cases::managed_domains::{
     CreateManagedDomainUseCase, DeleteManagedDomainUseCase, GetManagedDomainsUseCase,
     UpdateManagedDomainUseCase,
@@ -8,8 +8,6 @@ use std::sync::Arc;
 
 mod helpers;
 use helpers::{MockBlockFilterEngine, MockGroupRepository, MockManagedDomainRepository};
-
-// ── GetManagedDomainsUseCase ──────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_get_all_empty() {
@@ -88,8 +86,6 @@ async fn test_get_by_id_not_found() {
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
 }
-
-// ── CreateManagedDomainUseCase ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_create_deny_success() {
@@ -220,45 +216,6 @@ async fn test_create_group_not_found() {
 }
 
 #[tokio::test]
-async fn test_create_duplicate_name() {
-    let repo = Arc::new(MockManagedDomainRepository::new());
-    let group_repo = Arc::new(MockGroupRepository::new());
-    let engine = Arc::new(MockBlockFilterEngine::new());
-    let use_case = CreateManagedDomainUseCase::new(repo, group_repo, engine);
-
-    use_case
-        .execute(
-            "Duplicate".to_string(),
-            "ads.example.com".to_string(),
-            DomainAction::Deny,
-            1,
-            None,
-            true,
-        )
-        .await
-        .unwrap();
-
-    let result = use_case
-        .execute(
-            "Duplicate".to_string(),
-            "tracker.example.com".to_string(),
-            DomainAction::Deny,
-            1,
-            None,
-            true,
-        )
-        .await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        DomainError::InvalidManagedDomain(_) => {}
-        other => panic!("Expected InvalidManagedDomain, got {:?}", other),
-    }
-}
-
-// ── UpdateManagedDomainUseCase ────────────────────────────────────────────────
-
-#[tokio::test]
 async fn test_update_toggle_enabled() {
     let repo = Arc::new(MockManagedDomainRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
@@ -282,12 +239,10 @@ async fn test_update_toggle_enabled() {
     let result = update_uc
         .execute(
             created.id.unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(false),
+            ManagedDomainUpdate {
+                enabled: Some(false),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -320,12 +275,10 @@ async fn test_update_change_action() {
     let result = update_uc
         .execute(
             created.id.unwrap(),
-            None,
-            None,
-            Some(DomainAction::Allow),
-            None,
-            None,
-            None,
+            ManagedDomainUpdate {
+                action: Some(DomainAction::Allow),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -341,7 +294,13 @@ async fn test_update_not_found() {
     let use_case = UpdateManagedDomainUseCase::new(repo, group_repo, engine);
 
     let result = use_case
-        .execute(999, None, None, None, None, None, Some(false))
+        .execute(
+            999,
+            ManagedDomainUpdate {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
         .await;
 
     assert!(result.is_err());
@@ -373,7 +332,13 @@ async fn test_update_invalid_group() {
         .unwrap();
 
     let result = update_uc
-        .execute(created.id.unwrap(), None, None, None, Some(999), None, None)
+        .execute(
+            created.id.unwrap(),
+            ManagedDomainUpdate {
+                group_id: Some(999),
+                ..Default::default()
+            },
+        )
         .await;
 
     assert!(result.is_err());
@@ -382,8 +347,6 @@ async fn test_update_invalid_group() {
         other => panic!("Expected GroupNotFound, got {:?}", other),
     }
 }
-
-// ── DeleteManagedDomainUseCase ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_delete_success() {

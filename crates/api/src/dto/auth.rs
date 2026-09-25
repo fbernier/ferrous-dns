@@ -21,13 +21,15 @@ pub struct LoginResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub methods: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<String>)]
+    pub methods: Vec<&'static str>,
 }
 
 /// Second step of MFA login: verify a TOTP or recovery code against a challenge.
@@ -86,13 +88,6 @@ pub struct MfaStatusResponse {
     pub recovery_codes_remaining: usize,
     pub webauthn_configured: bool,
     pub passkeys: Vec<PasskeyResponse>,
-}
-
-/// Begins passkey registration (optionally naming the credential).
-#[derive(Debug, Default, Deserialize, ToSchema)]
-pub struct RegisterPasskeyStartRequest {
-    #[serde(default)]
-    pub label: Option<String>,
 }
 
 /// Server-side challenge plus the ceremony token to echo back.
@@ -174,7 +169,8 @@ pub struct AuthStatusResponse {
 pub struct SessionResponse {
     pub id: String,
     pub username: String,
-    pub role: String,
+    #[schema(value_type = String)]
+    pub role: &'static str,
     pub ip_address: String,
     pub user_agent: String,
     pub remember_me: bool,

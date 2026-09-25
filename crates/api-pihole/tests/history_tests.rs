@@ -11,7 +11,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn history_clients_returns_clients_array() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -38,7 +38,7 @@ async fn history_clients_entries_have_required_fields() {
     helpers::insert_query(&pool, "foo.com", "10.0.0.1", false, false, None).await;
     helpers::insert_query(&pool, "bar.com", "10.0.0.2", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -84,7 +84,7 @@ async fn history_clients_counts_queries_per_client() {
     helpers::insert_query(&pool, "three.com", "10.0.0.1", true, false, Some("Exact")).await;
     helpers::insert_query(&pool, "four.com", "10.0.0.2", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(

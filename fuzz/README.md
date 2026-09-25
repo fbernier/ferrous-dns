@@ -25,8 +25,9 @@ make fuzz-short
 
 | Target | Covers | Who controls the bytes |
 | --- | --- | --- |
-| `query_fast_path` | `dns::fast_path::parse_query` chained into `dns::wire_response::build_cache_hit_response` | any client that can send a UDP packet |
+| `query_fast_path` | `dns::fast_path::parse_query` chained into `dns::wire_response::build_cache_hit_response`, plus `FastPathQuery::edns_cookie`, `encode_response` and `encode_truncated` for the slow path | any client that can send a UDP packet |
 | `response_lowercase_0x20` | `dns::forwarding::response_validator::lowercase_owner_names` | the upstream resolver, or an off-path spoofer racing it |
+| `upstream_relay` | `dns::wire_response::relay_with_edns`, and `cache_form` chained into `relay_cached` | the upstream resolver, or an off-path spoofer racing it |
 | `dnssec_records` | `RrsigRecord::parse`, `DsRecord::parse`, `DnskeyRecord::parse` | a hostile signed zone |
 | `proxy_protocol_v2` | `dns::proxy_protocol::read_proxy_v2_client_ip` | whatever speaks to the TCP/DoT listener behind a load balancer |
 | `blocklist_text` | `dns::block_filter::compiler::parse_list_text` | the remote blocklist an operator subscribes to |
@@ -42,6 +43,14 @@ under one.
 It deliberately does *not* assert that hickory accepts everything the fast path
 accepts: `parse_query` tolerates a truncated additional section on purpose, and
 hickory rejects it.
+
+`upstream_relay` is differential too: whenever hickory decodes the upstream
+message, the relayed one must decode to the same records under our header and
+OPT. Cutting the upstream OPT out shifts every byte behind it, so this is what
+catches a relay that breaks compression pointers into that region. Its blind
+spot is the RDATA of types whose names the relay decompresses but hickory
+keeps as raw bytes (RP, AFSDB, MINFO and the like): a rewritten pointer there
+changes the bytes, not the name, so those RDATA are not compared.
 
 Parsers that are crate-private in a normal build are reached through
 `ferrous_dns_infrastructure::dns::fuzz_api`, a wrapper module compiled only

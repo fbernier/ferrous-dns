@@ -2,6 +2,7 @@ use ferrous_dns_domain::{DnsProtocol, UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::load_balancer::PoolManager;
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_pool_manager_expands_hostnames() {
     let pool = UpstreamPool {
         name: "test-expansion".into(),
@@ -15,7 +16,7 @@ async fn test_pool_manager_expands_hostnames() {
         .await
         .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
+    let protocols = pm.get_all_arc_protocols();
     assert!(
         protocols.len() >= 2,
         "dns.google hostname should expand to at least 2 resolved IPs, got {}",
@@ -36,6 +37,7 @@ async fn test_pool_manager_expands_hostnames() {
 }
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_pool_manager_expansion_includes_ipv6() {
     let pool = UpstreamPool {
         name: "test-v6".into(),
@@ -49,7 +51,7 @@ async fn test_pool_manager_expansion_includes_ipv6() {
         .await
         .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
+    let protocols = pm.get_all_arc_protocols();
     let has_v6 = protocols
         .iter()
         .any(|p| p.socket_addr().is_some_and(|a| a.is_ipv6()));
@@ -75,7 +77,7 @@ async fn test_pool_manager_keeps_literal_ips_unchanged() {
         .await
         .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
+    let protocols = pm.get_all_arc_protocols();
     assert_eq!(
         protocols.len(),
         2,
@@ -85,6 +87,7 @@ async fn test_pool_manager_keeps_literal_ips_unchanged() {
 }
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_pool_manager_mixed_literal_and_hostname() {
     let pool = UpstreamPool {
         name: "test-mixed".into(),
@@ -98,7 +101,7 @@ async fn test_pool_manager_mixed_literal_and_hostname() {
         .await
         .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
+    let protocols = pm.get_all_arc_protocols();
     assert!(
         protocols.len() >= 3,
         "1 literal + expanded dns.google should give at least 3 protocols, got {}",
@@ -113,6 +116,7 @@ async fn test_pool_manager_mixed_literal_and_hostname() {
 }
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_pool_manager_tls_hostname_expansion() {
     let pool = UpstreamPool {
         name: "test-tls".into(),
@@ -126,7 +130,7 @@ async fn test_pool_manager_tls_hostname_expansion() {
         .await
         .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
+    let protocols = pm.get_all_arc_protocols();
     assert!(
         protocols.len() >= 2,
         "TLS dns.google should expand to at least 2 resolved IPs, got {}",
@@ -134,7 +138,7 @@ async fn test_pool_manager_tls_hostname_expansion() {
     );
 
     for protocol in &protocols {
-        match protocol {
+        match protocol.as_ref() {
             DnsProtocol::Tls { addr, hostname } => {
                 assert!(addr.socket_addr().is_some(), "TLS addr should be resolved");
                 assert_eq!(
@@ -149,6 +153,7 @@ async fn test_pool_manager_tls_hostname_expansion() {
 }
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_pool_manager_https_not_expanded_but_preresolved() {
     let pool = UpstreamPool {
         name: "test-https".into(),
@@ -162,14 +167,14 @@ async fn test_pool_manager_https_not_expanded_but_preresolved() {
         .await
         .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
+    let protocols = pm.get_all_arc_protocols();
     assert_eq!(
         protocols.len(),
         1,
         "HTTPS protocols should remain as 1 entry (not expanded like UDP/TCP)"
     );
 
-    if let DnsProtocol::Https { resolved_addrs, .. } = &protocols[0] {
+    if let DnsProtocol::Https { resolved_addrs, .. } = protocols[0].as_ref() {
         assert!(
             !resolved_addrs.is_empty(),
             "HTTPS with hostname should have pre-resolved addresses"
@@ -180,6 +185,7 @@ async fn test_pool_manager_https_not_expanded_but_preresolved() {
 }
 
 #[tokio::test]
+#[ignore = "live network: resolves dns.google; run with --ignored"]
 async fn test_pool_manager_preresolves_h3_hostnames() {
     let pool = UpstreamPool {
         name: "test-h3".into(),
@@ -193,14 +199,14 @@ async fn test_pool_manager_preresolves_h3_hostnames() {
         .await
         .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
+    let protocols = pm.get_all_arc_protocols();
     assert_eq!(
         protocols.len(),
         1,
         "H3 protocols should remain as 1 entry (not expanded like UDP/TCP)"
     );
 
-    if let DnsProtocol::H3 { resolved_addrs, .. } = &protocols[0] {
+    if let DnsProtocol::H3 { resolved_addrs, .. } = protocols[0].as_ref() {
         assert!(
             !resolved_addrs.is_empty(),
             "H3 with hostname should have pre-resolved addresses"
@@ -212,27 +218,29 @@ async fn test_pool_manager_preresolves_h3_hostnames() {
 
 #[tokio::test]
 async fn test_pool_manager_https_ip_no_resolution() {
-    let pool = UpstreamPool {
-        name: "test-https-ip".into(),
-        strategy: UpstreamStrategy::Parallel,
-        priority: 1,
-        servers: vec!["https://1.1.1.1/dns-query".into()],
-        weight: None,
-    };
+    for server in ["https://1.1.1.1/dns-query", "https://[::1]:8443/dns-query"] {
+        let pool = UpstreamPool {
+            name: "test-https-ip".into(),
+            strategy: UpstreamStrategy::Parallel,
+            priority: 1,
+            servers: vec![server.into()],
+            weight: None,
+        };
 
-    let pm = PoolManager::new(vec![pool], None)
-        .await
-        .expect("PoolManager should create successfully");
+        let pm = PoolManager::new(vec![pool], None)
+            .await
+            .expect("PoolManager should create successfully");
 
-    let protocols = pm.get_all_protocols();
-    assert_eq!(protocols.len(), 1);
+        let protocols = pm.get_all_arc_protocols();
+        assert_eq!(protocols.len(), 1);
 
-    if let DnsProtocol::Https { resolved_addrs, .. } = &protocols[0] {
-        assert!(
-            resolved_addrs.is_empty(),
-            "HTTPS with IP literal should have empty resolved_addrs"
-        );
-    } else {
-        panic!("Expected Https variant, got: {}", protocols[0]);
+        if let DnsProtocol::Https { resolved_addrs, .. } = protocols[0].as_ref() {
+            assert!(
+                resolved_addrs.is_empty(),
+                "{server}: HTTPS with IP literal should have empty resolved_addrs"
+            );
+        } else {
+            panic!("Expected Https variant, got: {}", protocols[0]);
+        }
     }
 }

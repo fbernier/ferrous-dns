@@ -1,3 +1,5 @@
+use super::require_group;
+use ferrous_dns_domain::value_objects::validators::validate_comment;
 use ferrous_dns_domain::{DomainError, Group};
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -21,20 +23,13 @@ impl UpdateGroupUseCase {
         enabled: Option<bool>,
         comment: Option<String>,
     ) -> Result<Group, DomainError> {
-        let group = self
-            .group_repo
-            .get_by_id(id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(id))?;
+        let group = require_group(self.group_repo.as_ref(), id).await?;
 
         if let Some(ref n) = name {
             Group::validate_name(n).map_err(DomainError::InvalidGroupName)?;
         }
 
-        if let Some(ref c) = comment {
-            Group::validate_comment(&Some(Arc::from(c.as_str())))
-                .map_err(DomainError::InvalidGroupName)?;
-        }
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidGroupName)?;
 
         if enabled == Some(false) && group.is_default {
             return Err(DomainError::ProtectedGroupCannotBeDisabled);

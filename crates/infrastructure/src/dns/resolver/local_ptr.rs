@@ -5,9 +5,9 @@ use ferrous_dns_application::ports::{
     DnsResolution, DnsResolver, PtrRecordRegistry, EMPTY_CNAME_CHAIN,
 };
 use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, PrivateIpFilter, RecordType};
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::PTR;
-use hickory_proto::rr::{Name, RData};
+use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use rustc_hash::FxBuildHasher;
 use std::net::IpAddr;
@@ -25,7 +25,7 @@ pub type PtrMap = DashMap<IpAddr, (Arc<str>, u32), FxBuildHasher>;
 pub struct LocalPtrResolver {
     inner: Arc<dyn DnsResolver>,
     /// Live mapping of IP address → (FQDN, TTL).
-    pub map: Arc<PtrMap>,
+    map: Arc<PtrMap>,
 }
 
 impl LocalPtrResolver {
@@ -34,52 +34,45 @@ impl LocalPtrResolver {
         Self { inner, map }
     }
 
-    /// Builds a resolver pre-populated from local DNS records declared in config.
-    pub fn from_local_records(
+    /// Builds a PTR map from the exact records among the configured local
+    /// records. When several share an address, the last one wins.
+    pub fn map_from_local_records(
         records: &[LocalDnsRecord],
-        default_domain: &Option<String>,
-        inner: Arc<dyn DnsResolver>,
-    ) -> Self {
+        default_domain: Option<&str>,
+    ) -> Arc<PtrMap> {
         let map: PtrMap = DashMap::with_hasher(FxBuildHasher);
 
-        let mut count = 0usize;
-
-        for record in records {
-            // A wildcard covers a whole subtree, so there is no single name an
-            // address could reverse to. Skip it rather than inventing one.
-            if record.is_wildcard() {
-                continue;
-            }
-
-            match record.ip.parse::<IpAddr>() {
-                Ok(ip) => {
-                    let fqdn = record.fqdn(default_domain);
-                    map.insert(ip, (Arc::from(fqdn.as_str()), record.ttl_or_default()));
-                    count += 1;
-                }
-                Err(_) => {
-                    warn!(
-                        hostname = %record.hostname,
-                        ip = %record.ip,
-                        "PTR auto-generation: invalid IP address, skipping record"
-                    );
-                }
-            }
+        // A wildcard covers a whole subtree, so there is no single name an
+        // address could reverse to. Skip it rather than inventing one.
+        for record in records.iter().filter(|r| !r.is_wildcard()) {
+            let fqdn = record.fqdn(default_domain);
+            map.insert(record.ip, (Arc::from(fqdn), record.ttl_or_default()));
         }
 
         info!(
-            count,
+            count = map.len(),
             "PTR auto-generation: preloaded local records at startup"
         );
 
-        Self {
-            inner,
-            map: Arc::new(map),
-        }
+        Arc::new(map)
     }
 }
 
-impl PtrRecordRegistry for LocalPtrResolver {
+/// Mutating handle on the live PTR map, held by the CRUD use cases.
+///
+/// Separate from the resolver for the same reason as `WildcardRegistry`: the
+/// use cases only add and remove entries and have no inner resolver to give.
+pub struct PtrRegistry {
+    map: Arc<PtrMap>,
+}
+
+impl PtrRegistry {
+    pub fn new(map: Arc<PtrMap>) -> Self {
+        Self { map }
+    }
+}
+
+impl PtrRecordRegistry for PtrRegistry {
     fn register(&self, ip: IpAddr, fqdn: Arc<str>, ttl: u32) {
         self.map.insert(ip, (fqdn, ttl));
     }
@@ -115,7 +108,9 @@ impl DnsResolver for LocalPtrResolver {
             None => return self.inner.resolve(query).await,
         };
 
-        if let Some(entry) = self.map.get(&ip) {
+        // Built inside the closure so the shard guard is gone before any await:
+        // a register/unregister on that shard would otherwise block its thread.
+        let local = self.map.get(&ip).and_then(|entry| {
             let (fqdn, ttl) = entry.value();
             debug!(
                 domain = %query.domain,
@@ -123,49 +118,68 @@ impl DnsResolver for LocalPtrResolver {
                 ptr = %fqdn,
                 "LocalPtrResolver: PTR answered from local records"
             );
-            return match build_ptr_resolution(query, fqdn, *ttl) {
-                Some(resolution) => Ok(resolution),
-                None => self.inner.resolve(query).await,
-            };
-        }
+            parse_ptr_target(fqdn)
+                .and_then(|target| ptr_resolution(&query.domain, &[target], *ttl, true))
+        });
 
-        self.inner.resolve(query).await
+        match local {
+            Some(resolution) => Ok(resolution),
+            None => self.inner.resolve(query).await,
+        }
     }
 }
 
-fn build_ptr_resolution(query: &DnsQuery, hostname: &str, ttl: u32) -> Option<DnsResolution> {
-    let query_name = Name::from_str(&query.domain)
-        .map_err(|e| {
-            warn!(domain = %query.domain, error = %e, "PTR: failed to parse query name");
-        })
-        .ok()?;
-
-    let ptr_name = Name::from_str(hostname)
+fn parse_ptr_target(hostname: &str) -> Option<Name> {
+    Name::from_str(hostname)
         .map_err(|e| {
             warn!(hostname = %hostname, error = %e, "PTR: failed to parse PTR hostname");
         })
-        .ok()?;
+        .ok()
+}
 
-    let record = hickory_proto::rr::Record::from_rdata(query_name, ttl, RData::PTR(PTR(ptr_name)));
+/// An authoritative NOERROR answering the PTR query `owner` with `targets`,
+/// echoing its question (RFC 1035 §4.1.2): stubs drop answers without one.
+pub(super) fn ptr_resolution(
+    owner: &str,
+    targets: &[Name],
+    ttl: u32,
+    local_dns: bool,
+) -> Option<DnsResolution> {
+    let owner_name = Name::from_str(owner)
+        .map_err(|e| {
+            warn!(domain = %owner, error = %e, "PTR: failed to parse query name");
+        })
+        .ok()?;
 
     let mut message = Message::new(0, MessageType::Response, OpCode::Query);
     message.metadata.response_code = ResponseCode::NoError;
     message.metadata.authoritative = true;
-    message.add_answer(record);
+    message.add_query(Query::query(
+        owner_name.clone(),
+        hickory_proto::rr::RecordType::PTR,
+    ));
+    for target in targets {
+        message.add_answer(Record::from_rdata(
+            owner_name.clone(),
+            ttl,
+            RData::PTR(PTR(target.clone())),
+        ));
+    }
 
     let mut buf = Vec::with_capacity(128);
     let mut encoder = BinEncoder::new(&mut buf);
     message
         .emit(&mut encoder)
         .map_err(|e| {
-            warn!(hostname = %hostname, error = %e, "PTR: failed to serialize response");
+            warn!(domain = %owner, error = %e, "PTR: failed to serialize response");
         })
         .ok()?;
 
     Some(DnsResolution {
         addresses: Arc::new(Vec::new()),
         cache_hit: false,
-        local_dns: true,
+        local_dns,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,

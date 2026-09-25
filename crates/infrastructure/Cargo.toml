@@ -18,6 +18,7 @@ fuzzing = []
 [dependencies]
 ferrous-dns-domain.workspace = true
 ferrous-dns-application.workspace = true
+ipnetwork = "0.21"
 tokio.workspace = true
 async-trait.workspace = true
 sqlx.workspace = true
@@ -27,7 +28,6 @@ tracing.workspace = true
 fastrand.workspace = true
 getrandom.workspace = true
 lru.workspace = true
-hostname.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 rustc-hash.workspace = true
@@ -86,7 +86,6 @@ aho-corasick.workspace = true
 fancy-regex.workspace = true
 rayon.workspace = true
 libc.workspace = true
-equivalent = "1"
 toml_edit.workspace = true
 
 # TLS certificate management
@@ -97,3 +96,8 @@ x509-parser = "0.18"
 tempfile = "3.8"
 time = "0.3"
 tracing-subscriber.workspace = true
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "udp_cache_hit"
+harness = false

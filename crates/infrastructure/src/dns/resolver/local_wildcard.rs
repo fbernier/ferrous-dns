@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use ferrous_dns_application::ports::{
     DnsResolution, DnsResolver, WildcardRecordRegistry, EMPTY_CNAME_CHAIN,
 };
-use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, RecordType};
+use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, LocalRecordType, RecordType};
 use rustc_hash::FxBuildHasher;
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -33,19 +33,17 @@ impl WildcardAnswer {
         }
     }
 
-    fn set(&mut self, record_type: RecordType, address: IpAddr, ttl: u32) {
+    fn set(&mut self, record_type: LocalRecordType, address: IpAddr, ttl: u32) {
         match record_type {
-            RecordType::A => self.a = Some((address, ttl)),
-            RecordType::AAAA => self.aaaa = Some((address, ttl)),
-            _ => {}
+            LocalRecordType::A => self.a = Some((address, ttl)),
+            LocalRecordType::AAAA => self.aaaa = Some((address, ttl)),
         }
     }
 
-    fn clear(&mut self, record_type: RecordType) {
+    fn clear(&mut self, record_type: LocalRecordType) {
         match record_type {
-            RecordType::A => self.a = None,
-            RecordType::AAAA => self.aaaa = None,
-            _ => {}
+            LocalRecordType::A => self.a = None,
+            LocalRecordType::AAAA => self.aaaa = None,
         }
     }
 
@@ -63,7 +61,7 @@ impl WildcardAnswer {
 pub struct LocalWildcardResolver {
     inner: Arc<dyn DnsResolver>,
     /// Live index of covered suffix → answers.
-    pub map: Arc<WildcardMap>,
+    map: Arc<WildcardMap>,
 }
 
 impl LocalWildcardResolver {
@@ -76,40 +74,26 @@ impl LocalWildcardResolver {
     /// records. Exact records are left to the permanent cache.
     pub fn map_from_local_records(
         records: &[LocalDnsRecord],
-        default_domain: &Option<String>,
+        default_domain: Option<&str>,
     ) -> Arc<WildcardMap> {
         let map: WildcardMap = DashMap::with_hasher(FxBuildHasher);
 
-        for record in records {
+        for record in records.iter().filter(|r| r.is_wildcard()) {
             let Some(suffix) = record.wildcard_suffix(default_domain) else {
-                if record.is_wildcard() {
-                    warn!(
-                        hostname = %record.hostname,
-                        "Wildcard record has no domain to anchor it, skipping"
-                    );
-                }
-                continue;
-            };
-
-            let Ok(address) = record.ip.parse::<IpAddr>() else {
                 warn!(
                     hostname = %record.hostname,
-                    ip = %record.ip,
-                    "Wildcard record: invalid IP address, skipping"
+                    "Wildcard record has no domain to anchor it, skipping"
                 );
                 continue;
             };
 
-            let Ok(record_type) = record.record_type.parse::<RecordType>() else {
-                warn!(
-                    hostname = %record.hostname,
-                    record_type = %record.record_type,
-                    "Wildcard record: unrecognised record type, skipping"
-                );
-                continue;
-            };
-
-            register_in(&map, &suffix, record_type, address, record.ttl_or_default());
+            register_in(
+                &map,
+                &suffix,
+                record.record_type,
+                record.ip,
+                record.ttl_or_default(),
+            );
         }
 
         if !map.is_empty() {
@@ -154,11 +138,11 @@ impl WildcardRegistry {
 }
 
 impl WildcardRecordRegistry for WildcardRegistry {
-    fn register(&self, suffix: &str, record_type: RecordType, address: IpAddr, ttl: u32) {
+    fn register(&self, suffix: &str, record_type: LocalRecordType, address: IpAddr, ttl: u32) {
         register_in(&self.map, suffix, record_type, address, ttl);
     }
 
-    fn unregister(&self, suffix: &str, record_type: RecordType) {
+    fn unregister(&self, suffix: &str, record_type: LocalRecordType) {
         let key = suffix.to_ascii_lowercase();
 
         let emptied = match self.map.get_mut(key.as_str()) {
@@ -228,22 +212,12 @@ impl DnsResolver for LocalWildcardResolver {
 fn register_in(
     map: &WildcardMap,
     suffix: &str,
-    record_type: RecordType,
+    record_type: LocalRecordType,
     address: IpAddr,
     ttl: u32,
 ) {
-    let type_matches = matches!(
-        (record_type, address),
-        (RecordType::A, IpAddr::V4(_)) | (RecordType::AAAA, IpAddr::V6(_))
-    );
-
-    if !type_matches {
-        warn!(
-            suffix,
-            %record_type,
-            %address,
-            "Wildcard record: A needs IPv4 and AAAA needs IPv6, skipping"
-        );
+    if let Err(reason) = LocalDnsRecord::validate_address(record_type, address) {
+        warn!(suffix, %reason, "Wildcard record skipped");
         return;
     }
 
@@ -260,6 +234,7 @@ fn local_answer(addresses: Vec<IpAddr>, ttl: Option<u32>) -> DnsResolution {
         // guard from treating our own LAN address as an attack, and the query
         // log from reporting the answer as an upstream one.
         local_dns: true,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,

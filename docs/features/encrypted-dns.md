@@ -69,12 +69,12 @@ Ferrous DNS can serve DNS-over-TLS, DNS-over-HTTPS, and DNS-over-QUIC to clients
 The three protocols terminate TLS differently:
 
 - **DoT** is terminated by Ferrous DNS itself, using the certificate and key in `[server.encrypted_dns]`.
-- **DoH** is served as plain HTTP and expects a **reverse proxy** (nginx, Traefik, Caddy) in front of it to terminate TLS. The DoH endpoint reads `X-Real-IP` / `X-Forwarded-For` for correct client attribution, so it must sit behind a proxy that sets those headers.
+- **DoH** is served as plain HTTP and expects a **reverse proxy** (nginx, Traefik, Caddy) in front of it to terminate TLS, or `[server.web_tls]` when `/dns-query` is co-hosted on `web_port`. Queries are attributed to the connecting address; the proxy's `X-Forwarded-For` / `X-Real-IP` are honoured only when it is listed in `[server].trusted_proxies` (loopback by default). See [DoH client identity](../configuration/server.md#doh-client-identity).
 - **DoQ** is terminated by Ferrous DNS itself, same as DoT — QUIC's TLS 1.3 handshake uses the same certificate and key, just over UDP instead of TCP.
 
 ### Requirements
 
-- A TLS certificate and private key in PEM format (used by the DoT listener)
+- A TLS certificate and private key in PEM format (used by the DoT and DoQ listeners; DoH does not need one)
 - A reverse proxy terminating HTTPS for DoH
 - Open firewall ports (TCP/853 for DoT, UDP/853 for DoQ — no collision since they're different transports; on the proxy, 443 or custom for DoH)
 
@@ -104,7 +104,7 @@ doh_bind_address = "127.0.0.1"      # DoH reachable only from the local reverse 
 `doh_bind_address` is ignored when `doh_port` is omitted, since `/dns-query` is then co-hosted on `web_port`. See [Per-listener bind addresses](../configuration/server.md#per-listener-bind) for the details.
 
 !!! note "DoH TLS termination"
-    `tls_cert_path` / `tls_key_path` apply to the DoT listener. The DoH endpoint (`/dns-query`) is served over plain HTTP — put it behind a reverse proxy that terminates TLS and forwards to `doh_port` (or to `web_port` if `doh_port` is omitted). The cert/key must still load successfully for DoH to start.
+    `tls_cert_path` / `tls_key_path` apply to the DoT and DoQ listeners only. The DoH endpoint (`/dns-query`) is served over plain HTTP — put it behind a reverse proxy that terminates TLS and forwards to `doh_port` (or to `web_port` if `doh_port` is omitted). DoH starts whether or not those files exist.
 
 ### Self-Signed Certificate
 

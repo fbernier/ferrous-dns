@@ -150,16 +150,8 @@ fn read_loadavg() -> [f64; 3] {
     std::fs::read_to_string("/proc/loadavg")
         .ok()
         .and_then(|s| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            if parts.len() >= 3 {
-                Some([
-                    parts[0].parse().unwrap_or(0.0),
-                    parts[1].parse().unwrap_or(0.0),
-                    parts[2].parse().unwrap_or(0.0),
-                ])
-            } else {
-                None
-            }
+            let mut loads = s.split_whitespace().map(|v| v.parse().unwrap_or(0.0));
+            Some([loads.next()?, loads.next()?, loads.next()?])
         })
         .unwrap_or([0.0; 3])
 }
@@ -188,22 +180,23 @@ fn parse_kb_value(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// `(total, used)` bytes of the root filesystem.
+#[cfg(target_os = "linux")]
 fn read_disk_usage() -> (u64, u64) {
-    // Use statvfs for root filesystem.
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        use std::mem::MaybeUninit;
-        let path = CString::new("/").unwrap();
-        let mut stat = MaybeUninit::<libc::statvfs>::uninit();
-        // SAFETY: statvfs is a standard POSIX syscall, path is valid C string.
-        let ret = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
-        if ret == 0 {
-            let stat = unsafe { stat.assume_init() };
-            let total = stat.f_blocks * stat.f_frsize;
-            let free = stat.f_bfree * stat.f_frsize;
-            return (total, total.saturating_sub(free));
-        }
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the path is a NUL-terminated literal and `stat` is writable
+    // storage for exactly one `statvfs`, which is all the call writes.
+    if unsafe { libc::statvfs(c"/".as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return (0, 0);
     }
+    // SAFETY: statvfs returned 0, so it initialised every field of `stat`.
+    let stat = unsafe { stat.assume_init() };
+    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
+    let free = stat.f_bfree.saturating_mul(stat.f_frsize);
+    (total, total.saturating_sub(free))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_disk_usage() -> (u64, u64) {
     (0, 0)
 }

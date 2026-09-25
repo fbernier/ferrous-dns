@@ -5,11 +5,17 @@
 //! renders them as an OpenMetrics/Prometheus exposition. No DNS hot-path
 //! instrumentation and no global recorder — the registry is rebuilt per scrape.
 
-use axum::{extract::State, http::header, response::IntoResponse, routing::get, Router};
-use ferrous_dns_application::ports::{
-    AggregateStatus, CacheMetricsSnapshot, IpFamily, UpstreamGroupHealth, UpstreamStatus,
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
 };
-use ferrous_dns_domain::QueryStats;
+use ferrous_dns_application::ports::{
+    AggregateStatus, CacheMetricsSnapshot, UpstreamGroupHealth, UpstreamStatus,
+};
+use ferrous_dns_domain::{DomainError, QueryStats};
 use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -17,7 +23,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::state::AppState;
 
@@ -44,14 +50,6 @@ struct TypeLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct BuildLabels {
     version: String,
-}
-
-fn ip_family_str(family: IpFamily) -> &'static str {
-    match family {
-        IpFamily::Ipv4 => "ipv4",
-        IpFamily::Ipv6 => "ipv6",
-        IpFamily::Unknown => "unknown",
-    }
 }
 
 /// Maps an aggregate status to a 1/0 "up" value, or `None` when unknown
@@ -83,10 +81,9 @@ pub fn render_metrics(
     query_stats: Option<&QueryStats>,
     blocklist_domains: usize,
     version: &str,
-) -> String {
+) -> Result<String, DomainError> {
     let mut registry = Registry::with_prefix("ferrousdns");
 
-    // --- Cache counters (monotonic since process start) ---
     let cache_counters: [(&str, &str, u64); 12] = [
         ("cache_hits", "DNS cache hits", cache.hits),
         ("cache_misses", "DNS cache misses", cache.misses),
@@ -139,7 +136,6 @@ pub fn render_metrics(
         registry.register(name, help, counter);
     }
 
-    // --- Cache gauges ---
     let cache_entries = Gauge::<i64>::default();
     cache_entries.set(cache.total_entries as i64);
     registry.register(
@@ -156,7 +152,6 @@ pub fn render_metrics(
         cache_hit_rate,
     );
 
-    // --- Upstream health gauges (per resolved endpoint) ---
     let upstream_up = Family::<UpstreamLabels, Gauge>::default();
     let upstream_latency = Family::<UpstreamLabels, Gauge>::default();
     let upstream_failures = Family::<UpstreamLabels, Gauge>::default();
@@ -176,7 +171,7 @@ pub fn render_metrics(
                 pool: group.pool_name.clone(),
                 server: group.address.clone(),
                 address: ep.address.clone(),
-                family: ip_family_str(ep.family).to_string(),
+                family: ep.family.as_str().to_string(),
             };
             if let Some(up) = endpoint_up(ep.status) {
                 upstream_up.get_or_create(&labels).set(up);
@@ -205,7 +200,6 @@ pub fn render_metrics(
         upstream_failures,
     );
 
-    // --- Blocklist size ---
     let blocklist = Gauge::<i64>::default();
     blocklist.set(blocklist_domains as i64);
     registry.register(
@@ -214,7 +208,6 @@ pub fn render_metrics(
         blocklist,
     );
 
-    // --- Query-log–derived gauges (24h rolling window) ---
     if let Some(stats) = query_stats {
         let windowed: [(&str, &str, i64); 7] = [
             (
@@ -301,7 +294,6 @@ pub fn render_metrics(
         );
     }
 
-    // --- Build info ---
     let build = Family::<BuildLabels, Gauge>::default();
     build
         .get_or_create(&BuildLabels {
@@ -311,12 +303,12 @@ pub fn render_metrics(
     registry.register("build_info", "Build information", build);
 
     let mut buffer = String::new();
-    encode(&mut buffer, &registry).expect("encoding metrics into a String cannot fail");
-    buffer
+    encode(&mut buffer, &registry).map_err(|e| DomainError::IoError(e.to_string()))?;
+    Ok(buffer)
 }
 
 #[instrument(skip(state), name = "api_get_metrics")]
-async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn metrics_handler(State(state): State<AppState>) -> Response {
     let cache = state.dns.cache.cache_metrics_snapshot();
     let upstreams = state.dns.upstream_health.get_grouped_upstream_health();
     let blocklist_domains = state.blocking.get_block_filter_stats.execute();
@@ -332,7 +324,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     debug!("Rendering Prometheus metrics");
-    let body = render_metrics(
+    let rendered = render_metrics(
         &cache,
         &upstreams,
         query_stats.as_ref(),
@@ -340,7 +332,13 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         env!("CARGO_PKG_VERSION"),
     );
 
-    ([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], body)
+    match rendered {
+        Ok(body) => ([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], body).into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to encode Prometheus metrics");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Router exposing a bare, unauthenticated `GET /metrics`.

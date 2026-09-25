@@ -14,7 +14,7 @@ pub enum RateUnit {
 }
 
 impl RateUnit {
-    pub fn to_seconds(&self) -> i64 {
+    fn to_seconds(self) -> i64 {
         match self {
             RateUnit::Second => 1,
             RateUnit::Minute => 60,
@@ -22,7 +22,7 @@ impl RateUnit {
         }
     }
 
-    pub fn suffix(&self) -> &'static str {
+    fn suffix(self) -> &'static str {
         match self {
             RateUnit::Second => "q/s",
             RateUnit::Minute => "q/m",
@@ -30,7 +30,7 @@ impl RateUnit {
         }
     }
 
-    fn index(&self) -> usize {
+    fn index(self) -> usize {
         match self {
             RateUnit::Second => 0,
             RateUnit::Minute => 1,
@@ -68,30 +68,14 @@ impl GetQueryRateUseCase {
     pub async fn execute(&self, unit: RateUnit) -> Result<QueryRate, DomainError> {
         let slot = &self.cache[unit.index()];
 
-        {
-            let guard = slot.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref cached) = *guard {
-                if cached.computed_at.elapsed() < RATE_CACHE_TTL {
-                    return Ok(QueryRate {
-                        queries: cached.queries,
-                        rate: cached.rate.clone(),
-                    });
-                }
-            }
+        if let Some(rate) = fresh(slot) {
+            return Ok(rate);
         }
 
         let _lock = self.refresh_locks[unit.index()].lock().await;
 
-        {
-            let guard = slot.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref cached) = *guard {
-                if cached.computed_at.elapsed() < RATE_CACHE_TTL {
-                    return Ok(QueryRate {
-                        queries: cached.queries,
-                        rate: cached.rate.clone(),
-                    });
-                }
-            }
+        if let Some(rate) = fresh(slot) {
+            return Ok(rate);
         }
 
         let seconds = unit.to_seconds();
@@ -112,6 +96,17 @@ impl GetQueryRateUseCase {
             rate: formatted_rate,
         })
     }
+}
+
+fn fresh(slot: &RwLock<Option<CachedRate>>) -> Option<QueryRate> {
+    let guard = slot.read().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .filter(|cached| cached.computed_at.elapsed() < RATE_CACHE_TTL)
+        .map(|cached| QueryRate {
+            queries: cached.queries,
+            rate: cached.rate.clone(),
+        })
 }
 
 fn format_rate(count: u64, suffix: &str) -> String {

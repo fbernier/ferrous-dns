@@ -1,25 +1,29 @@
+use super::require_group;
 use ferrous_dns_domain::DomainError;
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 
-use crate::ports::GroupRepository;
+use crate::ports::{BlockFilterEnginePort, GroupRepository};
 
 pub struct DeleteGroupUseCase {
     group_repo: Arc<dyn GroupRepository>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl DeleteGroupUseCase {
-    pub fn new(group_repo: Arc<dyn GroupRepository>) -> Self {
-        Self { group_repo }
+    pub fn new(
+        group_repo: Arc<dyn GroupRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
+    ) -> Self {
+        Self {
+            group_repo,
+            block_filter_engine,
+        }
     }
 
     #[instrument(skip(self))]
     pub async fn execute(&self, id: i64) -> Result<(), DomainError> {
-        let group = self
-            .group_repo
-            .get_by_id(id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(id))?;
+        let group = require_group(self.group_repo.as_ref(), id).await?;
 
         if group.is_default {
             return Err(DomainError::ProtectedGroupCannotBeDeleted);
@@ -37,6 +41,11 @@ impl DeleteGroupUseCase {
             name = %group.name,
             "Group deleted successfully"
         );
+
+        // The delete cascades to managed domains and client subnets the engine still holds.
+        if let Err(e) = self.block_filter_engine.reload().await {
+            error!(error = %e, "Failed to reload block filter after group deletion");
+        }
 
         Ok(())
     }

@@ -3,7 +3,7 @@ use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::{
-    CachedData, DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
+    CachedData, DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy,
 };
 use hickory_proto::rr::rdata::SOA;
 use hickory_proto::rr::{Name, RData, Record};
@@ -47,6 +47,7 @@ impl DnsResolver for MockNegativeResolver {
             addresses: Arc::new(vec![]),
             cache_hit: false,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: None,
             cname_chain: Arc::from(vec![]),
             upstream_server: None,
@@ -62,10 +63,8 @@ fn make_cache() -> Arc<DnsCache> {
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries: 1000,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 2.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -88,7 +87,6 @@ async fn test_soa_ttl_used_when_present() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -100,7 +98,7 @@ async fn test_soa_ttl_used_when_present() {
 
     let cached = cache.get(&Arc::from("nxdomain.example.com"), &RecordType::A);
     assert!(cached.is_some(), "Negative response should be cached");
-    let (data, _, remaining_ttl) = cached.unwrap();
+    let (data, _, remaining_ttl, _) = cached.unwrap();
     assert!(matches!(data, CachedData::NegativeResponse));
     let ttl = remaining_ttl.unwrap_or(0);
     assert!(
@@ -119,7 +117,6 @@ async fn test_soa_ttl_below_min_clamped_to_300() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -130,7 +127,7 @@ async fn test_soa_ttl_below_min_clamped_to_300() {
     let _ = resolver.resolve(&query).await;
 
     let cached = cache.get(&Arc::from("low-ttl.example.com"), &RecordType::A);
-    let (_, _, remaining_ttl) = cached.expect("Should be cached");
+    let (_, _, remaining_ttl, _) = cached.expect("Should be cached");
     let ttl = remaining_ttl.unwrap_or(0);
     assert!(
         (290..=300).contains(&ttl),
@@ -148,7 +145,6 @@ async fn test_soa_ttl_above_max_clamped_to_3600() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -159,7 +155,7 @@ async fn test_soa_ttl_above_max_clamped_to_3600() {
     let _ = resolver.resolve(&query).await;
 
     let cached = cache.get(&Arc::from("high-ttl.example.com"), &RecordType::A);
-    let (_, _, remaining_ttl) = cached.expect("Should be cached");
+    let (_, _, remaining_ttl, _) = cached.expect("Should be cached");
     let ttl = remaining_ttl.unwrap_or(0);
     assert!(
         (3590..=3600).contains(&ttl),
@@ -178,7 +174,6 @@ async fn test_fallback_to_tracker_when_no_soa() {
         inner,
         Arc::clone(&cache) as Arc<dyn DnsCacheAccess>,
         3600,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -193,6 +188,6 @@ async fn test_fallback_to_tracker_when_no_soa() {
         cached.is_some(),
         "Should still cache even without SOA using tracker fallback"
     );
-    let (data, _, _) = cached.unwrap();
+    let (data, _, _, _) = cached.unwrap();
     assert!(matches!(data, CachedData::NegativeResponse));
 }

@@ -8,7 +8,10 @@ use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    dto::{CreateWhitelistSourceRequest, UpdateWhitelistSourceRequest, WhitelistSourceResponse},
+    dto::{
+        source_common::{create_group_ids, update_group_ids},
+        CreateWhitelistSourceRequest, UpdateWhitelistSourceRequest, WhitelistSourceResponse,
+    },
     errors::ApiError,
     state::AppState,
 };
@@ -68,12 +71,7 @@ async fn get_whitelist_source_by_id(
         .get_whitelist_sources
         .get_by_id(id)
         .await?
-        .ok_or_else(|| {
-            ApiError(DomainError::NotFound(format!(
-                "Whitelist source {} not found",
-                id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::WhitelistSourceNotFound(id)))?;
     Ok(Json(WhitelistSourceResponse::from_source(source)))
 }
 
@@ -92,7 +90,7 @@ async fn create_whitelist_source(
     State(state): State<AppState>,
     Json(req): Json<CreateWhitelistSourceRequest>,
 ) -> Result<(StatusCode, Json<WhitelistSourceResponse>), ApiError> {
-    let group_ids = req.resolved_group_ids(1);
+    let group_ids = create_group_ids(req.group_ids, req.group_id, 1);
     let enabled = req.enabled.unwrap_or(true);
 
     let source = state
@@ -124,7 +122,7 @@ async fn update_whitelist_source(
     Path(id): Path<i64>,
     Json(req): Json<UpdateWhitelistSourceRequest>,
 ) -> Result<Json<WhitelistSourceResponse>, ApiError> {
-    let group_ids = req.resolved_group_ids();
+    let group_ids = update_group_ids(req.group_ids, req.group_id);
     let source = state
         .blocking
         .update_whitelist_source

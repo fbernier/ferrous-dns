@@ -1,40 +1,19 @@
 use super::rollup::minute_bucket;
 use chrono::Utc;
-use ferrous_dns_domain::{BlockSource, ClientProtocol, QueryLog, QuerySource, RecordType};
+use ferrous_dns_domain::{
+    BlockSource, ClientProtocol, DnssecStatus, QueryLog, QuerySource, RecordType,
+};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use std::net::IpAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 
 /// First rollup bucket of a window ending now. Rollup-backed reads are
 /// minute-aligned: they include the whole minute the window starts in.
+/// Saturates at the epoch so an absurd window can't overflow the subtraction.
 pub fn window_start_bucket(hours: f32) -> i64 {
-    minute_bucket(Utc::now().timestamp() - (hours * 3_600.0) as i64)
-}
-
-pub fn hours_ago_cutoff(hours: f32) -> String {
-    let ms = (hours * 3_600_000.0) as i64;
-    (Utc::now() - chrono::Duration::milliseconds(ms))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
-pub fn seconds_ago_cutoff(seconds: i64) -> String {
-    (Utc::now() - chrono::Duration::seconds(seconds))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
-fn to_static_dnssec(s: &str) -> Option<&'static str> {
-    match s {
-        "Secure" => Some("Secure"),
-        "Insecure" => Some("Insecure"),
-        "Bogus" => Some("Bogus"),
-        "Indeterminate" => Some("Indeterminate"),
-        "Unknown" => Some("Unknown"),
-        _ => None,
-    }
+    let window_secs = (hours * 3_600.0) as i64;
+    minute_bucket(Utc::now().timestamp().saturating_sub(window_secs).max(0))
 }
 
 fn to_static_response_status(s: &str) -> Option<&'static str> {
@@ -68,40 +47,23 @@ pub fn row_to_query_log(row: SqliteRow) -> Option<QueryLog> {
     let record_type_str: String = row.get("record_type");
     let domain_str: String = row.get("domain");
 
-    let dnssec_status: Option<&'static str> = row
+    let dnssec_status: Option<DnssecStatus> = row
         .get::<Option<String>, _>("dnssec_status")
-        .and_then(|s| to_static_dnssec(&s));
+        .and_then(|s| s.parse().ok());
     let response_status: Option<&'static str> = row
         .get::<Option<String>, _>("response_status")
         .and_then(|s| to_static_response_status(&s));
 
-    let query_source_str: String = row
+    let query_source = row
         .get::<Option<String>, _>("query_source")
-        .unwrap_or_else(|| "client".to_string());
-    let query_source = QuerySource::from_str(&query_source_str).unwrap_or(QuerySource::Client);
-
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(QuerySource::Client);
     let protocol: Option<ClientProtocol> = row
-        .try_get::<Option<String>, _>("protocol")
-        .ok()
-        .flatten()
-        .and_then(|s| ClientProtocol::from_str(&s).ok());
-
-    let block_source: Option<BlockSource> =
-        row.get::<Option<String>, _>("block_source")
-            .and_then(|s| match s.as_str() {
-                "blocklist" => Some(BlockSource::Blocklist),
-                "managed_domain" => Some(BlockSource::ManagedDomain),
-                "regex_filter" => Some(BlockSource::RegexFilter),
-                "cname_cloaking" => Some(BlockSource::CnameCloaking),
-                "schedule" => Some(BlockSource::Schedule),
-                "dns_rebinding" => Some(BlockSource::DnsRebinding),
-                "rate_limit" => Some(BlockSource::RateLimit),
-                "dns_tunneling" => Some(BlockSource::DnsTunneling),
-                "nxdomain_hijack" => Some(BlockSource::NxdomainHijack),
-                "response_ip_filter" => Some(BlockSource::ResponseIpFilter),
-                "dga_detection" => Some(BlockSource::DgaDetection),
-                _ => None,
-            });
+        .get::<Option<String>, _>("protocol")
+        .and_then(|s| s.parse().ok());
+    let block_source: Option<BlockSource> = row
+        .get::<Option<String>, _>("block_source")
+        .and_then(|s| s.parse().ok());
 
     Some(QueryLog {
         id: Some(row.get("id")),
@@ -118,21 +80,17 @@ pub fn row_to_query_log(row: SqliteRow) -> Option<QueryLog> {
         cache_hit: row.get::<i64, _>("cache_hit") != 0,
         cache_refresh: row.get::<i64, _>("cache_refresh") != 0,
         dnssec_status,
-        dns64_synthesized: row
-            .try_get::<i64, _>("dns64_synthesized")
-            .map(|v| v != 0)
-            .unwrap_or(false),
-        answers: parse_answers(row.try_get::<Option<String>, _>("answers").ok().flatten()),
+        dns64_synthesized: row.get::<i64, _>("dns64_synthesized") != 0,
+        answers: parse_answers(row.get("answers")),
         upstream_server: row
             .get::<Option<String>, _>("upstream_server")
             .map(|s| Arc::from(s.as_str())),
         upstream_pool: row
-            .try_get::<Option<String>, _>("upstream_pool")
-            .ok()
-            .flatten()
+            .get::<Option<String>, _>("upstream_pool")
             .map(|s| Arc::from(s.as_str())),
         response_status,
-        timestamp: Some(row.get("created_at")),
+        // `datetime()` yields NULL for an unparseable stored value.
+        timestamp: row.get("created_at"),
         query_source,
         protocol,
         group_id: row.get("group_id"),

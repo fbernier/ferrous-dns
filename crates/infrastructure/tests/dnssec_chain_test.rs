@@ -1,96 +1,39 @@
-use ferrous_dns_domain::{UpstreamPool, UpstreamStrategy};
+use ferrous_dns_domain::{DnssecStatus, UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::dnssec::trust_anchor::TrustAnchorStore;
-use ferrous_dns_infrastructure::dns::dnssec::{ChainVerifier, DnskeyRecord, DnssecCache};
+use ferrous_dns_infrastructure::dns::dnssec::{ChainVerifier, DnssecCache};
 use ferrous_dns_infrastructure::dns::PoolManager;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 
-fn make_chain_verifier() -> ChainVerifier {
+#[tokio::test]
+async fn chain_walk_honours_the_configured_upstream_timeout() {
+    // Receives queries but never answers, so every lookup runs into the timeout.
+    let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let pool = UpstreamPool {
         name: "test".into(),
         strategy: UpstreamStrategy::Parallel,
         priority: 1,
-        servers: vec!["udp://127.0.0.1:5353".into()],
+        servers: vec![format!("udp://{}", blackhole.local_addr().unwrap())],
         weight: None,
     };
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let pm = Arc::new(rt.block_on(PoolManager::new(vec![pool], None)).unwrap());
-    ChainVerifier::new(pm, TrustAnchorStore::empty(), Arc::new(DnssecCache::new()))
-}
-
-#[test]
-fn test_get_zone_keys_returns_none_on_empty_chain() {
-    let verifier = make_chain_verifier();
-    assert!(verifier.get_zone_keys("example.com.").is_none());
-    assert!(verifier.get_zone_keys(".").is_none());
-    assert!(verifier.get_zone_keys("com.").is_none());
-}
-
-#[test]
-fn test_get_zone_keys_returns_inserted_keys() {
-    let mut verifier = make_chain_verifier();
-    let key = DnskeyRecord {
-        flags: 256,
-        protocol: 3,
-        algorithm: 15,
-        public_key: vec![0u8; 32],
-    };
-    verifier.insert_zone_keys_for_test("example.com.", vec![key.clone()]);
-
-    let stored = verifier.get_zone_keys("example.com.").unwrap();
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0], key);
-}
-
-#[test]
-fn test_get_zone_keys_returns_ksk_and_zsk_after_rrsig_verification() {
-    let mut verifier = make_chain_verifier();
-    let ksk = DnskeyRecord {
-        flags: 257,
-        protocol: 3,
-        algorithm: 8,
-        public_key: vec![1, 2, 3, 4],
-    };
-    let zsk = DnskeyRecord {
-        flags: 256,
-        protocol: 3,
-        algorithm: 8,
-        public_key: vec![5, 6, 7, 8],
-    };
-    verifier.insert_zone_keys_for_test("example.com.", vec![ksk.clone(), zsk.clone()]);
-
-    let stored = verifier.get_zone_keys("example.com.").unwrap();
-    assert_eq!(stored.len(), 2);
-    assert!(
-        stored.iter().any(|k| k.flags == 257),
-        "KSK should be stored"
+    let pm = Arc::new(PoolManager::new(vec![pool], None).await.unwrap());
+    let mut verifier = ChainVerifier::new(
+        pm,
+        TrustAnchorStore::new(),
+        Arc::new(DnssecCache::new()),
+        200,
     );
+
+    let started = Instant::now();
+    let status = verifier.verify_chain("example.com.").await;
+
+    assert_eq!(status, DnssecStatus::Indeterminate);
     assert!(
-        stored.iter().any(|k| k.flags == 256),
-        "ZSK should be stored"
+        started.elapsed() < Duration::from_secs(3),
+        "walk took {:?}; the 200 ms timeout was not applied",
+        started.elapsed()
     );
-}
-
-#[test]
-fn test_get_zone_keys_multiple_zones_are_independent() {
-    let mut verifier = make_chain_verifier();
-    let key_a = DnskeyRecord {
-        flags: 257,
-        protocol: 3,
-        algorithm: 8,
-        public_key: vec![1],
-    };
-    let key_b = DnskeyRecord {
-        flags: 256,
-        protocol: 3,
-        algorithm: 15,
-        public_key: vec![0u8; 32],
-    };
-    verifier.insert_zone_keys_for_test("com.", vec![key_a]);
-    verifier.insert_zone_keys_for_test("example.com.", vec![key_b]);
-
-    assert_eq!(verifier.get_zone_keys("com.").unwrap().len(), 1);
-    assert_eq!(verifier.get_zone_keys("example.com.").unwrap().len(), 1);
-    assert!(verifier.get_zone_keys("net.").is_none());
 }
 
 #[test]

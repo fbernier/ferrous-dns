@@ -5,12 +5,14 @@
 
 use ferrous_dns_application::ports::QueryLogRepository;
 use ferrous_dns_domain::config::DatabaseConfig;
-use ferrous_dns_domain::{BlockSource, QueryLog, QuerySource, RecordType};
+use ferrous_dns_domain::{BlockSource, DnssecStatus, QueryLog, QuerySource, RecordType};
 use ferrous_dns_infrastructure::repositories::query_log_repository::SqliteQueryLogRepository;
-use sqlx::sqlite::SqlitePoolOptions;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[path = "support/db.rs"]
+mod db;
 
 const ROLLUP_TABLES: [&str; 4] = [
     "query_log_minute",
@@ -58,11 +60,10 @@ fn random_query(rng: &mut fastrand::Rng) -> QueryLog {
             rng,
             &[
                 None,
-                Some("Secure"),
-                Some("Insecure"),
-                Some("Bogus"),
-                Some("Indeterminate"),
-                Some("Unknown"),
+                Some(DnssecStatus::Secure),
+                Some(DnssecStatus::Insecure),
+                Some(DnssecStatus::Bogus),
+                Some(DnssecStatus::Indeterminate),
             ],
         ),
         dns64_synthesized: rng.u8(..8) == 0,
@@ -117,11 +118,7 @@ async fn symmetric_difference(pool: &sqlx::SqlitePool, a: &str, b: &str) -> i64 
 
 #[tokio::test]
 async fn writer_rollups_equal_backfill_over_raw_rows() {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let pool = db::migrated_pool().await;
 
     let cfg = DatabaseConfig {
         query_log_max_batch_size: 97,

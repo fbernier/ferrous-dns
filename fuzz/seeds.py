@@ -27,11 +27,16 @@ def name_wire(labels) -> bytes:
     return out + b"\x00"
 
 
-def opt_record(payload: int = 4096, do_bit: bool = False, version: int = 0) -> bytes:
+def opt_record(payload: int = 4096, do_bit: bool = False, version: int = 0,
+               options: bytes = b"") -> bytes:
     flags = 0x8000 if do_bit else 0x0000
     # root owner name, TYPE=41, CLASS=UDP payload size, TTL=(rcode, version,
-    # flags), RDLENGTH=0
-    return b"\x00" + struct.pack(">HHBBHH", 41, payload, 0, version, flags, 0)
+    # flags), RDLENGTH, then the options
+    return b"\x00" + struct.pack(">HHBBHH", 41, payload, 0, version, flags, len(options)) + options
+
+
+def edns_option(code: int, data: bytes) -> bytes:
+    return struct.pack(">HH", code, len(data)) + data
 
 
 def query(labels, qtype: int, qclass: int = 1, edns=None, qid: int = 0x1234) -> bytes:
@@ -65,6 +70,16 @@ write("query_fast_path", "a_edns_512", query(EXAMPLE, 1, edns=opt_record(payload
 write("query_fast_path", "a_edns_max", query(EXAMPLE, 1, edns=opt_record(payload=65535)))
 write("query_fast_path", "a_edns_do_bit", query(EXAMPLE, 1, edns=opt_record(do_bit=True)))
 write("query_fast_path", "a_edns_bad_version", query(EXAMPLE, 1, edns=opt_record(version=1)))
+write("query_fast_path", "a_edns_client_cookie",
+      query(EXAMPLE, 1, edns=opt_record(options=edns_option(10, bytes(range(1, 9))))))
+write("query_fast_path", "txt_edns_full_cookie_do",
+      query([b"example", b"com"], 16,
+            edns=opt_record(do_bit=True, options=edns_option(10, bytes(range(1, 25))))))
+write("query_fast_path", "a_edns_padding_then_cookie",
+      query(EXAMPLE, 1, edns=opt_record(options=edns_option(12, bytes(3))
+                                          + edns_option(10, bytes(range(1, 9))))))
+write("query_fast_path", "a_edns_option_overruns_rdata",
+      query(EXAMPLE, 1, edns=opt_record(options=struct.pack(">HH", 10, 8) + bytes(4))))
 write("query_fast_path", "root_a", query([], 1))
 write("query_fast_path", "a_uppercase", query([b"WwW", b"ExAmPlE", b"CoM"], 1))
 write("query_fast_path", "a_idn_alabel", query([b"xn--bcher-kva", b"de"], 1))
@@ -96,6 +111,39 @@ write("response_lowercase_0x20", "nxdomain",
       + name_wire(EXAMPLE) + struct.pack(">HH", 1, 1))
 write("response_lowercase_0x20", "truncated_rdata",
       response(EXAMPLE, 1, a_record(b"\x5d\xb8\xd8\x22")[:-2], 1))
+
+# ----------------------------------------------------------------- upstream_relay
+# The ID doubles as the relay's knobs (see the target); 0 swaps in our OPT.
+def upstream(qtype: int, answers: bytes, additional: bytes, an: int, ar: int,
+             flags: int = 0x8180) -> bytes:
+    header = struct.pack(">HHHHHH", 0, flags, 1, an, 0, ar)
+    return header + name_wire([b"example", b"com"]) + struct.pack(">HH", qtype, 1) + answers + additional
+
+
+COOKIE_OPT = opt_record(1232, options=edns_option(10, bytes(24)))
+MX = b"\xc0\x0c" + struct.pack(">HHIHH", 15, 1, 300, 7, 10) + b"\x02mx\xc0\x0c"
+GLUE = b"\x02mx\xc0\x0c" + struct.pack(">HHIH", 1, 1, 300, 4) + b"\xc0\x00\x02\x19"
+write("upstream_relay", "txt_opt_cookie",
+      upstream(16, b"\xc0\x0c" + struct.pack(">HHIH", 16, 1, 300, 12) + b"\x0bv=spf1 -all",
+               COOKIE_OPT, an=1, ar=1))
+write("upstream_relay", "mx_glue_opt_last", upstream(15, MX, GLUE + COOKIE_OPT, an=1, ar=2))
+write("upstream_relay", "mx_glue_opt_first", upstream(15, MX, COOKIE_OPT + GLUE, an=1, ar=2))
+write("upstream_relay", "badcookie_extended_rcode",
+      upstream(1, b"", b"\x00" + struct.pack(">HHBBHH", 41, 1232, 1, 0, 0, 0), an=0, ar=1,
+               flags=0x8187))
+# TSIG and SIG(0) must stay last (RFC 8945 §5.1, RFC 2931 §3.1); the relay drops them.
+# TSIG: key name, class ANY, hmac-sha256, 32-byte MAC.
+TSIG_RDATA = (name_wire([b"hmac-sha256"]) + struct.pack(">HIHH", 0, 0x6700_0000, 300, 32)
+              + bytes(32) + struct.pack(">HHH", 0, 0, 0))
+write("upstream_relay", "tsig_last",
+      upstream(1, b"", name_wire([b"key"]) + struct.pack(">HHIH", 250, 255, 0, len(TSIG_RDATA))
+               + TSIG_RDATA, an=0, ar=1))
+# SIG(0): type covered 0, algo 13, 0 labels, TTL 0, expiry, inception, tag, signer, signature.
+SIG0_RDATA = (struct.pack(">HBBIIIH", 0, 13, 0, 0, 0x6800_0000, 0x6700_0000, 0x1234)
+              + name_wire([b"example", b"com"]) + bytes(64))
+write("upstream_relay", "sig0_last",
+      upstream(1, b"", b"\x00" + struct.pack(">HHIH", 24, 255, 0, len(SIG0_RDATA)) + SIG0_RDATA,
+               an=0, ar=1))
 
 # ------------------------------------------------------------------ dnssec_records
 # RRSIG rdata: type covered A, algo 13, 2 labels, TTL, expiry, inception, tag,

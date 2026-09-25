@@ -17,7 +17,7 @@ fn make_use_case(
         Arc::new(MockBlockFilterEngine::new()),
         Arc::new(MockQueryLogRepository::new()),
     )
-    .with_rebinding_protection(true, local_domain, allowlist)
+    .with_rebinding_protection(local_domain, allowlist)
 }
 
 fn resolution_with_ip(ip: IpAddr) -> DnsResolution {
@@ -299,23 +299,25 @@ async fn test_allowlist_match_is_case_insensitive() {
 }
 
 #[tokio::test]
-async fn test_protection_disabled_does_not_block() {
+async fn test_cached_private_answer_for_public_domain_is_blocked() {
+    let private = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
     let resolver = MockDnsResolver::new();
+    resolver.set_cached_response("evil.com", DnsResolution::new(vec![private], true));
     resolver
-        .set_response(
-            "evil.com",
-            resolution_with_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
-        )
+        .set_response("evil.com", DnsResolution::new(vec![private], true))
         .await;
 
-    let use_case = HandleDnsQueryUseCase::new(
-        Arc::new(resolver),
-        Arc::new(MockBlockFilterEngine::new()),
-        Arc::new(MockQueryLogRepository::new()),
-    )
-    .with_rebinding_protection(false, None, &[]);
+    let use_case = make_use_case(resolver, None, &[]);
 
+    assert!(use_case
+        .try_cache_direct(
+            "evil.com",
+            RecordType::A,
+            "127.0.0.1".parse().unwrap(),
+            ferrous_dns_domain::ClientProtocol::Udp,
+            |_, _| Some(()),
+        )
+        .is_none());
     let result = use_case.execute(&dns_request("evil.com")).await;
-
-    assert!(result.is_ok());
+    assert!(matches!(result, Err(DomainError::Blocked)));
 }

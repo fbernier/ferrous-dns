@@ -1,53 +1,100 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// DNS Cookies anti-spoofing configuration (RFC 7873).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct DnsCookiesConfig {
     /// Master switch — enabled by default for anti-spoofing protection.
-    #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Hex-encoded 32-byte HMAC secret (64 hex chars).
-    /// When empty, the server generates an ephemeral secret on startup that
-    /// will not survive a restart — suitable for testing only.
-    #[serde(default)]
-    pub server_secret: String,
+    /// 32-byte HMAC secret, written as 64 hex digits in the config file.
+    /// `None` (an empty string) makes the server generate an ephemeral secret
+    /// on startup that will not survive a restart — suitable for testing only.
+    #[serde(
+        serialize_with = "serialize_secret",
+        deserialize_with = "deserialize_secret"
+    )]
+    pub server_secret: Option<[u8; 32]>,
 
     /// How often the server rotates to a new secret (seconds).
     /// The previous secret remains accepted during one full rotation window
     /// to allow in-flight clients to re-negotiate without errors.
-    #[serde(default = "default_rotation_secs")]
     pub secret_rotation_secs: u64,
 
     /// When `true`, queries that carry an invalid or absent server cookie are
     /// rejected with REFUSED + EDE 25 (Bad or Missing EDNS Cookie).
     /// When `false` (default), the server responds normally but always
     /// echoes a fresh server cookie so clients can learn and cache it.
-    #[serde(default = "default_false")]
     pub require_valid_cookie: bool,
 }
 
 impl Default for DnsCookiesConfig {
     fn default() -> Self {
         Self {
-            enabled: default_true(),
-            server_secret: String::new(),
-            secret_rotation_secs: default_rotation_secs(),
-            require_valid_cookie: default_false(),
+            enabled: true,
+            server_secret: None,
+            secret_rotation_secs: 3600,
+            require_valid_cookie: false,
         }
     }
 }
 
-fn default_true() -> bool {
-    true
+/// How to fix a malformed `server_secret`, appended to its parse error.
+const SECRET_FIX: &str = "generate one with `openssl rand -hex 32`, set it to \"\" for a secret \
+     regenerated at each start, or turn cookies off with dns.dns_cookies.enabled = false";
+
+/// Parses a configured secret: empty (after trimming) is `None`, otherwise it
+/// must be exactly 64 hex digits.
+pub(super) fn parse_server_secret(text: &str) -> Result<Option<[u8; 32]>, String> {
+    let hex = text.trim().as_bytes();
+    if hex.is_empty() {
+        return Ok(None);
+    }
+    if hex.len() != 64 {
+        return Err(format!(
+            "dns.dns_cookies.server_secret must be 64 hex digits (32 bytes), got {} characters; {SECRET_FIX}",
+            text.trim().chars().count()
+        ));
+    }
+    let mut secret = [0u8; 32];
+    for (byte, &[high, low]) in secret.iter_mut().zip(hex.as_chunks::<2>().0) {
+        let (Some(high), Some(low)) = (hex_digit(high), hex_digit(low)) else {
+            return Err(format!(
+                "dns.dns_cookies.server_secret contains characters that are not hex digits; {SECRET_FIX}"
+            ));
+        };
+        *byte = high << 4 | low;
+    }
+    Ok(Some(secret))
 }
 
-fn default_false() -> bool {
-    false
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
-fn default_rotation_secs() -> u64 {
-    3600
+fn serialize_secret<S: Serializer>(
+    secret: &Option<[u8; 32]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(64);
+    for byte in secret.iter().flatten() {
+        hex.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    serializer.serialize_str(&hex)
+}
+
+fn deserialize_secret<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u8; 32]>, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    parse_server_secret(&text).map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -58,7 +105,7 @@ mod tests {
     fn deserializes_empty_toml_with_defaults() {
         let config: DnsCookiesConfig = toml::from_str("").unwrap();
         assert!(config.enabled);
-        assert!(config.server_secret.is_empty());
+        assert!(config.server_secret.is_none());
         assert_eq!(config.secret_rotation_secs, 3600);
         assert!(!config.require_valid_cookie);
     }
@@ -71,24 +118,52 @@ mod tests {
         "#;
         let config: DnsCookiesConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
-        assert!(config.server_secret.is_empty());
+        assert!(config.server_secret.is_none());
         assert_eq!(config.secret_rotation_secs, 7200);
         assert!(!config.require_valid_cookie);
     }
 
     #[test]
-    fn serializes_and_deserializes_roundtrip() {
-        let original = DnsCookiesConfig {
-            enabled: true,
-            server_secret: "aabbcc".repeat(10).chars().take(64).collect(),
-            secret_rotation_secs: 1800,
-            require_valid_cookie: true,
-        };
-        let toml_str = toml::to_string(&original).unwrap();
-        let restored: DnsCookiesConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(restored.enabled, original.enabled);
-        assert_eq!(restored.server_secret, original.server_secret);
-        assert_eq!(restored.secret_rotation_secs, original.secret_rotation_secs);
-        assert_eq!(restored.require_valid_cookie, original.require_valid_cookie);
+    fn an_empty_secret_means_ephemeral() {
+        let config: DnsCookiesConfig = toml::from_str("server_secret = \"\"").unwrap();
+        assert!(config.server_secret.is_none());
+    }
+
+    #[test]
+    fn a_configured_secret_is_decoded_and_serialized_back_as_hex() {
+        let hex = "0fA1".repeat(16);
+        let config: DnsCookiesConfig =
+            toml::from_str(&format!("server_secret = \"  {hex}  \"")).unwrap();
+        let secret = config.server_secret.unwrap();
+        assert_eq!(secret[..2], [0x0f, 0xa1]);
+        assert_eq!(secret[30..], [0x0f, 0xa1]);
+
+        let serialized = toml::Value::try_from(&config).unwrap();
+        assert_eq!(
+            serialized["server_secret"].as_str(),
+            Some(hex.to_ascii_lowercase().as_str())
+        );
+    }
+
+    #[test]
+    fn an_ephemeral_secret_serializes_as_an_empty_string() {
+        let serialized = toml::Value::try_from(DnsCookiesConfig::default()).unwrap();
+        assert_eq!(serialized["server_secret"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn malformed_secrets_are_parse_errors() {
+        for bad in [
+            "abc".to_string(),
+            "zz".repeat(32),
+            "+f".repeat(32),
+            format!("{}é", "a".repeat(62)),
+            "0".repeat(66),
+        ] {
+            assert!(
+                toml::from_str::<DnsCookiesConfig>(&format!("server_secret = \"{bad}\"")).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
     }
 }

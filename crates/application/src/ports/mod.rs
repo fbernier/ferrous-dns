@@ -1,28 +1,35 @@
 mod api_token_repository;
 mod arp_reader;
-mod backup_ports;
 mod block_filter_engine;
 mod blocked_service_repository;
 mod blocklist_repository;
+mod blocklist_source_creator;
 mod blocklist_source_repository;
 mod cache_maintenance_port;
 mod client_repository;
 mod client_subnet_repository;
 mod config_file_port;
 mod config_repository;
+mod create_user_input;
 mod custom_service_repository;
+mod dga_eviction_target;
 mod dga_flag_store;
 mod dns_cache_port;
 mod dns_resolver;
 mod dnssec_stats_port;
+mod group_creator;
 mod group_repository;
 mod hostname_resolver;
+mod local_record_creator;
 mod managed_domain_repository;
 mod mfa_repository;
+mod nxdomain_hijack_probe_target;
 mod nxdomain_hijack_store;
+mod password_hasher;
 mod ptr_record_registry;
 mod query_log_repository;
 mod regex_filter_repository;
+mod response_ip_filter_eviction_target;
 mod response_ip_filter_store;
 mod safe_search_config_repository;
 mod safe_search_engine_port;
@@ -32,21 +39,23 @@ mod service_catalog_port;
 mod session_repository;
 mod tls_certificate_port;
 mod totp_service;
+mod tunneling_eviction_target;
 mod tunneling_flag_store;
 mod upstream_health_port;
 mod upstream_reload_port;
+mod user_provider;
 mod user_repository;
 mod webauthn_service;
 mod whitelist_repository;
 mod whitelist_source_repository;
 mod wildcard_record_registry;
 
-pub use api_token_repository::ApiTokenRepository;
+pub use api_token_repository::{ApiKeyMaterial, ApiTokenRepository};
 pub use arp_reader::{ArpReader, ArpTable};
-pub use backup_ports::{BlocklistSourceCreator, GroupCreator, LocalRecordCreator};
 pub use block_filter_engine::{BlockFilterEnginePort, FilterDecision};
 pub use blocked_service_repository::BlockedServiceRepository;
 pub use blocklist_repository::BlocklistRepository;
+pub use blocklist_source_creator::BlocklistSourceCreator;
 pub use blocklist_source_repository::BlocklistSourceRepository;
 pub use cache_maintenance_port::{
     CacheCompactionOutcome, CacheMaintenancePort, CacheRefreshOutcome,
@@ -55,25 +64,32 @@ pub use client_repository::ClientRepository;
 pub use client_subnet_repository::ClientSubnetRepository;
 pub use config_file_port::ConfigFilePersistence;
 pub use config_repository::ConfigRepository;
+pub use create_user_input::CreateUserInput;
 pub use custom_service_repository::CustomServiceRepository;
-pub use dga_flag_store::{DgaEvictionTarget, DgaFlagStore};
+pub use dga_eviction_target::DgaEvictionTarget;
+pub use dga_flag_store::DgaFlagStore;
 pub use dns_cache_port::{
     CacheEntryOrder, CacheEntryPage, CacheEntryQuery, CacheEntrySnapshot, CacheEntrySort,
     CacheMetricsSnapshot, DnsCachePort,
 };
 pub use dns_resolver::{DnsResolution, DnsResolver, EMPTY_CNAME_CHAIN};
 pub use dnssec_stats_port::{DnssecStatsPort, DnssecValidatorStats};
+pub use group_creator::GroupCreator;
 pub use group_repository::GroupRepository;
 pub use hostname_resolver::HostnameResolver;
-pub use managed_domain_repository::ManagedDomainRepository;
+pub use local_record_creator::LocalRecordCreator;
+pub use managed_domain_repository::{ManagedDomainRepository, ManagedDomainUpdate};
 pub use mfa_repository::MfaRepository;
-pub use nxdomain_hijack_store::{NxdomainHijackIpStore, NxdomainHijackProbeTarget};
+pub use nxdomain_hijack_probe_target::NxdomainHijackProbeTarget;
+pub use nxdomain_hijack_store::NxdomainHijackIpStore;
+pub use password_hasher::PasswordHasher;
 pub use ptr_record_registry::PtrRecordRegistry;
 pub use query_log_repository::{
-    CacheStats, PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
+    CacheStats, PageAt, PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
 };
-pub use regex_filter_repository::RegexFilterRepository;
-pub use response_ip_filter_store::{ResponseIpFilterEvictionTarget, ResponseIpFilterStore};
+pub use regex_filter_repository::{RegexFilterRepository, RegexFilterUpdate};
+pub use response_ip_filter_eviction_target::ResponseIpFilterEvictionTarget;
+pub use response_ip_filter_store::ResponseIpFilterStore;
 pub use safe_search_config_repository::SafeSearchConfigRepository;
 pub use safe_search_engine_port::SafeSearchEnginePort;
 pub use schedule_profile_repository::ScheduleProfileRepository;
@@ -82,16 +98,16 @@ pub use service_catalog_port::ServiceCatalogPort;
 pub use session_repository::SessionRepository;
 pub use tls_certificate_port::{TlsCertificateInfo, TlsCertificatePort};
 pub use totp_service::TotpService;
-pub use tunneling_flag_store::{TunnelingEvictionTarget, TunnelingFlagStore};
+pub use tunneling_eviction_target::TunnelingEvictionTarget;
+pub use tunneling_flag_store::TunnelingFlagStore;
 pub use upstream_health_port::{
     AggregateStatus, IpFamily, ResolvedEndpointHealth, UpstreamGroupHealth, UpstreamHealthPort,
     UpstreamStatus,
 };
 pub use upstream_reload_port::UpstreamReloadPort;
-pub use user_repository::{CreateUserInput, PasswordHasher, UserProvider, UserRepository};
+pub use user_provider::UserProvider;
+pub use user_repository::UserRepository;
 pub use webauthn_service::{AuthenticatedCredential, RegisteredCredential, WebauthnService};
 pub use whitelist_repository::WhitelistRepository;
 pub use whitelist_source_repository::WhitelistSourceRepository;
 pub use wildcard_record_registry::WildcardRecordRegistry;
-
-pub use ferrous_dns_domain::DnsQuery;

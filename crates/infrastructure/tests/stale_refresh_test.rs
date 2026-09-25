@@ -12,10 +12,8 @@ fn create_stale_cache() -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.0,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -173,7 +171,7 @@ fn test_stale_get_without_sender_still_works() {
     coarse_clock::tick();
 
     let result = cache.get(&Arc::from("no-sender.com"), &RecordType::CNAME);
-    if let Some((_, _, Some(ttl))) = result {
+    if let Some((_, _, Some(ttl), _)) = result {
         assert!(
             ttl >= 1,
             "Stale entry must return valid TTL even without sender; got {ttl}"

@@ -17,15 +17,15 @@ use ferrous_dns_application::ports::{
     LocalRecordCreator,
 };
 use ferrous_dns_application::use_cases::backup::snapshot::BackupSnapshot;
-use ferrous_dns_application::use_cases::{CreateBlocklistSourceUseCase, ImportConfigUseCase};
+use ferrous_dns_application::use_cases::{
+    ConfigDestination, CreateBlocklistSourceUseCase, ImportConfigUseCase,
+};
 use ferrous_dns_domain::{Config, DomainError, Group, LocalDnsRecord};
 use serde_json::json;
 use tokio::sync::RwLock;
 
 mod helpers;
 use helpers::{MockBlockFilterEngine, MockBlocklistSourceRepository, MockGroupRepository};
-
-// ── Stubs for the ports this test does not exercise ──────────────────────────
 
 struct StubGroupCreator;
 
@@ -44,14 +44,7 @@ struct StubLocalRecordCreator;
 
 #[async_trait::async_trait]
 impl LocalRecordCreator for StubLocalRecordCreator {
-    async fn create_local_record(
-        &self,
-        _hostname: String,
-        _domain: Option<String>,
-        _ip: String,
-        _record_type: String,
-        _ttl: Option<u32>,
-    ) -> Result<LocalDnsRecord, DomainError> {
+    async fn create_local_record(&self, _record: LocalDnsRecord) -> Result<(), DomainError> {
         Err(DomainError::IoError("test stub".to_string()))
     }
 }
@@ -60,12 +53,14 @@ impl LocalRecordCreator for StubLocalRecordCreator {
 struct NullConfigFilePersistence;
 
 impl ConfigFilePersistence for NullConfigFilePersistence {
-    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), String> {
+    fn load_config_from_file(&self, _path: &str) -> Result<Config, DomainError> {
+        Ok(Config::default())
+    }
+
+    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), DomainError> {
         Ok(())
     }
 }
-
-// ── Fixtures ─────────────────────────────────────────────────────────────────
 
 /// Builds a version-1 snapshot carrying one blocklist source per name.
 ///
@@ -148,38 +143,37 @@ fn snapshot_with_sources(names: &[&str]) -> BackupSnapshot {
 /// path ever started reloading, the counts asserted below would grow by one per
 /// imported source.
 fn build_import(
-    engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    engine: Arc<dyn BlockFilterEnginePort>,
 ) -> (ImportConfigUseCase, Arc<MockBlocklistSourceRepository>) {
     let source_repo = Arc::new(MockBlocklistSourceRepository::new());
     let group_repo = Arc::new(MockGroupRepository::new());
 
-    let mut creator = CreateBlocklistSourceUseCase::new(source_repo.clone(), group_repo);
-    if let Some(ref engine) = engine {
-        creator = creator.with_block_filter(engine.clone());
-    }
-    let creator: Arc<dyn BlocklistSourceCreator> = Arc::new(creator);
+    let creator: Arc<dyn BlocklistSourceCreator> = Arc::new(CreateBlocklistSourceUseCase::new(
+        source_repo.clone(),
+        group_repo,
+        engine.clone(),
+    ));
 
-    let mut import = ImportConfigUseCase::new(
-        Arc::new(RwLock::new(Config::default())),
-        Arc::new(NullConfigFilePersistence),
-        Some("/tmp/ferrous-dns-backup-import-test.toml".to_string()),
+    let import = ImportConfigUseCase::new(
+        ConfigDestination {
+            config: Arc::new(RwLock::new(Config::default())),
+            writer: Arc::default(),
+            persistence: Arc::new(NullConfigFilePersistence),
+            path: Some("/tmp/ferrous-dns-backup-import-test.toml".to_string()),
+        },
         Arc::new(StubGroupCreator),
         creator,
         Arc::new(StubLocalRecordCreator),
+        engine,
     );
-    if let Some(engine) = engine {
-        import = import.with_block_filter(engine);
-    }
 
     (import, source_repo)
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_import_reloads_block_filter_once_for_the_whole_batch() {
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let (import, source_repo) = build_import(Some(engine.clone()));
+    let (import, source_repo) = build_import(engine.clone());
 
     let summary = import
         .execute(snapshot_with_sources(&[
@@ -205,7 +199,7 @@ async fn test_import_reloads_block_filter_once_for_the_whole_batch() {
 #[tokio::test]
 async fn test_import_without_blocklist_sources_does_not_reload() {
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let (import, _source_repo) = build_import(Some(engine.clone()));
+    let (import, _source_repo) = build_import(engine.clone());
 
     let summary = import.execute(snapshot_with_sources(&[])).await.unwrap();
 
@@ -220,7 +214,7 @@ async fn test_import_without_blocklist_sources_does_not_reload() {
 #[tokio::test]
 async fn test_import_reloads_once_when_some_sources_are_duplicates() {
     let engine = Arc::new(MockBlockFilterEngine::new());
-    let (import, source_repo) = build_import(Some(engine.clone()));
+    let (import, source_repo) = build_import(engine.clone());
 
     import
         .execute(snapshot_with_sources(&["hagezi-pro"]))
@@ -236,6 +230,11 @@ async fn test_import_reloads_once_when_some_sources_are_duplicates() {
 
     assert_eq!(summary.blocklist_sources_imported, 1);
     assert_eq!(summary.blocklist_sources_skipped, 1);
+    assert!(
+        summary.errors.is_empty(),
+        "an existing source is skipped silently, not reported: {:?}",
+        summary.errors
+    );
     assert_eq!(source_repo.count().await, 2);
     assert_eq!(
         engine.reload_count().await,
@@ -244,15 +243,113 @@ async fn test_import_reloads_once_when_some_sources_are_duplicates() {
     );
 }
 
-#[tokio::test]
-async fn test_import_succeeds_without_a_block_filter_engine() {
-    let (import, source_repo) = build_import(None);
+/// Holds the import mid-save until the test releases it.
+struct GatedSave {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<std::sync::Barrier>,
+}
 
-    let summary = import
-        .execute(snapshot_with_sources(&["hagezi-pro", "oisd"]))
+impl ConfigFilePersistence for GatedSave {
+    fn load_config_from_file(&self, _path: &str) -> Result<Config, DomainError> {
+        Ok(Config::default())
+    }
+
+    fn save_config_to_file(&self, _config: &Config, _path: &str) -> Result<(), DomainError> {
+        self.started.notify_one();
+        self.release.wait();
+        Ok(())
+    }
+}
+
+fn import_with(
+    config: Arc<RwLock<Config>>,
+    config_writer: Arc<tokio::sync::Mutex<()>>,
+    persistence: Arc<dyn ConfigFilePersistence>,
+) -> ImportConfigUseCase {
+    let engine: Arc<dyn BlockFilterEnginePort> = Arc::new(MockBlockFilterEngine::new());
+    ImportConfigUseCase::new(
+        ConfigDestination {
+            config,
+            writer: config_writer,
+            persistence,
+            path: Some("/tmp/ferrous-dns-backup-import-test.toml".to_string()),
+        },
+        Arc::new(StubGroupCreator),
+        Arc::new(CreateBlocklistSourceUseCase::new(
+            Arc::new(MockBlocklistSourceRepository::new()),
+            Arc::new(MockGroupRepository::new()),
+            engine.clone(),
+        )),
+        Arc::new(StubLocalRecordCreator),
+        engine,
+    )
+}
+
+/// Mirrors the API config-update test: a writer that does not take the config
+/// writer lock (a local-record or password change) lands while the import is
+/// saving, and must survive it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_import_does_not_overwrite_a_concurrent_config_write() {
+    let config = Arc::new(RwLock::new(Config::default()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let import = import_with(
+        config.clone(),
+        Arc::default(),
+        Arc::new(GatedSave {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+
+    let save = tokio::spawn(async move { import.execute(snapshot_with_sources(&[])).await });
+    started.notified().await;
+
+    let writer_config = config.clone();
+    let mut writer = tokio::spawn(async move {
+        writer_config.write().await.dns.query_timeout = 7;
+    });
+    let writer_done = tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer)
         .await
-        .unwrap();
+        .is_ok();
+    release.wait();
 
-    assert_eq!(summary.blocklist_sources_imported, 2);
-    assert_eq!(source_repo.count().await, 2);
+    let summary = save.await.unwrap().unwrap();
+    assert!(summary.config_updated, "{:?}", summary.errors);
+    if !writer_done {
+        writer.await.unwrap();
+    }
+
+    let config = config.read().await;
+    assert_eq!(config.dns.query_timeout, 7, "the concurrent write was lost");
+    assert_eq!(
+        config.dns.cache_max_entries, 1000,
+        "the import was not applied"
+    );
+}
+
+#[tokio::test]
+async fn test_import_waits_for_the_config_writer() {
+    let config = Arc::new(RwLock::new(Config::default()));
+    let config_writer: Arc<tokio::sync::Mutex<()>> = Arc::default();
+    let import = import_with(
+        config.clone(),
+        config_writer.clone(),
+        Arc::new(NullConfigFilePersistence),
+    );
+
+    let save_in_flight = config_writer.lock().await;
+    let mut run = tokio::spawn(async move { import.execute(snapshot_with_sources(&[])).await });
+    let finished_early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut run)
+        .await
+        .is_ok();
+    assert!(
+        !finished_early,
+        "an import must not interleave with a config save"
+    );
+    assert_ne!(config.read().await.dns.cache_max_entries, 1000);
+    drop(save_in_flight);
+
+    assert!(run.await.unwrap().unwrap().config_updated);
+    assert_eq!(config.read().await.dns.cache_max_entries, 1000);
 }

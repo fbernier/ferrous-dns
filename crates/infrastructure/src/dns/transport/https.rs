@@ -1,18 +1,21 @@
-use super::{doh_response_too_large, DnsTransport, TransportResponse, MAX_DOH_MESSAGE_SIZE};
-use async_trait::async_trait;
-use bytes::BytesMut;
+use super::{doh_response_too_large, MAX_DOH_MESSAGE_SIZE};
+use bytes::{Bytes, BytesMut};
 use ferrous_dns_domain::DomainError;
 use std::net::SocketAddr;
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .use_rustls_tls()
         .pool_max_idle_per_host(4)
         .http2_prior_knowledge()
         .tcp_keepalive(Duration::from_secs(15))
+}
+
+static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    client_builder()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 });
@@ -21,16 +24,18 @@ const DNS_MESSAGE_CONTENT_TYPE: &str = "application/dns-message";
 
 pub struct HttpsTransport {
     url: String,
-    hostname: String,
+    /// URL host without port: reqwest keys its resolve overrides on the bare host.
+    host: String,
     resolved_addrs: Vec<SocketAddr>,
     client: OnceLock<reqwest::Client>,
 }
 
 impl HttpsTransport {
-    pub fn new(url: String, hostname: String, resolved_addrs: Vec<SocketAddr>) -> Self {
+    /// `host` is the URL host without port or brackets.
+    pub fn new(url: String, host: &str, resolved_addrs: Vec<SocketAddr>) -> Self {
         Self {
             url,
-            hostname,
+            host: host.to_owned(),
             resolved_addrs,
             client: OnceLock::new(),
         }
@@ -43,25 +48,18 @@ impl HttpsTransport {
                 return SHARED_CLIENT.clone();
             }
 
-            reqwest::Client::builder()
-                .use_rustls_tls()
-                .pool_max_idle_per_host(4)
-                .http2_prior_knowledge()
-                .tcp_keepalive(Duration::from_secs(15))
-                .resolve_to_addrs(&self.hostname, &self.resolved_addrs)
+            client_builder()
+                .resolve_to_addrs(&self.host, &self.resolved_addrs)
                 .build()
                 .unwrap_or_else(|_| SHARED_CLIENT.clone())
         })
     }
-}
 
-#[async_trait]
-impl DnsTransport for HttpsTransport {
-    async fn send(
+    pub async fn send(
         &self,
         message_bytes: &[u8],
         timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
+    ) -> Result<Bytes, DomainError> {
         debug!(
             url = %self.url,
             message_len = message_bytes.len(),
@@ -78,7 +76,7 @@ impl DnsTransport for HttpsTransport {
                 .post(&self.url)
                 .header("Content-Type", DNS_MESSAGE_CONTENT_TYPE)
                 .header("Accept", DNS_MESSAGE_CONTENT_TYPE)
-                .body(bytes::Bytes::copy_from_slice(message_bytes))
+                .body(Bytes::copy_from_slice(message_bytes))
                 .send(),
         )
         .await
@@ -100,10 +98,10 @@ impl DnsTransport for HttpsTransport {
             return Err(doh_response_too_large(&self.url));
         }
         enum Body {
-            Single(bytes::Bytes),
+            Single(Bytes),
             Multiple(BytesMut),
         }
-        let mut body = Body::Single(bytes::Bytes::new());
+        let mut body = Body::Single(Bytes::new());
         while let Some(chunk) = {
             let remaining = timeout.saturating_sub(start.elapsed());
             tokio::time::timeout(remaining, response.chunk())
@@ -148,22 +146,15 @@ impl DnsTransport for HttpsTransport {
             "DoH response received"
         );
 
-        Ok(TransportResponse {
-            bytes: response_bytes,
-            protocol_used: "HTTPS",
-        })
-    }
-
-    fn protocol_name(&self) -> &'static str {
-        "HTTPS"
+        Ok(response_bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DnsTransport, HttpsTransport};
+    use super::HttpsTransport;
     use bytes::Bytes;
-    use ferrous_dns_domain::DomainError;
+    use ferrous_dns_domain::{DnsProtocol, DomainError};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -176,11 +167,8 @@ mod tests {
             .http1_only()
             .build()
             .unwrap();
-        let transport = HttpsTransport::new(
-            format!("http://{addr}/dns-query"),
-            hostname.clone(),
-            vec![addr],
-        );
+        let transport =
+            HttpsTransport::new(format!("http://{addr}/dns-query"), &hostname, vec![addr]);
         transport.client.set(client).unwrap();
         let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
         let server = async {
@@ -198,7 +186,7 @@ mod tests {
         let client = async {
             let result = transport.send(&[0; 12], Duration::from_secs(30)).await;
             let _ = consumed_tx.send(());
-            result.map(|response| response.bytes)
+            result
         };
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(server, client).1
@@ -232,5 +220,32 @@ mod tests {
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 65535\r\n\r\n".to_vec();
         response.extend_from_slice(&expected);
         assert_eq!(loopback_response(response).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_https_preresolved_addrs_apply_when_url_has_a_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // `.invalid` never resolves, so reaching the listener proves the override was used.
+        let upstream: DnsProtocol =
+            format!("https://ferrous-doh-test.invalid:{}/dns-query", addr.port())
+                .parse()
+                .unwrap();
+        let DnsProtocol::Https { url, hostname, .. } = upstream.with_resolved_addrs(vec![addr])
+        else {
+            panic!("expected an HTTPS upstream");
+        };
+        let transport = HttpsTransport::new(url.to_string(), &hostname, vec![addr]);
+
+        let accepted = tokio::select! {
+            accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept()) => accepted,
+            _ = transport.send(&[0; 12], Duration::from_secs(5)) => {
+                panic!("the exchange must not finish before the listener sees a connection")
+            }
+        };
+        assert!(
+            matches!(accepted, Ok(Ok(_))),
+            "pre-resolved address must be dialed"
+        );
     }
 }

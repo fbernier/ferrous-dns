@@ -8,10 +8,10 @@ pub mod tls_config;
 mod udp;
 
 pub use mdns::start_mdns_listener;
+pub use tcp::bind_tcp_listener;
 
 use connection_limiter::ConnectionLimiter;
 use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
-use socket2::Domain;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -19,38 +19,30 @@ use tracing::info;
 
 const MAX_IN_FLIGHT_UDP_QUERIES: usize = 4096;
 
+/// Starts the Do53 listeners on `bind`: one SO_REUSEPORT UDP socket and TCP
+/// listener per worker, each a dual-stack AF_INET6 socket (see `udp` / `tcp`).
 pub async fn start_dns_server(
-    bind_addr: String,
+    bind: SocketAddr,
     handler: DnsServerHandler,
     num_workers: usize,
     proxy_protocol_enabled: bool,
     tcp_conn_limiter: ConnectionLimiter,
 ) -> anyhow::Result<()> {
-    let parsed: SocketAddr = bind_addr.parse()?;
-    // Unify the UDP/TCP path on a dual-stack AF_INET6 socket. IPv4 binds are
-    // mapped to `::ffff:a.b.c.d` so the pktinfo plumbing can always assume
-    // sockaddr_in6 / in6_pktinfo; `set_only_v6(false)` (in create_*_socket) lets
-    // a `[::]` bind answer both families. A mapped IPv4 bind preserves v4-only
-    // behaviour for that single address.
-    let socket_addr = pktinfo::v6_mapped_bind_addr(parsed);
-    let domain = Domain::IPV6;
-
-    // Report the address as configured, not the v4-mapped form it is bound as.
-    info!(bind_address = %parsed, num_workers, "Starting DNS server with SO_REUSEPORT");
+    info!(bind_address = %bind, num_workers, "Starting DNS server with SO_REUSEPORT");
 
     let handler = Arc::new(handler);
     let udp_admission = Arc::new(udp::FallbackAdmission::new(MAX_IN_FLIGHT_UDP_QUERIES));
     let mut join_set: JoinSet<()> = JoinSet::new();
 
     for i in 0..num_workers {
-        let udp_socket = Arc::new(udp::create_udp_socket(domain, socket_addr)?);
+        let udp_socket = Arc::new(udp::create_udp_socket(bind)?);
         let handler_udp = handler.clone();
         let admission = udp_admission.clone();
         join_set.spawn(async move {
             udp::run_udp_worker(udp_socket, handler_udp, admission, i).await;
         });
 
-        let tcp_listener = Arc::new(tcp::create_tcp_listener(domain, socket_addr)?);
+        let tcp_listener = Arc::new(tcp::bind_tcp_listener(bind)?);
         let handler_tcp = handler.clone();
         let tcp_limiter = tcp_conn_limiter.clone();
         join_set.spawn(async move {
@@ -64,10 +56,7 @@ pub async fn start_dns_server(
         });
     }
 
-    info!(
-        "DNS server ready — {} workers on {}",
-        num_workers, socket_addr
-    );
+    info!("DNS server ready — {} workers on {}", num_workers, bind);
 
     while join_set.join_next().await.is_some() {}
     Ok(())

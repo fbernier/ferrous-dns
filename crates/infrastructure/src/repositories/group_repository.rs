@@ -1,12 +1,13 @@
-use super::client_row_mapper::{row_to_client, ClientRow, CLIENT_SELECT};
+use super::client_row_mapper::{row_to_client, ClientRow, CLIENT_SELECT_BY_GROUP};
+use crate::repositories::{db_err, is_unique_violation, sql_now};
 use async_trait::async_trait;
 use ferrous_dns_application::ports::GroupRepository;
 use ferrous_dns_domain::{Client, DomainError, Group};
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tracing::{error, instrument};
+use tracing::instrument;
 
-type GroupRow = (i64, String, i64, Option<String>, i64, String, String);
+type GroupRow = (i64, String, bool, Option<String>, bool, String, String);
 
 pub struct SqliteGroupRepository {
     pool: SqlitePool,
@@ -23,9 +24,9 @@ impl SqliteGroupRepository {
         Group {
             id: Some(id),
             name: Arc::from(name.as_str()),
-            enabled: enabled != 0,
+            enabled,
             comment: comment.map(|s| Arc::from(s.as_str())),
-            is_default: is_default != 0,
+            is_default,
             created_at: Some(created_at),
             updated_at: Some(updated_at),
         }
@@ -35,26 +36,31 @@ impl SqliteGroupRepository {
 #[async_trait]
 impl GroupRepository for SqliteGroupRepository {
     #[instrument(skip(self))]
-    async fn create(&self, name: String, comment: Option<String>) -> Result<Group, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    async fn create(
+        &self,
+        name: String,
+        comment: Option<String>,
+        enabled: bool,
+    ) -> Result<Group, DomainError> {
+        let now = sql_now();
 
         let row = sqlx::query_as::<_, GroupRow>(
             "INSERT INTO groups (name, enabled, comment, is_default, created_at, updated_at)
-             VALUES (?, 1, ?, 0, ?, ?)
+             VALUES (?, ?, ?, 0, ?, ?)
              RETURNING id, name, enabled, comment, is_default, created_at, updated_at",
         )
         .bind(&name)
+        .bind(enabled)
         .bind(&comment)
         .bind(&now)
         .bind(&now)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint failed") {
-                DomainError::InvalidGroupName(format!("Group '{}' already exists", name))
+            if is_unique_violation(&e) {
+                DomainError::AlreadyExists(format!("Group '{name}' already exists"))
             } else {
-                error!(error = %e, "Failed to create group");
-                DomainError::DatabaseError(e.to_string())
+                db_err("Failed to create group")(e)
             }
         })?;
 
@@ -70,10 +76,7 @@ impl GroupRepository for SqliteGroupRepository {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query group by id");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query group by id"))?;
 
         Ok(row.map(Self::row_to_group))
     }
@@ -87,10 +90,7 @@ impl GroupRepository for SqliteGroupRepository {
         .bind(name)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query group by name");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query group by name"))?;
 
         Ok(row.map(Self::row_to_group))
     }
@@ -103,17 +103,17 @@ impl GroupRepository for SqliteGroupRepository {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query all groups");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query all groups"))?;
 
         Ok(rows.into_iter().map(Self::row_to_group).collect())
     }
 
     #[instrument(skip(self))]
     async fn get_all_with_client_counts(&self) -> Result<Vec<(Group, u64)>, DomainError> {
-        let rows = sqlx::query_as::<_, (i64, String, i64, Option<String>, i64, String, String, i64)>(
+        let rows = sqlx::query_as::<
+            _,
+            (i64, String, bool, Option<String>, bool, String, String, i64),
+        >(
             "SELECT g.id, g.name, g.enabled, g.comment, g.is_default, g.created_at, g.updated_at,
                     COUNT(c.id) as client_count
              FROM groups g
@@ -123,24 +123,15 @@ impl GroupRepository for SqliteGroupRepository {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query groups with client counts");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query groups with client counts"))?;
 
         Ok(rows
             .into_iter()
             .map(
                 |(id, name, enabled, comment, is_default, created_at, updated_at, count)| {
-                    let group = Group {
-                        id: Some(id),
-                        name: Arc::from(name.as_str()),
-                        enabled: enabled != 0,
-                        comment: comment.map(|s| Arc::from(s.as_str())),
-                        is_default: is_default != 0,
-                        created_at: Some(created_at),
-                        updated_at: Some(updated_at),
-                    };
+                    let group = Self::row_to_group((
+                        id, name, enabled, comment, is_default, created_at, updated_at,
+                    ));
                     (group, count as u64)
                 },
             )
@@ -155,35 +146,30 @@ impl GroupRepository for SqliteGroupRepository {
         enabled: Option<bool>,
         comment: Option<String>,
     ) -> Result<Group, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        let current = self
-            .get_by_id(id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(id))?;
-
-        let final_name = name.unwrap_or_else(|| current.name.to_string());
-        let final_enabled = enabled.unwrap_or(current.enabled);
-        let final_comment = comment.or_else(|| current.comment.as_ref().map(|s| s.to_string()));
-
         let row = sqlx::query_as::<_, GroupRow>(
-            "UPDATE groups SET name = ?, enabled = ?, comment = ?, updated_at = ?
+            "UPDATE groups
+             SET name = COALESCE(?, name),
+                 enabled = COALESCE(?, enabled),
+                 comment = COALESCE(?, comment),
+                 updated_at = ?
              WHERE id = ?
              RETURNING id, name, enabled, comment, is_default, created_at, updated_at",
         )
-        .bind(&final_name)
-        .bind(if final_enabled { 1 } else { 0 })
-        .bind(&final_comment)
-        .bind(&now)
+        .bind(&name)
+        .bind(enabled)
+        .bind(&comment)
+        .bind(sql_now())
         .bind(id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint failed") {
-                DomainError::InvalidGroupName(format!("Group '{}' already exists", final_name))
+            if is_unique_violation(&e) {
+                DomainError::AlreadyExists(format!(
+                    "Group '{}' already exists",
+                    name.as_deref().unwrap_or_default()
+                ))
             } else {
-                error!(error = %e, "Failed to update group");
-                DomainError::DatabaseError(e.to_string())
+                db_err("Failed to update group")(e)
             }
         })?;
 
@@ -197,14 +183,7 @@ impl GroupRepository for SqliteGroupRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                if e.to_string().contains("FOREIGN KEY constraint failed") {
-                    DomainError::GroupHasAssignedClients(0)
-                } else {
-                    error!(error = %e, "Failed to delete group");
-                    DomainError::DatabaseError(e.to_string())
-                }
-            })?;
+            .map_err(db_err("Failed to delete group"))?;
 
         if result.rows_affected() == 0 {
             return Err(DomainError::GroupNotFound(id));
@@ -215,17 +194,11 @@ impl GroupRepository for SqliteGroupRepository {
 
     #[instrument(skip(self))]
     async fn get_clients_in_group(&self, group_id: i64) -> Result<Vec<Client>, DomainError> {
-        let rows = sqlx::query_as::<_, ClientRow>(&format!(
-            "{} WHERE group_id = ? ORDER BY last_seen DESC",
-            CLIENT_SELECT
-        ))
-        .bind(group_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query clients in group");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        let rows = sqlx::query_as::<_, ClientRow>(CLIENT_SELECT_BY_GROUP)
+            .bind(group_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err("Failed to query clients in group"))?;
 
         Ok(rows.into_iter().filter_map(row_to_client).collect())
     }
@@ -236,10 +209,7 @@ impl GroupRepository for SqliteGroupRepository {
             .bind(group_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to count clients in group");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to count clients in group"))?;
 
         Ok(count.0 as u64)
     }

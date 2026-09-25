@@ -3,7 +3,6 @@ use super::key::CacheKey;
 use crate::counted_map::CountedDashMap;
 use ferrous_dns_domain::RecordType;
 use rustc_hash::FxBuildHasher;
-use smallvec::SmallVec;
 
 /// Maximum entries inspected for expiration per full-cache insert.
 const EVICTION_BATCH_SIZE: usize = 64;
@@ -17,18 +16,33 @@ pub(crate) const MIN_NEGATIVE_TTL: u32 = 300;
 
 /// Maximum TTL applied to negative cache entries. Caps how long a stale
 /// NXDOMAIN can linger if the upstream advertises an unreasonable SOA TTL.
-pub(crate) const MAX_NEGATIVE_TTL: u32 = 3_600;
+const MAX_NEGATIVE_TTL: u32 = 3_600;
 
-/// Clamps a negative cache TTL to the `[MIN_NEGATIVE_TTL, MAX_NEGATIVE_TTL]`
-/// window. Shared with the resolver's cache layer so negative responses from
-/// both the SOA path and direct NXDOMAIN insertions use the same bounds.
-#[inline]
-pub(crate) fn clamp_negative_ttl(ttl: u32) -> u32 {
-    ttl.clamp(MIN_NEGATIVE_TTL, MAX_NEGATIVE_TTL)
-}
+/// Marks an entry from the local DNS server in the top bit of its expiry,
+/// which epoch seconds never reach; the entry stays one `u64`.
+const LOCAL_DNS_BIT: u64 = 1 << 63;
 
 struct NegativeEntry {
-    expires_at_secs: u64,
+    expiry_and_source: u64,
+}
+
+impl NegativeEntry {
+    fn new(expires_at_secs: u64, local_dns: bool) -> Self {
+        let source = if local_dns { LOCAL_DNS_BIT } else { 0 };
+        Self {
+            expiry_and_source: (expires_at_secs & !LOCAL_DNS_BIT) | source,
+        }
+    }
+
+    #[inline]
+    fn expires_at_secs(&self) -> u64 {
+        self.expiry_and_source & !LOCAL_DNS_BIT
+    }
+
+    #[inline]
+    fn is_local_dns(&self) -> bool {
+        self.expiry_and_source & LOCAL_DNS_BIT != 0
+    }
 }
 
 pub struct NegativeDnsCache {
@@ -37,17 +51,13 @@ pub struct NegativeDnsCache {
 }
 
 impl NegativeDnsCache {
-    /// Builds a negative cache with the given capacity ceiling.
-    ///
-    /// The positive and negative caches share the `cache_max_entries` config so
-    /// a Pi-hole-style deployment with a 200K-entry positive cache no longer
-    /// evicts NXDOMAINs at 65K while the positive cache still has headroom.
+    /// Builds a negative cache with the given capacity ceiling, the same
+    /// `cache_max_entries` the positive cache is sized by.
     ///
     /// # Memory sizing
     ///
     /// Each entry costs ~80 bytes (`CacheKey` + `NegativeEntry` + DashMap
-    /// overhead). 200K entries ≈ 16 MB. The cap is shared with the positive
-    /// cache via `cache_max_entries`.
+    /// overhead). 200K entries ≈ 16 MB.
     pub fn new(max_entries: usize) -> Self {
         Self {
             cache: CountedDashMap::with_capacity_and_hasher(max_entries, FxBuildHasher),
@@ -55,67 +65,43 @@ impl NegativeDnsCache {
         }
     }
 
-    pub fn get(&self, domain: &str, record_type: &RecordType) -> Option<u32> {
-        debug_assert!(
-            domain.bytes().all(|b| !b.is_ascii_uppercase()),
-            "NegativeDnsCache::get expects caller to pass ASCII-lowercased domain; got `{}`",
-            domain
-        );
-        let key = CacheKey::new(domain, *record_type);
+    /// Remaining TTL and whether the local DNS server gave the answer.
+    pub fn get(&self, domain: &str, record_type: &RecordType) -> Option<(u32, bool)> {
+        let key = CacheKey::from_lowercase(domain, *record_type);
         let now = coarse_now_secs();
 
         match self.cache.get(&key) {
             Some(entry) => {
-                let expires = entry.value().expires_at_secs;
+                let expires = entry.value().expires_at_secs();
                 if now < expires {
-                    return Some(expires.saturating_sub(now) as u32);
+                    return Some((
+                        expires.saturating_sub(now) as u32,
+                        entry.value().is_local_dns(),
+                    ));
                 }
                 drop(entry);
-                self.cache.remove_if(&key, |_, v| v.expires_at_secs <= now);
+                self.cache
+                    .remove_if(&key, |_, v| v.expires_at_secs() <= now);
                 None
             }
             None => None,
         }
     }
 
-    pub fn insert(&self, domain: &str, record_type: RecordType, ttl: u32) {
-        debug_assert!(
-            domain.bytes().all(|b| !b.is_ascii_uppercase()),
-            "NegativeDnsCache::insert expects caller to pass ASCII-lowercased domain; got `{}`",
-            domain
-        );
-        let ttl = clamp_negative_ttl(ttl);
-        if self.cache.len() >= self.max_entries {
-            let now = coarse_now_secs();
-            let expired: SmallVec<[CacheKey; EVICTION_BATCH_SIZE]> = self
-                .cache
-                .iter()
-                .take(EVICTION_BATCH_SIZE)
-                .filter(|e| now >= e.value().expires_at_secs)
-                .map(|e| e.key().clone())
-                .collect();
-            for k in &expired {
-                self.cache.remove(k);
-            }
-            if self.cache.len() >= self.max_entries {
-                let fallback_key = self.cache.iter().next().map(|e| e.key().clone());
-                if let Some(key) = fallback_key {
-                    self.cache.remove(&key);
-                }
-            }
-        }
-        let expires_at_secs = coarse_now_secs() + ttl as u64;
-        let key = CacheKey::new(domain, record_type);
-        self.cache.insert(key, NegativeEntry { expires_at_secs });
+    pub fn insert(&self, domain: &str, record_type: RecordType, ttl: u32, local_dns: bool) {
+        let ttl = ttl.clamp(MIN_NEGATIVE_TTL, MAX_NEGATIVE_TTL);
+        let now = coarse_now_secs();
+        self.cache
+            .evict_if_full::<EVICTION_BATCH_SIZE>(self.max_entries, |entry| {
+                now >= entry.expires_at_secs()
+            });
+        let key = CacheKey::from_lowercase(domain, record_type);
+        self.cache
+            .insert(key, NegativeEntry::new(now + ttl as u64, local_dns));
     }
 
     pub fn remove(&self, domain: &str, record_type: &RecordType) {
-        debug_assert!(
-            domain.bytes().all(|b| !b.is_ascii_uppercase()),
-            "NegativeDnsCache::remove expects caller to pass ASCII-lowercased domain; got `{}`",
-            domain
-        );
-        let key = CacheKey::new(domain, *record_type);
+        let key = CacheKey::from_lowercase(domain, *record_type);
         self.cache.remove(&key);
     }
 
@@ -129,7 +115,7 @@ impl NegativeDnsCache {
     /// entries elsewhere would otherwise hold capacity until read again.
     pub fn purge_expired(&self, now_secs: u64) -> usize {
         self.cache
-            .retain(|_, entry| now_secs < entry.expires_at_secs)
+            .retain(|_, entry| now_secs < entry.expires_at_secs())
     }
 
     pub fn len(&self) -> usize {
@@ -138,10 +124,6 @@ impl NegativeDnsCache {
 
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
-    }
-
-    pub fn max_entries(&self) -> usize {
-        self.max_entries
     }
 }
 
@@ -156,16 +138,16 @@ mod tests {
         for i in 0..capacity {
             cache.cache.insert(
                 CacheKey::new(&format!("zone{i}.example"), RecordType::A),
-                NegativeEntry { expires_at_secs: 0 },
+                NegativeEntry::new(0, false),
             );
         }
         // Keep the sampled prefix live and leave the rest expired. Updating
         // values preserves iteration order; release every guard before insert.
         for mut entry in cache.cache.iter_mut().take(EVICTION_BATCH_SIZE) {
-            entry.value_mut().expires_at_secs = u64::MAX;
+            *entry.value_mut() = NegativeEntry::new(u64::MAX, false);
         }
 
-        cache.insert("new.example", RecordType::A, 600);
+        cache.insert("new.example", RecordType::A, 600, false);
 
         // A bounded scan finds no expired entries and evicts one fallback key.
         // Filtering before taking the budget would remove the expired suffix.

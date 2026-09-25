@@ -6,7 +6,7 @@ use ferrous_dns_application::ports::{
 use ferrous_dns_application::use_cases::{
     BacktestBlocklistsUseCase, BacktestRequest, CandidateAction,
 };
-use ferrous_dns_domain::query_log::{DnssecStats, QueryLog, QueryLogFilter, QueryStats};
+use ferrous_dns_domain::entities::query_log::{DnssecStats, QueryLog, QueryLogFilter, QueryStats};
 use ferrous_dns_domain::{
     AllowMatch, AllowMatchKind, BlockMatch, BlockMatchKind, DomainError, FilterExplanation,
     MatchType,
@@ -25,15 +25,17 @@ impl QueryLogRepository for FakeQueryLog {
     async fn log_query(&self, _q: &QueryLog) -> Result<(), DomainError> {
         Ok(())
     }
+    fn log_query_sync(&self, _q: &QueryLog) -> Result<(), DomainError> {
+        Ok(())
+    }
     async fn get_recent(&self, _l: u32, _p: f32) -> Result<Vec<QueryLog>, DomainError> {
         Ok(Vec::new())
     }
     async fn get_recent_paged(
         &self,
         _l: u32,
-        _o: u32,
+        _page: ferrous_dns_application::ports::PageAt,
         _p: f32,
-        _c: Option<i64>,
         _f: &QueryLogFilter,
     ) -> Result<PagedQueryResult, DomainError> {
         unimplemented!()
@@ -46,7 +48,7 @@ impl QueryLogRepository for FakeQueryLog {
     }
     async fn get_timeline(
         &self,
-        _p: u32,
+        _p: f32,
         _g: TimeGranularity,
     ) -> Result<Vec<TimelineBucket>, DomainError> {
         unimplemented!()

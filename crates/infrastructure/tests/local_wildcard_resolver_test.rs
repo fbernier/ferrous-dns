@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use ferrous_dns_application::ports::{
     DnsResolution, DnsResolver, WildcardRecordRegistry, EMPTY_CNAME_CHAIN,
 };
-use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, RecordType};
+use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, LocalRecordType, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::{
     LocalWildcardResolver, WildcardMap, WildcardRegistry,
 };
@@ -20,8 +20,8 @@ fn record(hostname: &str, domain: &str, ip: &str, record_type: &str) -> LocalDns
     LocalDnsRecord {
         hostname: hostname.to_string(),
         domain: Some(domain.to_string()),
-        ip: ip.to_string(),
-        record_type: record_type.to_string(),
+        ip: ip.parse().unwrap(),
+        record_type: record_type.parse().unwrap(),
         ttl: Some(120),
     }
 }
@@ -35,6 +35,7 @@ fn upstream_resolution() -> DnsResolution {
         addresses: Arc::new(vec![ip("93.184.216.34")]),
         cache_hit: false,
         local_dns: false,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: Some(Arc::from("1.1.1.1:53")),
@@ -78,7 +79,7 @@ impl DnsResolver for MockInner {
 
 fn resolver_with(records: &[LocalDnsRecord]) -> (LocalWildcardResolver, Arc<MockInner>) {
     let inner = Arc::new(MockInner::default());
-    let map = LocalWildcardResolver::map_from_local_records(records, &None);
+    let map = LocalWildcardResolver::map_from_local_records(records, None);
     (LocalWildcardResolver::new(inner.clone(), map), inner)
 }
 
@@ -157,7 +158,7 @@ async fn test_exact_cached_record_beats_the_wildcard() {
     });
     let map = LocalWildcardResolver::map_from_local_records(
         &[record("*", "home.lan", "192.168.1.10", "A")],
-        &None,
+        None,
     );
     let resolver = LocalWildcardResolver::new(inner.clone(), map);
 
@@ -183,7 +184,7 @@ async fn test_negative_cache_entry_does_not_beat_the_wildcard() {
     });
     let map = LocalWildcardResolver::map_from_local_records(
         &[record("*", "home.lan", "192.168.1.10", "A")],
-        &None,
+        None,
     );
     let resolver = LocalWildcardResolver::new(inner, map);
 
@@ -291,11 +292,11 @@ async fn test_wildcard_without_a_domain_is_not_indexed() {
     let unanchored = LocalDnsRecord {
         hostname: "*".to_string(),
         domain: None,
-        ip: "192.168.1.10".to_string(),
-        record_type: "A".to_string(),
+        ip: "192.168.1.10".parse().unwrap(),
+        record_type: LocalRecordType::A,
         ttl: None,
     };
-    let map = LocalWildcardResolver::map_from_local_records(&[unanchored], &None);
+    let map = LocalWildcardResolver::map_from_local_records(&[unanchored], None);
 
     assert!(map.is_empty());
 }
@@ -303,11 +304,11 @@ async fn test_wildcard_without_a_domain_is_not_indexed() {
 #[tokio::test]
 async fn test_register_and_unregister_take_effect_live() {
     let inner = Arc::new(MockInner::default());
-    let map: Arc<WildcardMap> = LocalWildcardResolver::map_from_local_records(&[], &None);
+    let map: Arc<WildcardMap> = LocalWildcardResolver::map_from_local_records(&[], None);
     let resolver = LocalWildcardResolver::new(inner.clone(), Arc::clone(&map));
     let registry = WildcardRegistry::new(Arc::clone(&map));
 
-    registry.register("home.lan", RecordType::A, ip("192.168.1.10"), 60);
+    registry.register("home.lan", LocalRecordType::A, ip("192.168.1.10"), 60);
 
     let answered = resolver
         .resolve(&DnsQuery::new("nas.home.lan", RecordType::A))
@@ -316,7 +317,7 @@ async fn test_register_and_unregister_take_effect_live() {
     assert_eq!(answered.addresses.as_ref(), &[ip("192.168.1.10")]);
     assert_eq!(answered.min_ttl, Some(60));
 
-    registry.unregister("home.lan", RecordType::A);
+    registry.unregister("home.lan", LocalRecordType::A);
     assert!(map.is_empty());
 
     let passed_through = resolver
@@ -333,12 +334,12 @@ async fn test_unregister_one_type_keeps_the_other() {
             record("*", "home.lan", "192.168.1.10", "A"),
             record("*", "home.lan", "fd00::1", "AAAA"),
         ],
-        &None,
+        None,
     );
     let resolver = LocalWildcardResolver::new(Arc::new(MockInner::default()), Arc::clone(&map));
     let registry = WildcardRegistry::new(Arc::clone(&map));
 
-    registry.unregister("home.lan", RecordType::A);
+    registry.unregister("home.lan", LocalRecordType::A);
 
     assert!(!map.is_empty());
     let v6 = resolver

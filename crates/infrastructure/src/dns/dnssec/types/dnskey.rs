@@ -1,3 +1,4 @@
+use super::algorithm_name;
 use ferrous_dns_domain::DomainError;
 use std::fmt;
 
@@ -47,37 +48,23 @@ impl DnskeyRecord {
         self.flags & 0x0001 != 0
     }
 
-    pub fn is_zsk(&self) -> bool {
-        !self.is_ksk()
-    }
-
+    /// RFC 4034 Appendix B key tag.
     pub fn calculate_key_tag(&self) -> u16 {
-        let mut accumulator: u32 = 0;
-
-        let flags_bytes = self.flags.to_be_bytes();
-        accumulator += u32::from(u16::from_be_bytes([flags_bytes[0], flags_bytes[1]]));
-
-        accumulator += u32::from(u16::from_be_bytes([self.protocol, self.algorithm]));
+        // u64 so an oversized key (trust anchor files are not RDLENGTH-bounded)
+        // cannot overflow the running sum; identical to the RFC's u32 for real keys.
+        let mut accumulator: u64 = u64::from(self.flags);
+        accumulator += u64::from(u16::from_be_bytes([self.protocol, self.algorithm]));
 
         for chunk in self.public_key.chunks(2) {
-            if chunk.len() == 2 {
-                accumulator += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
-            } else {
-                accumulator += u32::from(chunk[0]) << 8;
-            }
+            accumulator += match *chunk {
+                [hi, lo] => u64::from(u16::from_be_bytes([hi, lo])),
+                [hi] => u64::from(hi) << 8,
+                _ => 0,
+            };
         }
 
         accumulator += accumulator >> 16;
         (accumulator & 0xFFFF) as u16
-    }
-
-    pub fn algorithm_name(&self) -> &'static str {
-        match self.algorithm {
-            8 => "RSA/SHA-256",
-            13 => "ECDSA P-256/SHA-256",
-            15 => "Ed25519",
-            _ => "Unknown",
-        }
     }
 }
 
@@ -87,7 +74,7 @@ impl fmt::Display for DnskeyRecord {
             f,
             "DNSKEY(flags={}, algo={}, tag={}, {})",
             self.flags,
-            self.algorithm_name(),
+            algorithm_name(self.algorithm),
             self.calculate_key_tag(),
             if self.is_ksk() { "KSK" } else { "ZSK" }
         )

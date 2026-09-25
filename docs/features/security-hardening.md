@@ -32,7 +32,7 @@ Ferrous DNS validates every upstream response at two layers. A response that fai
 
 Implemented in the UDP transport, before a single byte is parsed as a DNS message:
 
-- **Source address** — the datagram must come from the IP of the upstream that was queried.
+- **Source address** — the datagram must come from the IP *and port* of the upstream that was queried (an IPv4 peer reported as IPv4-mapped IPv6 still matches).
 - **Message ID** — the first two bytes must match the transaction ID that was sent.
 - **Size cap** — responses larger than 4096 bytes are not read.
 
@@ -81,7 +81,7 @@ secret_rotation_secs = 3600
 require_valid_cookie = false   # true = REFUSED + EDE 25 for cookieless clients
 ```
 
-`server_secret` must be exactly 64 hex characters when set; anything else aborts startup rather than silently falling back. Leaving it empty is fine for a single instance, but every restart invalidates outstanding client cookies — set it explicitly for production and for multi-instance deployments.
+`server_secret` must be exactly 64 hex characters when set; with cookies enabled anything else aborts startup rather than silently falling back (with `enabled = false` it is ignored with a warning). Leaving it empty is fine for a single instance, but every restart invalidates outstanding client cookies — set it explicitly for production and for multi-instance deployments.
 
 ---
 
@@ -112,7 +112,7 @@ Upstream UDP sockets are pooled, retaining up to 4 idle sockets per upstream ser
 
 ## EDNS buffer size and truncation
 
-Upstream queries advertise a 1232-byte EDNS UDP payload — small enough to avoid IP fragmentation on nearly every path, which is itself a spoofing vector. Oversized answers come back with `TC=1` and are retried over TCP, and client-advertised buffer sizes are honoured with correct truncation on the way back (RFC 6891 §6.2.5 / RFC 7766). Answers the server builds (addresses, blocks, errors) carry an OPT record only when the query did (RFC 6891 §7) and copy the query's DO bit into it (RFC 3225 §3); cached answers of other types are relayed with the upstream's OPT unless a client cookie has to be added.
+Upstream queries advertise a 1232-byte EDNS UDP payload — small enough to avoid IP fragmentation on nearly every path, which is itself a spoofing vector. Oversized answers come back with `TC=1` and are retried over TCP, and client-advertised buffer sizes are honoured with correct truncation on the way back (RFC 6891 §6.2.5 / RFC 7766). Every answer carries an OPT record only when the query did (RFC 6891 §7) and copies the query's DO bit into it (RFC 3225 §3). That includes the upstream answers relayed for record types other than A/AAAA, cached or not: their upstream OPT is replaced by ours, with the upstream's extended RCODE kept and a client cookie echoed beside our server cookie (RFC 7873 §5.3). The upstream's own options, including its echo of the cookie Ferrous sent it, never reach the client, and neither does a TSIG or SIG(0): it signs the upstream's exchange with Ferrous, not the client's, and must stay the last record, where our OPT goes (RFC 8945 §5.1, §5.3; RFC 2931 §3). A client that did not set DO gets none of the RRSIG, NSEC and NSEC3 records the DO=1 upstream query returned, unless it asked for that type (RFC 4035 §3.2.1). Records behind a removed one keep their names: compression pointers into moved bytes are re-aimed, and pointers into removed bytes are replaced by the labels they pointed to.
 
 ---
 
@@ -178,4 +178,5 @@ Published so you can plan around it rather than discover it.
 - [ ] Consider `dnssec_mode = "strict"` once you have watched `permissive` for a while without false Bogus.
 - [ ] Try `qname_case_randomization = true` and watch upstream failure counts before keeping it.
 - [ ] Keep `metrics_enabled = false` unless the port is reachable only from your monitoring host.
+- [ ] Serving DoH through a reverse proxy on another host or container? List only that proxy in `[server] trusted_proxies`; every peer in the list can name any client (and so choose its group's filtering). See [DoH client identity](../configuration/server.md#doh-client-identity).
 - [ ] Put the dashboard behind HTTPS and enable TOTP or a passkey — the login lockout slows password guessing but does not replace a second factor.

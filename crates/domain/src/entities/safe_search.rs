@@ -1,24 +1,5 @@
+use crate::errors::domain_error::DomainError;
 use serde::{Deserialize, Serialize};
-
-/// Error returned when a string cannot be parsed as a known [`SafeSearchEngine`] variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownSafeSearchEngine(pub String);
-
-impl std::fmt::Display for UnknownSafeSearchEngine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown Safe Search engine: '{}'", self.0)
-    }
-}
-
-/// Error returned when a string cannot be parsed as a known [`YouTubeMode`] variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownYouTubeMode(pub String);
-
-impl std::fmt::Display for UnknownYouTubeMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown YouTube mode: '{}'", self.0)
-    }
-}
 
 /// Search engine covered by Safe Search enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,7 +28,6 @@ impl SafeSearchEngine {
         }
     }
 
-    /// Returns a slice of all supported engines in a stable order.
     pub fn all() -> &'static [SafeSearchEngine] {
         &[
             SafeSearchEngine::Google,
@@ -62,7 +42,7 @@ impl SafeSearchEngine {
 }
 
 impl std::str::FromStr for SafeSearchEngine {
-    type Err = UnknownSafeSearchEngine;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -73,7 +53,7 @@ impl std::str::FromStr for SafeSearchEngine {
             "yandex" => Ok(SafeSearchEngine::Yandex),
             "brave" => Ok(SafeSearchEngine::Brave),
             "ecosia" => Ok(SafeSearchEngine::Ecosia),
-            _ => Err(UnknownSafeSearchEngine(s.to_owned())),
+            other => Err(DomainError::InvalidSafeSearchEngine(other.to_owned())),
         }
     }
 }
@@ -100,13 +80,15 @@ impl YouTubeMode {
 }
 
 impl std::str::FromStr for YouTubeMode {
-    type Err = UnknownYouTubeMode;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "strict" => Ok(YouTubeMode::Strict),
             "moderate" => Ok(YouTubeMode::Moderate),
-            _ => Err(UnknownYouTubeMode(s.to_owned())),
+            other => Err(DomainError::InvalidInput(format!(
+                "unknown YouTube mode: '{other}'"
+            ))),
         }
     }
 }
@@ -116,11 +98,8 @@ impl std::str::FromStr for YouTubeMode {
 pub struct SafeSearchConfig {
     /// Database row identifier. `None` before first persist.
     pub id: Option<i64>,
-    /// The group this configuration applies to.
     pub group_id: i64,
-    /// The search engine this configuration controls.
     pub engine: SafeSearchEngine,
-    /// Whether Safe Search is active for this engine and group.
     pub enabled: bool,
     /// YouTube restriction level. Only relevant when `engine == YouTube`.
     pub youtube_mode: YouTubeMode,

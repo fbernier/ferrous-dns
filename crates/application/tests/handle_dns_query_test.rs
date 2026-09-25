@@ -1,6 +1,10 @@
 mod helpers;
 
-use ferrous_dns_application::{ports::DnsResolution, use_cases::HandleDnsQueryUseCase};
+use async_trait::async_trait;
+use ferrous_dns_application::{
+    ports::{DnsResolution, SafeSearchEnginePort},
+    use_cases::HandleDnsQueryUseCase,
+};
 use ferrous_dns_domain::{BlockSource, ClientProtocol, DnsRequest, DomainError, RecordType};
 use helpers::{
     DnsResolutionBuilder, MockBlockFilterEngine, MockClientRepository, MockDnsResolver,
@@ -29,11 +33,29 @@ fn cached_resolution(ip: &str) -> DnsResolution {
 fn local_dns_resolution(ip: &str) -> DnsResolution {
     DnsResolution {
         local_dns: true,
+        local_nxdomain: false,
         ..DnsResolution::new(vec![ip.parse().unwrap()], false)
     }
 }
 
-// ── execute: upstream path ─────────────────────────────────────────────────
+/// A fast-path `respond` that serves every A/AAAA hit.
+fn served(addresses: &[IpAddr], ttl: u32) -> Option<(Vec<IpAddr>, u32)> {
+    Some((addresses.to_vec(), ttl))
+}
+
+/// A fast-path `respond` that serves every wire hit.
+fn served_wire(wire: &[u8], remaining: u32) -> Option<(Vec<u8>, u32)> {
+    Some((wire.to_vec(), remaining))
+}
+
+/// A cached wire answer for `mail.example.com`, as the cache layer reports it.
+fn cached_wire_resolution() -> DnsResolution {
+    DnsResolution {
+        upstream_wire_data: Some(bytes::Bytes::from_static(b"\x00\x01\x02\x03")),
+        min_ttl: Some(300),
+        ..DnsResolution::new(vec![], true)
+    }
+}
 
 #[tokio::test]
 async fn test_execute_upstream_resolution_logs_noerror() {
@@ -79,8 +101,6 @@ async fn test_execute_local_dns_resolution_logs_local_dns_status() {
     assert_eq!(logs[0].response_status, Some("LOCAL_DNS"));
 }
 
-// ── execute: block path ────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_execute_blocked_domain_returns_error_and_logs_blocked() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -100,8 +120,6 @@ async fn test_execute_blocked_domain_returns_error_and_logs_blocked() {
     assert!(logs[0].blocked);
     assert_eq!(logs[0].response_status, Some("BLOCKED"));
 }
-
-// ── execute: error paths ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_execute_nxdomain_logs_nxdomain_status() {
@@ -190,8 +208,6 @@ async fn test_execute_local_nxdomain_logs_local_dns_and_returns_nxdomain() {
     assert_eq!(logs[0].response_status, Some("LOCAL_DNS"));
 }
 
-// ── execute: cache paths ───────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_execute_cache_hit_logs_cache_hit_true() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -236,8 +252,6 @@ async fn test_execute_negative_cache_hit_returns_nxdomain() {
     assert_eq!(logs[0].response_status, Some("NXDOMAIN"));
 }
 
-// ── try_cache_direct ───────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_try_cache_direct_returns_none_on_miss() {
     let resolver = Arc::new(MockDnsResolver::new());
@@ -246,8 +260,13 @@ async fn test_try_cache_direct_returns_none_on_miss() {
 
     let use_case = make_use_case(resolver, filter, log.clone());
 
-    let result =
-        use_case.try_cache_direct("google.com", RecordType::A, CLIENT_IP, ClientProtocol::Udp);
+    let result = use_case.try_cache_direct(
+        "google.com",
+        RecordType::A,
+        CLIENT_IP,
+        ClientProtocol::Udp,
+        served,
+    );
 
     assert!(result.is_none());
     assert_eq!(log.sync_log_count(), 0);
@@ -263,8 +282,13 @@ async fn test_try_cache_direct_returns_addresses_and_logs_on_hit() {
 
     let use_case = make_use_case(resolver, filter, log.clone());
 
-    let result =
-        use_case.try_cache_direct("google.com", RecordType::A, CLIENT_IP, ClientProtocol::Udp);
+    let result = use_case.try_cache_direct(
+        "google.com",
+        RecordType::A,
+        CLIENT_IP,
+        ClientProtocol::Udp,
+        served,
+    );
 
     assert!(result.is_some());
     let (addresses, _ttl) = result.unwrap();
@@ -291,8 +315,13 @@ async fn test_try_cache_direct_logs_the_protocol_it_was_given() {
 
     let use_case = make_use_case(resolver, filter, log.clone());
 
-    let result =
-        use_case.try_cache_direct("google.com", RecordType::A, CLIENT_IP, ClientProtocol::Dot);
+    let result = use_case.try_cache_direct(
+        "google.com",
+        RecordType::A,
+        CLIENT_IP,
+        ClientProtocol::Dot,
+        served,
+    );
 
     assert!(result.is_some());
     let logs = log.get_sync_logs();
@@ -354,14 +383,17 @@ async fn test_try_cache_direct_returns_none_when_cached_addresses_empty() {
 
     let use_case = make_use_case(resolver, filter, log.clone());
 
-    let result =
-        use_case.try_cache_direct("empty.com", RecordType::A, CLIENT_IP, ClientProtocol::Udp);
+    let result = use_case.try_cache_direct(
+        "empty.com",
+        RecordType::A,
+        CLIENT_IP,
+        ClientProtocol::Udp,
+        served,
+    );
 
     assert!(result.is_none());
     assert_eq!(log.sync_log_count(), 0);
 }
-
-// ── client tracking ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_execute_with_client_tracking_updates_last_seen() {
@@ -406,8 +438,6 @@ async fn test_execute_without_client_tracking_does_not_create_clients() {
 
     assert_eq!(client_repo.count().await, 0);
 }
-
-// ── CNAME cloaking detection ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_cname_cloaking_blocked_upstream_path() {
@@ -552,13 +582,12 @@ async fn test_try_cache_direct_returns_none_when_domain_blocked() {
         RecordType::A,
         CLIENT_IP,
         ClientProtocol::Udp,
+        served,
     );
 
     assert!(result.is_none());
     assert_eq!(log.sync_log_count(), 0);
 }
-
-// ── try_cache_wire_direct ──────────────────────────────────────────────────
 
 #[test]
 fn try_cache_wire_direct_returns_none_on_cache_miss() {
@@ -573,48 +602,74 @@ fn try_cache_wire_direct_returns_none_on_cache_miss() {
         RecordType::MX,
         CLIENT_IP,
         ClientProtocol::Udp,
+        served_wire,
     );
 
     assert!(result.is_none());
 }
 
 #[test]
-fn try_cache_wire_direct_returns_wire_bytes_on_cache_hit() {
-    use bytes::Bytes;
-    use ferrous_dns_application::ports::EMPTY_CNAME_CHAIN;
-
+fn try_cache_wire_direct_hands_a_hit_and_what_its_entry_has_left_to_respond() {
     let resolver = Arc::new(MockDnsResolver::new());
     let filter = Arc::new(MockBlockFilterEngine::new());
     let log = Arc::new(MockQueryLogRepository::new());
 
-    let wire_bytes = Bytes::from_static(b"\x00\x01\x02\x03");
-    let resolution = DnsResolution {
-        addresses: Arc::new(vec![]),
-        cache_hit: true,
-        local_dns: false,
-        dnssec_status: None,
-        cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
-        upstream_server: None,
-        upstream_pool: None,
-        min_ttl: Some(300),
-        negative_soa_ttl: None,
-        upstream_wire_data: Some(wire_bytes.clone()),
-    };
-    resolver.set_cached_response("mail.example.com", resolution);
+    resolver.set_cached_response("mail.example.com", cached_wire_resolution());
 
-    let use_case = make_use_case(resolver, filter, log);
+    let use_case = make_use_case(resolver, filter, log.clone());
 
     let result = use_case.try_cache_wire_direct(
         "mail.example.com",
         RecordType::MX,
         CLIENT_IP,
         ClientProtocol::Udp,
+        served_wire,
     );
 
-    assert!(result.is_some());
-    let (bytes, ttl) = result.unwrap();
-    assert_eq!(bytes, wire_bytes);
-    assert_eq!(ttl, 300);
+    assert_eq!(result, Some((b"\x00\x01\x02\x03".to_vec(), 300)));
+    assert_eq!(log.sync_log_count(), 1);
+}
+
+/// A hit the server cannot answer inline (too big for the client, or a
+/// relay that fails) goes to `execute`, which logs it: the fast path must
+/// not have logged it already.
+#[tokio::test]
+async fn fast_path_hits_declined_by_the_server_are_logged_once_by_the_slow_path() {
+    let resolver = Arc::new(MockDnsResolver::new());
+    let filter = Arc::new(MockBlockFilterEngine::new());
+    let log = Arc::new(MockQueryLogRepository::new());
+    resolver.set_cached_response("mail.example.com", cached_wire_resolution());
+    resolver.set_cached_response("google.com", cached_resolution("8.8.8.8"));
+    let use_case = make_use_case(resolver, filter, log.clone());
+
+    let declined = use_case.try_cache_wire_direct(
+        "mail.example.com",
+        RecordType::MX,
+        CLIENT_IP,
+        ClientProtocol::Udp,
+        |_, _| None::<()>,
+    );
+    assert!(declined.is_none());
+    let declined = use_case.try_cache_direct(
+        "google.com",
+        RecordType::A,
+        CLIENT_IP,
+        ClientProtocol::Udp,
+        |_, _| None::<()>,
+    );
+    assert!(declined.is_none());
+    assert_eq!(log.sync_log_count(), 0, "a declined hit is not logged");
+
+    for (domain, record_type) in [
+        ("mail.example.com", RecordType::MX),
+        ("google.com", RecordType::A),
+    ] {
+        let request = DnsRequest::new(domain, record_type, CLIENT_IP);
+        assert!(use_case.execute(&request).await.is_ok());
+    }
+    let logs = log.get_sync_logs();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().all(|entry| entry.cache_hit));
 }
 
 #[test]
@@ -636,6 +691,7 @@ fn try_cache_wire_direct_returns_none_when_cached_resolution_has_no_wire_data() 
         RecordType::MX,
         CLIENT_IP,
         ClientProtocol::Udp,
+        served_wire,
     );
 
     assert!(result.is_none());
@@ -656,6 +712,7 @@ fn try_cache_wire_direct_returns_none_when_domain_blocked() {
         addresses: Arc::new(vec![]),
         cache_hit: true,
         local_dns: false,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,
@@ -673,12 +730,11 @@ fn try_cache_wire_direct_returns_none_when_domain_blocked() {
         RecordType::MX,
         CLIENT_IP,
         ClientProtocol::Udp,
+        served_wire,
     );
 
     assert!(result.is_none());
 }
-
-// ── log metadata ───────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_execute_log_contains_correct_domain_and_record_type() {
@@ -719,4 +775,61 @@ async fn test_execute_log_records_response_time() {
 
     let logs = log.get_sync_logs();
     assert!(logs[0].response_time_us.is_some());
+}
+
+//
+// `resolve` expects callers to have probed the cache, so the rewrite must do
+// it itself or every rewritten query goes upstream.
+
+const SAFE_TARGET: &str = "forcesafesearch.google.com";
+
+struct ForceSafeSearch;
+
+#[async_trait]
+impl SafeSearchEnginePort for ForceSafeSearch {
+    fn cname_for(&self, domain: &str, _group_id: i64) -> Option<&'static str> {
+        (domain == "www.google.com").then_some(SAFE_TARGET)
+    }
+    async fn reload(&self) -> Result<(), DomainError> {
+        Ok(())
+    }
+}
+
+/// Rewrites `www.google.com` with `cached` in the target's cache entry and
+/// `resolved` as its upstream answer (unset: resolving fails the query).
+async fn safe_search(
+    cached: Option<DnsResolution>,
+    resolved: Option<DnsResolution>,
+) -> DnsResolution {
+    let resolver = Arc::new(MockDnsResolver::new());
+    if let Some(cached) = cached {
+        resolver.set_cached_response(SAFE_TARGET, cached);
+    }
+    if let Some(resolved) = resolved {
+        resolver.set_response(SAFE_TARGET, resolved).await;
+    }
+    let use_case = make_use_case(
+        resolver,
+        Arc::new(MockBlockFilterEngine::new()),
+        Arc::new(MockQueryLogRepository::new()),
+    )
+    .with_safe_search(Arc::new(ForceSafeSearch));
+    use_case
+        .execute(&DnsRequest::new("www.google.com", RecordType::A, CLIENT_IP))
+        .await
+        .expect("rewrite answered")
+}
+
+#[tokio::test]
+async fn test_safe_search_target_is_served_from_cache_without_resolving() {
+    let result = safe_search(Some(cached_resolution("216.239.38.120")), None).await;
+    assert!(result.cache_hit);
+}
+
+#[tokio::test]
+async fn test_safe_search_target_resolves_on_a_miss_or_a_negative_entry() {
+    let upstream = || Some(upstream_resolution("216.239.38.120"));
+    assert!(!safe_search(None, upstream()).await.cache_hit);
+    let negative = Some(DnsResolution::new(Vec::new(), true));
+    assert!(!safe_search(negative, upstream()).await.cache_hit);
 }

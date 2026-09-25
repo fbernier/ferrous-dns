@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
-use super::session_factory::generate_session_id;
+use super::session_factory::{expires_in, is_expired, random_hex_256};
 use crate::ports::{MfaRepository, WebauthnService};
 use ferrous_dns_domain::{DomainError, MfaChallenge, MfaMethod, WebauthnCredential};
 
@@ -58,7 +58,7 @@ impl RegisterPasskeyUseCase {
             self.webauthn
                 .start_registration(username, display_name, &existing)?;
 
-        let ceremony_token = generate_session_id()?;
+        let ceremony_token = random_hex_256()?;
         self.mfa_repo
             .create_challenge(&MfaChallenge {
                 token: Arc::from(ceremony_token.as_str()),
@@ -66,7 +66,7 @@ impl RegisterPasskeyUseCase {
                 remember_me: false,
                 kind: MfaMethod::Webauthn,
                 state: Some(state_json),
-                expires_at: expiry(self.challenge_ttl_secs),
+                expires_at: expires_in(self.challenge_ttl_secs)?,
             })
             .await?;
 
@@ -125,16 +125,4 @@ impl RegisterPasskeyUseCase {
         info!(username = username, "Passkey registered");
         Ok(())
     }
-}
-
-fn expiry(secs: i64) -> String {
-    (chrono::Utc::now() + chrono::Duration::seconds(secs))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
-fn is_expired(expires_at: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S")
-        .map(|exp| chrono::Utc::now().naive_utc() > exp)
-        .unwrap_or(true)
 }

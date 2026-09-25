@@ -67,6 +67,7 @@ fn test_doh_reloaded_addresses_do_not_reuse_previous_endpoint() {
             let protocol = |addr| DnsProtocol::Https {
                 url: url.clone(),
                 hostname: hostname.clone(),
+                port: first_addr.port(),
                 resolved_addrs: vec![addr],
             };
             let first = get_or_create_transport(&protocol(first_addr)).unwrap();
@@ -80,7 +81,7 @@ fn test_doh_reloaded_addresses_do_not_reuse_previous_endpoint() {
                     .send(&[0; 12], Duration::from_secs(5))
                     .await
                     .unwrap();
-                assert_eq!(response.bytes.as_ref(), expected);
+                assert_eq!(response.as_ref(), expected);
             }
         });
 }

@@ -1,152 +1,120 @@
+use std::net::{IpAddr, SocketAddr};
+
 use serde::{Deserialize, Serialize};
 
+use super::cache_eviction::CacheEvictionStrategy;
 use super::dga_detection::DgaDetectionConfig;
 use super::dns_cookies::DnsCookiesConfig;
 use super::dnssec::DnssecMode;
 use super::health::HealthCheckConfig;
-use super::local_records::LocalDnsRecord;
+use super::local_records::{self, LocalDnsRecord};
 use super::nxdomain_hijack::NxdomainHijackConfig;
 use super::rate_limit::RateLimitConfig;
 use super::response_ip_filter::ResponseIpFilterConfig;
 use super::tunneling::TunnelingDetectionConfig;
 use super::upstream::UpstreamPool;
 use super::upstream::UpstreamStrategy;
+use crate::errors::domain_error::DomainError;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct DnsConfig {
+    /// Empty when omitted, unlike `Default`, which seeds public resolvers.
     #[serde(default)]
     pub upstream_servers: Vec<String>,
 
-    #[serde(default = "default_query_timeout")]
     pub query_timeout: u64,
 
-    #[serde(default = "default_true")]
     pub cache_enabled: bool,
 
-    #[serde(default = "default_cache_ttl")]
     pub cache_ttl: u32,
 
     /// DNSSEC validation enforcement mode (RFC 4035 / 6840). Single source of
     /// truth. When absent, falls back to the deprecated `dnssec_enabled` flag
     /// (see `effective_dnssec_mode`).
-    #[serde(default)]
     pub dnssec_mode: Option<DnssecMode>,
 
     /// Deprecated: use `dnssec_mode`. Kept only for backward-compatibility with
     /// older config files; `true` maps to `Permissive`, `false` to `Off`.
-    #[serde(default)]
     pub dnssec_enabled: Option<bool>,
 
     /// Path to a DNSSEC trust anchor file in DNS presentation format (DS and/or
     /// DNSKEY records), replacing the IANA root anchors embedded in the binary.
     /// Read once at startup — deliberately not exposed through the API, since it
     /// names a host path and only takes effect on restart.
-    #[serde(default)]
     pub dnssec_trust_anchor_file: Option<String>,
 
-    #[serde(default)]
     pub default_strategy: UpstreamStrategy,
 
-    #[serde(default)]
     pub pools: Vec<UpstreamPool>,
 
-    #[serde(default)]
     pub health_check: HealthCheckConfig,
 
-    #[serde(default = "default_cache_max_entries")]
     pub cache_max_entries: usize,
-    #[serde(default = "default_cache_eviction_strategy")]
-    pub cache_eviction_strategy: String,
-    #[serde(default = "default_cache_optimistic_refresh")]
+    pub cache_eviction_strategy: CacheEvictionStrategy,
     pub cache_optimistic_refresh: bool,
-    #[serde(default = "default_cache_min_hit_rate")]
     pub cache_min_hit_rate: f64,
-    #[serde(default = "default_cache_min_frequency")]
     pub cache_min_frequency: u64,
-    #[serde(default = "default_cache_min_lfuk_score")]
     pub cache_min_lfuk_score: f64,
-    #[serde(default = "default_cache_refresh_threshold")]
     pub cache_refresh_threshold: f64,
 
-    #[serde(default = "default_cache_lfuk_history_size")]
     pub cache_lfuk_history_size: usize,
-    #[serde(default = "default_cache_batch_eviction_percentage")]
     pub cache_batch_eviction_percentage: f64,
-    #[serde(default = "default_cache_compaction_interval")]
     pub cache_compaction_interval: u64,
-    #[serde(default = "default_cache_adaptive_thresholds")]
     pub cache_adaptive_thresholds: bool,
 
-    #[serde(default = "default_cache_shard_amount")]
     pub cache_shard_amount: usize,
 
-    #[serde(default = "default_cache_inflight_shards")]
     pub cache_inflight_shards: usize,
 
-    #[serde(default = "default_cache_access_window_secs")]
     pub cache_access_window_secs: u64,
 
-    #[serde(default = "default_cache_eviction_sample_size")]
     pub cache_eviction_sample_size: usize,
 
-    #[serde(default = "default_cache_min_ttl")]
     pub cache_min_ttl: u32,
 
-    #[serde(default = "default_cache_max_ttl")]
     pub cache_max_ttl: u32,
 
-    #[serde(default = "default_true")]
     pub block_private_ptr: bool,
 
-    #[serde(default = "default_false")]
     pub block_non_fqdn: bool,
 
-    #[serde(default = "default_false")]
     pub mdns_enabled: bool,
 
-    #[serde(default)]
     pub local_domain: Option<String>,
 
-    #[serde(default)]
+    /// `IP:port`; a bare IP, as older builds saved it, means port 53.
     pub local_dns_server: Option<String>,
 
-    #[serde(default)]
+    #[serde(deserialize_with = "local_records::deserialize_lenient")]
     pub local_records: Vec<LocalDnsRecord>,
 
     /// Whether DNS rebinding protection is enabled. When `true`, responses that
     /// resolve a public domain to a private/RFC1918 IP are blocked.
     /// Defaults to `true` — opt-out rather than opt-in for security-sensitive features.
-    #[serde(default = "default_true")]
     pub rebinding_protection_enabled: bool,
 
     /// Domains that are always exempt from rebinding protection, regardless of the
     /// resolved IP address. Useful for split-horizon DNS scenarios where an external
     /// name intentionally resolves to a private address (e.g. VPN or router admin panels).
-    #[serde(default)]
     pub rebinding_allowlist: Vec<String>,
 
     /// DNS query rate limiting and DoS protection configuration.
-    #[serde(default)]
     pub rate_limit: RateLimitConfig,
 
     /// DNS tunneling detection configuration.
-    #[serde(default)]
     pub tunneling_detection: TunnelingDetectionConfig,
 
     /// NXDomain hijack detection configuration.
-    #[serde(default)]
     pub nxdomain_hijack: NxdomainHijackConfig,
 
     /// Response IP filtering (block known C2 IPs in DNS responses).
-    #[serde(default)]
     pub response_ip_filter: ResponseIpFilterConfig,
 
     /// DGA (Domain Generation Algorithm) detection configuration.
-    #[serde(default)]
     pub dga_detection: DgaDetectionConfig,
 
     /// DNS Cookies anti-spoofing configuration (RFC 7873).
-    #[serde(default)]
     pub dns_cookies: DnsCookiesConfig,
 
     /// Randomize the case of QNAME letters on A/AAAA upstream queries
@@ -154,7 +122,6 @@ pub struct DnsConfig {
     /// echoed case on the response. Off by default: some upstreams/forwarders do
     /// not preserve QNAME case and would fail validation. DNS Cookies on A/AAAA
     /// upstream queries are always on and graceful, independent of this flag.
-    #[serde(default = "default_false")]
     pub qname_case_randomization: bool,
 }
 
@@ -162,32 +129,32 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             upstream_servers: vec!["8.8.8.8:53".to_string(), "1.1.1.1:53".to_string()],
-            query_timeout: default_query_timeout(),
+            query_timeout: 3,
             cache_enabled: true,
-            cache_ttl: default_cache_ttl(),
+            cache_ttl: 3600,
             dnssec_mode: None,
             dnssec_enabled: None,
             dnssec_trust_anchor_file: None,
             default_strategy: UpstreamStrategy::Parallel,
             pools: vec![],
             health_check: HealthCheckConfig::default(),
-            cache_max_entries: default_cache_max_entries(),
-            cache_eviction_strategy: default_cache_eviction_strategy(),
-            cache_optimistic_refresh: default_cache_optimistic_refresh(),
-            cache_min_hit_rate: default_cache_min_hit_rate(),
-            cache_min_frequency: default_cache_min_frequency(),
-            cache_min_lfuk_score: default_cache_min_lfuk_score(),
-            cache_refresh_threshold: default_cache_refresh_threshold(),
-            cache_lfuk_history_size: default_cache_lfuk_history_size(),
-            cache_batch_eviction_percentage: default_cache_batch_eviction_percentage(),
-            cache_compaction_interval: default_cache_compaction_interval(),
-            cache_adaptive_thresholds: default_cache_adaptive_thresholds(),
+            cache_max_entries: 200_000,
+            cache_eviction_strategy: CacheEvictionStrategy::HitRate,
+            cache_optimistic_refresh: true,
+            cache_min_hit_rate: 2.0,
+            cache_min_frequency: 10,
+            cache_min_lfuk_score: 1.5,
+            cache_refresh_threshold: 0.75,
+            cache_lfuk_history_size: 10,
+            cache_batch_eviction_percentage: 0.1,
+            cache_compaction_interval: 300,
+            cache_adaptive_thresholds: false,
             cache_shard_amount: default_cache_shard_amount(),
             cache_inflight_shards: default_cache_inflight_shards(),
-            cache_access_window_secs: default_cache_access_window_secs(),
-            cache_eviction_sample_size: default_cache_eviction_sample_size(),
-            cache_min_ttl: default_cache_min_ttl(),
-            cache_max_ttl: default_cache_max_ttl(),
+            cache_access_window_secs: 7200,
+            cache_eviction_sample_size: 8,
+            cache_min_ttl: 0,
+            cache_max_ttl: 86_400,
             block_private_ptr: true,
             block_non_fqdn: false,
             mdns_enabled: false,
@@ -222,82 +189,26 @@ impl DnsConfig {
             None => DnssecMode::default(),
         }
     }
-}
 
-fn default_query_timeout() -> u64 {
-    3
-}
+    /// `local_dns_server` as the address the forwarder queries.
+    pub fn local_dns_server_addr(&self) -> Result<Option<SocketAddr>, DomainError> {
+        self.local_dns_server
+            .as_deref()
+            .map(Self::parse_local_dns_server)
+            .transpose()
+    }
 
-fn default_cache_ttl() -> u32 {
-    3600
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_false() -> bool {
-    false
-}
-
-fn default_cache_max_entries() -> usize {
-    200_000
-}
-
-fn default_cache_eviction_strategy() -> String {
-    "hit_rate".to_string()
-}
-
-fn default_cache_optimistic_refresh() -> bool {
-    true
-}
-
-fn default_cache_min_hit_rate() -> f64 {
-    2.0
-}
-
-fn default_cache_min_frequency() -> u64 {
-    10
-}
-
-fn default_cache_min_lfuk_score() -> f64 {
-    1.5
-}
-
-fn default_cache_refresh_threshold() -> f64 {
-    0.75
-}
-
-fn default_cache_lfuk_history_size() -> usize {
-    10
-}
-
-fn default_cache_batch_eviction_percentage() -> f64 {
-    0.1
-}
-
-fn default_cache_compaction_interval() -> u64 {
-    300
-}
-
-fn default_cache_adaptive_thresholds() -> bool {
-    false
-}
-
-fn default_cache_access_window_secs() -> u64 {
-    7200
-}
-
-fn default_cache_eviction_sample_size() -> usize {
-    8
-}
-
-fn default_cache_min_ttl() -> u32 {
-    0
-}
-
-fn default_cache_max_ttl() -> u32 {
-    86_400
+    /// Parses a `local_dns_server` value: `IP:port`, or a bare IP for port 53.
+    pub fn parse_local_dns_server(value: &str) -> Result<SocketAddr, DomainError> {
+        value
+            .parse::<SocketAddr>()
+            .or_else(|_| value.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+            .map_err(|_| {
+                DomainError::ConfigError(format!(
+                    "dns.local_dns_server '{value}' must be an IP address or IP:port such as 192.168.1.1:53"
+                ))
+            })
+    }
 }
 
 fn default_cache_shard_amount() -> usize {
@@ -311,6 +222,6 @@ fn default_cache_inflight_shards() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    // In-flight entries are transient: use 1/4 of cache shards, clamped to 8..=128.
+    // In-flight entries are transient: half the cache shard count.
     (cpus * 2).next_power_of_two().clamp(8, 128)
 }

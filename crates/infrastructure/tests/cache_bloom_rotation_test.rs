@@ -10,10 +10,8 @@ fn create_cache(min_ttl: u32) -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 1000,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.1,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 8,
@@ -124,7 +122,6 @@ fn rotation_reseeds_permanent_entries() {
         RecordType::A,
         make_cname_data("printer.local"),
         300,
-        None,
     );
 
     cache.rotate_bloom();

@@ -9,7 +9,7 @@ The `[dns.rate_limit]` section configures per-subnet token-bucket rate limiting 
 Ferrous DNS rate limiting protects against DNS query floods and DoS attacks while allowing legitimate traffic through. It works at three levels:
 
 1. **Query rate limiting** — token bucket per client subnet (UDP + TCP)
-2. **NXDOMAIN budget** — separate stricter limit for non-existent domain responses
+2. **NXDOMAIN budget** — separate stricter limit that applies only to NXDOMAIN answers
 3. **Connection limiting** — per-IP caps on concurrent TCP and DoT connections
 
 When disabled (`enabled = false`), rate limiting adds zero overhead to query processing.
@@ -78,7 +78,7 @@ Subnet 10.0.0.0/24:
 | `ipv4_prefix_len` | `u8` | `24` | IPv4 prefix length used to group clients into subnet buckets. `24` groups a `/24` subnet |
 | `ipv6_prefix_len` | `u8` | `48` | IPv6 prefix length used to group clients into subnet buckets. `48` covers a standard home delegation |
 | `whitelist` | `[str]` | `[]` | List of CIDRs that bypass rate limiting entirely |
-| `nxdomain_per_second` | `u32` | `50` | Separate budget for NXDOMAIN responses. Catches random-subdomain attacks |
+| `nxdomain_per_second` | `u32` | `50` | Separate budget for NXDOMAIN answers; only an NXDOMAIN over it is limited. Catches random-subdomain attacks. `0` = no NXDOMAIN budget |
 | `slip_ratio` | `u32` | `0` | Every Nth rate-limited response is TC=1 instead of REFUSED. `0` = disabled |
 | `dry_run` | `bool` | `false` | Log rate-limit events without refusing queries |
 | `stale_entry_ttl_secs` | `u64` | `300` | Seconds before an idle subnet bucket is evicted from memory |
@@ -114,13 +114,20 @@ TC=1 forces clients to retry over TCP, which:
 
 ## NXDOMAIN Budget
 
-The NXDOMAIN budget is a separate, stricter token bucket that only applies to queries resulting in NXDOMAIN responses. This catches:
+The NXDOMAIN budget works like BIND's response rate limiting (`nxdomains-per-second`). It is a separate, stricter token bucket per subnet, charged for each NXDOMAIN answer the subnet receives. This catches:
 
 - **Random subdomain attacks** — bots generating `abc123.example.com` queries
 - **IoT scanning** — devices probing many non-existent subdomains
 - **DGA malware** — domain generation algorithm traffic
 
-The NXDOMAIN burst capacity is `nxdomain_per_second * 2`. The general query budget is not affected by NXDOMAIN traffic.
+The budget is charged when the NXDOMAIN answer is produced, and it decides that answer only. An NXDOMAIN answer over the budget gets the configured action: REFUSED or TC=1 per `slip_ratio`, or only a log line under `dry_run`. The subnet's other queries are never refused because of it, so one device sweeping non-existent names does not take the rest of its `/24` offline.
+
+NXDOMAINs from `local_dns_server` are never charged, fresh or from the negative cache: they are the LAN's own traffic, such as a router answering reverse lookups for hosts it does not know. Whitelisted clients are never charged either.
+
+The NXDOMAIN burst capacity is `nxdomain_per_second * 2` and it refills at `nxdomain_per_second`. Answers that resolve do not spend it, and NXDOMAIN answers do not spend the general query budget. `nxdomain_per_second = 0` disables the NXDOMAIN budget.
+
+!!! note "Upstream NXDOMAINs"
+    Upstream pools currently report an NXDOMAIN answer as a successful resolution ([#244](https://github.com/ferrous-networking/ferrous-dns/issues/244)), so upstream NXDOMAINs are not charged yet. The budget covers them once that issue is fixed.
 
 ---
 

@@ -5,9 +5,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use anyhow::Context;
 use clap::Parser;
-use ferrous_dns_domain::CliOverrides;
 use ferrous_dns_infrastructure::dns::server::{BlockPolicy, DnsServerHandler};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -25,25 +23,20 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .max_blocking_threads(16)
         .build()
-        .expect("Failed to build tokio runtime");
+        .context("Failed to build tokio runtime")?;
 
     runtime.block_on(async_main())
 }
 
 async fn async_main() -> anyhow::Result<()> {
     let cli = args::Cli::parse();
+    let log_level = bootstrap::init_logging();
 
-    let cli_overrides = CliOverrides {
-        dns_port: cli.dns_port,
-        web_port: cli.web_port,
-        bind_address: cli.bind.clone(),
-        database_path: cli.database.clone(),
-        log_level: cli.log_level.clone(),
-    };
+    let config_path = bootstrap::resolve_config_path(cli.config.as_deref());
+    let overrides = bootstrap::config_overrides(&cli);
+    let config = bootstrap::load_config(config_path.as_deref(), &overrides)?;
 
-    let config = bootstrap::load_config(cli.config.as_deref(), cli_overrides)?;
-
-    bootstrap::init_logging(&config);
+    bootstrap::apply_log_level(&log_level, &config);
 
     info!("Starting Ferrous DNS Server v{}", env!("CARGO_PKG_VERSION"));
 
@@ -64,60 +57,42 @@ async fn async_main() -> anyhow::Result<()> {
         config.blocking.enabled,
     )
     .await?;
-    let mut dns_services = wiring::DnsServices::new(&config, &repos).await?;
+    let dns_services = wiring::DnsServices::new(&config, &repos).await?;
     let use_cases = wiring::UseCases::new(
         &repos,
         dns_services.pool_manager.clone(),
-        config.dns.local_dns_server.clone(),
+        dns_services.local_dns_server,
     );
 
-    let tunneling_eviction_job = dns_services.tunneling_eviction_job.take();
-    let nxdomain_hijack_job = dns_services.nxdomain_hijack_eviction_job.take();
-    let response_ip_filter_job = dns_services.response_ip_filter_eviction_job.take();
-    let dga_eviction_job = dns_services.dga_eviction_job.take();
-    let runner = bootstrap::build_job_runner(
+    bootstrap::spawn_jobs(
         &use_cases,
         &repos,
         &config,
         wal_pool,
         dns_services.cache_maintenance.clone(),
-        tunneling_eviction_job,
-        nxdomain_hijack_job,
-        response_ip_filter_job,
-        dga_eviction_job,
     );
 
-    runner.start().await;
-
-    info!("Loading subnet matcher cache");
-    if let Err(e) = use_cases.subnet_matcher.refresh().await {
-        error!(error = %e, "Failed to load subnet matcher cache");
-    }
-    info!("Subnet matcher cache loaded");
-
-    let effective_config_path: Option<Arc<str>> =
-        cli.config.as_deref().map(Arc::from).or_else(|| {
-            ferrous_dns_domain::Config::get_config_path().map(|p| Arc::from(p.as_str()))
-        });
-
-    let upstream_health: Arc<dyn ferrous_dns_application::ports::UpstreamHealthPort> =
-        Arc::new(ferrous_dns_infrastructure::dns::UpstreamHealthAdapter::new(
-            dns_services.pool_manager.clone(),
-            dns_services.health_checker.clone(),
-        ));
+    let effective_config_path: Option<Arc<str>> = config_path.as_deref().map(Arc::from);
+    let config_services = wiring::app_state::build_config_services(
+        &dns_services,
+        config_arc.clone(),
+        effective_config_path.clone(),
+        overrides,
+    );
 
     let auth =
         wiring::build_auth_services(&repos, config_arc.clone(), effective_config_path.as_deref())
             .await;
 
-    let pihole_state = wiring::build_pihole_state(
-        &use_cases,
-        &auth,
-        repos.block_filter_engine.clone(),
-        upstream_health,
-        config_arc.clone(),
-        effective_config_path.clone(),
-    );
+    let pihole_state = config.server.pihole_compat.then(|| {
+        wiring::build_pihole_state(
+            &use_cases,
+            &auth,
+            repos.block_filter_engine.clone(),
+            config_arc.clone(),
+            config_services.reload.clone(),
+        )
+    });
 
     // The session cookie's `Secure` flag must follow the transport actually in
     // use, so the web TLS material is loaded before the state is built: with
@@ -139,8 +114,7 @@ async fn async_main() -> anyhow::Result<()> {
         auth.use_cases,
         &repos,
         &dns_services,
-        config_arc,
-        effective_config_path,
+        &config_services,
         web_tls_config.is_some(),
     )
     .await;
@@ -175,27 +149,17 @@ async fn async_main() -> anyhow::Result<()> {
     });
 
     if config.dns.mdns_enabled {
-        tokio::spawn(async move {
-            if let Err(e) = server::start_mdns_listener().await {
-                error!(error = %e, "mDNS listener error");
-            }
-        });
+        tokio::spawn(server::start_mdns_listener());
     }
 
-    let tls_config =
-        if config.server.encrypted_dns.dot_enabled || config.server.encrypted_dns.doh_enabled {
-            server::load_server_tls_config(
-                &config.server.encrypted_dns.tls_cert_path,
-                &config.server.encrypted_dns.tls_key_path,
-                "DoT/DoH",
-                &[],
-            )?
-        } else {
-            None
-        };
-
     if config.server.encrypted_dns.dot_enabled {
-        if let Some(tls_cfg) = tls_config.clone() {
+        let dot_tls_config = server::load_server_tls_config(
+            &config.server.encrypted_dns.tls_cert_path,
+            &config.server.encrypted_dns.tls_key_path,
+            "DoT",
+            &[],
+        )?;
+        if let Some(tls_cfg) = dot_tls_config {
             let dot_addr = config.server.dot_listen_address();
             let dot_handler = Arc::new(DnsServerHandler::new(
                 handler_use_case.clone(),
@@ -241,44 +205,35 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    let doh_handler = if config.server.encrypted_dns.doh_enabled {
-        if let Some(doh_bind_addr) = config.server.doh_listen_address() {
-            if tls_config.is_some() {
-                let doh_addr: SocketAddr =
-                    doh_bind_addr.parse().context("Invalid DoH bind address")?;
-                let dedicated_doh_handler = Arc::new(DnsServerHandler::new(
-                    handler_use_case.clone(),
-                    block_policy,
-                ));
-                tokio::spawn(async move {
-                    if let Err(e) = server::start_doh_server(doh_addr, dedicated_doh_handler).await
-                    {
-                        error!(error = %e, "DoH server error");
-                    }
-                });
-            }
+    // DoH is plain HTTP here (TLS is terminated in front of it, or by the web
+    // listener), so unlike DoT and DoQ it needs no certificate.
+    let doh = config.server.encrypted_dns.doh_enabled.then(|| {
+        Arc::new(server::DohContext {
+            handler: Arc::new(DnsServerHandler::new(handler_use_case, block_policy)),
+            trusted_proxies: config.server.trusted_proxies.clone(),
+        })
+    });
+    let web_doh = match (doh, config.server.doh_listen_address()) {
+        (Some(doh), Some(doh_addr)) => {
+            tokio::spawn(async move {
+                if let Err(e) = server::start_doh_server(doh_addr, doh).await {
+                    error!(error = %e, "DoH server error");
+                }
+            });
             None
-        } else {
-            tls_config.map(|_| Arc::new(DnsServerHandler::new(handler_use_case, block_policy)))
         }
-    } else {
-        None
+        (doh, _) => doh,
     };
 
-    let web_addr: SocketAddr = config
-        .server
-        .web_listen_address()
-        .parse()
-        .expect("Invalid address");
+    let web_addr = config.server.web_listen_address();
 
     server::start_web_server(
         web_addr,
         app_state,
         pihole_state,
         &config.server.cors_allowed_origins,
-        config.server.pihole_compat,
         config.server.metrics_enabled,
-        doh_handler,
+        web_doh,
         web_tls_config,
     )
     .await?;

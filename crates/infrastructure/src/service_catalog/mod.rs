@@ -2,7 +2,7 @@ mod composite;
 
 pub use composite::CompositeServiceCatalog;
 
-use ferrous_dns_domain::ServiceDefinition;
+use ferrous_dns_domain::{DomainError, ServiceDefinition};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,10 +24,11 @@ pub struct ServiceCatalog {
 }
 
 impl ServiceCatalog {
-    pub fn load() -> Self {
+    pub fn load() -> Result<Self, DomainError> {
         let json = include_str!("catalog.json");
-        let raw: Vec<RawService> =
-            serde_json::from_str(json).expect("catalog.json must be valid JSON");
+        let raw: Vec<RawService> = serde_json::from_str(json).map_err(|e| {
+            DomainError::ConfigError(format!("embedded service catalog is invalid: {e}"))
+        })?;
 
         let mut services = Vec::with_capacity(raw.len());
         let mut by_id = HashMap::with_capacity(raw.len());
@@ -46,7 +47,7 @@ impl ServiceCatalog {
             });
         }
 
-        Self { services, by_id }
+        Ok(Self { services, by_id })
     }
 
     pub fn get_by_id(&self, id: &str) -> Option<&ServiceDefinition> {

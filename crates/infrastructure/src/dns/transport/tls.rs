@@ -1,207 +1,98 @@
-use super::tcp::{read_with_length_prefix, send_with_length_prefix};
-use super::{DnsTransport, TransportResponse};
-use async_trait::async_trait;
-use dashmap::DashMap;
+use super::tcp::{connect_tcp, exchange_framed, IdlePool};
+use super::{require_resolved, tls_client_config};
+use bytes::Bytes;
 use ferrous_dns_domain::{DomainError, UpstreamAddr};
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::{timeout_at, Instant};
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
 
 const MAX_IDLE_PER_HOST: usize = 12;
 
-static SHARED_TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    config.resumption = rustls::client::Resumption::in_memory_sessions(64);
-
-    Arc::new(config)
-});
-
-type TlsConnection = TlsStream<TcpStream>;
-type PoolKey = (Arc<str>, u16);
-type TlsConnectionPool = DashMap<PoolKey, Vec<TlsConnection>>;
-
-static TLS_POOL: LazyLock<TlsConnectionPool> = LazyLock::new(TlsConnectionPool::new);
+static SHARED_TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> =
+    LazyLock::new(|| Arc::new(tls_client_config()));
 
 pub struct TlsTransport {
     upstream_addr: UpstreamAddr,
-    hostname: Arc<str>,
+    server_name: ServerName<'static>,
+    // Per transport, i.e. per (address, hostname): a connection to one resolved
+    // address must never answer for another, or health checks lie.
+    idle: IdlePool<TlsStream<TcpStream>>,
 }
 
 impl TlsTransport {
-    pub fn new(upstream_addr: UpstreamAddr, hostname: Arc<str>) -> Self {
-        Self {
+    pub fn new(upstream_addr: UpstreamAddr, hostname: &str) -> Result<Self, DomainError> {
+        let server_name = ServerName::try_from(hostname.to_owned()).map_err(|e| {
+            DomainError::ConfigError(format!("Invalid TLS hostname '{hostname}': {e}"))
+        })?;
+        Ok(Self {
             upstream_addr,
-            hostname,
-        }
-    }
-
-    fn pool_key(&self) -> PoolKey {
-        (Arc::clone(&self.hostname), self.upstream_addr.port())
-    }
-
-    fn resolved_addr(&self) -> Result<SocketAddr, DomainError> {
-        self.upstream_addr.socket_addr().ok_or_else(|| {
-            DomainError::IoError(format!(
-                "TLS transport requires resolved address, got: {}",
-                self.upstream_addr
-            ))
+            server_name,
+            idle: IdlePool::new(MAX_IDLE_PER_HOST),
         })
     }
 
-    fn take_pooled(&self) -> Option<TlsStream<TcpStream>> {
-        let key = self.pool_key();
-        let mut entry = TLS_POOL.get_mut(&key)?;
-        entry.pop()
-    }
+    async fn connect_new(
+        &self,
+        server_addr: SocketAddr,
+        deadline: Instant,
+    ) -> Result<TlsStream<TcpStream>, DomainError> {
+        let tcp_stream = connect_tcp(server_addr, deadline, "TLS").await?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::clone(&SHARED_TLS_CONFIG));
 
-    fn return_to_pool(&self, stream: TlsStream<TcpStream>) {
-        let key = self.pool_key();
-        let mut entry = TLS_POOL.entry(key).or_default();
-        if entry.len() < MAX_IDLE_PER_HOST {
-            entry.push(stream);
-        }
-    }
-
-    async fn connect_new(&self, timeout: Duration) -> Result<TlsStream<TcpStream>, DomainError> {
-        let server_addr = self.resolved_addr()?;
-        let connector = tokio_rustls::TlsConnector::from(SHARED_TLS_CONFIG.clone());
-
-        let server_name = ServerName::try_from(self.hostname.to_string()).map_err(|e| {
-            DomainError::InvalidDomainName(format!(
-                "Invalid TLS hostname '{}': {}",
-                self.hostname, e
-            ))
+        let tls_stream = timeout_at(
+            deadline,
+            connector.connect(self.server_name.clone(), tcp_stream),
+        )
+        .await
+        .map_err(|_| {
+            DomainError::IoError(format!("Timeout during TLS handshake with {}", server_addr))
+        })?
+        .map_err(|e| {
+            DomainError::IoError(format!("TLS handshake failed with {}: {}", server_addr, e))
         })?;
 
-        let tcp_stream = tokio::time::timeout(timeout, TcpStream::connect(server_addr))
-            .await
-            .map_err(|_| {
-                DomainError::IoError(format!("Timeout connecting to TLS server {}", server_addr))
-            })?
-            .map_err(|e| {
-                DomainError::IoError(format!(
-                    "Connection refused by TLS server {}: {}",
-                    server_addr, e
-                ))
-            })?;
-
-        // A query on a reused connection must not wait for the ACK of the previous one.
-        tcp_stream.set_nodelay(true).map_err(|e| {
-            DomainError::IoError(format!(
-                "Failed to set TCP_NODELAY on {}: {}",
-                server_addr, e
-            ))
-        })?;
-
-        let sock_ref = socket2::SockRef::from(&tcp_stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(15))
-            .with_interval(std::time::Duration::from_secs(5));
-        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-            debug!(server = %server_addr, error = %e, "Failed to set TCP keepalive");
-        }
-
-        let tls_stream = tokio::time::timeout(timeout, connector.connect(server_name, tcp_stream))
-            .await
-            .map_err(|_| {
-                DomainError::IoError(format!("Timeout during TLS handshake with {}", server_addr))
-            })?
-            .map_err(|e| {
-                DomainError::IoError(format!("TLS handshake failed with {}: {}", server_addr, e))
-            })?;
-
-        debug!(server = %server_addr, hostname = %self.hostname, "TLS connection established");
+        debug!(server = %server_addr, server_name = ?self.server_name, "TLS connection established");
         Ok(tls_stream)
     }
 
-    async fn send_on_stream(
-        &self,
-        stream: &mut TlsStream<TcpStream>,
-        message_bytes: &[u8],
-        timeout: Duration,
-    ) -> Result<Vec<u8>, DomainError> {
-        let server_addr = self.resolved_addr()?;
-
-        tokio::time::timeout(timeout, send_with_length_prefix(stream, message_bytes))
-            .await
-            .map_err(|_| {
-                DomainError::IoError(format!("Timeout sending TLS query to {}", server_addr))
-            })??;
-
-        let response_bytes = tokio::time::timeout(timeout, read_with_length_prefix(stream))
-            .await
-            .map_err(|_| {
-                DomainError::IoError(format!(
-                    "Timeout waiting for TLS response from {}",
-                    server_addr
-                ))
-            })??;
-
-        Ok(response_bytes)
-    }
-}
-
-#[async_trait]
-impl DnsTransport for TlsTransport {
-    async fn send(
+    pub async fn send(
         &self,
         message_bytes: &[u8],
         timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
-        let server_addr = self.resolved_addr()?;
+    ) -> Result<Bytes, DomainError> {
+        let server_addr = require_resolved(&self.upstream_addr, "TLS")?;
+        let deadline = Instant::now() + timeout;
 
-        if let Some(mut stream) = self.take_pooled() {
-            match self
-                .send_on_stream(&mut stream, message_bytes, timeout)
-                .await
-            {
-                Ok(response_bytes) => {
+        if let Some(mut stream) = self.idle.take() {
+            match exchange_framed(&mut stream, message_bytes, deadline, server_addr, "TLS").await {
+                Ok(response) => {
                     debug!(server = %server_addr, "TLS query via pooled connection");
-                    self.return_to_pool(stream);
-                    return Ok(TransportResponse {
-                        bytes: bytes::Bytes::from(response_bytes),
-                        protocol_used: "TLS",
-                    });
+                    self.idle.park(stream);
+                    return Ok(Bytes::from(response));
                 }
+                Err(e) if Instant::now() >= deadline => return Err(e),
                 Err(_) => {
                     debug!(server = %server_addr, "Pooled TLS connection stale, reconnecting");
                 }
             }
         }
 
-        let mut stream = self.connect_new(timeout).await?;
-
-        let response_bytes = self
-            .send_on_stream(&mut stream, message_bytes, timeout)
-            .await?;
+        let mut stream = self.connect_new(server_addr, deadline).await?;
+        let response =
+            exchange_framed(&mut stream, message_bytes, deadline, server_addr, "TLS").await?;
 
         debug!(
             server = %server_addr,
-            response_len = response_bytes.len(),
+            response_len = response.len(),
             "TLS response received"
         );
 
-        self.return_to_pool(stream);
-
-        Ok(TransportResponse {
-            bytes: bytes::Bytes::from(response_bytes),
-            protocol_used: "TLS",
-        })
-    }
-
-    fn protocol_name(&self) -> &'static str {
-        "TLS"
+        self.idle.park(stream);
+        Ok(Bytes::from(response))
     }
 }

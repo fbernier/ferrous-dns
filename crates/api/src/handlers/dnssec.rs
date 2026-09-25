@@ -2,15 +2,13 @@ use crate::{
     dto::{DnssecStatsResponse, StatsQuery},
     errors::ApiError,
     state::AppState,
-    utils::{parse_period, validate_period},
+    utils::period_hours,
 };
 use axum::{
     extract::{Query, State},
     Json,
 };
 use tracing::instrument;
-
-const DEFAULT_PERIOD_HOURS: f32 = 24.0;
 
 #[utoipa::path(
     get,
@@ -28,11 +26,11 @@ pub async fn get_dnssec_stats(
     State(state): State<AppState>,
     Query(params): Query<StatsQuery>,
 ) -> Result<Json<DnssecStatsResponse>, ApiError> {
-    let period_hours = parse_period(&params.period)
-        .map(validate_period)
-        .unwrap_or(DEFAULT_PERIOD_HOURS);
-
-    let stats = state.query.get_stats.execute_dnssec(period_hours).await?;
+    let stats = state
+        .query
+        .get_stats
+        .execute_dnssec(period_hours(&params.period))
+        .await?;
     let validator = state.dns.dnssec_stats.validator_stats();
 
     Ok(Json(DnssecStatsResponse {

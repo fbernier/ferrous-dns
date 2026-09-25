@@ -1,4 +1,7 @@
+use super::algorithm_name;
+use crate::dns::forwarding::record_type_map::RecordTypeMapper;
 use ferrous_dns_domain::{DomainError, RecordType};
+use hickory_proto::dnssec::rdata::RRSIG;
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -15,7 +18,24 @@ pub struct RrsigRecord {
 }
 
 impl RrsigRecord {
-    pub fn parse(data: &[u8], full_data: &[u8]) -> Result<Self, DomainError> {
+    /// Converts hickory's parsed RRSIG; `None` when the covered type has no
+    /// project [`RecordType`].
+    pub(crate) fn from_hickory(rrsig: &RRSIG) -> Option<Self> {
+        let input = rrsig.input();
+        Some(Self {
+            type_covered: RecordTypeMapper::from_hickory(input.type_covered)?,
+            algorithm: u8::from(input.algorithm),
+            labels: input.num_labels,
+            original_ttl: input.original_ttl,
+            signature_expiration: input.sig_expiration.get(),
+            signature_inception: input.sig_inception.get(),
+            key_tag: input.key_tag,
+            signer_name: input.signer_name.to_string(),
+            signature: rrsig.sig().to_vec(),
+        })
+    }
+
+    pub fn parse(data: &[u8]) -> Result<Self, DomainError> {
         if data.len() < 18 {
             return Err(DomainError::InvalidDnsResponse(
                 "RRSIG record too short".into(),
@@ -34,7 +54,7 @@ impl RrsigRecord {
         let signature_inception = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
         let key_tag = u16::from_be_bytes([data[16], data[17]]);
 
-        let (signer_name, name_len) = Self::parse_domain_name(&data[18..], full_data)?;
+        let (signer_name, name_len) = Self::parse_domain_name(&data[18..])?;
         let signature = data[18 + name_len..].to_vec();
 
         Ok(Self {
@@ -50,7 +70,7 @@ impl RrsigRecord {
         })
     }
 
-    fn parse_domain_name(data: &[u8], _full_data: &[u8]) -> Result<(String, usize), DomainError> {
+    fn parse_domain_name(data: &[u8]) -> Result<(String, usize), DomainError> {
         let mut name = String::new();
         let mut pos = 0;
 
@@ -91,20 +111,6 @@ impl RrsigRecord {
         Ok((name, pos))
     }
 
-    pub fn algorithm_name(&self) -> &'static str {
-        match self.algorithm {
-            8 => "RSA/SHA-256",
-            13 => "ECDSA P-256/SHA-256",
-            15 => "Ed25519",
-            _ => "Unknown",
-        }
-    }
-
-    pub fn is_expired(&self, now: u32) -> bool {
-        // `now > expiration` under RFC 4034 §3.1.5 serial arithmetic.
-        !serial_le(now, self.signature_expiration)
-    }
-
     pub fn is_valid_at(&self, now: u32) -> bool {
         // RFC 4034 §3.1.5: RRSIG inception/expiration are mod-2^32 serial
         // numbers, not absolute u32s, so a window straddling the 2106 wrap (or
@@ -129,7 +135,7 @@ impl fmt::Display for RrsigRecord {
             f,
             "RRSIG({:?}, algo={}, tag={}, signer={})",
             self.type_covered,
-            self.algorithm_name(),
+            algorithm_name(self.algorithm),
             self.key_tag,
             self.signer_name
         )

@@ -1,5 +1,3 @@
-//! Tests for Phase 2 of the cache optimization plan: negative cache TTL floor.
-//!
 //! The negative cache must enforce a `[300s, 3600s]` window on its TTLs so that
 //! upstream responses with TTL=0 for NXDOMAIN (plus `cache_min_ttl=0` on the
 //! general cache config) do not cause every repeated miss to escape to upstream.
@@ -19,10 +17,8 @@ fn make_cache() -> DnsCache {
     DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.0,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -56,7 +52,7 @@ fn should_apply_300s_floor_on_negative_cache() {
     );
 
     let result = cache.get(&Arc::from("nothere.com"), &RecordType::A);
-    let (data, dnssec, remaining) = result.expect("negative entry must be retrievable");
+    let (data, dnssec, remaining, _) = result.expect("negative entry must be retrievable");
 
     assert!(matches!(data, CachedData::NegativeResponse));
     assert!(dnssec.is_none());
@@ -81,7 +77,7 @@ fn should_cap_at_3600s_for_huge_negative_ttl() {
     );
 
     let result = cache.get(&Arc::from("longlived.com"), &RecordType::A);
-    let (_data, _dnssec, remaining) = result.expect("negative entry must be retrievable");
+    let (_data, _dnssec, remaining, _) = result.expect("negative entry must be retrievable");
     let remaining_ttl = remaining.expect("negative entry carries a remaining TTL");
     assert!(
         remaining_ttl <= 3600,
@@ -103,7 +99,7 @@ fn should_preserve_positive_record_ttl_exactly() {
     );
 
     let result = cache.get(&Arc::from("positive.com"), &RecordType::A);
-    let (_data, _dnssec, remaining) = result.expect("positive entry must be retrievable");
+    let (_data, _dnssec, remaining, _) = result.expect("positive entry must be retrievable");
     let remaining_ttl = remaining.expect("positive entry carries a remaining TTL");
     assert!(
         (4..=5).contains(&remaining_ttl),

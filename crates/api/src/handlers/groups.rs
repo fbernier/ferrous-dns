@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use ferrous_dns_domain::DomainError;
 use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -60,12 +61,7 @@ async fn get_group_by_id(
         .get_groups
         .get_by_id(id)
         .await?
-        .ok_or_else(|| {
-            ApiError(ferrous_dns_domain::DomainError::NotFound(format!(
-                "Group {} not found",
-                id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::GroupNotFound(id)))?;
     let client_count = state
         .groups
         .get_groups
@@ -93,17 +89,11 @@ async fn create_group(
     let group = state
         .groups
         .create_group
-        .execute(req.name, req.comment)
+        .execute(req.name, req.comment, req.enabled.unwrap_or(true))
         .await?;
-    let client_count = state
-        .groups
-        .get_groups
-        .count_clients_in_group(group.id.unwrap_or(0))
-        .await
-        .ok();
     Ok((
         StatusCode::CREATED,
-        Json(GroupResponse::from_group(group, client_count)),
+        Json(GroupResponse::from_group(group, Some(0))),
     ))
 }
 
@@ -174,18 +164,7 @@ async fn get_group_clients(
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<ClientResponse>>, ApiError> {
     let clients = state.groups.get_groups.get_clients_in_group(id).await?;
-    let response: Vec<ClientResponse> = clients
-        .into_iter()
-        .map(|c| ClientResponse {
-            id: c.id.unwrap_or(0),
-            ip_address: c.ip_address.to_string(),
-            mac_address: c.mac_address.map(|s| s.to_string()),
-            hostname: c.hostname.map(|s| s.to_string()),
-            first_seen: c.first_seen.unwrap_or_default(),
-            last_seen: c.last_seen.unwrap_or_default(),
-            query_count: c.query_count,
-            group_id: c.group_id,
-        })
-        .collect();
-    Ok(Json(response))
+    Ok(Json(
+        clients.into_iter().map(ClientResponse::from).collect(),
+    ))
 }

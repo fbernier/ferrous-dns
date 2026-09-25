@@ -8,8 +8,9 @@ pub struct QueryParams {
     pub limit: u32,
     #[serde(default)]
     pub offset: u32,
+    /// `next_cursor` of the previous page; takes precedence over `offset`.
     pub cursor: Option<i64>,
-    #[serde(default = "default_period")]
+    #[serde(default = "crate::utils::default_period")]
     pub period: String,
     pub domain: Option<String>,
     pub category: Option<String>,
@@ -42,10 +43,6 @@ pub struct PaginatedQueries {
     pub limit: u32,
     pub offset: u32,
     pub next_cursor: Option<i64>,
-}
-
-fn default_period() -> String {
-    "24h".to_string()
 }
 
 #[derive(Serialize, Debug, Clone, ToSchema)]

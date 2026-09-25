@@ -1,34 +1,32 @@
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use ferrous_dns_application::ports::{ResponseIpFilterEvictionTarget, ResponseIpFilterStore};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
-use ferrous_dns_domain::ResponseIpFilterConfig;
+use ferrous_dns_domain::{DomainError, ResponseIpFilterConfig};
 use rustc_hash::FxBuildHasher;
 use std::net::IpAddr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 const NS_PER_SEC: u64 = 1_000_000_000;
+/// Largest feed body accepted; a feed past it is skipped rather than buffered.
+const MAX_FEED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Downloads C2 IP threat feeds and provides O(1) hot-path lookup.
 ///
-/// Maintains a `DashSet` of known C2 IPs for lock-free hot-path checks, and a
-/// `DashMap` with TTL metadata for background eviction. The fetch loop runs as
-/// an async task, downloading feeds at the configured interval.
+/// Known C2 IPs are looked up on the hot path and aged out in the background.
+/// The fetch loop runs as an async task, downloading feeds at the configured
+/// interval.
 pub struct ResponseIpFilterDetector {
     config: ResponseIpFilterConfig,
-    /// O(1) hot-path lookup set.
-    pub blocked_ips: DashSet<IpAddr, FxBuildHasher>,
-    /// Last confirmation timestamp (ns) per IP, for TTL-based eviction.
-    pub blocked_ip_confirmed_at: DashMap<IpAddr, u64, FxBuildHasher>,
+    /// C2 IP → last time a feed listed it (coarse ns), for TTL eviction.
+    pub blocked_ips: DashMap<IpAddr, u64, FxBuildHasher>,
 }
 
 impl ResponseIpFilterDetector {
-    /// Creates a new detector with empty state.
     pub fn new(config: &ResponseIpFilterConfig) -> Self {
         Self {
             config: config.clone(),
-            blocked_ips: DashSet::with_hasher(FxBuildHasher),
-            blocked_ip_confirmed_at: DashMap::with_hasher(FxBuildHasher),
+            blocked_ips: DashMap::with_hasher(FxBuildHasher),
         }
     }
 
@@ -57,11 +55,10 @@ impl ResponseIpFilterDetector {
         let mut fetch_errors = 0usize;
 
         for url in &self.config.ip_list_urls {
-            match fetch_ip_list(url, http_client).await {
+            match fetch_ip_list(url, http_client, MAX_FEED_BYTES).await {
                 Ok(ips) => {
                     for ip in ips {
-                        self.blocked_ip_confirmed_at.insert(ip, now_ns);
-                        if self.blocked_ips.insert(ip) {
+                        if self.blocked_ips.insert(ip, now_ns).is_none() {
                             total_new += 1;
                         }
                     }
@@ -88,26 +85,22 @@ impl ResponseIpFilterDetector {
 
 impl ResponseIpFilterStore for ResponseIpFilterDetector {
     fn is_blocked_ip(&self, ip: &IpAddr) -> bool {
-        self.blocked_ips.contains(ip)
+        self.blocked_ips.contains_key(ip)
     }
 }
 
 impl ResponseIpFilterEvictionTarget for ResponseIpFilterDetector {
     fn evict_stale_ips(&self) {
         let now_ns = coarse_now_ns();
-        let ttl_ns = self.config.ip_ttl_secs * NS_PER_SEC;
+        let ttl_ns = self.config.ip_ttl_secs.saturating_mul(NS_PER_SEC);
 
-        self.blocked_ip_confirmed_at
-            .retain(|ip, &mut confirmed_ns| {
-                let age_ns = now_ns.saturating_sub(confirmed_ns);
-                if age_ns > ttl_ns {
-                    self.blocked_ips.remove(ip);
-                    debug!(ip = %ip, "Evicted stale C2 IP");
-                    false
-                } else {
-                    true
-                }
-            });
+        self.blocked_ips.retain(|ip, confirmed_ns| {
+            let keep = now_ns.saturating_sub(*confirmed_ns) <= ttl_ns;
+            if !keep {
+                debug!(ip = %ip, "Evicted stale C2 IP");
+            }
+            keep
+        });
     }
 
     fn blocked_ip_count(&self) -> usize {
@@ -115,24 +108,45 @@ impl ResponseIpFilterEvictionTarget for ResponseIpFilterDetector {
     }
 }
 
-async fn fetch_ip_list(url: &str, client: &reqwest::Client) -> Result<Vec<IpAddr>, String> {
-    let response = client
+async fn fetch_ip_list(
+    url: &str,
+    client: &reqwest::Client,
+    max_bytes: usize,
+) -> Result<Vec<IpAddr>, DomainError> {
+    let mut response = client
         .get(url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("fetch error for {url}: {e}"))?;
+        .map_err(|e| DomainError::IoError(format!("fetch error for {url}: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(format!("HTTP {} for {url}", response.status().as_u16()));
+        return Err(DomainError::IoError(format!(
+            "HTTP {} for {url}",
+            response.status().as_u16()
+        )));
     }
 
-    let text = response
-        .text()
+    let too_large = || DomainError::IoError(format!("feed {url} exceeds {max_bytes} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("read error for {url}: {e}"))?;
+        .map_err(|e| DomainError::IoError(format!("read error for {url}: {e}")))?
+    {
+        if chunk.len() > max_bytes - body.len() {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
 
-    Ok(parse_ip_list(&text))
+    Ok(parse_ip_list(&String::from_utf8_lossy(&body)))
 }
 
 /// Parses an IP list in standard format: one IP per line, `#` comments, blank lines ignored.
@@ -147,6 +161,69 @@ fn parse_ip_list(text: &str) -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `response` to one request and keeps the connection open, so a
+    /// reader that waits for EOF hangs.
+    async fn serve_once(response: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        format!("http://{addr}/feed")
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_feeds_are_rejected_while_streaming() {
+        let body = "192.0.2.1\n".repeat(20);
+        let advertised = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let streamed = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+            body.len()
+        );
+        for response in [advertised, streamed] {
+            let url = serve_once(response).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_ip_list(&url, &client(), body.len() - 1),
+            )
+            .await
+            .expect("an oversized feed must be rejected without waiting for EOF");
+            assert!(matches!(result, Err(DomainError::IoError(_))), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_of_exactly_the_cap_is_parsed() {
+        let body = "192.0.2.1\n2001:db8::1\n";
+        let url = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let ips = fetch_ip_list(&url, &client(), body.len()).await.unwrap();
+        assert_eq!(
+            ips,
+            [
+                "192.0.2.1".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+    }
 
     #[test]
     fn parse_ip_list_handles_comments_and_blanks() {

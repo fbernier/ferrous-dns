@@ -4,5 +4,5 @@ mod decision_cache;
 mod engine;
 mod suffix_trie;
 
-pub use compiler::mark_sources_synced;
+pub use compiler::{mark_sources_synced, SourceTable};
 pub use engine::BlockFilterEngine;

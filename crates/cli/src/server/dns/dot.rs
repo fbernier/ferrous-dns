@@ -1,11 +1,9 @@
 use super::connection_limiter::{ConnectionGuard, ConnectionLimiter};
 use super::pktinfo;
-use ferrous_dns_domain::ClientProtocol;
-use ferrous_dns_infrastructure::dns::proxy_protocol::{
-    read_proxy_v2_client_ip, ProxyProtocolError,
-};
+use super::tcp::bind_tcp_listener;
+use ferrous_dns_domain::{ClientProtocol, DomainError};
+use ferrous_dns_infrastructure::dns::proxy_protocol::read_proxy_v2_client_ip;
 use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
-use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,34 +12,15 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-/// Binds the DoT listener on `bind_addr`. Like the Do53 listeners, the socket
-/// is always AF_INET6 with `only_v6` off: an IPv4 `bind_addr` is bound in
-/// v4-mapped form and keeps its v4-only behaviour, while `[::]` serves both
-/// families on one socket. Binding is synchronous, so the returned listener is
-/// ready to accept immediately.
-pub fn bind_dot_listener(bind_addr: &str) -> anyhow::Result<TcpListener> {
-    let addr = pktinfo::v6_mapped_bind_addr(bind_addr.parse()?);
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_only_v6(false)?;
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-    socket.set_nonblocking(true)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    Ok(TcpListener::from_std(std_listener)?)
-}
-
 pub async fn start_dot_server(
-    bind_addr: String,
+    bind: SocketAddr,
     handler: Arc<DnsServerHandler>,
     tls_config: Arc<rustls::ServerConfig>,
     num_workers: usize,
     proxy_protocol_enabled: bool,
     dot_conn_limiter: ConnectionLimiter,
 ) -> anyhow::Result<()> {
-    let listener = Arc::new(bind_dot_listener(&bind_addr)?);
+    let listener = Arc::new(bind_tcp_listener(bind)?);
     // `local_addr` reports the v4-mapped form of an IPv4 bind; report the
     // address the operator configured.
     let local_addr = pktinfo::unmap_socket_addr(listener.local_addr()?);
@@ -149,7 +128,7 @@ async fn handle_dot_connection(
         .await
         {
             Ok(Ok(ip)) => ip,
-            Ok(Err(ProxyProtocolError::Io(e))) => {
+            Ok(Err(DomainError::IoError(e))) => {
                 warn!(client = %peer_addr, error = %e, "DoT PROXY Protocol I/O error");
                 return;
             }

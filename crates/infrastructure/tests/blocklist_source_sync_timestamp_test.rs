@@ -17,7 +17,7 @@ use ferrous_dns_application::ports::{
 use ferrous_dns_domain::config::DatabaseConfig;
 use ferrous_dns_domain::BlockSource;
 use ferrous_dns_infrastructure::database::create_write_pool;
-use ferrous_dns_infrastructure::dns::block_filter::mark_sources_synced;
+use ferrous_dns_infrastructure::dns::block_filter::{mark_sources_synced, SourceTable};
 use ferrous_dns_infrastructure::dns::BlockFilterEngine;
 use ferrous_dns_infrastructure::repositories::blocklist_source_repository::SqliteBlocklistSourceRepository;
 use ferrous_dns_infrastructure::repositories::whitelist_source_repository::SqliteWhitelistSourceRepository;
@@ -251,7 +251,7 @@ async fn test_mark_sources_synced_with_no_ids_is_a_no_op() {
 
     // A reload where every source failed passes an empty slice; building an
     // `IN ()` statement for it would be a syntax error.
-    mark_sources_synced(&pool, "blocklist_sources", &[], STAMP)
+    mark_sources_synced(&pool, SourceTable::Blocklist, &[], STAMP)
         .await
         .expect("an empty id slice must not error");
 
@@ -279,7 +279,7 @@ async fn test_update_preserves_last_synced_at() {
         .unwrap();
     let id = source.id.unwrap();
 
-    mark_sources_synced(&pool, "blocklist_sources", &[id], STAMP)
+    mark_sources_synced(&pool, SourceTable::Blocklist, &[id], STAMP)
         .await
         .unwrap();
 

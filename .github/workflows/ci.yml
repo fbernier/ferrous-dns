@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  TARPAULIN_VERSION: '0.27.0'
+  TARPAULIN_VERSION: '0.37.4'
   AUDIT_VERSION: '0.22.2'
   CARGO_FUZZ_VERSION: '0.13.2'
   # cargo-fuzz needs nightly. Pinned on purpose: this job gates merges, so a
@@ -299,6 +299,7 @@ jobs:
         target:
           - query_fast_path
           - response_lowercase_0x20
+          - upstream_relay
           - dnssec_records
           - proxy_protocol_v2
           - blocklist_text

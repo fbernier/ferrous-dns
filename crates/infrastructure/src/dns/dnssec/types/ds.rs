@@ -1,3 +1,4 @@
+use super::algorithm_name;
 use ferrous_dns_domain::DomainError;
 use std::fmt;
 
@@ -58,15 +59,6 @@ impl DsRecord {
             _ => "Unknown",
         }
     }
-
-    pub fn algorithm_name(&self) -> &'static str {
-        match self.algorithm {
-            8 => "RSA/SHA-256",
-            13 => "ECDSA P-256/SHA-256",
-            15 => "Ed25519",
-            _ => "Unknown",
-        }
-    }
 }
 
 impl fmt::Display for DsRecord {
@@ -75,7 +67,7 @@ impl fmt::Display for DsRecord {
             f,
             "DS(tag={}, algo={}, digest={})",
             self.key_tag,
-            self.algorithm_name(),
+            algorithm_name(self.algorithm),
             self.digest_type_name()
         )
     }

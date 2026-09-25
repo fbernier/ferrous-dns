@@ -1,12 +1,15 @@
 use super::ngram::bigram_deviation_score;
-use crate::dns::tunneling::entropy::{extract_apex, shannon_entropy};
+use crate::dns::tunneling::client_stats::subnet_key_from_ip;
+use crate::dns::tunneling::signal::SignalScore;
 use dashmap::DashMap;
-use ferrous_dns_application::ports::DgaFlagStore;
+use ferrous_dns_application::ports::{DgaEvictionTarget, DgaFlagStore};
 use ferrous_dns_application::use_cases::dns::coarse_timer::coarse_now_ns;
+use ferrous_dns_application::use_cases::dns::domain_heuristics::{
+    char_ratios, extract_apex, shannon_entropy,
+};
 use ferrous_dns_application::use_cases::dns::DgaAnalysisEvent;
 use ferrous_dns_domain::DgaDetectionConfig;
 use rustc_hash::FxBuildHasher;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -47,16 +50,6 @@ impl ClientDgaStats {
     }
 }
 
-/// Alert persisted when a domain is flagged as DGA.
-#[allow(dead_code)]
-struct DgaAlert {
-    signal: String,
-    measured_value: f32,
-    threshold: f32,
-    confidence: f32,
-    timestamp_ns: u64,
-}
-
 /// Background DGA detector.
 ///
 /// Consumes `DgaAnalysisEvent`s from the hot path via an mpsc channel,
@@ -67,8 +60,8 @@ pub struct DgaDetector {
     config: DgaDetectionConfig,
     /// Per-client subnet stats: DGA domain count per time window.
     stats: DashMap<u64, ClientDgaStats, FxBuildHasher>,
-    /// Domains flagged as DGA by background analysis.
-    flagged_domains: DashMap<Arc<str>, DgaAlert, FxBuildHasher>,
+    /// Flagged apex → when it was last flagged (coarse ns).
+    flagged_domains: DashMap<Arc<str>, u64, FxBuildHasher>,
 }
 
 impl DgaDetector {
@@ -89,38 +82,10 @@ impl DgaDetector {
         (detector, tx, rx)
     }
 
-    /// Returns the configured stale entry TTL in seconds.
     pub fn stale_entry_ttl_secs(&self) -> u64 {
         self.config.stale_entry_ttl_secs
     }
 
-    /// Removes stale entries older than `stale_entry_ttl_secs`.
-    pub fn evict_stale(&self) {
-        let now_ns = coarse_now_ns();
-        let ttl_ns = self.config.stale_entry_ttl_secs * 1_000_000_000;
-        let before = self.stats.len();
-        self.stats
-            .retain(|_, stats| now_ns - stats.last_seen_ns.load(Ordering::Relaxed) < ttl_ns);
-        let evicted = before.saturating_sub(self.stats.len());
-
-        let flagged_before = self.flagged_domains.len();
-        self.flagged_domains.retain(|_, alert| {
-            now_ns - alert.timestamp_ns < ttl_ns * FLAGGED_DOMAIN_TTL_MULTIPLIER
-        });
-        let flagged_evicted = flagged_before.saturating_sub(self.flagged_domains.len());
-
-        if evicted > 0 || flagged_evicted > 0 {
-            debug!(
-                evicted,
-                flagged_evicted,
-                remaining = self.stats.len(),
-                flagged = self.flagged_domains.len(),
-                "DGA detector stale eviction"
-            );
-        }
-    }
-
-    /// Runs the background analysis loop, consuming events from the channel.
     pub async fn run_analysis_loop(self: Arc<Self>, mut rx: mpsc::Receiver<DgaAnalysisEvent>) {
         info!("DGA analysis loop started");
         while let Some(event) = rx.recv().await {
@@ -139,36 +104,18 @@ impl DgaDetector {
         let now_ns = coarse_now_ns();
         let subnet_key = subnet_key_from_ip(event.client_ip);
 
-        // Compute signals
         let entropy = shannon_entropy(sld.as_bytes());
         let (consonants, vowels, digits, total) = char_ratios(sld);
         let ngram_score = bigram_deviation_score(sld);
 
-        // Compute weighted confidence
-        let mut confidence: f32 = 0.0;
-        let mut top_signal = "none";
-        let mut top_measured: f32 = 0.0;
-        let mut top_threshold: f32 = 0.0;
-        let mut top_weight: f32 = 0.0;
-
-        macro_rules! add_signal {
-            ($weight:expr, $name:expr, $measured:expr, $threshold:expr) => {
-                confidence += $weight;
-                if $weight > top_weight {
-                    top_weight = $weight;
-                    top_signal = $name;
-                    top_measured = $measured;
-                    top_threshold = $threshold;
-                }
-            };
-        }
+        let mut score = SignalScore::new();
 
         if entropy > self.config.sld_entropy_threshold {
-            add_signal!(
+            score.add(
                 WEIGHT_SLD_ENTROPY,
                 "sld_entropy",
                 entropy,
-                self.config.sld_entropy_threshold
+                self.config.sld_entropy_threshold,
             );
         }
 
@@ -176,11 +123,11 @@ impl DgaDetector {
         if alpha > 0 {
             let consonant_ratio = consonants as f32 / alpha as f32;
             if consonant_ratio > self.config.consonant_ratio_threshold {
-                add_signal!(
+                score.add(
                     WEIGHT_CONSONANT_RATIO,
                     "consonant_ratio",
                     consonant_ratio,
-                    self.config.consonant_ratio_threshold
+                    self.config.consonant_ratio_threshold,
                 );
             }
         }
@@ -188,34 +135,33 @@ impl DgaDetector {
         if total > 0 {
             let digit_ratio = digits as f32 / total as f32;
             if digit_ratio > self.config.digit_ratio_threshold {
-                add_signal!(
+                score.add(
                     WEIGHT_DIGIT_RATIO,
                     "digit_ratio",
                     digit_ratio,
-                    self.config.digit_ratio_threshold
+                    self.config.digit_ratio_threshold,
                 );
             }
         }
 
         if sld.len() > self.config.sld_max_length {
-            add_signal!(
+            score.add(
                 WEIGHT_SLD_LENGTH,
                 "sld_length",
                 sld.len() as f32,
-                self.config.sld_max_length as f32
+                self.config.sld_max_length as f32,
             );
         }
 
         if ngram_score > self.config.ngram_score_threshold {
-            add_signal!(
+            score.add(
                 WEIGHT_NGRAM_SCORE,
                 "ngram_score",
                 ngram_score,
-                self.config.ngram_score_threshold
+                self.config.ngram_score_threshold,
             );
         }
 
-        // Track per-client DGA rate
         let entry = self
             .stats
             .entry(subnet_key)
@@ -233,47 +179,34 @@ impl DgaDetector {
         }
         stats.last_seen_ns.store(now_ns, Ordering::Relaxed);
 
-        // Count this domain toward DGA rate if it has at least one signal
-        if confidence > 0.0 {
+        // Only domains with at least one lexical signal count toward the client's DGA rate.
+        if score.confidence > 0.0 {
             let dga_count = stats.dga_domain_count.fetch_add(1, Ordering::Relaxed) + 1;
             if dga_count > self.config.dga_rate_per_client {
-                add_signal!(
+                score.add(
                     WEIGHT_DGA_RATE,
                     "dga_rate",
                     dga_count as f32,
-                    self.config.dga_rate_per_client as f32
+                    self.config.dga_rate_per_client as f32,
                 );
             }
         }
 
-        let _ = top_weight;
-
-        if confidence >= self.config.confidence_threshold {
-            let apex_arc: Arc<str> = Arc::from(apex);
-            self.flagged_domains
-                .entry(apex_arc)
-                .and_modify(|alert| {
-                    alert.timestamp_ns = now_ns;
-                    alert.confidence = confidence;
-                    alert.measured_value = top_measured;
-                })
-                .or_insert_with(|| {
+        if score.confidence >= self.config.confidence_threshold {
+            match self.flagged_domains.get_mut(apex) {
+                Some(mut flagged_at) => *flagged_at = now_ns,
+                None => {
                     warn!(
                         domain = apex,
-                        signal = top_signal,
-                        confidence,
-                        measured = top_measured,
-                        threshold = top_threshold,
+                        signal = score.top_signal,
+                        confidence = score.confidence,
+                        measured = score.top_measured,
+                        threshold = score.top_threshold,
                         "DGA domain detected — domain flagged"
                     );
-                    DgaAlert {
-                        signal: top_signal.to_string(),
-                        measured_value: top_measured,
-                        threshold: top_threshold,
-                        confidence,
-                        timestamp_ns: now_ns,
-                    }
-                });
+                    self.flagged_domains.insert(Arc::from(apex), now_ns);
+                }
+            }
         }
     }
 }
@@ -285,9 +218,39 @@ impl DgaFlagStore for DgaDetector {
     }
 }
 
-impl ferrous_dns_application::ports::DgaEvictionTarget for DgaDetector {
+impl DgaEvictionTarget for DgaDetector {
     fn evict_stale(&self) {
-        self.evict_stale();
+        let now_ns = coarse_now_ns();
+        let ttl_ns = self
+            .config
+            .stale_entry_ttl_secs
+            .saturating_mul(1_000_000_000);
+        let flagged_ttl_ns = ttl_ns.saturating_mul(FLAGGED_DOMAIN_TTL_MULTIPLIER);
+
+        // saturating_sub: the analysis loop can stamp an entry after `now_ns` was read.
+        let evicted = {
+            let before = self.stats.len();
+            self.stats.retain(|_, stats| {
+                now_ns.saturating_sub(stats.last_seen_ns.load(Ordering::Relaxed)) < ttl_ns
+            });
+            before.saturating_sub(self.stats.len())
+        };
+        let flagged_evicted = {
+            let before = self.flagged_domains.len();
+            self.flagged_domains
+                .retain(|_, flagged_at| now_ns.saturating_sub(*flagged_at) < flagged_ttl_ns);
+            before.saturating_sub(self.flagged_domains.len())
+        };
+
+        if evicted > 0 || flagged_evicted > 0 {
+            debug!(
+                evicted,
+                flagged_evicted,
+                remaining = self.stats.len(),
+                flagged = self.flagged_domains.len(),
+                "DGA detector stale eviction"
+            );
+        }
     }
 
     fn tracked_count(&self) -> usize {
@@ -299,53 +262,21 @@ impl ferrous_dns_application::ports::DgaEvictionTarget for DgaDetector {
     }
 }
 
-/// Computes character class counts for DGA detection.
-#[inline]
-fn char_ratios(sld: &str) -> (u32, u32, u32, u32) {
-    let mut consonants = 0u32;
-    let mut vowels = 0u32;
-    let mut digits = 0u32;
-    let mut total = 0u32;
-
-    for &b in sld.as_bytes() {
-        total += 1;
-        let lower = b.to_ascii_lowercase();
-        match lower {
-            b'a' | b'e' | b'i' | b'o' | b'u' => vowels += 1,
-            b'b'..=b'd' | b'f'..=b'h' | b'j'..=b'n' | b'p'..=b't' | b'v'..=b'z' => {
-                consonants += 1;
-            }
-            b'0'..=b'9' => digits += 1,
-            _ => {}
-        }
-    }
-
-    (consonants, vowels, digits, total)
-}
-
-/// Computes a subnet key from an IP address.
-fn subnet_key_from_ip(ip: IpAddr) -> u64 {
-    match ip {
-        IpAddr::V4(v4) => {
-            let bits = u32::from(v4);
-            let mask = u32::MAX << (32 - 24); // /24
-            (bits & mask) as u64
-        }
-        IpAddr::V6(v6) => {
-            let bits = u128::from(v6);
-            let mask = u128::MAX << (128 - 48); // /48
-            ((bits & mask) >> 64) as u64
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn default_config() -> DgaDetectionConfig {
         DgaDetectionConfig::default()
+    }
+
+    fn stats_seen_at(last_seen_ns: u64) -> ClientDgaStats {
+        ClientDgaStats {
+            dga_domain_count: AtomicU32::new(1),
+            last_seen_ns: AtomicU64::new(last_seen_ns),
+            window_start_ns: AtomicU64::new(last_seen_ns),
+        }
     }
 
     #[test]
@@ -357,17 +288,9 @@ mod tests {
     #[test]
     fn flagged_domain_detected() {
         let (detector, _tx, _rx) = DgaDetector::new(&default_config());
-        let apex: Arc<str> = Arc::from("xjk4f9a2h.com");
-        detector.flagged_domains.insert(
-            apex,
-            DgaAlert {
-                signal: "test".to_string(),
-                measured_value: 4.0,
-                threshold: 3.5,
-                confidence: 0.7,
-                timestamp_ns: coarse_now_ns(),
-            },
-        );
+        detector
+            .flagged_domains
+            .insert(Arc::from("xjk4f9a2h.com"), coarse_now_ns());
         assert!(detector.is_flagged("xjk4f9a2h.com"));
         assert!(detector.is_flagged("sub.xjk4f9a2h.com"));
     }
@@ -378,29 +301,8 @@ mod tests {
         config.stale_entry_ttl_secs = 0; // immediate expiry
         let (detector, _tx, _rx) = DgaDetector::new(&config);
 
-        detector.stats.insert(
-            12345,
-            ClientDgaStats {
-                dga_domain_count: AtomicU32::new(5),
-                last_seen_ns: AtomicU64::new(0), // very old
-                window_start_ns: AtomicU64::new(0),
-            },
-        );
-
-        let apex: Arc<str> = Arc::from("old.com");
-        detector.flagged_domains.insert(
-            apex,
-            DgaAlert {
-                signal: "test".to_string(),
-                measured_value: 4.0,
-                threshold: 3.5,
-                confidence: 0.7,
-                timestamp_ns: 0,
-            },
-        );
-
-        assert_eq!(detector.stats.len(), 1);
-        assert_eq!(detector.flagged_domains.len(), 1);
+        detector.stats.insert(12345, stats_seen_at(0));
+        detector.flagged_domains.insert(Arc::from("old.com"), 0);
 
         detector.evict_stale();
 
@@ -410,30 +312,11 @@ mod tests {
 
     #[test]
     fn eviction_keeps_fresh_entries() {
-        let config = default_config();
-        let (detector, _tx, _rx) = DgaDetector::new(&config);
+        let (detector, _tx, _rx) = DgaDetector::new(&default_config());
 
         let now = coarse_now_ns();
-        detector.stats.insert(
-            12345,
-            ClientDgaStats {
-                dga_domain_count: AtomicU32::new(1),
-                last_seen_ns: AtomicU64::new(now),
-                window_start_ns: AtomicU64::new(now),
-            },
-        );
-
-        let apex: Arc<str> = Arc::from("fresh.com");
-        detector.flagged_domains.insert(
-            apex,
-            DgaAlert {
-                signal: "test".to_string(),
-                measured_value: 4.0,
-                threshold: 3.5,
-                confidence: 0.7,
-                timestamp_ns: now,
-            },
-        );
+        detector.stats.insert(12345, stats_seen_at(now));
+        detector.flagged_domains.insert(Arc::from("fresh.com"), now);
 
         detector.evict_stale();
 
@@ -442,15 +325,34 @@ mod tests {
     }
 
     #[test]
-    fn tracked_and_flagged_counts() {
+    fn eviction_keeps_entries_stamped_after_it_read_the_clock() {
         let (detector, _tx, _rx) = DgaDetector::new(&default_config());
-        assert_eq!(detector.stats.len(), 0);
-        assert_eq!(detector.flagged_domains.len(), 0);
 
-        let now = coarse_now_ns();
-        detector.stats.insert(1, ClientDgaStats::new(now));
-        detector.stats.insert(2, ClientDgaStats::new(now));
-        assert_eq!(detector.stats.len(), 2);
+        let later = coarse_now_ns() + 60_000_000_000;
+        detector.stats.insert(12345, stats_seen_at(later));
+        detector
+            .flagged_domains
+            .insert(Arc::from("racing.com"), later);
+
+        detector.evict_stale();
+
+        assert_eq!(detector.stats.len(), 1);
+        assert_eq!(detector.flagged_domains.len(), 1);
+    }
+
+    #[test]
+    fn eviction_with_unbounded_ttl_keeps_everything() {
+        let mut config = default_config();
+        config.stale_entry_ttl_secs = u64::MAX;
+        let (detector, _tx, _rx) = DgaDetector::new(&config);
+
+        detector.stats.insert(12345, stats_seen_at(0));
+        detector.flagged_domains.insert(Arc::from("old.com"), 0);
+
+        detector.evict_stale();
+
+        assert_eq!(detector.stats.len(), 1);
+        assert_eq!(detector.flagged_domains.len(), 1);
     }
 
     #[test]

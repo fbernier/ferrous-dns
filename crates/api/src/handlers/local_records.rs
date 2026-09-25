@@ -27,7 +27,7 @@ async fn get_all_records(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<LocalRecordDto>>, ApiError> {
     let config = state.config.read().await;
-    let local_domain = &config.dns.local_domain;
+    let local_domain = config.dns.local_domain.as_deref();
 
     let dtos: Vec<LocalRecordDto> = config
         .dns
@@ -58,7 +58,7 @@ async fn create_record(
     let (new_record, new_index) = state
         .dns
         .create_local_record
-        .execute(req.hostname, req.domain, req.ip, req.record_type, req.ttl)
+        .execute(req.into_record()?)
         .await?;
 
     let local_domain = state.config.read().await.dns.local_domain.clone();
@@ -70,7 +70,7 @@ async fn create_record(
         "Added local DNS record to config and cache"
     );
 
-    let dto = LocalRecordDto::from_config(&new_record, new_index as i64, &local_domain);
+    let dto = LocalRecordDto::from_config(&new_record, new_index as i64, local_domain.as_deref());
     Ok((StatusCode::CREATED, Json(dto)))
 }
 
@@ -94,14 +94,7 @@ async fn update_record(
     let (updated_record, _old_record) = state
         .dns
         .update_local_record
-        .execute(
-            id,
-            req.hostname,
-            req.domain,
-            req.ip,
-            req.record_type,
-            req.ttl,
-        )
+        .execute(id, req.into_record()?)
         .await?;
 
     let local_domain = state.config.read().await.dns.local_domain.clone();
@@ -113,7 +106,7 @@ async fn update_record(
         "Updated local DNS record in config and cache"
     );
 
-    let dto = LocalRecordDto::from_config(&updated_record, id, &local_domain);
+    let dto = LocalRecordDto::from_config(&updated_record, id, local_domain.as_deref());
     Ok(Json(dto))
 }
 

@@ -20,3 +20,9 @@ pub fn lowercase_owner_names(wire: &Bytes) -> Option<Bytes> {
 pub fn parse_list_text(text: &str) -> Vec<ParsedEntry> {
     crate::dns::block_filter::compiler::parse_list_text(text)
 }
+
+/// See [`crate::dns::wire_response`]: whether re-sectioning a message may
+/// rewrite the compressed names inside the RDATA of `rtype`.
+pub fn rdata_has_names(rtype: u16) -> bool {
+    crate::dns::wire_response::rdata_has_names(rtype)
+}

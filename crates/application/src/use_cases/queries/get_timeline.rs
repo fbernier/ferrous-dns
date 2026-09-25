@@ -13,10 +13,10 @@ impl GetTimelineUseCase {
 
     pub async fn execute(
         &self,
-        period_hours: u32,
+        period_hours: f32,
         granularity: TimeGranularity,
     ) -> Result<Vec<TimelineBucket>, DomainError> {
-        let period = period_hours.min(720);
+        let period = period_hours.min(720.0);
         self.repository.get_timeline(period, granularity).await
     }
 }

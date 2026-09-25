@@ -1,12 +1,10 @@
-//! Regression: answers from `local_dns_server` must be relayed on the wire.
+//! Answers from `local_dns_server` must be relayed on the wire.
 //!
 //! `CoreResolver::resolve_local_tld` forwards private-range PTR queries (and
 //! anything under `local_domain`) to the configured local DNS server, typically
 //! the LAN router. The parser only lifts A/AAAA rdata into `addresses`, so a PTR
-//! (or SRV/TXT/MX) answer has nothing to carry it unless the raw upstream bytes
-//! are attached as `upstream_wire_data`, the way the pool path already does.
-//! Before the fix the client received an empty NXDOMAIN for every LAN reverse
-//! lookup even though the router had answered correctly.
+//! (or SRV/TXT/MX) answer reaches the client only through the raw upstream bytes
+//! attached as `upstream_wire_data`, as on the pool path.
 
 use ferrous_dns_application::ports::DnsResolver;
 use ferrous_dns_domain::{DnsQuery, RecordType, UpstreamPool, UpstreamStrategy};
@@ -86,7 +84,7 @@ async fn manager(addr: SocketAddr) -> Arc<PoolManager> {
 async fn resolver_with_local_server(addr: SocketAddr) -> CoreResolver {
     CoreResolver::new(manager(addr).await, 2000, false)
         .with_local_domain(Some("lan".to_string()))
-        .with_local_dns_server(Some(addr.to_string()))
+        .with_local_dns_server(Some(addr))
 }
 
 #[tokio::test]
@@ -145,4 +143,23 @@ async fn test_local_dns_server_a_record_populates_addresses() {
         resolution.upstream_wire_data.is_some(),
         "address answers should also carry wire bytes, matching the pool path"
     );
+}
+
+#[tokio::test]
+async fn test_local_suffix_check_handles_multibyte_names() {
+    let addr = spawn_local_dns_server().await;
+    let resolver = resolver_with_local_server(addr).await;
+
+    // Six bytes, so the four-byte ".lan" comparison starts inside the three-byte '€'.
+    let outside = resolver
+        .resolve(&DnsQuery::new("a€ab", RecordType::A))
+        .await
+        .expect("a non-local name must go to the pool");
+    assert!(!outside.local_dns);
+
+    let inside = resolver
+        .resolve(&DnsQuery::new("ä.lan", RecordType::A))
+        .await
+        .expect("a name under local_domain must go to local_dns_server");
+    assert!(inside.local_dns);
 }

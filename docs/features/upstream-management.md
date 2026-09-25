@@ -12,10 +12,12 @@ All upstream servers are specified as URLs. Every major DNS transport protocol i
 |:---------|:-------|:--------|
 | Plain UDP | `udp://host:port` | `udp://8.8.8.8:53` |
 | Plain TCP | `tcp://host:port` | `tcp://8.8.8.8:53` |
-| DNS-over-HTTPS (DoH) | `https://host/path` | `https://cloudflare-dns.com/dns-query` |
+| DNS-over-HTTPS (DoH) | `https://host[:port]/path` | `https://cloudflare-dns.com/dns-query` |
 | DNS-over-TLS (DoT) | `tls://host:port` | `tls://1.1.1.1:853` |
 | DNS-over-QUIC (DoQ) | `doq://host:port` | `doq://dns.adguard-dns.com:853` |
-| HTTP/3 | `h3://host/path` | `h3://dns.google/dns-query` |
+| HTTP/3 | `h3://host[:port]/path` | `h3://dns.google/dns-query` |
+
+DoH and HTTP/3 URLs default to port 443. An IPv6 literal goes in brackets, as in any URL: `https://[2606:4700:4700::1111]/dns-query`. A URL with an unbracketed IPv6 address or a port that is not a number from 0 to 65535 is rejected at startup and by the configuration API.
 
 Hostnames in upstream URLs are resolved once at startup — you never need to use bare IP addresses:
 
@@ -251,6 +253,10 @@ Server A: probe every 30s
 ```
 
 The health checker runs independently of query traffic, so a flaky server is detected and removed without clients ever seeing a failed response — the pool routes around it transparently.
+
+If every server in every pool is marked unhealthy at once, Ferrous DNS fails open and queries them anyway, in pool priority order, until a probe marks one healthy again. The checker can lag reality — a network change after boot, or probes that fail while real queries would succeed — and refusing every query would turn a stale verdict into a total outage. Entering and leaving this state is logged once each (`No upstream server is marked healthy; querying all servers anyway`).
+
+An answer that came back truncated over UDP and was retried over TCP is attributed to the configured server with a `(tcp retry)` suffix, e.g. `udp://9.9.9.9:53 (tcp retry)`, in the query log and upstream statistics.
 
 The current state of every pool and server is shown on the dashboard under
 **Settings > System Status**:

@@ -10,32 +10,22 @@ pub use get_api_tokens::GetApiTokensUseCase;
 pub use update_api_token::UpdateApiTokenUseCase;
 pub use validate_api_token::ValidateApiTokenUseCase;
 
-use ferrous_dns_domain::DomainError;
-use std::fmt::Write;
+use super::auth::session_factory::hex_encode;
 
-/// Generates a cryptographically random 64-char hex token.
-fn generate_token() -> Result<String, DomainError> {
-    use ring::rand::SecureRandom;
-    let mut buf = [0u8; 32];
-    ring::rand::SystemRandom::new()
-        .fill(&mut buf)
-        .map_err(|_| DomainError::IoError("CSPRNG fill failed".to_string()))?;
-    let mut hex = String::with_capacity(64);
-    for byte in &buf {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    Ok(hex)
+/// Leading bytes of a key shown to admins so they can tell keys apart.
+const KEY_PREFIX_LEN: usize = 8;
+
+/// Display prefix and SHA-256 hash stored for a raw API key.
+fn key_material(raw_token: &str) -> (&str, String) {
+    // Custom keys may be any UTF-8; cut at the last char boundary within the prefix length.
+    let end = (0..=KEY_PREFIX_LEN.min(raw_token.len()))
+        .rev()
+        .find(|&i| raw_token.is_char_boundary(i))
+        .unwrap_or(0);
+    (&raw_token[..end], hash_token(raw_token))
 }
 
-/// Computes SHA-256 hash of a raw token, returning hex string.
 fn hash_token(token: &str) -> String {
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let result = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in result.as_slice() {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    hex_encode(&Sha256::digest(token.as_bytes()))
 }

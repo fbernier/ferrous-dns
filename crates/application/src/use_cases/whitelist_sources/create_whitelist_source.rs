@@ -1,20 +1,28 @@
+use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::{validate_comment, validate_url};
 use ferrous_dns_domain::{DomainError, WhitelistSource};
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 
-use crate::ports::{GroupRepository, WhitelistSourceRepository};
+use crate::ports::{BlockFilterEnginePort, GroupRepository, WhitelistSourceRepository};
 
 pub struct CreateWhitelistSourceUseCase {
     repo: Arc<dyn WhitelistSourceRepository>,
     group_repo: Arc<dyn GroupRepository>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl CreateWhitelistSourceUseCase {
     pub fn new(
         repo: Arc<dyn WhitelistSourceRepository>,
         group_repo: Arc<dyn GroupRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
-        Self { repo, group_repo }
+        Self {
+            repo,
+            group_repo,
+            block_filter_engine,
+        }
     }
 
     #[instrument(skip(self))]
@@ -28,17 +36,11 @@ impl CreateWhitelistSourceUseCase {
     ) -> Result<WhitelistSource, DomainError> {
         WhitelistSource::validate_name(&name).map_err(DomainError::InvalidWhitelistSource)?;
 
-        WhitelistSource::validate_url(&url.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidWhitelistSource)?;
-
-        WhitelistSource::validate_comment(&comment.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidWhitelistSource)?;
+        validate_url(url.as_deref()).map_err(DomainError::InvalidWhitelistSource)?;
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidWhitelistSource)?;
 
         for &gid in &group_ids {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
         let source = self
@@ -52,6 +54,10 @@ impl CreateWhitelistSourceUseCase {
             group_ids = ?group_ids,
             "Whitelist source created successfully"
         );
+
+        if let Err(e) = self.block_filter_engine.reload().await {
+            error!(error = %e, "Failed to reload block filter after whitelist source creation");
+        }
 
         Ok(source)
     }

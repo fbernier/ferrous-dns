@@ -14,76 +14,48 @@ pub(crate) type ClientRow = (
     Option<i64>,
 );
 
-pub(crate) const CLIENT_SELECT: &str = "SELECT id, ip_address, mac_address, hostname,
+macro_rules! client_select {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, ip_address, mac_address, hostname,
             datetime(first_seen) as first_seen,
             datetime(last_seen) as last_seen,
             query_count,
             CAST(strftime('%s', last_mac_update) AS INTEGER) as last_mac_update,
             CAST(strftime('%s', last_hostname_update) AS INTEGER) as last_hostname_update,
             group_id
-     FROM clients";
+     FROM clients",
+            $tail
+        )
+    };
+}
 
-pub(crate) const CLIENT_SELECT_BY_IP: &str = "SELECT id, ip_address, mac_address, hostname,
-            datetime(first_seen) as first_seen,
-            datetime(last_seen) as last_seen,
-            query_count,
-            CAST(strftime('%s', last_mac_update) AS INTEGER) as last_mac_update,
-            CAST(strftime('%s', last_hostname_update) AS INTEGER) as last_hostname_update,
-            group_id
-     FROM clients WHERE ip_address = ?";
+pub(crate) const CLIENT_SELECT_BY_IP: &str = client_select!(" WHERE ip_address = ?");
 
-pub(crate) const CLIENT_SELECT_BY_ID: &str = "SELECT id, ip_address, mac_address, hostname,
-            datetime(first_seen) as first_seen,
-            datetime(last_seen) as last_seen,
-            query_count,
-            CAST(strftime('%s', last_mac_update) AS INTEGER) as last_mac_update,
-            CAST(strftime('%s', last_hostname_update) AS INTEGER) as last_hostname_update,
-            group_id
-     FROM clients WHERE id = ?";
+pub(crate) const CLIENT_SELECT_BY_ID: &str = client_select!(" WHERE id = ?");
 
-pub(crate) const CLIENT_SELECT_ALL: &str = "SELECT id, ip_address, mac_address, hostname,
-            datetime(first_seen) as first_seen,
-            datetime(last_seen) as last_seen,
-            query_count,
-            CAST(strftime('%s', last_mac_update) AS INTEGER) as last_mac_update,
-            CAST(strftime('%s', last_hostname_update) AS INTEGER) as last_hostname_update,
-            group_id
-     FROM clients ORDER BY last_seen DESC LIMIT ? OFFSET ?";
+pub(crate) const CLIENT_SELECT_BY_GROUP: &str =
+    client_select!(" WHERE group_id = ? ORDER BY last_seen DESC");
 
-pub(crate) const CLIENT_SELECT_ACTIVE: &str = "SELECT id, ip_address, mac_address, hostname,
-            datetime(first_seen) as first_seen,
-            datetime(last_seen) as last_seen,
-            query_count,
-            CAST(strftime('%s', last_mac_update) AS INTEGER) as last_mac_update,
-            CAST(strftime('%s', last_hostname_update) AS INTEGER) as last_hostname_update,
-            group_id
-     FROM clients WHERE last_seen > datetime('now', ?) ORDER BY last_seen DESC LIMIT ?";
+pub(crate) const CLIENT_SELECT_ALL: &str =
+    client_select!(" ORDER BY last_seen DESC LIMIT ? OFFSET ?");
 
-pub(crate) const CLIENT_SELECT_NEEDS_MAC_UPDATE: &str =
-    "SELECT id, ip_address, mac_address, hostname,
-            datetime(first_seen) as first_seen,
-            datetime(last_seen) as last_seen,
-            query_count,
-            CAST(strftime('%s', last_mac_update) AS INTEGER) as last_mac_update,
-            CAST(strftime('%s', last_hostname_update) AS INTEGER) as last_hostname_update,
-            group_id
-     FROM clients WHERE (last_mac_update IS NULL
+pub(crate) const CLIENT_SELECT_ACTIVE: &str =
+    client_select!(" WHERE last_seen > datetime('now', ?) ORDER BY last_seen DESC LIMIT ?");
+
+pub(crate) const CLIENT_SELECT_NEEDS_MAC_UPDATE: &str = client_select!(
+    " WHERE (last_mac_update IS NULL
                          OR last_mac_update < datetime('now', '-5 minutes'))
      AND last_seen > datetime('now', '-1 day')
-     ORDER BY last_seen DESC LIMIT ?";
+     ORDER BY last_seen DESC LIMIT ?"
+);
 
-pub(crate) const CLIENT_SELECT_NEEDS_HOSTNAME_UPDATE: &str =
-    "SELECT id, ip_address, mac_address, hostname,
-            datetime(first_seen) as first_seen,
-            datetime(last_seen) as last_seen,
-            query_count,
-            CAST(strftime('%s', last_mac_update) AS INTEGER) as last_mac_update,
-            CAST(strftime('%s', last_hostname_update) AS INTEGER) as last_hostname_update,
-            group_id
-     FROM clients WHERE (last_hostname_update IS NULL
+pub(crate) const CLIENT_SELECT_NEEDS_HOSTNAME_UPDATE: &str = client_select!(
+    " WHERE (last_hostname_update IS NULL
                          OR last_hostname_update < datetime('now', '-1 hour'))
      AND last_seen > datetime('now', '-7 days')
-     ORDER BY last_seen DESC LIMIT ?";
+     ORDER BY last_seen DESC LIMIT ?"
+);
 
 pub(crate) fn row_to_client(row: ClientRow) -> Option<Client> {
     let (

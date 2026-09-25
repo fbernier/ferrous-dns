@@ -1,5 +1,4 @@
 use super::Repositories;
-use ferrous_dns_application::services::SubnetMatcherService;
 use ferrous_dns_application::use_cases::{
     AssignClientGroupUseCase, AssignScheduleProfileUseCase, BacktestBlocklistsUseCase,
     BlockServiceUseCase, CleanupOldClientsUseCase, CleanupOldQueryLogsUseCase,
@@ -24,6 +23,7 @@ use ferrous_dns_application::use_cases::{
 };
 use ferrous_dns_infrastructure::dns::PoolManager;
 use ferrous_dns_infrastructure::system::{LinuxArpReader, PtrHostnameResolver};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub struct UseCases {
@@ -81,7 +81,6 @@ pub struct UseCases {
     pub get_custom_services: Arc<GetCustomServicesUseCase>,
     pub update_custom_service: Arc<UpdateCustomServiceUseCase>,
     pub delete_custom_service: Arc<DeleteCustomServiceUseCase>,
-    pub subnet_matcher: Arc<SubnetMatcherService>,
     pub get_safe_search_configs: Arc<GetSafeSearchConfigsUseCase>,
     pub toggle_safe_search: Arc<ToggleSafeSearchUseCase>,
     pub delete_safe_search_configs: Arc<DeleteSafeSearchConfigsUseCase>,
@@ -97,14 +96,12 @@ impl UseCases {
     pub fn new(
         repos: &Repositories,
         pool_manager: Arc<PoolManager>,
-        local_dns_server: Option<String>,
+        local_dns_server: Option<SocketAddr>,
     ) -> Self {
         let arp_reader = Arc::new(LinuxArpReader::new());
         let hostname_resolver = Arc::new(
             PtrHostnameResolver::new(pool_manager, 5).with_local_dns_server(local_dns_server),
         );
-
-        let subnet_matcher = Arc::new(SubnetMatcherService::new(repos.client_subnet.clone()));
 
         Self {
             get_stats: Arc::new(GetQueryStatsUseCase::new(
@@ -142,7 +139,10 @@ impl UseCases {
             get_groups: Arc::new(GetGroupsUseCase::new(repos.group.clone())),
             create_group: Arc::new(CreateGroupUseCase::new(repos.group.clone())),
             update_group: Arc::new(UpdateGroupUseCase::new(repos.group.clone())),
-            delete_group: Arc::new(DeleteGroupUseCase::new(repos.group.clone())),
+            delete_group: Arc::new(DeleteGroupUseCase::new(
+                repos.group.clone(),
+                repos.block_filter_engine.clone(),
+            )),
             assign_client_group: Arc::new(AssignClientGroupUseCase::new(
                 repos.client.clone(),
                 repos.group.clone(),
@@ -158,40 +158,37 @@ impl UseCases {
                 repos.client_subnet.clone(),
                 repos.block_filter_engine.clone(),
             )),
-            create_manual_client: Arc::new(
-                CreateManualClientUseCase::new(repos.client.clone(), repos.group.clone())
-                    .with_block_filter(repos.block_filter_engine.clone()),
-            ),
-            update_client: Arc::new(
-                UpdateClientUseCase::new(repos.client.clone())
-                    .with_group_repo(repos.group.clone())
-                    .with_block_filter(repos.block_filter_engine.clone()),
-            ),
-            delete_client: Arc::new(
-                DeleteClientUseCase::new(repos.client.clone())
-                    .with_block_filter(repos.block_filter_engine.clone()),
-            ),
+            create_manual_client: Arc::new(CreateManualClientUseCase::new(
+                repos.client.clone(),
+                repos.group.clone(),
+                repos.block_filter_engine.clone(),
+            )),
+            update_client: Arc::new(UpdateClientUseCase::new(
+                repos.client.clone(),
+                repos.group.clone(),
+                repos.block_filter_engine.clone(),
+            )),
+            delete_client: Arc::new(DeleteClientUseCase::new(
+                repos.client.clone(),
+                repos.block_filter_engine.clone(),
+            )),
             get_blocklist_sources: Arc::new(GetBlocklistSourcesUseCase::new(
                 repos.blocklist_source.clone(),
             )),
-            create_blocklist_source: Arc::new(
-                CreateBlocklistSourceUseCase::new(
-                    repos.blocklist_source.clone(),
-                    repos.group.clone(),
-                )
-                .with_block_filter(repos.block_filter_engine.clone()),
-            ),
-            update_blocklist_source: Arc::new(
-                UpdateBlocklistSourceUseCase::new(
-                    repos.blocklist_source.clone(),
-                    repos.group.clone(),
-                )
-                .with_block_filter(repos.block_filter_engine.clone()),
-            ),
-            delete_blocklist_source: Arc::new(
-                DeleteBlocklistSourceUseCase::new(repos.blocklist_source.clone())
-                    .with_block_filter(repos.block_filter_engine.clone()),
-            ),
+            create_blocklist_source: Arc::new(CreateBlocklistSourceUseCase::new(
+                repos.blocklist_source.clone(),
+                repos.group.clone(),
+                repos.block_filter_engine.clone(),
+            )),
+            update_blocklist_source: Arc::new(UpdateBlocklistSourceUseCase::new(
+                repos.blocklist_source.clone(),
+                repos.group.clone(),
+                repos.block_filter_engine.clone(),
+            )),
+            delete_blocklist_source: Arc::new(DeleteBlocklistSourceUseCase::new(
+                repos.blocklist_source.clone(),
+                repos.block_filter_engine.clone(),
+            )),
             sync_blocklist_sources: Arc::new(SyncBlocklistSourcesUseCase::new(
                 repos.block_filter_engine.clone(),
             )),
@@ -202,13 +199,16 @@ impl UseCases {
             create_whitelist_source: Arc::new(CreateWhitelistSourceUseCase::new(
                 repos.whitelist_source.clone(),
                 repos.group.clone(),
+                repos.block_filter_engine.clone(),
             )),
             update_whitelist_source: Arc::new(UpdateWhitelistSourceUseCase::new(
                 repos.whitelist_source.clone(),
                 repos.group.clone(),
+                repos.block_filter_engine.clone(),
             )),
             delete_whitelist_source: Arc::new(DeleteWhitelistSourceUseCase::new(
                 repos.whitelist_source.clone(),
+                repos.block_filter_engine.clone(),
             )),
             get_managed_domains: Arc::new(GetManagedDomainsUseCase::new(
                 repos.managed_domain.clone(),
@@ -281,7 +281,6 @@ impl UseCases {
                 repos.managed_domain.clone(),
                 repos.block_filter_engine.clone(),
             )),
-            subnet_matcher,
             get_safe_search_configs: Arc::new(GetSafeSearchConfigsUseCase::new(
                 repos.safe_search_config.clone(),
                 repos.group.clone(),

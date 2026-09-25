@@ -56,15 +56,7 @@ impl TlsCertificatePort for TlsCertificateService {
         validate_pem_cert(cert_data)?;
         validate_pem_key(key_data)?;
 
-        ensure_parent_dir(cert_path).await?;
-        tokio::fs::write(cert_path, cert_data)
-            .await
-            .map_err(|e| DomainError::IoError(format!("Failed to write certificate: {e}")))?;
-        tokio::fs::write(key_path, key_data)
-            .await
-            .map_err(|e| DomainError::IoError(format!("Failed to write key: {e}")))?;
-
-        Ok(())
+        write_pair(cert_path, cert_data, key_path, key_data).await
     }
 
     async fn generate_self_signed(
@@ -74,24 +66,17 @@ impl TlsCertificatePort for TlsCertificateService {
     ) -> Result<(), DomainError> {
         let (cert_pem, key_pem) = tokio::task::spawn_blocking(generate_self_signed_cert)
             .await
-            .map_err(|e| DomainError::IoError(format!("Task join error: {e}")))?
-            .map_err(|e| DomainError::IoError(format!("Certificate generation failed: {e}")))?;
+            .map_err(|e| DomainError::IoError(format!("Task join error: {e}")))??;
 
-        ensure_parent_dir(cert_path).await?;
-        tokio::fs::write(cert_path, cert_pem.as_bytes())
-            .await
-            .map_err(|e| DomainError::IoError(format!("Failed to write certificate: {e}")))?;
-        tokio::fs::write(key_path, key_pem.as_bytes())
-            .await
-            .map_err(|e| DomainError::IoError(format!("Failed to write key: {e}")))?;
-
-        Ok(())
+        write_pair(cert_path, cert_pem.as_bytes(), key_path, key_pem.as_bytes()).await
     }
 }
 
-fn generate_self_signed_cert() -> Result<(String, String), String> {
-    let mut params = rcgen::CertificateParams::new(vec!["ferrous-dns".to_string()])
-        .map_err(|e| e.to_string())?;
+fn generate_self_signed_cert() -> Result<(String, String), DomainError> {
+    let gen_err =
+        |e: rcgen::Error| DomainError::IoError(format!("Certificate generation failed: {e}"));
+    let mut params =
+        rcgen::CertificateParams::new(vec!["ferrous-dns".to_string()]).map_err(gen_err)?;
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "ferrous-dns");
@@ -102,20 +87,12 @@ fn generate_self_signed_cert() -> Result<(String, String), String> {
     params.not_after = (now + one_year).into();
 
     params.subject_alt_names = vec![
-        rcgen::SanType::DnsName(
-            "ferrous-dns"
-                .try_into()
-                .map_err(|e: rcgen::Error| e.to_string())?,
-        ),
-        rcgen::SanType::DnsName(
-            "localhost"
-                .try_into()
-                .map_err(|e: rcgen::Error| e.to_string())?,
-        ),
+        rcgen::SanType::DnsName("ferrous-dns".try_into().map_err(gen_err)?),
+        rcgen::SanType::DnsName("localhost".try_into().map_err(gen_err)?),
     ];
 
-    let key_pair = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
-    let cert = params.self_signed(&key_pair).map_err(|e| e.to_string())?;
+    let key_pair = rcgen::KeyPair::generate().map_err(gen_err)?;
+    let cert = params.self_signed(&key_pair).map_err(gen_err)?;
 
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
@@ -165,6 +142,41 @@ fn validate_pem_key(data: &[u8]) -> Result<(), DomainError> {
     PrivateKeyDer::from_pem_slice(data)
         .map_err(|e| DomainError::InvalidInput(format!("Invalid key PEM: {e}")))?;
     Ok(())
+}
+
+async fn write_pair(
+    cert_path: &str,
+    cert: &[u8],
+    key_path: &str,
+    key: &[u8],
+) -> Result<(), DomainError> {
+    ensure_parent_dir(cert_path).await?;
+    ensure_parent_dir(key_path).await?;
+    tokio::fs::write(cert_path, cert)
+        .await
+        .map_err(|e| DomainError::IoError(format!("Failed to write certificate: {e}")))?;
+    write_private(key_path, key)
+        .await
+        .map_err(|e| DomainError::IoError(format!("Failed to write key: {e}")))
+}
+
+/// Writes a private key readable by the owner only, tightening a pre-existing file before the secret lands in it.
+async fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut file = opts.open(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await?;
+    }
+    file.write_all(data).await?;
+    file.flush().await
 }
 
 async fn ensure_parent_dir(path: &str) -> Result<(), DomainError> {

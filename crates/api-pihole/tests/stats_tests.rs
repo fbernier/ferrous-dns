@@ -8,14 +8,10 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// GET /stats/summary — empty database
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn summary_returns_zero_counts_when_no_queries_have_been_logged() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -42,14 +38,10 @@ async fn summary_returns_zero_counts_when_no_queries_have_been_logged() {
     assert_eq!(json["queries"]["percent_blocked"], 0.0);
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/summary — schema conformance (Pi-hole v6)
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn summary_response_matches_pihole_v6_schema() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -110,10 +102,6 @@ async fn summary_response_matches_pihole_v6_schema() {
     assert_eq!(json["status"], "enabled");
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/summary — correct calculations with real data
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn summary_calculates_percent_blocked_correctly_from_query_log() {
     let pool = helpers::create_test_db().await;
@@ -141,7 +129,7 @@ async fn summary_calculates_percent_blocked_correctly_from_query_log() {
     )
     .await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -187,7 +175,7 @@ async fn summary_counts_unique_clients_in_active_and_total_fields() {
     helpers::insert_query(&pool, "b.com", "10.0.0.1", false, false, None).await;
     helpers::insert_query(&pool, "c.com", "10.0.0.2", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -225,7 +213,7 @@ async fn summary_separates_cached_queries_from_forwarded_queries() {
         helpers::insert_query(&pool, "fresh.com", "10.0.0.1", false, false, None).await;
     }
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -251,18 +239,29 @@ async fn summary_separates_cached_queries_from_forwarded_queries() {
     );
     assert_eq!(
         json["queries"]["forwarded"], 2,
-        "forwarded = total - blocked - cached"
+        "cache hits are not forwarded"
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/history
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn summary_does_not_count_local_dns_answers_as_forwarded() {
+    let pool = helpers::create_test_db().await;
+    helpers::insert_upstream_query(&pool, "remote.example", "default", "1.1.1.1:53").await;
+    for _ in 0..2 {
+        helpers::insert_local_dns_query(&pool, "nas.lan").await;
+    }
+
+    let app = helpers::create_pihole_test_app(pool).await;
+    let json = get_json(app, "/stats/summary").await;
+
+    assert_eq!(json["queries"]["total"], 3);
+    assert_eq!(json["queries"]["forwarded"], 1);
+}
 
 #[tokio::test]
 async fn history_returns_array_under_history_key_in_pihole_v6_format() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -305,7 +304,7 @@ async fn history_buckets_contain_required_pihole_v6_fields() {
     )
     .await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -345,14 +344,10 @@ async fn history_buckets_contain_required_pihole_v6_fields() {
     assert!(ts > 0, "timestamp must be a positive unix epoch");
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/top_blocked
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn top_blocked_returns_object_under_top_blocked_key() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -422,7 +417,7 @@ async fn top_blocked_includes_blocked_domains_with_their_hit_counts() {
     // Allowed query — must NOT appear in top_blocked
     helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -460,14 +455,10 @@ async fn top_blocked_includes_blocked_domains_with_their_hit_counts() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/top_clients
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn top_clients_returns_object_under_top_sources_key() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -510,7 +501,7 @@ async fn top_clients_entries_have_ip_and_count_fields() {
     helpers::insert_query(&pool, "a.com", "192.168.1.100", false, false, None).await;
     helpers::insert_query(&pool, "b.com", "192.168.1.100", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -560,7 +551,7 @@ async fn top_clients_counts_are_per_source_ip() {
     }
     helpers::insert_query(&pool, "x.com", "10.0.0.200", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -593,14 +584,10 @@ async fn top_clients_counts_are_per_source_ip() {
     assert_eq!(entry_200, Some(1), "10.0.0.200 should have count 1");
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/query_types
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn query_types_returns_object_under_querytypes_key() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -637,7 +624,7 @@ async fn query_types_percentages_sum_to_100_when_queries_are_present() {
         helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
     }
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -673,7 +660,7 @@ async fn query_types_percentages_sum_to_100_when_queries_are_present() {
 #[tokio::test]
 async fn query_types_returns_zero_percentages_when_no_queries_logged() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -704,14 +691,10 @@ async fn query_types_returns_zero_percentages_when_no_queries_logged() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/top_domains
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn top_domains_returns_both_top_domains_and_top_blocked_keys() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -760,7 +743,7 @@ async fn top_domains_returns_allowed_domains_by_default() {
         helpers::insert_query(&pool, "ads.com", "10.0.0.1", true, false, Some("blocklist")).await;
     }
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -800,14 +783,10 @@ async fn top_domains_returns_allowed_domains_by_default() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/upstreams
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn upstreams_returns_required_fields() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -851,7 +830,7 @@ async fn upstreams_total_queries_matches_data() {
         helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
     }
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -876,14 +855,75 @@ async fn upstreams_total_queries_matches_data() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/recent_blocked
-// ---------------------------------------------------------------------------
+async fn get_json(app: axum::Router, uri: &str) -> Value {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("failed to build request"),
+        )
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to read body")
+        .to_bytes();
+    serde_json::from_slice(&bytes).expect("invalid JSON")
+}
+
+#[tokio::test]
+async fn upstreams_exclude_cache_local_and_block_sources() {
+    let pool = helpers::create_test_db().await;
+    for _ in 0..3 {
+        helpers::insert_upstream_query(&pool, "a.example", "default", "1.1.1.1:53").await;
+    }
+    helpers::insert_upstream_query(&pool, "b.example", "default", "[2606:4700::1111]:53").await;
+    helpers::insert_query(&pool, "c.example", "10.0.0.1", false, true, None).await;
+    for source in [
+        "blocklist",
+        "regex_filter",
+        "dns_tunneling",
+        "managed_domain",
+    ] {
+        helpers::insert_query(&pool, "ads.example", "10.0.0.1", true, false, Some(source)).await;
+    }
+
+    let app = helpers::create_pihole_test_app(pool).await;
+    let json = get_json(app, "/stats/upstreams").await;
+
+    assert_eq!(
+        json["upstreams"],
+        serde_json::json!({
+            "default:1.1.1.1:53": 3,
+            "default:[2606:4700::1111]:53": 1,
+        })
+    );
+    assert_eq!(json["forwarded_queries"], 4);
+    assert_eq!(json["total_queries"], 9);
+}
+
+#[tokio::test]
+async fn out_of_range_period_is_clamped_instead_of_overflowing() {
+    let pool = helpers::create_test_db().await;
+    helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
+
+    for from in ["1e30", "-1e30", "inf", "NaN"] {
+        let summary = get_json(app.clone(), &format!("/stats/summary?from={from}")).await;
+        assert!(summary["queries"]["total"].is_u64(), "from={from}");
+        get_json(app.clone(), &format!("/stats/top_domains?from={from}")).await;
+        get_json(app.clone(), &format!("/stats/top_clients?from={from}")).await;
+    }
+}
 
 #[tokio::test]
 async fn recent_blocked_returns_domain_field() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -930,7 +970,7 @@ async fn recent_blocked_returns_most_recently_blocked_domain() {
     )
     .await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -957,10 +997,6 @@ async fn recent_blocked_returns_most_recently_blocked_domain() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/top_domains?blocked=true — v6 blocked filter
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn top_domains_blocked_true_returns_only_blocked_domains() {
     let pool = helpers::create_test_db().await;
@@ -972,7 +1008,7 @@ async fn top_domains_blocked_true_returns_only_blocked_domains() {
         helpers::insert_query(&pool, "ads.com", "10.0.0.1", true, false, Some("blocklist")).await;
     }
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -1008,17 +1044,13 @@ async fn top_domains_blocked_true_returns_only_blocked_domains() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/history — cached and forwarded fields
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn history_buckets_include_cached_and_forwarded_fields() {
     let pool = helpers::create_test_db().await;
 
     helpers::insert_query(&pool, "example.com", "10.0.0.1", false, false, None).await;
 
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()
@@ -1051,14 +1083,10 @@ async fn history_buckets_include_cached_and_forwarded_fields() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /stats/summary — gravity.last_update present
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn summary_gravity_includes_last_update_field() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(

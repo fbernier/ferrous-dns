@@ -3,8 +3,7 @@
 //! On x86_64: uses `rdtsc` (~1–5 ns overhead) with one-time TSC frequency calibration.
 //! On other architectures: falls back to `CLOCK_MONOTONIC` via `Instant`.
 //!
-//! This replaces `CLOCK_MONOTONIC_COARSE` (resolution ~4–10 ms) for cache timing,
-//! giving true µs-level precision without meaningful hot-path cost.
+//! `CLOCK_MONOTONIC_COARSE` (~4–10 ms resolution) is too coarse for µs-level cache timings.
 
 #[cfg(target_arch = "x86_64")]
 mod imp {
@@ -89,7 +88,8 @@ mod imp {
     }
 }
 
-pub use imp::{init, now, to_us};
+use imp::to_us;
+pub use imp::{init, now};
 
 /// Measures elapsed microseconds between `start` (from `now()`) and the current instant.
 #[inline(always)]

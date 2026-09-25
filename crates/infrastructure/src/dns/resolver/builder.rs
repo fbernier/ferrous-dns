@@ -1,8 +1,7 @@
-use super::super::cache::{DnsCache, NegativeQueryTracker};
+use super::super::cache::DnsCache;
 use super::super::dnssec::{DnssecCache, TrustAnchorStore};
 use super::super::load_balancer::PoolManager;
 use super::cache_layer::CachedResolver;
-use super::config::ResolverConfig;
 use super::core::CoreResolver;
 use super::dns64_layer::Dns64Resolver;
 use super::dnssec_layer::DnssecResolver;
@@ -11,33 +10,43 @@ use super::filters::QueryFilters;
 use super::local_ptr::{LocalPtrResolver, PtrMap};
 use super::local_wildcard::{LocalWildcardResolver, WildcardMap};
 use ferrous_dns_application::ports::DnsResolver;
-use std::net::Ipv6Addr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tracing::info;
 
+/// Assembles the resolver layers around the upstream [`CoreResolver`]; every
+/// layer is optional and absent unless its `with_*` is called.
 pub struct ResolverBuilder {
     pool_manager: Arc<PoolManager>,
-    dnssec_pool_manager: Option<Arc<PoolManager>>,
-    trust_anchors: Option<TrustAnchorStore>,
-    dnssec_cache: Option<Arc<DnssecCache>>,
-    config: ResolverConfig,
-    cache: Option<Arc<DnsCache>>,
+    query_timeout_ms: u64,
+    dnssec: Option<DnssecSetup>,
+    cache: Option<CacheSetup>,
     local_domain: Option<String>,
-    local_dns_server: Option<String>,
+    local_dns_server: Option<SocketAddr>,
     filters: Option<QueryFilters>,
     local_ptr_map: Option<Arc<PtrMap>>,
     local_wildcards: Option<Arc<WildcardMap>>,
     dns64_prefix: Option<Ipv6Addr>,
 }
 
+struct DnssecSetup {
+    pool_manager: Arc<PoolManager>,
+    trust_anchors: TrustAnchorStore,
+    cache: Arc<DnssecCache>,
+}
+
+struct CacheSetup {
+    cache: Arc<DnsCache>,
+    ttl: u32,
+    inflight_shards: usize,
+}
+
 impl ResolverBuilder {
-    pub fn new(pool_manager: Arc<PoolManager>) -> Self {
+    pub fn new(pool_manager: Arc<PoolManager>, query_timeout_ms: u64) -> Self {
         Self {
             pool_manager,
-            dnssec_pool_manager: None,
-            trust_anchors: None,
-            dnssec_cache: None,
-            config: ResolverConfig::default(),
+            query_timeout_ms,
+            dnssec: None,
             cache: None,
             local_domain: None,
             local_dns_server: None,
@@ -48,37 +57,28 @@ impl ResolverBuilder {
         }
     }
 
-    pub fn with_dnssec_pool_manager(mut self, pool_manager: Arc<PoolManager>) -> Self {
-        self.dnssec_pool_manager = Some(pool_manager);
+    /// Validates answers with DNSSEC, walking the chain of trust on
+    /// `pool_manager`. `cache` is caller-owned so its counters can be reported.
+    pub fn with_dnssec(
+        mut self,
+        pool_manager: Arc<PoolManager>,
+        trust_anchors: TrustAnchorStore,
+        cache: Arc<DnssecCache>,
+    ) -> Self {
+        self.dnssec = Some(DnssecSetup {
+            pool_manager,
+            trust_anchors,
+            cache,
+        });
         self
     }
 
-    /// Overrides the DNSSEC trust anchors. Without this the validator uses the
-    /// IANA root anchors embedded in the binary.
-    pub fn with_trust_anchors(mut self, trust_anchors: TrustAnchorStore) -> Self {
-        self.trust_anchors = Some(trust_anchors);
-        self
-    }
-
-    /// Supplies the DNSKEY/DS cache for the validator instead of letting it
-    /// create its own, so the caller retains a handle for stats reporting.
-    pub fn with_dnssec_cache(mut self, cache: Arc<DnssecCache>) -> Self {
-        self.dnssec_cache = Some(cache);
-        self
-    }
-
-    pub fn with_config(mut self, config: ResolverConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    pub fn with_cache(mut self, cache: Arc<DnsCache>) -> Self {
-        self.cache = Some(cache);
-        self
-    }
-
-    pub fn with_dnssec(mut self) -> Self {
-        self.config.dnssec_enabled = true;
+    pub fn with_cache(mut self, cache: Arc<DnsCache>, ttl: u32, inflight_shards: usize) -> Self {
+        self.cache = Some(CacheSetup {
+            cache,
+            ttl,
+            inflight_shards,
+        });
         self
     }
 
@@ -87,7 +87,8 @@ impl ResolverBuilder {
         self
     }
 
-    pub fn with_local_dns_server(mut self, server: Option<String>) -> Self {
+    /// The LAN server that answers names under the local domain and private PTRs.
+    pub fn with_local_dns_server(mut self, server: Option<SocketAddr>) -> Self {
         self.local_dns_server = server;
         self
     }
@@ -97,7 +98,7 @@ impl ResolverBuilder {
         self
     }
 
-    /// Attaches a pre-populated PTR map so that `LocalPtrResolver` is added as the
+    /// Attaches a live PTR map so that `LocalPtrResolver` is added as the
     /// outermost layer, intercepting PTR queries before any other resolver.
     pub fn with_local_ptr_map(mut self, map: Arc<PtrMap>) -> Self {
         self.local_ptr_map = Some(map);
@@ -122,7 +123,7 @@ impl ResolverBuilder {
 
     pub fn build(self) -> Arc<dyn DnsResolver> {
         info!(
-            dnssec = self.config.dnssec_enabled,
+            dnssec = self.dnssec.is_some(),
             cache = self.cache.is_some(),
             filters = self.filters.is_some(),
             local_ptr = self.local_ptr_map.is_some(),
@@ -131,36 +132,23 @@ impl ResolverBuilder {
         );
 
         let core = CoreResolver::new(
-            self.pool_manager.clone(),
-            self.config.query_timeout_ms,
-            self.config.dnssec_enabled,
+            self.pool_manager,
+            self.query_timeout_ms,
+            self.dnssec.is_some(),
         )
         .with_local_domain(self.local_domain)
         .with_local_dns_server(self.local_dns_server);
 
         let mut resolver: Arc<dyn DnsResolver> = Arc::new(core);
 
-        if self.config.dnssec_enabled {
-            let dnssec_pm = self
-                .dnssec_pool_manager
-                .clone()
-                .unwrap_or_else(|| self.pool_manager.clone());
-            let trust_anchors = self.trust_anchors.unwrap_or_default();
-            resolver = Arc::new(match self.dnssec_cache {
-                Some(cache) => DnssecResolver::with_shared_cache(
-                    resolver,
-                    dnssec_pm,
-                    self.config.query_timeout_ms,
-                    trust_anchors,
-                    cache,
-                ),
-                None => DnssecResolver::new(
-                    resolver,
-                    dnssec_pm,
-                    self.config.query_timeout_ms,
-                    trust_anchors,
-                ),
-            });
+        if let Some(dnssec) = self.dnssec {
+            resolver = Arc::new(DnssecResolver::new(
+                resolver,
+                dnssec.pool_manager,
+                self.query_timeout_ms,
+                dnssec.trust_anchors,
+                dnssec.cache,
+            ));
         }
 
         // DNS64 sits below the cache: synthesized AAAA answers are stored as
@@ -171,17 +159,12 @@ impl ResolverBuilder {
         }
 
         if let Some(cache) = self.cache {
-            let tracker = Arc::new(NegativeQueryTracker::new());
-            tracker.start_cleanup_task();
-            let cached = CachedResolver::new(
+            resolver = Arc::new(CachedResolver::new(
                 resolver,
-                cache,
-                self.config.cache_ttl,
-                tracker,
-                self.config.inflight_shards,
-            );
-
-            resolver = Arc::new(cached);
+                cache.cache,
+                cache.ttl,
+                cache.inflight_shards,
+            ));
         }
 
         // Wildcard local records answer above the cache. A cache key is matched

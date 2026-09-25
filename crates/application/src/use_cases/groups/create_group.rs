@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use ferrous_dns_domain::value_objects::validators::validate_comment;
 use ferrous_dns_domain::{DomainError, Group};
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -19,16 +20,20 @@ impl CreateGroupUseCase {
         &self,
         name: String,
         comment: Option<String>,
+        enabled: bool,
     ) -> Result<Group, DomainError> {
         Group::validate_name(&name).map_err(DomainError::InvalidGroupName)?;
-        Group::validate_comment(&comment.as_ref().map(|s| Arc::from(s.as_str())))
-            .map_err(DomainError::InvalidGroupName)?;
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidGroupName)?;
 
-        let group = self.group_repo.create(name.clone(), comment).await?;
+        let group = self
+            .group_repo
+            .create(name.clone(), comment, enabled)
+            .await?;
 
         info!(
             group_id = ?group.id,
             name = %name,
+            enabled,
             "Group created successfully"
         );
 
@@ -43,6 +48,7 @@ impl GroupCreator for CreateGroupUseCase {
         name: String,
         comment: Option<String>,
     ) -> Result<Group, DomainError> {
-        self.execute(name, comment).await
+        // Backup snapshots carry no enabled flag; restored groups start enabled.
+        self.execute(name, comment, true).await
     }
 }

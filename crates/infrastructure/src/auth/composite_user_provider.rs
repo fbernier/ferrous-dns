@@ -9,14 +9,7 @@ use ferrous_dns_domain::{Config, DomainError, User};
 
 use super::toml_admin_provider::TomlAdminProvider;
 
-/// Combines TOML admin source with SQLite user repository.
-///
-/// Follows the same Composite pattern as `CompositeServiceCatalog`:
-/// a static source (TOML admin) merged with a dynamic source (SQLite users).
-/// TOML admin always takes priority when usernames collide.
-///
-/// Shares the same `Arc<RwLock<Config>>` as the rest of the application
-/// so that password changes are immediately visible to `GetAuthStatusUseCase`.
+/// TOML admin over SQLite users (TOML wins on name collision); shares the app `Config` lock so hash changes are live.
 pub struct CompositeUserProvider {
     toml_admin: RwLock<TomlAdminProvider>,
     db_users: Arc<dyn UserRepository>,
@@ -103,12 +96,17 @@ impl UserProvider for CompositeUserProvider {
 impl CompositeUserProvider {
     async fn update_toml_admin_password(&self, password_hash: &str) -> Result<(), DomainError> {
         let mut config = self.config.write().await;
-        config.auth.admin.password_hash = Some(password_hash.to_string());
+        let previous = config
+            .auth
+            .admin
+            .password_hash
+            .replace(password_hash.to_string());
 
-        if let Some(ref path) = self.config_path {
-            self.config_persistence
-                .save_config_to_file(&config, path)
-                .map_err(|e| DomainError::ConfigError(format!("Failed to save config: {e}")))?;
+        if let Some(path) = &self.config_path {
+            if let Err(e) = self.config_persistence.save_config_to_file(&config, path) {
+                config.auth.admin.password_hash = previous;
+                return Err(e);
+            }
         }
 
         let admin_config = config.auth.admin.clone();

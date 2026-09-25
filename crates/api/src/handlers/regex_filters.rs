@@ -3,12 +3,16 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use ferrous_dns_domain::{DomainAction, DomainError};
+use ferrous_dns_application::ports::RegexFilterUpdate;
+use ferrous_dns_domain::DomainError;
 use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    dto::{CreateRegexFilterRequest, RegexFilterResponse, UpdateRegexFilterRequest},
+    dto::{
+        managed_domain::parse_action, CreateRegexFilterRequest, RegexFilterResponse,
+        UpdateRegexFilterRequest,
+    },
     errors::ApiError,
     state::AppState,
 };
@@ -68,12 +72,7 @@ async fn get_regex_filter_by_id(
         .get_regex_filters
         .get_by_id(id)
         .await?
-        .ok_or_else(|| {
-            ApiError(DomainError::NotFound(format!(
-                "Regex filter {} not found",
-                id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::RegexFilterNotFound(id)))?;
     Ok(Json(RegexFilterResponse::from_domain(filter)))
 }
 
@@ -92,12 +91,7 @@ async fn create_regex_filter(
     State(state): State<AppState>,
     Json(req): Json<CreateRegexFilterRequest>,
 ) -> Result<(StatusCode, Json<RegexFilterResponse>), ApiError> {
-    let action = req.action.parse::<DomainAction>().ok().ok_or_else(|| {
-        ApiError(DomainError::InvalidDomainName(format!(
-            "Invalid action '{}': must be 'allow' or 'deny'",
-            req.action
-        )))
-    })?;
+    let action = parse_action(&req.action)?;
 
     let group_id = req.group_id.unwrap_or(1);
     let enabled = req.enabled.unwrap_or(true);
@@ -138,27 +132,21 @@ async fn update_regex_filter(
     Path(id): Path<i64>,
     Json(req): Json<UpdateRegexFilterRequest>,
 ) -> Result<Json<RegexFilterResponse>, ApiError> {
-    let action = match req.action {
-        Some(ref s) => Some(s.parse::<DomainAction>().ok().ok_or_else(|| {
-            ApiError(DomainError::InvalidDomainName(format!(
-                "Invalid action '{}': must be 'allow' or 'deny'",
-                s
-            )))
-        })?),
-        None => None,
-    };
+    let action = req.action.as_deref().map(parse_action).transpose()?;
 
     let filter = state
         .blocking
         .update_regex_filter
         .execute(
             id,
-            req.name,
-            req.pattern,
-            action,
-            req.group_id,
-            req.comment,
-            req.enabled,
+            RegexFilterUpdate {
+                name: req.name,
+                pattern: req.pattern,
+                action,
+                group_id: req.group_id,
+                comment: req.comment,
+                enabled: req.enabled,
+            },
         )
         .await?;
 

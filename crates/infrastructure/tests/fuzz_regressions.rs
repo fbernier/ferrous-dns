@@ -4,7 +4,7 @@
 //! minimized input, so the bug stays fixed even if the corpus is lost.
 
 use ferrous_dns_infrastructure::dns::fast_path::{self, FastPathKind};
-use ferrous_dns_infrastructure::dns::wire_response;
+use ferrous_dns_infrastructure::dns::wire_response::{self, EdnsReply};
 use hickory_proto::op::{Message, Query};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use std::net::{IpAddr, Ipv4Addr};
@@ -320,4 +320,130 @@ fn query_fast_path_seed_corpus_is_clean() {
     }
 
     assert!(seeds > 0, "no seeds found in {}", corpus.display());
+}
+
+/// BADCOOKIE is RCODE 23: header 7 plus 1 in the OPT's extended-RCODE byte.
+/// Swapping in our OPT used to zero that byte, turning it into YXRRSET.
+#[test]
+fn relay_keeps_the_upstream_extended_rcode() {
+    let upstream = b"\x00\x08\x81\x87\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\
+                     \x00\x01\x00\x01\x00\x00\x29\x04\xd0\x01\x00\x00\x00\x00\x00";
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: Some(&[0x55; 16]),
+        ede: None,
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours)).unwrap();
+    let rcode = Message::from_vec(&relayed).unwrap().metadata.response_code;
+    assert_eq!(u16::from(rcode), 23);
+
+    // Without an OPT of our own the extended bits have nowhere to go.
+    assert!(wire_response::relay_with_edns(upstream, 1, true, false, None).is_none());
+}
+
+/// `crash-53ce8e0a` from the `upstream_relay` target: an NXDOMAIN whose only
+/// additional record is a TSIG. The relay appended our OPT behind it, and
+/// hickory rejects any record after a TSIG (`RecordAfterSig`, RFC 8945 §5.1).
+/// The TSIG signs the upstream's transaction with us, so neither the client
+/// nor the cache gets it (RFC 8945 §5.3).
+#[test]
+fn relay_drops_a_tsig_rather_than_append_an_opt_behind_it() {
+    let upstream = b"\x00\x00\x81\x83\x00\x01\x00\x00\x00\x00\x00\x01\x04nope\x03com\x00\
+                     \x00\x01\x00\x01\
+                     \x00\x00\xfa\x00\xff\x00\x00\x00\x00\x00\x11\
+                     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    assert!(Message::from_vec(upstream).unwrap().signature.is_some());
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: Some(&[0x55; 16]),
+        ede: None,
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours))
+        .expect("re-sectioned");
+    let cached = wire_response::cache_form(upstream, 60, 0..=u32::MAX).expect("cacheable");
+    let served = wire_response::relay_cached(&cached, 1, true, Some(&ours), 60).expect("served");
+    for reply in [relayed, served] {
+        let msg = Message::from_vec(&reply).expect("relayed message decodes");
+        assert_eq!(u16::from(msg.metadata.response_code), 3);
+        assert!(msg.signature.is_none() && msg.additionals.is_empty());
+        assert!(msg.edns.is_some());
+    }
+}
+
+/// `crash-11436e02` from the `upstream_relay` target: a SIG with an empty
+/// RDATA. Telling SIG(0) apart read its type-covered field past the record,
+/// from whatever follows it: garbage upstream, our OPT once relayed, which
+/// opens with the two zero bytes of SIG(0). So a second pass over our own
+/// output, as serving a cache form takes, dropped the record the first kept.
+#[test]
+fn relay_reads_a_sig_type_covered_field_inside_its_rdata() {
+    let upstream = b"\x00\x00\x81\x80\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\
+                     \x00\x01\x00\x01\
+                     \x00\x00\x18\x00\x01\x00\x00\x00\x00\x00\x00";
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: None,
+        ede: None,
+    };
+    let once = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours)).unwrap();
+    let twice = wire_response::relay_with_edns(&once, 1, true, false, Some(&ours));
+    assert_eq!(twice.as_deref(), Some(&once[..]));
+}
+
+/// `crash-aa9f0262` from the `upstream_relay` target: a glue owner whose
+/// pointer names labels at the tail of the answer's RDATA, and those run on
+/// into the root owner of the OPT that follows. The pointer's target sits
+/// before the dropped OPT, so it was kept as is, and the name picked up
+/// whatever moved into the OPT's place — the glue record itself, a loop.
+#[test]
+fn relay_keeps_a_name_whose_labels_run_into_the_dropped_opt() {
+    let upstream = b"\x11\x11\x81\x80\x00\x01\x00\x01\x00\x00\x00\x02\x07example\x03com\x00\
+                     \x00\x10\x00\x01\
+                     \xc0\x0c\x00\x10\x00\x01\x00\x00\x00\x3c\x00\x04\x03bar\
+                     \x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x00\
+                     \x03foo\xc0\x29\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x01";
+    let source = Message::from_vec(upstream).unwrap();
+    assert_eq!(source.additionals[0].name.to_ascii(), "foo.bar.");
+    let ours = EdnsReply {
+        dnssec_ok: false,
+        cookie: None,
+        ede: None,
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&ours)).unwrap();
+    let cached = wire_response::cache_form(upstream, 60, 0..=u32::MAX).unwrap();
+    let served = wire_response::relay_cached(&cached, 1, true, Some(&ours), 60).unwrap();
+    for reply in [relayed, served] {
+        let msg = Message::from_vec(&reply).expect("relayed message decodes");
+        assert_eq!(msg.additionals, source.additionals);
+    }
+}
+
+/// `crash-a616f390` from the `upstream_relay` target: an RRSIG with an empty
+/// RDATA behind the upstream OPT. Once the OPT is dropped, every later record
+/// is copied field by field. A client without DO never sees the RRSIG, so its
+/// relay drops it unread; the cache form keeps DNSSEC RRs for DO clients,
+/// walks it and declines. The harness had assumed anything relayed is
+/// cacheable. The contract is that the cache form and the DO relay accept the
+/// same messages.
+#[test]
+fn a_malformed_rrsig_is_stripped_for_plain_clients_but_never_cached() {
+    let upstream = b"\x00\x00\x81\x80\x00\x01\x00\x00\x00\x00\x00\x02\x07example\x03com\x00\
+                     \x00\x01\x00\x01\
+                     \x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x00\
+                     \xc0\x0c\x00\x2e\x00\x01\x00\x00\x00\x3c\x00\x00";
+    let plain = EdnsReply {
+        dnssec_ok: false,
+        cookie: None,
+        ede: None,
+    };
+    let with_do = EdnsReply {
+        dnssec_ok: true,
+        ..plain
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&plain))
+        .expect("a plain client gets the answer without the RRSIG");
+    let msg = Message::from_vec(&relayed).unwrap();
+    assert!(msg.additionals.is_empty() && msg.edns.is_some());
+    assert!(wire_response::relay_with_edns(upstream, 1, true, false, Some(&with_do)).is_none());
+    assert!(wire_response::cache_form(upstream, 60, 0..=u32::MAX).is_none());
 }

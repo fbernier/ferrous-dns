@@ -33,6 +33,7 @@ fn empty_resolution(rcode: ResponseCode) -> DnsResolution {
         addresses: Arc::new(vec![]),
         cache_hit: false,
         local_dns: false,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,
@@ -51,7 +52,7 @@ struct MockInner {
     aaaa_rcode: Option<ResponseCode>,
     /// Addresses returned for the A re-query.
     a_addrs: Vec<IpAddr>,
-    a_dnssec: Option<&'static str>,
+    a_dnssec: Option<ferrous_dns_domain::DnssecStatus>,
     /// PTR target for `*.in-addr.arpa` queries (None = no PTR).
     ptr_target: Option<String>,
     calls: Mutex<Vec<(String, RecordType)>>,
@@ -196,7 +197,7 @@ async fn skips_when_all_a_addresses_are_private() {
 async fn skips_synthesis_for_dnssec_bogus_a() {
     let inner = Arc::new(MockInner {
         a_addrs: vec!["93.184.216.34".parse().unwrap()],
-        a_dnssec: Some("Bogus"),
+        a_dnssec: Some(ferrous_dns_domain::DnssecStatus::Bogus),
         ..Default::default()
     });
     let resolver = Dns64Resolver::new(Arc::clone(&inner) as Arc<dyn DnsResolver>, prefix());

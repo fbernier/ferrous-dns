@@ -19,7 +19,6 @@ ferrous-dns-api-pihole.workspace = true
 
 tokio.workspace = true
 bytes.workspace = true
-futures.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 base64.workspace = true
@@ -32,12 +31,12 @@ tower-http.workspace = true
 hyper = { version = "1", features = ["server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 tower.workspace = true
+ipnetwork = "0.21"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 sqlx.workspace = true
-hickory-server.workspace = true
 socket2.workspace = true
 mimalloc.workspace = true
 libc.workspace = true
@@ -53,3 +52,4 @@ quinn.workspace = true
 tempfile = "3.8"
 rcgen = "0.14"
 async-trait.workspace = true
+futures.workspace = true

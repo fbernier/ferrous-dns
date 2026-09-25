@@ -1,3 +1,4 @@
+use crate::value_objects::validators::exceeds_chars;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -13,38 +14,12 @@ pub struct Group {
 }
 
 impl Group {
-    pub fn new(
-        id: Option<i64>,
-        name: Arc<str>,
-        enabled: bool,
-        comment: Option<Arc<str>>,
-        is_default: bool,
-    ) -> Self {
-        Self {
-            id,
-            name,
-            enabled,
-            comment,
-            is_default,
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
-    pub fn can_disable(&self) -> bool {
-        !self.is_default
-    }
-
-    pub fn can_delete(&self) -> bool {
-        !self.is_default
-    }
-
     pub fn validate_name(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("Group name cannot be empty".to_string());
         }
 
-        if name.len() > 100 {
+        if exceeds_chars(name, 100) {
             return Err("Group name cannot exceed 100 characters".to_string());
         }
 
@@ -61,21 +36,4 @@ impl Group {
 
         Ok(())
     }
-
-    pub fn validate_comment(comment: &Option<Arc<str>>) -> Result<(), String> {
-        if let Some(c) = comment {
-            if c.len() > 500 {
-                return Err("Comment cannot exceed 500 characters".to_string());
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GroupStats {
-    pub total_groups: u64,
-    pub enabled_groups: u64,
-    pub disabled_groups: u64,
-    pub total_clients: u64,
 }

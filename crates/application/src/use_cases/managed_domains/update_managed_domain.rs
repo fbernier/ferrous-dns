@@ -1,8 +1,12 @@
-use ferrous_dns_domain::{DomainAction, DomainError, ManagedDomain};
+use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::validate_comment;
+use ferrous_dns_domain::{DomainError, ManagedDomain};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
 
-use crate::ports::{BlockFilterEnginePort, GroupRepository, ManagedDomainRepository};
+use crate::ports::{
+    BlockFilterEnginePort, GroupRepository, ManagedDomainRepository, ManagedDomainUpdate,
+};
 
 pub struct UpdateManagedDomainUseCase {
     repo: Arc<dyn ManagedDomainRepository>,
@@ -24,46 +28,32 @@ impl UpdateManagedDomainUseCase {
     }
 
     #[instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         id: i64,
-        name: Option<String>,
-        domain: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
+        update: ManagedDomainUpdate,
     ) -> Result<ManagedDomain, DomainError> {
         self.repo
             .get_by_id(id)
             .await?
             .ok_or(DomainError::ManagedDomainNotFound(id))?;
 
-        if let Some(ref n) = name {
+        if let Some(ref n) = update.name {
             ManagedDomain::validate_name(n).map_err(DomainError::InvalidManagedDomain)?;
         }
 
-        if let Some(ref d) = domain {
+        if let Some(ref d) = update.domain {
             ManagedDomain::validate_domain(d).map_err(DomainError::InvalidManagedDomain)?;
         }
 
-        if let Some(ref c) = comment {
-            ManagedDomain::validate_comment(&Some(Arc::from(c.as_str())))
-                .map_err(DomainError::InvalidManagedDomain)?;
+        validate_comment(update.comment.as_ref().and_then(Option::as_deref))
+            .map_err(DomainError::InvalidManagedDomain)?;
+
+        if let Some(gid) = update.group_id {
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
-        if let Some(gid) = group_id {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
-        }
-
-        let updated = self
-            .repo
-            .update(id, name, domain, action, group_id, comment, enabled)
-            .await?;
+        let updated = self.repo.update(id, update).await?;
 
         info!(
             domain_id = ?id,

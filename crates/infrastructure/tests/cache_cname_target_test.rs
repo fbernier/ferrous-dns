@@ -1,4 +1,4 @@
-//! Phase 4: CNAME chain target caching.
+//! CNAME chain target caching.
 //!
 //! When the upstream resolves `www.foo.com A?` via the chain
 //! `www.foo.com CNAME cdn.foo.com, cdn.foo.com A 1.2.3.4`, the resolver
@@ -8,10 +8,10 @@
 
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
-use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
+use ferrous_dns_domain::{DnsQuery, DnssecStatus, DomainError, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::CachedResolver;
 use ferrous_dns_infrastructure::dns::{
-    DnsCache, DnsCacheAccess, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
+    CachedAddresses, CachedData, DnsCache, DnsCacheConfig, EvictionStrategy,
 };
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +23,7 @@ struct CnameChainResolver {
     call_count: Arc<AtomicUsize>,
     addresses: Vec<IpAddr>,
     cname_chain: Vec<Arc<str>>,
-    dnssec_status: Option<&'static str>,
+    dnssec_status: Option<DnssecStatus>,
 }
 
 impl CnameChainResolver {
@@ -47,7 +47,7 @@ impl CnameChainResolver {
         }
     }
 
-    fn with_dnssec(mut self, status: &'static str) -> Self {
+    fn with_dnssec(mut self, status: DnssecStatus) -> Self {
         self.dnssec_status = Some(status);
         self
     }
@@ -66,6 +66,7 @@ impl DnsResolver for CnameChainResolver {
             addresses: Arc::new(self.addresses.clone()),
             cache_hit: false,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: self.dnssec_status,
             cname_chain,
             upstream_server: None,
@@ -77,14 +78,12 @@ impl DnsResolver for CnameChainResolver {
     }
 }
 
-fn make_cache() -> Arc<dyn DnsCacheAccess> {
+fn make_cache() -> Arc<DnsCache> {
     Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries: 1000,
         eviction_strategy: EvictionStrategy::LRU,
-        min_threshold: 2.0,
         refresh_threshold: 0.75,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -111,7 +110,6 @@ async fn should_cache_cname_target_addresses_separately() {
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
         make_cache(),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -144,9 +142,8 @@ async fn should_not_cache_target_when_chain_is_empty() {
     let cache = make_cache();
     let resolver = CachedResolver::new(
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
-        Arc::clone(&cache),
+        cache.clone(),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -174,14 +171,14 @@ async fn should_not_cache_target_when_chain_is_empty() {
 #[tokio::test]
 async fn should_inherit_dnssec_status_from_qname_entry() {
     let mock = Arc::new(
-        CnameChainResolver::new("9.9.9.9", &["secure-target.example"]).with_dnssec("Secure"),
+        CnameChainResolver::new("9.9.9.9", &["secure-target.example"])
+            .with_dnssec(DnssecStatus::Secure),
     );
     let cache = make_cache();
     let resolver = CachedResolver::new(
         Arc::clone(&mock) as Arc<dyn DnsResolver>,
-        Arc::clone(&cache),
+        cache.clone(),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     );
 
@@ -196,7 +193,7 @@ async fn should_inherit_dnssec_status_from_qname_entry() {
     // Hop to a fresh OS thread so the L2 path runs and surfaces the stored
     // DNSSEC status.
     let cache_clone = Arc::clone(&cache);
-    let (_, dnssec, _) = std::thread::spawn(move || {
+    let (_, dnssec, _, _) = std::thread::spawn(move || {
         cache_clone
             .get("secure-target.example", &RecordType::A)
             .expect("target entry must be cached")
@@ -208,5 +205,36 @@ async fn should_inherit_dnssec_status_from_qname_entry() {
         dnssec,
         Some(ferrous_dns_infrastructure::dns::CachedDnssecStatus::Secure),
         "target entry must inherit the qname entry's DNSSEC status"
+    );
+}
+
+/// A chain ending in a local name must not overwrite that name's configured
+/// record, or any upstream domain could repoint a local host.
+#[tokio::test]
+async fn should_not_overwrite_a_local_record_with_a_cname_target() {
+    let cache = make_cache();
+    let local: IpAddr = "10.0.0.5".parse().unwrap();
+    cache.insert_permanent(
+        "nas.home.lan",
+        RecordType::A,
+        CachedData::IpAddresses(CachedAddresses {
+            addresses: Arc::new(vec![local]),
+        }),
+        300,
+    );
+    let mock = Arc::new(CnameChainResolver::new("203.0.113.66", &["nas.home.lan"]));
+    let resolver = CachedResolver::new(mock as Arc<dyn DnsResolver>, cache.clone(), 300, 4);
+
+    resolver
+        .resolve(&make_query("evil.example.com"))
+        .await
+        .unwrap();
+
+    let (data, _, _, _) = cache
+        .get("nas.home.lan", &RecordType::A)
+        .expect("the local record must still answer");
+    assert_eq!(
+        data.as_ip_addresses().map(|a| a.as_ref().clone()),
+        Some(vec![local])
     );
 }

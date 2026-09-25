@@ -1,3 +1,4 @@
+use ferrous_dns_domain::value_objects::validators::validate_comment;
 use ferrous_dns_domain::{DomainError, ScheduleProfile};
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -29,9 +30,12 @@ impl UpdateScheduleProfileUseCase {
         if let Some(ref n) = name {
             ScheduleProfile::validate_name(n).map_err(DomainError::InvalidScheduleProfile)?;
         }
-        if let Some(ref tz) = timezone {
-            ScheduleProfile::validate_timezone(tz).map_err(DomainError::InvalidScheduleProfile)?;
-        }
+        let timezone = timezone
+            .as_deref()
+            .map(ScheduleProfile::parse_timezone)
+            .transpose()
+            .map_err(DomainError::InvalidScheduleProfile)?;
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidScheduleProfile)?;
 
         let profile = self.repo.update(id, name, timezone, comment).await?;
 

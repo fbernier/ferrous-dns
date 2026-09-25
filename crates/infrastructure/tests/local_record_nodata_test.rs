@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::RecordType::{A, AAAA, CNAME, TXT};
-use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, RecordType};
+use ferrous_dns_domain::{DnsQuery, DomainError, LocalDnsRecord, LocalRecordType, RecordType};
 use ferrous_dns_infrastructure::dns::resolver::{CachedResolver, LocalWildcardResolver};
 use ferrous_dns_infrastructure::dns::{
-    CachedAddresses, CachedData, DnsCache, DnsCacheConfig, EvictionStrategy, NegativeQueryTracker,
+    CachedAddresses, CachedData, DnsCache, DnsCacheConfig, EvictionStrategy,
 };
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,10 +38,8 @@ fn setup() -> (Arc<DnsCache>, Arc<CachedResolver>, Arc<Upstream>) {
     let cache = Arc::new(DnsCache::new(DnsCacheConfig {
         max_entries: 100,
         eviction_strategy: EvictionStrategy::HitRate,
-        min_threshold: 0.0,
         refresh_threshold: 0.0,
         batch_eviction_percentage: 0.2,
-        adaptive_thresholds: false,
         min_frequency: 0,
         min_lfuk_score: 0.0,
         shard_amount: 4,
@@ -53,13 +51,7 @@ fn setup() -> (Arc<DnsCache>, Arc<CachedResolver>, Arc<Upstream>) {
         max_ttl: 86_400,
     }));
     let upstream = Arc::new(Upstream::default());
-    let resolver = Arc::new(CachedResolver::new(
-        upstream.clone(),
-        cache.clone(),
-        300,
-        Arc::new(NegativeQueryTracker::new()),
-        4,
-    ));
+    let resolver = Arc::new(CachedResolver::new(upstream.clone(), cache.clone(), 300, 4));
     (cache, resolver, upstream)
 }
 
@@ -75,7 +67,6 @@ fn insert_local(cache: &DnsCache, name: &str, record_type: RecordType, address: 
             addresses: Arc::new(vec![ip(address)]),
         }),
         300,
-        None,
     );
 }
 
@@ -192,11 +183,11 @@ async fn test_exact_local_nodata_beats_covering_wildcard_until_last_record_remov
         &[LocalDnsRecord {
             hostname: "*".to_string(),
             domain: Some("wildcard.test".to_string()),
-            ip: "2001:db8::99".to_string(),
-            record_type: "AAAA".to_string(),
+            ip: "2001:db8::99".parse().unwrap(),
+            record_type: LocalRecordType::AAAA,
             ttl: Some(120),
         }],
-        &None,
+        None,
     );
     let resolver = LocalWildcardResolver::new(cached_resolver, map);
     let a = DnsQuery::new(name, A);
@@ -225,7 +216,6 @@ async fn test_non_address_permanent_entry_survives_clear_without_owning_missing_
         CNAME,
         CachedData::CanonicalName(Arc::from("target.local.test")),
         300,
-        None,
     );
     insert_local(&cache, name, A, "192.0.2.50");
     insert_local(&cache, name, AAAA, "2001:db8::50");
@@ -280,7 +270,7 @@ async fn test_coalesced_followers_keep_local_nodata() {
             &self,
             domain: &str,
             kind: &RecordType,
-        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
+        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>, bool)> {
             self.cache.get(domain, kind)
         }
 
@@ -308,8 +298,9 @@ async fn test_coalesced_followers_keep_local_nodata() {
             data: CachedData,
             ttl: u32,
             status: Option<CachedDnssecStatus>,
+            local_dns: bool,
         ) {
-            self.cache.insert(domain, kind, data, ttl, status);
+            DnsCacheAccess::insert(&*self.cache, domain, kind, data, ttl, status, local_dns);
         }
     }
 
@@ -327,7 +318,6 @@ async fn test_coalesced_followers_keep_local_nodata() {
             release: Mutex::new(release_rx),
         }),
         300,
-        Arc::new(NegativeQueryTracker::new()),
         4,
     ));
     let leader_resolver = resolver.clone();

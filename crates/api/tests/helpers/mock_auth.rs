@@ -1,6 +1,6 @@
 use ferrous_dns_api::AuthUseCases;
 use ferrous_dns_application::ports::{
-    ApiTokenRepository, AuthenticatedCredential, MfaRepository, PasswordHasher,
+    ApiKeyMaterial, ApiTokenRepository, AuthenticatedCredential, MfaRepository, PasswordHasher,
     RegisteredCredential, SessionRepository, TotpService, UserProvider, UserRepository,
     WebauthnService,
 };
@@ -12,10 +12,9 @@ use ferrous_dns_application::use_cases::{
     LogoutUseCase, RegisterPasskeyUseCase, SetupPasswordUseCase, SetupTotpUseCase,
     UpdateApiTokenUseCase, ValidateApiTokenUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
 };
-use ferrous_dns_domain::User;
 use ferrous_dns_domain::{
-    ApiToken, AuthConfig, AuthSession, Config, DomainError, MfaChallenge, RecoveryCode, UserMfa,
-    WebauthnCredential,
+    ApiToken, AuthConfig, AuthSession, Config, DomainError, MfaChallenge, RecoveryCode, User,
+    UserMfa, UserRole, WebauthnCredential,
 };
 use std::sync::Arc;
 
@@ -38,6 +37,9 @@ impl SessionRepository for NullSessionRepository {
     async fn delete_expired(&self) -> Result<u64, DomainError> {
         Ok(0)
     }
+    async fn delete_other_sessions(&self, _: &str, _: &str) -> Result<u64, DomainError> {
+        Ok(0)
+    }
     async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError> {
         Ok(vec![])
     }
@@ -52,7 +54,7 @@ impl UserRepository for NullUserRepository {
         _username: &str,
         _display_name: Option<&str>,
         _password_hash: &str,
-        _role: &str,
+        _role: UserRole,
     ) -> Result<User, DomainError> {
         Err(DomainError::ConfigError("not implemented".to_string()))
     }
@@ -143,9 +145,7 @@ impl ApiTokenRepository for NullApiTokenRepository {
         &self,
         _id: i64,
         _name: &str,
-        _key_prefix: Option<&str>,
-        _key_hash: Option<&str>,
-        _key_raw: Option<&str>,
+        _new_key: Option<ApiKeyMaterial<'_>>,
     ) -> Result<ApiToken, DomainError> {
         Err(DomainError::ConfigError("not implemented".to_string()))
     }
@@ -154,9 +154,6 @@ impl ApiTokenRepository for NullApiTokenRepository {
     }
     async fn update_last_used(&self, _id: i64) -> Result<(), DomainError> {
         Ok(())
-    }
-    async fn get_all_hashes(&self) -> Result<Vec<(i64, String)>, DomainError> {
-        Ok(vec![])
     }
     async fn get_id_by_hash(&self, _key_hash: &str) -> Result<Option<i64>, DomainError> {
         Ok(None)
@@ -175,6 +172,9 @@ impl MfaRepository for NullMfaRepository {
     }
     async fn enable(&self, _username: &str) -> Result<(), DomainError> {
         Ok(())
+    }
+    async fn advance_totp_step(&self, _username: &str, _step: u64) -> Result<bool, DomainError> {
+        Ok(false)
     }
     async fn delete_all(&self, _username: &str) -> Result<(), DomainError> {
         Ok(())
@@ -222,10 +222,11 @@ impl MfaRepository for NullMfaRepository {
     ) -> Result<Option<WebauthnCredential>, DomainError> {
         Ok(None)
     }
-    async fn update_credential_counter(
+    async fn update_credential(
         &self,
         _credential_id: &str,
         _sign_count: i64,
+        _passkey_json: &str,
     ) -> Result<(), DomainError> {
         Ok(())
     }
@@ -249,8 +250,8 @@ impl TotpService for NullTotpService {
     fn qr_svg(&self, _otpauth_uri: &str) -> Result<String, DomainError> {
         Ok("<svg/>".to_string())
     }
-    fn verify(&self, _secret: &str, _code: &str) -> Result<bool, DomainError> {
-        Ok(false)
+    fn verify(&self, _secret: &str, _code: &str) -> Result<Option<u64>, DomainError> {
+        Ok(None)
     }
 }
 
@@ -285,6 +286,7 @@ impl WebauthnService for NullWebauthnService {
         &self,
         _response: serde_json::Value,
         _state_json: &str,
+        _passkeys_json: &[String],
     ) -> Result<AuthenticatedCredential, DomainError> {
         Err(DomainError::WebauthnNotConfigured)
     }
@@ -340,6 +342,7 @@ pub fn build_test_auth_use_cases() -> AuthUseCases {
         change_password: Arc::new(ChangePasswordUseCase::new(
             user_provider.clone(),
             password_hasher.clone(),
+            session_repo.clone(),
         )),
         get_auth_status: Arc::new(GetAuthStatusUseCase::new(config)),
         get_active_sessions: Arc::new(GetActiveSessionsUseCase::new(session_repo.clone())),
@@ -352,6 +355,7 @@ pub fn build_test_auth_use_cases() -> AuthUseCases {
             user_repo.clone(),
             user_provider.clone(),
             password_hasher.clone(),
+            "admin".to_string(),
         )),
         get_users: Arc::new(GetUsersUseCase::new(user_provider.clone())),
         delete_user: Arc::new(DeleteUserUseCase::new(user_repo)),

@@ -8,14 +8,10 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// GET /info/version
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn version_returns_required_fields() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -45,7 +41,7 @@ async fn version_returns_required_fields() {
 #[tokio::test]
 async fn version_contains_valid_semver() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -74,14 +70,10 @@ async fn version_contains_valid_semver() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /info/ftl
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn ftl_info_returns_required_fields() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -118,14 +110,10 @@ async fn ftl_info_returns_required_fields() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// GET /info/system
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn system_info_returns_required_fields() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -167,14 +155,10 @@ async fn system_info_returns_required_fields() {
     assert!(disk["percent"].is_number(), "disk.percent must be a number");
 }
 
-// ---------------------------------------------------------------------------
-// GET /info/host
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn host_info_returns_hostname_string() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -202,14 +186,10 @@ async fn host_info_returns_hostname_string() {
     assert!(!hostname.is_empty(), "hostname must be a non-empty string");
 }
 
-// ---------------------------------------------------------------------------
-// GET /info/database
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn database_info_returns_required_fields() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(

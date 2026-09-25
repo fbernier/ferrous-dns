@@ -1,17 +1,14 @@
+use ferrous_dns_application::ports::CacheStats;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 #[derive(Deserialize, Debug, IntoParams)]
 pub struct CacheStatsQuery {
-    #[serde(default = "default_period")]
+    #[serde(default = "crate::utils::default_period")]
     pub period: String,
 }
 
-fn default_period() -> String {
-    "24h".to_string()
-}
-
-#[derive(Serialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Debug, Clone, Default, ToSchema)]
 pub struct CacheStatsResponse {
     pub total_entries: usize,
     pub total_hits: u64,
@@ -19,6 +16,19 @@ pub struct CacheStatsResponse {
     pub total_refreshes: u64,
     pub hit_rate: f64,
     pub refresh_rate: f64,
+}
+
+impl CacheStatsResponse {
+    pub fn new(total_entries: usize, stats: &CacheStats) -> Self {
+        Self {
+            total_entries,
+            total_hits: stats.total_hits,
+            total_misses: stats.total_misses,
+            total_refreshes: stats.total_refreshes,
+            hit_rate: stats.hit_rate,
+            refresh_rate: stats.refresh_rate,
+        }
+    }
 }
 
 #[derive(Serialize, Debug, Clone, ToSchema)]

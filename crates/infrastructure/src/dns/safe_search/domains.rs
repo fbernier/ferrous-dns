@@ -1,20 +1,17 @@
-use ferrous_dns_domain::SafeSearchEngine;
+use ferrous_dns_domain::{SafeSearchEngine, YouTubeMode};
 
 /// CNAME target that enforces Safe Search for each engine.
 ///
 /// For YouTube the target depends on the mode configured per group;
 /// all other engines have a single fixed target.
-pub const fn cname_target(engine: SafeSearchEngine, youtube_strict: bool) -> &'static str {
+pub const fn cname_target(engine: SafeSearchEngine, youtube: YouTubeMode) -> &'static str {
     match engine {
         SafeSearchEngine::Google => "forcesafesearch.google.com",
         SafeSearchEngine::Bing => "strict.bing.com",
-        SafeSearchEngine::YouTube => {
-            if youtube_strict {
-                "restrict.youtube.com"
-            } else {
-                "restrictmoderate.youtube.com"
-            }
-        }
+        SafeSearchEngine::YouTube => match youtube {
+            YouTubeMode::Strict => "restrict.youtube.com",
+            YouTubeMode::Moderate => "restrictmoderate.youtube.com",
+        },
         SafeSearchEngine::DuckDuckGo => "safe.duckduckgo.com",
         SafeSearchEngine::Yandex => "familysearch.yandex.com",
         SafeSearchEngine::Brave => "forcesafe.search.brave.com",

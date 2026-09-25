@@ -1,7 +1,8 @@
 use super::rollup::{minute_bucket, MinuteRollup};
+use crate::repositories::sql_ts;
 use chrono::Utc;
 use compact_str::{CompactString, ToCompactString};
-use ferrous_dns_domain::{BlockSource, QueryLog, QuerySource, RecordType};
+use ferrous_dns_domain::{BlockSource, DnssecStatus, QueryLog, QuerySource, RecordType};
 use sqlx::SqlitePool;
 use std::fmt::Write as _;
 use std::net::IpAddr;
@@ -26,7 +27,7 @@ pub(super) struct QueryLogEntry {
     pub(super) response_time_us: Option<i64>,
     pub(super) cache_hit: bool,
     pub(super) cache_refresh: bool,
-    pub(super) dnssec_status: Option<&'static str>,
+    pub(super) dnssec_status: Option<DnssecStatus>,
     pub(super) dns64_synthesized: bool,
     pub(super) answers: Option<Arc<Vec<IpAddr>>>,
     pub(super) upstream_server: Option<Arc<str>>,
@@ -143,7 +144,7 @@ async fn flush_batch(pool: &SqlitePool, batch: &mut Vec<QueryLogEntry>) {
     // One clock read stamps the raw rows and picks the rollup bucket, so the two
     // can never disagree about which minute a row belongs to.
     let now = Utc::now();
-    let created_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let created_at = sql_ts(now);
     let bucket = minute_bucket(now.timestamp());
 
     let mut tx = match pool.begin().await {
@@ -181,7 +182,7 @@ async fn flush_batch(pool: &SqlitePool, batch: &mut Vec<QueryLogEntry>) {
                 .bind(entry.response_time_us)
                 .bind(if entry.cache_hit { 1i64 } else { 0i64 })
                 .bind(if entry.cache_refresh { 1i64 } else { 0i64 })
-                .bind(entry.dnssec_status)
+                .bind(entry.dnssec_status.map(|s| s.as_str()))
                 .bind(if entry.dns64_synthesized { 1i64 } else { 0i64 })
                 .bind(entry.upstream_server.as_deref())
                 .bind(entry.upstream_pool.as_deref())

@@ -78,7 +78,8 @@ fn render_includes_cache_counters_and_gauges() {
         Some(&sample_stats()),
         1234,
         "9.9.9",
-    );
+    )
+    .unwrap();
 
     // Cache atomics are monotonic since boot → counters (encoder appends `_total`).
     assert!(body.contains("# TYPE ferrousdns_cache_hits counter"));
@@ -100,7 +101,8 @@ fn render_includes_upstream_and_query_series() {
         Some(&sample_stats()),
         0,
         "9.9.9",
-    );
+    )
+    .unwrap();
 
     assert!(body.contains("ferrousdns_upstream_up{"));
     assert!(body.contains("ferrousdns_upstream_latency_ms{"));
@@ -116,7 +118,7 @@ fn render_includes_upstream_and_query_series() {
 
 #[test]
 fn render_omits_query_gauges_when_stats_missing() {
-    let body = render_metrics(&sample_cache(), &sample_upstreams(), None, 5, "9.9.9");
+    let body = render_metrics(&sample_cache(), &sample_upstreams(), None, 5, "9.9.9").unwrap();
 
     // Live metrics still present even without query stats.
     assert!(body.contains("ferrousdns_cache_hits_total 5"));

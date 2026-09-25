@@ -1,6 +1,6 @@
 use crate::ports::{ClientRepository, QueryLogRepository};
 use ferrous_dns_domain::{
-    query_log::{DnssecStats, QueryStats},
+    entities::query_log::{DnssecStats, QueryStats},
     DomainError,
 };
 use std::sync::{Arc, RwLock};

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use argon2::{
     password_hash::{
-        rand_core::OsRng, PasswordHash, PasswordHasher as _, PasswordVerifier, SaltString,
+        self, rand_core::OsRng, PasswordHash, PasswordHasher as _, PasswordVerifier, SaltString,
     },
     Argon2, Params,
 };
@@ -14,10 +14,7 @@ use tokio::sync::Semaphore;
 // Process-wide: each active Argon2 operation uses 19 MiB, even across instances.
 static HASHING_CAPACITY: Semaphore = Semaphore::const_new(2);
 
-/// Argon2id password hasher using OWASP-recommended parameters.
-///
-/// Parameters: m=19456 (19 MiB), t=2 iterations, p=1 parallelism.
-/// Every operation is admitted before submission to the blocking pool.
+/// Argon2id with OWASP parameters (m=19 MiB, t=2, p=1), admitted through `HASHING_CAPACITY`.
 #[derive(Default)]
 pub struct Argon2PasswordHasher;
 impl Argon2PasswordHasher {
@@ -95,9 +92,13 @@ fn verify_password(password: &str, hash: &str) -> Result<bool, DomainError> {
     let parsed = PasswordHash::new(hash)
         .map_err(|e| DomainError::ConfigError(format!("Invalid hash format: {e}")))?;
 
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok())
+    match Argon2::default().verify_password(password.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(password_hash::Error::Password) => Ok(false),
+        Err(e) => Err(DomainError::ConfigError(format!(
+            "Unverifiable password hash: {e}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +148,18 @@ mod tests {
         );
         assert!(matches!(
             hasher.verify_any("first-code", vec![malformed]).await,
+            Err(DomainError::ConfigError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsupported_algorithm_is_an_error_not_a_mismatch() {
+        let hasher = Argon2PasswordHasher::new();
+        let hash = hasher.hash("secret").await.unwrap();
+        let foreign = hash.replacen("$argon2id$", "$scrypt$", 1);
+        assert!(PasswordHash::new(&foreign).is_ok());
+        assert!(matches!(
+            hasher.verify("secret", &foreign).await,
             Err(DomainError::ConfigError(_))
         ));
     }

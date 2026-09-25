@@ -51,6 +51,12 @@ All API endpoints are protected by the auth guard middleware, except:
 - `POST /api/auth/logout` — logout
 - `GET /api/health` — health check
 
+### Users and Roles
+
+Besides the `[auth.admin]` account from the config file, users can be created under **Settings > Users** or via `POST /api/users`. The admin username is reserved: no database user can take it, even before the admin's password is set.
+
+Each user has a role, `admin` or `viewer`. **Roles are informational only**: they are stored and displayed, but no endpoint checks them, so a `viewer` has the same access as an `admin`. Only create accounts for people you would trust with full control.
+
 ### Session Management
 
 View and revoke active sessions from **Settings > Security** or via the API:
@@ -60,12 +66,14 @@ GET /api/auth/sessions
 DELETE /api/auth/sessions/{id}
 ```
 
+Like every other protected endpoint, these are not restricted by role or owner: any signed-in user or API token can list every session and revoke any of them, the admin's included.
+
 ### Password Change
 
-Change the admin password from **Settings > Security** or via:
+Change the signed-in user's password from **Settings > Security** or via:
 
 ```http
-POST /api/auth/change-password
+POST /api/auth/password
 Content-Type: application/json
 
 {
@@ -73,6 +81,8 @@ Content-Type: application/json
   "new_password": "new-password"
 }
 ```
+
+The change signs out every other session of that user, so any device still holding a session from before the change must log in again. The session that made the change stays signed in; other users' sessions are untouched.
 
 ### Background Cleanup
 
@@ -320,7 +330,7 @@ stale_entry_ttl_secs       = 300      # evict idle subnet buckets after 5 min
 | `ipv4_prefix_len` | `24` | IPv4 subnet grouping prefix length |
 | `ipv6_prefix_len` | `48` | IPv6 subnet grouping prefix length |
 | `whitelist` | `[]` | CIDRs that bypass rate limiting entirely |
-| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN responses |
+| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN answers; only an NXDOMAIN over it is limited. 0 = no NXDOMAIN budget |
 | `slip_ratio` | `0` | Every Nth rate-limited response sends TC=1 instead of REFUSED. 0 = disabled |
 | `dry_run` | `false` | Log rate-limit events without refusing queries |
 | `stale_entry_ttl_secs` | `300` | Seconds before an idle subnet bucket is evicted |
@@ -335,7 +345,7 @@ When `slip_ratio` is set (e.g. `2`), every Nth rate-limited UDP response is sent
 
 ### NXDOMAIN Budget
 
-The `nxdomain_per_second` setting provides a separate, stricter budget for NXDOMAIN responses. This catches malware and IoT devices that probe many random subdomains while leaving the general query budget unaffected.
+The `nxdomain_per_second` setting provides a separate, stricter budget charged for each NXDOMAIN answer a subnet receives, like BIND's `nxdomains-per-second`. This catches malware and IoT devices that probe many random subdomains. Only an NXDOMAIN answer over the budget is limited (REFUSED or TC=1, or only logged under `dry_run`); the subnet's other queries are never refused because of it. NXDOMAINs from `local_dns_server` are never charged. Upstream NXDOMAINs are not charged until [#244](https://github.com/ferrous-networking/ferrous-dns/issues/244) is fixed. See [Rate Limiting](../configuration/rate-limiting.md#nxdomain-budget).
 
 ### Dry-Run Mode
 
@@ -472,7 +482,7 @@ This gives RFC-aware clients a precise machine-readable reason for the rejection
 
 ### Fast Path Behaviour
 
-Cache hits bypass the DNS Cookie guard entirely — a query served from L1 or L2 cache does not incur any cookie verification overhead. Cookie validation runs only on cache misses, keeping the hot path at zero additional cost.
+Cache hits skip cookie validation: a query served from L1 or L2 cache is answered even in strict mode, and validation runs only on cache misses. A cache hit for a non-address type (MX, TXT, HTTPS, PTR and so on) answers a client cookie the way RFC 7873 §5.3 requires: the reply echoes that cookie beside a fresh server cookie, so a validating client does not discard the answer. Only queries that carry a cookie pay for the HMAC. The UDP fast path for A/AAAA hits answers with an OPT record but no COOKIE option, which RFC 7873 permits: the client treats the reply as coming from a server without cookie support.
 
 ### Configuration
 

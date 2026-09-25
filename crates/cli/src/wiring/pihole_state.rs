@@ -5,7 +5,8 @@ use ferrous_dns_api_pihole::{
     },
     PiholeAppState,
 };
-use ferrous_dns_application::ports::{BlockFilterEnginePort, UpstreamHealthPort};
+use ferrous_dns_application::ports::BlockFilterEnginePort;
+use ferrous_dns_application::use_cases::ReloadConfigUseCase;
 use ferrous_dns_domain::Config;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -19,9 +20,8 @@ pub fn build_pihole_state(
     use_cases: &UseCases,
     auth: &AuthServices,
     block_filter_engine: Arc<dyn BlockFilterEnginePort>,
-    upstream_health: Arc<dyn UpstreamHealthPort>,
     config: Arc<RwLock<Config>>,
-    config_path: Option<Arc<str>>,
+    reload_config: Option<Arc<ReloadConfigUseCase>>,
 ) -> PiholeAppState {
     PiholeAppState {
         query: PiholeQueryState {
@@ -31,9 +31,6 @@ pub fn build_pihole_state(
             get_top_allowed_domains: use_cases.get_top_allowed_domains.clone(),
             get_top_clients: use_cases.get_top_clients.clone(),
             get_recent_queries: use_cases.get_queries.clone(),
-            upstream_health,
-            get_block_filter_stats: use_cases.get_block_filter_stats.clone(),
-            get_cache_stats: use_cases.get_cache_stats.clone(),
         },
         blocking: PiholeBlockingState {
             block_filter_engine,
@@ -68,12 +65,11 @@ pub fn build_pihole_state(
             create_manual_client: use_cases.create_manual_client.clone(),
             update_client: use_cases.update_client.clone(),
             delete_client: use_cases.delete_client.clone(),
-            assign_client_group: use_cases.assign_client_group.clone(),
         },
         system: PiholeSystemState {
             cleanup_query_logs: use_cases.cleanup_query_logs.clone(),
             config,
-            config_path,
+            reload_config,
             process_start: std::time::Instant::now(),
         },
         auth: PiholeAuthState {

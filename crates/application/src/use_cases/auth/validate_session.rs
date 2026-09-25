@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tracing::instrument;
 
+use super::session_factory::is_expired;
 use crate::ports::SessionRepository;
 use ferrous_dns_domain::{AuthSession, DomainError};
 
@@ -34,11 +35,4 @@ impl ValidateSessionUseCase {
         self.session_repo.update_last_seen(session_id).await?;
         Ok(session)
     }
-}
-
-/// Checks if an expiry timestamp has passed. Returns `true` (expired) on parse failure (fail-closed).
-fn is_expired(expires_at: &str) -> bool {
-    chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S")
-        .map(|exp| chrono::Utc::now().naive_utc() > exp)
-        .unwrap_or(true)
 }

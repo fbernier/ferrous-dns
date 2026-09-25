@@ -205,8 +205,8 @@ Schedule Profiles let you control **when** blocking is active. Assign a schedule
 
 | Concept | Description |
 |:--------|:------------|
-| **Schedule Profile** | A named set of time-based rules with a timezone (e.g. "Kids Weeknight") |
-| **Time Slot** | A rule inside a profile: which days, start time, end time, and action |
+| **Schedule Profile** | A named set of time-based rules with an IANA timezone such as `America/Sao_Paulo` or `UTC` (e.g. "Kids Weeknight"); unknown names are rejected |
+| **Time Slot** | A rule inside a profile: which days, start time, end time, and action. Times are zero-padded 24-hour `HH:MM` (`09:00`, not `9:00`); the slot covers `start_time` up to, but not including, `end_time` |
 | **Action** | `block_all` — block every DNS query; `allow_all` — bypass all blocking |
 | **Assignment** | A profile is assigned to one or more groups |
 
@@ -220,13 +220,13 @@ Schedule Profile: "Kids Bedtime"
 
 ### How Evaluation Works
 
-The schedule evaluator runs every 60 seconds. For each group with an assigned profile:
+The schedule evaluator runs once at startup and then every 60 seconds. For each group with an assigned profile:
 
 1. Determine the current day and time in the profile's timezone
 2. Check each time slot against the current day (bitmask) and time
 3. If a `block_all` slot matches → set `BlockAll` override for the group
 4. If an `allow_all` slot matches (and no `block_all`) → set `AllowAll` override
-5. If no slot matches → remove override (normal blocking rules apply)
+5. If no slot matches, or the assigned profile no longer exists → remove override (normal blocking rules apply)
 
 !!! warning "Conflict Resolution"
     If a `block_all` and `allow_all` slot overlap for the same time, **`block_all` always wins**. This prevents accidental bypasses.

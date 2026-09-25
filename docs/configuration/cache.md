@@ -84,8 +84,13 @@ cache_adaptive_thresholds = false
 | `"hit_rate"` | Evicts entries with the lowest hits-per-minute rate | Default — keeps the most-used entries alive |
 | `"lfu"` | Least Frequently Used — evicts entries with fewest total hits | Stable workloads |
 | `"lru"` | Least Recently Used — evicts entries not accessed recently | Bursty workloads |
+| `"lfu-k"` | LFU-K — scores hit frequency over a sliding window (see LFU-K parameters below) | Workloads whose popular set drifts |
+
+Names are case-insensitive (`hitrate` and `lfuk` are accepted too). Any other value in the config file, such as `"hit-rate"`, runs as `"hit_rate"` with a warning in the log, which is what earlier releases did with it; the API rejects the update.
 
 For most home and office deployments, `"hit_rate"` gives the best results as it preserves entries for frequently visited sites regardless of recency.
+
+Eviction runs on a fixed 60-second maintenance cycle and compaction every `cache_compaction_interval` seconds, whether or not optimistic refresh is enabled. Inserts do not evict, so between cycles the cache can briefly exceed `cache_max_entries`; each cycle that finds it at or over the limit removes `cache_batch_eviction_percentage` of `cache_max_entries`.
 
 The negative-response and DNSSEC-material caches use bounded expiration sampling when full, falling back to an arbitrary eviction if the sample finds no expired entries. Inserting a new entry does not scan the entire live cache. Because the sample covers a fixed slice of the map, expired negative entries elsewhere are reclaimed by the `cache_compaction_interval` sweep instead. DNSSEC material has no periodic sweep: it is keyed per zone, so a re-validated zone replaces its own entry, and only zones that are never queried again keep expired keys until they are evicted.
 
@@ -122,7 +127,7 @@ cache_access_window_secs = 43200
     Every eligible entry is queued for renewal. `cache_min_hit_rate` and `cache_min_frequency` only come into play when a cycle finds more candidates than the queue can hold: candidates are ordered by how much their loss would cost -- entries that clear both thresholds first, and within each group the ones closest to being unusable -- and the tail is dropped. On a healthy deployment nothing is dropped and neither threshold has any effect on refresh. Watch `cache_optimistic_refresh_shed` on `/metrics`: a sustained non-zero value means the working set has outgrown the queue, which is sized from `cache_max_entries`.
 
 !!! note "Serve-stale is never paced"
-    Pacing applies only to background pre-expiry refreshes. When an entry has expired but is still inside its stale-serve grace period, the client is handed the stale answer and a refresh is queued -- those bypass the pacer entirely, because someone is already waiting on the fresh result.
+    Pacing applies only to background pre-expiry refreshes. When an entry has expired but is still inside its stale-serve grace period, the client is handed the stale answer and a refresh is queued -- those bypass the pacer entirely, because someone is already waiting on the fresh result. Serve-stale repairs run whenever the cache is enabled, including with `cache_optimistic_refresh = false`; that option only turns off the pre-expiry scan.
 
 !!! note
     `cache_min_ttl` should be >= 240 seconds so the refresh job has time to act before expiry.

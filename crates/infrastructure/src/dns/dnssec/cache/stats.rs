@@ -10,19 +10,19 @@ pub struct CacheStats {
 }
 
 impl CacheStats {
-    pub fn record_dnskey_hit(&self, _domain: &str) {
+    pub fn record_dnskey_hit(&self) {
         self.dnskey_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_dnskey_miss(&self, _domain: &str) {
+    pub fn record_dnskey_miss(&self) {
         self.dnskey_misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_ds_hit(&self, _domain: &str) {
+    pub fn record_ds_hit(&self) {
         self.ds_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_ds_miss(&self, _domain: &str) {
+    pub fn record_ds_miss(&self) {
         self.ds_misses.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -65,24 +65,4 @@ pub struct CacheStatsSnapshot {
     pub total_ds_hits: u64,
     pub total_ds_misses: u64,
     pub total_ds_denial_fail_opens: u64,
-}
-
-impl CacheStatsSnapshot {
-    pub fn dnskey_hit_rate(&self) -> f64 {
-        let total = self.total_dnskey_hits + self.total_dnskey_misses;
-        if total == 0 {
-            0.0
-        } else {
-            self.total_dnskey_hits as f64 / total as f64
-        }
-    }
-
-    pub fn ds_hit_rate(&self) -> f64 {
-        let total = self.total_ds_hits + self.total_ds_misses;
-        if total == 0 {
-            0.0
-        } else {
-            self.total_ds_hits as f64 / total as f64
-        }
-    }
 }

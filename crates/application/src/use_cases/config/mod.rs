@@ -1,3 +1,3 @@
-pub mod reload;
+mod reload;
 
-pub use reload::ReloadConfigUseCase;
+pub use reload::{ConfigOverrides, ReloadConfigUseCase};

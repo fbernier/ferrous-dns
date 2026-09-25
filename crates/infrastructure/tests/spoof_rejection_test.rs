@@ -25,12 +25,16 @@ enum Mode {
     /// Echo the correct ID but flip the case of one QNAME byte — an off-path forger
     /// guessing the 0x20-randomized case wrong.
     FlipQnameCase,
+    /// A faithful echo sent from another port on the server's IP: a forger
+    /// sharing the host, or an off-path spoof guessing only the address.
+    WrongPort,
 }
 
 /// Spawns a UDP DNS responder on an ephemeral port and returns its address.
 async fn spawn_responder(mode: Mode) -> SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
+    let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; 1500];
@@ -74,7 +78,11 @@ async fn spawn_responder(mode: Mode) -> SocketAddr {
                 resp.set_edns(edns);
             }
 
-            let _ = socket.send_to(&resp.to_bytes().unwrap(), peer).await;
+            let sender = match mode {
+                Mode::WrongPort => &other_port,
+                _ => &socket,
+            };
+            let _ = sender.send_to(&resp.to_bytes().unwrap(), peer).await;
         }
     });
 
@@ -113,13 +121,13 @@ async fn manager_hardened(addr: SocketAddr) -> Arc<PoolManager> {
     )
 }
 
-async fn resolve(mode: Mode) -> Result<SocketAddr, ferrous_dns_domain::DomainError> {
+async fn resolve(mode: Mode) -> Result<Arc<str>, ferrous_dns_domain::DomainError> {
     let addr = spawn_responder(mode).await;
     let pm = manager(addr).await;
     let domain: Arc<str> = Arc::from("example.com");
     pm.query(&domain, &RecordType::A, 2000, false)
         .await
-        .map(|r| r.server)
+        .map(|r| r.server_display)
 }
 
 #[tokio::test]
@@ -137,6 +145,15 @@ async fn spoofed_transaction_id_is_rejected() {
     assert!(
         result.is_err(),
         "a response with the wrong transaction ID must be rejected, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn response_from_wrong_port_is_rejected() {
+    let result = resolve(Mode::WrongPort).await;
+    assert!(
+        result.is_err(),
+        "a response from the server's IP but another port must be rejected, got {result:?}"
     );
 }
 
@@ -165,9 +182,9 @@ async fn case_forged_qname_is_rejected_with_0x20() {
 
 #[tokio::test]
 async fn case_forged_qname_is_rejected_for_non_address_types() {
-    // These used to be exempt from 0x20 and cookies, so an off-path forger only
-    // had to guess the 16-bit transaction ID — against DS (the trust chain
-    // itself), MX (SPF/DKIM/DMARC) and HTTPS (ipv4hint/ipv6hint, ECH).
+    // Without 0x20 and cookies here an off-path forger only has to guess the
+    // 16-bit transaction ID — against DS (the trust chain itself), MX
+    // (SPF/DKIM/DMARC) and HTTPS (ipv4hint/ipv6hint, ECH).
     let addr = spawn_responder(Mode::FlipQnameCase).await;
     let pm = manager_hardened(addr).await;
     let domain: Arc<str> = Arc::from("example.com");
@@ -197,11 +214,16 @@ async fn forged_cookie_is_rejected_for_non_address_types() {
 /// Spawns a UDP responder that always answers with TC=1 (truncated), paired with
 /// a TCP responder on the same port. The UDP TC=1 forces the truncation retry;
 /// the TCP side replies per `tcp_mode`, letting us assert the validator also runs
-/// on the post-truncation TCP path (`query_server`'s second validate site).
+/// on the post-truncation TCP path.
 async fn spawn_truncating_pair(tcp_mode: Mode) -> SocketAddr {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = udp.local_addr().unwrap();
-    let listener = TcpListener::bind(addr).await.unwrap();
+    // An ephemeral UDP port may already be taken on TCP; retry until both bind.
+    let (udp, addr, listener) = loop {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp.local_addr().unwrap();
+        if let Ok(listener) = TcpListener::bind(addr).await {
+            break (udp, addr, listener);
+        }
+    };
 
     // UDP side: faithful echo but TC=1, so the response passes the first validate
     // and then triggers the TCP retry.
@@ -283,4 +305,18 @@ async fn validator_runs_on_post_truncation_tcp_retry() {
         bad.is_err(),
         "a wrong-txid TCP retry must be rejected, got {bad:?}"
     );
+}
+
+/// The answer after a TC retry comes from the configured server, so the display
+/// must stay its configured name rather than the synthesized `tcp://` endpoint.
+#[tokio::test]
+async fn tcp_retry_keeps_configured_server_display() {
+    let addr = spawn_truncating_pair(Mode::Faithful).await;
+    let pm = manager(addr).await;
+    let domain: Arc<str> = Arc::from("example.com");
+    let result = pm
+        .query(&domain, &RecordType::A, 2000, false)
+        .await
+        .unwrap();
+    assert_eq!(&*result.server_display, format!("udp://{addr} (tcp retry)"));
 }

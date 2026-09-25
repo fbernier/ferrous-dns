@@ -170,11 +170,10 @@ async fn seed_rules(pool: &SqlitePool, list_url: &str) {
     .expect("seed deny regex row");
 
     sqlx::query(
-        "INSERT INTO blocklist_sources (name, url, group_id, enabled)
-         VALUES ('manual-priority-fixture', ?, ?, 1)",
+        "INSERT INTO blocklist_sources (name, url, enabled)
+         VALUES ('manual-priority-fixture', ?, 1)",
     )
     .bind(list_url)
-    .bind(DEFAULT_GROUP_ID)
     .execute(pool)
     .await
     .expect("seed blocklist source");

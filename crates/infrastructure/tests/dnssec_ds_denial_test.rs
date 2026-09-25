@@ -12,12 +12,12 @@
 //! matching `dnssec_denial_test.rs`.
 
 use data_encoding::BASE32_DNSSEC;
+use ferrous_dns_domain::DnssecStatus;
 use ferrous_dns_infrastructure::dns::dnssec::validation::authority::collect_verified_denial;
 use ferrous_dns_infrastructure::dns::dnssec::validation::denial::{
     prove_denial, VerifiedNsec, VerifiedNsec3,
 };
-use ferrous_dns_infrastructure::dns::dnssec::validation::ValidationResult;
-use ferrous_dns_infrastructure::dns::dnssec::{DnskeyRecord, SignatureVerifier};
+use ferrous_dns_infrastructure::dns::dnssec::DnskeyRecord;
 use hickory_proto::dnssec::rdata::{DNSSECRData, NSEC, NSEC3};
 use hickory_proto::dnssec::Nsec3HashAlgorithm;
 use hickory_proto::op::ResponseCode;
@@ -61,7 +61,7 @@ fn nsec3(opt_out: bool, next_hash: Vec<u8>, types: &[RecordType]) -> NSEC3 {
 }
 
 /// Proves "no DS at CHILD" from the given NSEC3 records.
-fn prove_ds_absence_nsec3(nsec3s: &[VerifiedNsec3<'_>]) -> ValidationResult {
+fn prove_ds_absence_nsec3(nsec3s: &[VerifiedNsec3<'_>]) -> DnssecStatus {
     prove_denial(
         &n(CHILD),
         RecordType::DS,
@@ -73,7 +73,7 @@ fn prove_ds_absence_nsec3(nsec3s: &[VerifiedNsec3<'_>]) -> ValidationResult {
 }
 
 /// Proves "no DS at CHILD" from the given NSEC records.
-fn prove_ds_absence_nsec(nsecs: &[VerifiedNsec<'_>]) -> ValidationResult {
+fn prove_ds_absence_nsec(nsecs: &[VerifiedNsec<'_>]) -> DnssecStatus {
     prove_denial(
         &n(CHILD),
         RecordType::DS,
@@ -94,7 +94,7 @@ fn nsec3_matching_without_ds_bit_proves_absence() {
         owner_label: label_of(&hash(CHILD)),
         data: &rec,
     }];
-    assert_eq!(prove_ds_absence_nsec3(&nsec3s), ValidationResult::Secure);
+    assert_eq!(prove_ds_absence_nsec3(&nsec3s), DnssecStatus::Secure);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn nsec3_matching_with_ds_bit_contradicts_the_empty_answer() {
         owner_label: label_of(&hash(CHILD)),
         data: &rec,
     }];
-    assert_eq!(prove_ds_absence_nsec3(&nsec3s), ValidationResult::Bogus);
+    assert_eq!(prove_ds_absence_nsec3(&nsec3s), DnssecStatus::Bogus);
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn nsec3_matching_from_the_child_side_is_unusable_not_bogus() {
         owner_label: label_of(&hash(CHILD)),
         data: &rec,
     }];
-    assert_eq!(prove_ds_absence_nsec3(&nsec3s), ValidationResult::Insecure);
+    assert_eq!(prove_ds_absence_nsec3(&nsec3s), DnssecStatus::Insecure);
 }
 
 #[test]
@@ -150,10 +150,7 @@ fn insecure_does_not_distinguish_opt_out_from_an_inconclusive_proof() {
         owner_label: label_of(&before),
         data: &opt_out,
     }];
-    assert_eq!(
-        prove_ds_absence_nsec3(&covering),
-        ValidationResult::Insecure
-    );
+    assert_eq!(prove_ds_absence_nsec3(&covering), DnssecStatus::Insecure);
 
     // An NSEC3 that neither matches nor covers the name proves nothing.
     let unrelated = nsec3(false, hash("b.example.com."), &[RecordType::NS]);
@@ -163,7 +160,7 @@ fn insecure_does_not_distinguish_opt_out_from_an_inconclusive_proof() {
     }];
     assert_eq!(
         prove_ds_absence_nsec3(&inconclusive),
-        ValidationResult::Insecure
+        DnssecStatus::Insecure
     );
 }
 
@@ -177,7 +174,7 @@ fn nsec_matching_without_ds_bit_proves_absence() {
         owner: &owner,
         data: &rec,
     }];
-    assert_eq!(prove_ds_absence_nsec(&nsecs), ValidationResult::Secure);
+    assert_eq!(prove_ds_absence_nsec(&nsecs), DnssecStatus::Secure);
 }
 
 #[test]
@@ -188,7 +185,7 @@ fn nsec_matching_with_ds_bit_contradicts_the_empty_answer() {
         owner: &owner,
         data: &rec,
     }];
-    assert_eq!(prove_ds_absence_nsec(&nsecs), ValidationResult::Bogus);
+    assert_eq!(prove_ds_absence_nsec(&nsecs), DnssecStatus::Bogus);
 }
 
 #[test]
@@ -203,7 +200,7 @@ fn nsec_matching_from_the_child_side_is_unusable_not_bogus() {
         owner: &owner,
         data: &rec,
     }];
-    assert_eq!(prove_ds_absence_nsec(&nsecs), ValidationResult::Insecure);
+    assert_eq!(prove_ds_absence_nsec(&nsecs), DnssecStatus::Insecure);
 }
 
 #[test]
@@ -227,7 +224,7 @@ fn a_child_side_nsec_does_not_shadow_a_valid_parent_side_one() {
             data: &parent_side,
         },
     ];
-    assert_eq!(prove_ds_absence_nsec(&nsecs), ValidationResult::Secure);
+    assert_eq!(prove_ds_absence_nsec(&nsecs), DnssecStatus::Secure);
 }
 
 #[test]
@@ -251,7 +248,7 @@ fn the_child_side_rule_is_scoped_to_ds_queries() {
         &[],
         &nsecs,
     );
-    assert_eq!(result, ValidationResult::Secure);
+    assert_eq!(result, DnssecStatus::Secure);
 }
 
 #[test]
@@ -259,7 +256,7 @@ fn no_denial_records_at_all_is_bogus() {
     // Documents why `confirm_ds_absence` must short-circuit *before* calling
     // `prove_denial`: with nothing to verify this reports Bogus, which would
     // SERVFAIL every delegation behind an authority-stripping forwarder.
-    assert_eq!(prove_ds_absence_nsec3(&[]), ValidationResult::Bogus);
+    assert_eq!(prove_ds_absence_nsec3(&[]), DnssecStatus::Bogus);
 }
 
 // ------------- unauthenticated proofs count as no proof at all -------------
@@ -275,7 +272,7 @@ fn nsec_record(owner: &str, next: &str, types: &[RecordType]) -> Record {
 #[test]
 fn nsec_without_an_rrsig_is_not_collected() {
     let authority = vec![nsec_record(CHILD, "zzz.example.com.", &[RecordType::NS])];
-    let (nsec3s, nsecs) = collect_verified_denial(&authority, &SignatureVerifier, 0, &|_| None);
+    let (nsec3s, nsecs) = collect_verified_denial(&authority, 0, &|_| None);
 
     assert!(
         nsec3s.is_empty() && nsecs.is_empty(),
@@ -294,7 +291,7 @@ fn nsec_whose_signer_zone_has_no_keys_is_not_collected() {
         algorithm: 15,
         public_key: vec![0u8; 32],
     }]);
-    let (nsec3s, nsecs) = collect_verified_denial(&authority, &SignatureVerifier, 0, &|zone| {
+    let (nsec3s, nsecs) = collect_verified_denial(&authority, 0, &|zone| {
         (zone == "unrelated.test.").then(|| Arc::clone(&keys))
     });
 

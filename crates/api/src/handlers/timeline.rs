@@ -2,7 +2,7 @@ use crate::{
     dto::{TimelineBucket, TimelineQuery, TimelineResponse},
     errors::ApiError,
     state::AppState,
-    utils::{parse_period, validate_period},
+    utils::period_hours,
 };
 use axum::{
     extract::{Query, State},
@@ -42,10 +42,7 @@ pub async fn get_timeline(
         "Fetching query timeline"
     );
 
-    let period_hours = parse_period(&params.period)
-        .map(|h| validate_period(h) as u32)
-        .unwrap_or(24);
-
+    let period_hours = period_hours(&params.period);
     let granularity = parse_granularity(&params.granularity);
 
     let buckets = state
@@ -60,7 +57,7 @@ pub async fn get_timeline(
     Ok(Json(TimelineResponse {
         total_buckets: buckets_dto.len(),
         period: params.period,
-        granularity: params.granularity,
+        granularity: granularity.as_str().to_string(),
         buckets: buckets_dto,
     }))
 }

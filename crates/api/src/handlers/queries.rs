@@ -2,13 +2,15 @@ use crate::{
     dto::{PaginatedQueries, QueryParams, QueryResponse},
     errors::ApiError,
     state::AppState,
-    utils::{parse_period, validate_period},
+    utils::period_hours,
 };
 use axum::{
     extract::{Query, State},
     Json,
 };
+use ferrous_dns_application::ports::PageAt;
 use ferrous_dns_application::use_cases::PagedQueryInput;
+use ferrous_dns_domain::DnssecStatusFilter;
 use tracing::{debug, instrument};
 
 #[utoipa::path(
@@ -42,21 +44,26 @@ pub async fn get_queries(
         "Fetching recent queries"
     );
 
-    let period_hours = parse_period(&params.period)
-        .map(validate_period)
-        .unwrap_or(24.0);
+    let period_hours = period_hours(&params.period);
+    let dnssec_status = params
+        .dnssec_status
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::parse::<DnssecStatusFilter>)
+        .transpose()?;
 
     let input = PagedQueryInput {
         limit: params.limit,
-        offset: params.offset,
+        page: params
+            .cursor
+            .map_or(PageAt::Offset(params.offset), PageAt::Cursor),
         period_hours,
-        cursor: params.cursor,
         domain: params.domain.as_deref(),
         category: params.category.as_deref(),
         client: params.client.as_deref(),
         record_type: params.record_type.as_deref(),
         upstream: params.upstream.as_deref(),
-        dnssec_status: params.dnssec_status.as_deref(),
+        dnssec_status,
         dns64: params.dns64,
         protocol: params.protocol.as_deref(),
     };
@@ -76,7 +83,7 @@ pub async fn get_queries(
             response_time_us: q.response_time_us,
             cache_hit: q.cache_hit,
             cache_refresh: q.cache_refresh,
-            dnssec_status: q.dnssec_status,
+            dnssec_status: q.dnssec_status.map(|s| s.as_str()),
             dns64_synthesized: q.dns64_synthesized,
             answers: q
                 .answers

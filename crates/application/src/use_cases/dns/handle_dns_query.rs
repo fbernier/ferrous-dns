@@ -1,5 +1,5 @@
 use super::coarse_timer::coarse_now_ns;
-use super::cookie_guard::{CookieVerdict, DnsCookieGuard};
+use super::cookie_guard::DnsCookieGuard;
 use super::dga_guard::{DgaAnalysisEvent, DgaGuard, DgaVerdict};
 use super::nxdomain_hijack_guard::NxdomainHijackGuard;
 use super::rate_limiter::{DnsRateLimiter, RateLimitDecision};
@@ -25,11 +25,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-const LAST_SEEN_CAPACITY: usize = 8_192;
+const LAST_SEEN_CAPACITY: NonZeroUsize = match NonZeroUsize::new(8_192) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
 
 thread_local! {
     static LAST_SEEN_TRACKER: RefCell<LruCache<IpAddr, u64>> =
-        RefCell::new(LruCache::new(NonZeroUsize::new(LAST_SEEN_CAPACITY).unwrap()));
+        RefCell::new(LruCache::new(LAST_SEEN_CAPACITY));
 }
 
 pub struct HandleDnsQueryUseCase {
@@ -39,7 +42,7 @@ pub struct HandleDnsQueryUseCase {
     query_log: Arc<dyn QueryLogRepository>,
     client_repo: Option<Arc<dyn ClientRepository>>,
     client_tracking_interval: Duration,
-    rebinding_guard: RebindingGuard,
+    rebinding_guard: Option<RebindingGuard>,
     rate_limiter: Arc<DnsRateLimiter>,
     tunneling_guard: TunnelingGuard,
     tunneling_event_tx: Option<tokio::sync::mpsc::Sender<TunnelingAnalysisEvent>>,
@@ -49,17 +52,9 @@ pub struct HandleDnsQueryUseCase {
     dga_guard: DgaGuard,
     dga_event_tx: Option<tokio::sync::mpsc::Sender<DgaAnalysisEvent>>,
     dga_flag_store: Option<Arc<dyn DgaFlagStore>>,
-    cookie_guard: DnsCookieGuard,
-    /// When `true` (DNSSEC Strict mode), a `Bogus` validation result is enforced
-    /// with SERVFAIL instead of being delivered. Set via `with_dnssec_enforcement`.
+    cookie_guard: Option<DnsCookieGuard>,
     dnssec_enforce: bool,
-    /// `/96` NAT64 network prefix when DNS64 is enabled. Used only to derive the
-    /// `dns64_synthesized` query-log tag from an AAAA answer's address membership.
     dns64_prefix: Option<Ipv6Addr>,
-    /// Honors `[database] log_queries`. When `false`, query logging is fully
-    /// suppressed on every path: the hot cache-hit path skips building the
-    /// `QueryLog` entry (no per-hit `Arc<str>` alloc, no channel send) and
-    /// `log()` short-circuits for the slow paths. Set via `with_query_logging`.
     log_queries: bool,
 }
 
@@ -76,7 +71,7 @@ impl HandleDnsQueryUseCase {
             query_log,
             client_repo: None,
             client_tracking_interval: Duration::from_secs(60),
-            rebinding_guard: RebindingGuard::disabled(),
+            rebinding_guard: None,
             rate_limiter: Arc::new(DnsRateLimiter::disabled()),
             tunneling_guard: TunnelingGuard::disabled(),
             tunneling_event_tx: None,
@@ -86,7 +81,7 @@ impl HandleDnsQueryUseCase {
             dga_guard: DgaGuard::disabled(),
             dga_event_tx: None,
             dga_flag_store: None,
-            cookie_guard: DnsCookieGuard::disabled(),
+            cookie_guard: None,
             dnssec_enforce: false,
             dns64_prefix: None,
             log_queries: true,
@@ -149,11 +144,10 @@ impl HandleDnsQueryUseCase {
     /// local DNS server, or is explicitly listed in `allowlist`.
     pub fn with_rebinding_protection(
         mut self,
-        enabled: bool,
         local_domain: Option<&str>,
         allowlist: &[String],
     ) -> Self {
-        self.rebinding_guard = RebindingGuard::new(enabled, local_domain, allowlist);
+        self.rebinding_guard = Some(RebindingGuard::new(local_domain, allowlist));
         self
     }
 
@@ -227,14 +221,14 @@ impl HandleDnsQueryUseCase {
 
     /// Enables RFC 7873 DNS Cookie validation on the hot path.
     pub fn with_dns_cookies(mut self, guard: DnsCookieGuard) -> Self {
-        self.cookie_guard = guard;
+        self.cookie_guard = Some(guard);
         self
     }
 
-    /// Exposes the cookie guard so the server handler can generate server
-    /// cookies for inclusion in responses.
-    pub fn cookie_guard(&self) -> &DnsCookieGuard {
-        &self.cookie_guard
+    /// The cookie guard the server handler signs response cookies with;
+    /// `None` when DNS Cookies are disabled.
+    pub fn cookie_guard(&self) -> Option<&DnsCookieGuard> {
+        self.cookie_guard.as_ref()
     }
 
     /// Applies the configured tunneling action, returning an error if blocked.
@@ -256,12 +250,8 @@ impl HandleDnsQueryUseCase {
                 });
                 Err(DomainError::DnsTunnelingDetected)
             }
-            TunnelingAction::Alert => {
-                tracing::info!(domain = %request.domain, context, "DNS tunneling alert");
-                Ok(())
-            }
-            TunnelingAction::Throttle => {
-                tracing::info!(domain = %request.domain, context, "DNS tunneling alert (throttle mode)");
+            action @ (TunnelingAction::Alert | TunnelingAction::Throttle) => {
+                tracing::info!(domain = %request.domain, context, ?action, "DNS tunneling alert");
                 Ok(())
             }
         }
@@ -400,86 +390,10 @@ impl HandleDnsQueryUseCase {
             .map(|_| BlockSource::CnameCloaking)
     }
 
-    /// Checks the cache for a non-IP record type (NS, CNAME, SOA, PTR, MX, TXT,
-    /// HTTPS, SRV, SVCB) and returns the raw wire bytes if there is a hit.
-    /// The caller is responsible for patching the query ID before sending.
-    pub fn try_cache_wire_direct(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-        client_ip: IpAddr,
-        protocol: ClientProtocol,
-    ) -> Option<(bytes::Bytes, u32)> {
-        let tsc_start = tsc_timer::now();
-        let group_id = self.block_filter.resolve_group(client_ip);
-
-        let filter_decision = self.block_filter.check(domain, group_id);
-        if let FilterDecision::Block(_) = filter_decision {
-            return None;
-        }
-
-        if !self.rate_limiter.is_allowed(client_ip) {
-            return None;
-        }
-
-        // An explicitly allowed domain is exempt from the heuristic detectors —
-        // clearing their false positives is what the allowlist is for.
-        if !matches!(filter_decision, FilterDecision::ExplicitAllow) {
-            if let Some(ref store) = self.tunneling_flag_store {
-                if store.is_flagged(domain) {
-                    return None;
-                }
-            }
-
-            if let Some(ref store) = self.dga_flag_store {
-                if store.is_flagged(domain) {
-                    return None;
-                }
-            }
-        }
-
-        let resolution = self.resolver.try_cache_str(domain, record_type)?;
-        let wire = resolution.upstream_wire_data?;
-        let ttl = resolution.min_ttl.unwrap_or(0);
-
-        if self.log_queries {
-            let elapsed_us = tsc_timer::elapsed_us_since(tsc_start);
-            let domain_arc: Arc<str> = Arc::from(domain);
-            self.log(&QueryLog {
-                id: None,
-                domain: domain_arc,
-                record_type,
-                client_ip,
-                client_hostname: None,
-                blocked: false,
-                response_time_us: Some(elapsed_us),
-                cache_hit: true,
-                cache_refresh: false,
-                dnssec_status: resolution.dnssec_status,
-                dns64_synthesized: false,
-                answers: None,
-                upstream_server: None,
-                upstream_pool: None,
-                response_status: Some("NOERROR"),
-                timestamp: None,
-                query_source: QuerySource::Client,
-                protocol: Some(protocol),
-                group_id: Some(group_id),
-                block_source: None,
-            });
-        }
-
-        Some((wire, ttl))
-    }
-
-    pub fn try_cache_direct(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-        client_ip: IpAddr,
-        protocol: ClientProtocol,
-    ) -> Option<(Arc<Vec<IpAddr>>, u32)> {
-        let tsc_start = tsc_timer::now();
+    /// Fast-path admission shared by both cache probes: `None` means fall through
+    /// to [`Self::execute`], otherwise `(group_id, explicitly_allowed)`.
+    #[inline]
+    fn cache_gate(&self, domain: &str, client_ip: IpAddr) -> Option<(i64, bool)> {
         let group_id = self.block_filter.resolve_group(client_ip);
 
         let filter_decision = self.block_filter.check(domain, group_id);
@@ -509,47 +423,199 @@ impl HandleDnsQueryUseCase {
             }
         }
 
+        Some((group_id, explicitly_allowed))
+    }
+
+    fn cache_hit_log(
+        domain: &str,
+        record_type: RecordType,
+        client_ip: IpAddr,
+        protocol: ClientProtocol,
+        group_id: i64,
+        elapsed_us: u64,
+        dnssec_status: Option<DnssecStatus>,
+    ) -> QueryLog {
+        QueryLog {
+            id: None,
+            domain: Arc::from(domain),
+            record_type,
+            client_ip,
+            client_hostname: None,
+            blocked: false,
+            response_time_us: Some(elapsed_us),
+            cache_hit: true,
+            cache_refresh: false,
+            dnssec_status,
+            dns64_synthesized: false,
+            answers: None,
+            upstream_server: None,
+            upstream_pool: None,
+            response_status: Some("NOERROR"),
+            timestamp: None,
+            query_source: QuerySource::Client,
+            protocol: Some(protocol),
+            group_id: Some(group_id),
+            block_source: None,
+        }
+    }
+
+    /// Checks the cache for a non-IP record type (NS, CNAME, SOA, PTR, MX, TXT,
+    /// HTTPS, SRV, SVCB) and hands a hit's wire bytes and the seconds its entry
+    /// has left to `respond`, which builds the reply or declines it (`None`)
+    /// for the slow path. Only a hit `respond` answers is logged here;
+    /// [`Self::execute`] logs a declined one.
+    pub fn try_cache_wire_direct<R>(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        client_ip: IpAddr,
+        protocol: ClientProtocol,
+        respond: impl FnOnce(&[u8], u32) -> Option<R>,
+    ) -> Option<R> {
+        let tsc_start = tsc_timer::now();
+        let (group_id, _) = self.cache_gate(domain, client_ip)?;
+
+        let DnsResolution {
+            upstream_wire_data,
+            min_ttl,
+            dnssec_status,
+            ..
+        } = self.resolver.try_cache_str(domain, record_type)?;
+        let wire = upstream_wire_data.as_deref()?;
+        // The cache reports what every entry has left; the reply's TTLs need it.
+        let remaining = min_ttl?;
+        // Built before `respond`, which rarely declines, and logged only once
+        // it answers: the slow path logs a declined hit. The logged time is
+        // the cache probe's.
+        let log = self.log_queries.then(|| {
+            Self::cache_hit_log(
+                domain,
+                record_type,
+                client_ip,
+                protocol,
+                group_id,
+                tsc_timer::elapsed_us_since(tsc_start),
+                dnssec_status,
+            )
+        });
+        let reply = respond(wire, remaining)?;
+        if let Some(log) = &log {
+            self.log(log);
+        }
+
+        Some(reply)
+    }
+
+    /// Checks the cache for an A/AAAA answer and hands its addresses and TTL
+    /// to `respond`, logging the hit only if `respond` answers it; see
+    /// [`Self::try_cache_wire_direct`].
+    pub fn try_cache_direct<R>(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        client_ip: IpAddr,
+        protocol: ClientProtocol,
+        respond: impl FnOnce(&[IpAddr], u32) -> Option<R>,
+    ) -> Option<R> {
+        let tsc_start = tsc_timer::now();
+        let (group_id, explicitly_allowed) = self.cache_gate(domain, client_ip)?;
+
         let resolution = self.resolver.try_cache_str(domain, record_type)?;
         if resolution.addresses.is_empty() {
             return None;
         }
-        if !explicitly_allowed {
-            if self.nxdomain_hijack_guard.is_hijacked_response(&resolution) {
-                return None; // fall through to execute() for logging
-            }
-            if self.response_ip_filter_guard.has_blocked_ip(&resolution) {
-                return None; // fall through to execute() for logging
-            }
+        // Fall through to execute() so it logs and applies the configured action.
+        if !explicitly_allowed && self.is_suspicious_cached_answer(domain, &resolution) {
+            return None;
         }
-
-        if self.log_queries {
-            let elapsed_us = tsc_timer::elapsed_us_since(tsc_start);
-            let domain_arc: Arc<str> = Arc::from(domain);
-            self.log(&QueryLog {
-                id: None,
-                domain: domain_arc,
+        let DnsResolution {
+            addresses,
+            min_ttl,
+            dnssec_status,
+            ..
+        } = resolution;
+        // Built before `respond`, which rarely declines, and logged only once
+        // it answers: the slow path logs a declined hit.
+        let log = self.log_queries.then(|| QueryLog {
+            dns64_synthesized: self.is_dns64_synthesized(record_type, &addresses),
+            answers: Some(Arc::clone(&addresses)),
+            ..Self::cache_hit_log(
+                domain,
                 record_type,
                 client_ip,
-                client_hostname: None,
-                blocked: false,
-                response_time_us: Some(elapsed_us),
-                cache_hit: true,
-                cache_refresh: false,
-                dnssec_status: resolution.dnssec_status,
-                dns64_synthesized: self.is_dns64_synthesized(record_type, &resolution.addresses),
-                answers: Some(Arc::clone(&resolution.addresses)),
-                upstream_server: None,
-                upstream_pool: None,
-                response_status: Some("NOERROR"),
-                timestamp: None,
-                query_source: QuerySource::Client,
-                protocol: Some(protocol),
-                group_id: Some(group_id),
-                block_source: None,
-            });
+                protocol,
+                group_id,
+                tsc_timer::elapsed_us_since(tsc_start),
+                dnssec_status,
+            )
+        });
+        let reply = respond(&addresses, min_ttl.unwrap_or(60))?;
+        if let Some(log) = &log {
+            self.log(log);
         }
 
-        Some((resolution.addresses, resolution.min_ttl.unwrap_or(60)))
+        Some(reply)
+    }
+
+    /// Cached answers are admitted before the response guards run, so re-check the
+    /// ones whose verdict depends on the answer (hijack, C2 IP, rebinding).
+    #[inline]
+    fn is_suspicious_cached_answer(&self, domain: &str, resolution: &DnsResolution) -> bool {
+        self.nxdomain_hijack_guard.is_hijacked_response(resolution)
+            || self.response_ip_filter_guard.has_blocked_ip(resolution)
+            || self.is_rebinding_attempt(domain, resolution)
+    }
+
+    #[inline]
+    fn is_rebinding_attempt(&self, domain: &str, resolution: &DnsResolution) -> bool {
+        self.rebinding_guard
+            .as_ref()
+            .is_some_and(|guard| guard.is_rebinding_attempt(domain, resolution))
+    }
+
+    /// Applies a rate-limit decision for `budget`: `Err` carries the configured
+    /// action for a response over it, which is logged here.
+    fn apply_rate_limit(
+        &self,
+        decision: RateLimitDecision,
+        budget: &'static str,
+        request: &DnsRequest,
+        elapsed_us: impl Fn() -> u64,
+        group_id: i64,
+    ) -> Result<(), DomainError> {
+        let (status, error) = match decision {
+            RateLimitDecision::Allow => return Ok(()),
+            RateLimitDecision::DryRunWouldRefuse => {
+                tracing::debug!(client = %request.client_ip, budget, "[dry-run] would rate-limit");
+                return Ok(());
+            }
+            RateLimitDecision::Refuse => ("RATE_LIMITED", DomainError::DnsRateLimited),
+            RateLimitDecision::Slip => ("RATE_LIMITED_TC", DomainError::DnsRateLimitedSlip),
+        };
+        self.log(&QueryLog {
+            blocked: true,
+            response_status: Some(status),
+            block_source: Some(BlockSource::RateLimit),
+            ..Self::base_query_log(request, elapsed_us(), group_id)
+        });
+        Err(error)
+    }
+
+    /// Charges an NXDOMAIN answer to the client's NXDOMAIN budget; `Err` when
+    /// this answer is over it. Callers skip answers from the local DNS server.
+    fn charge_nxdomain(
+        &self,
+        request: &DnsRequest,
+        elapsed_us: impl Fn() -> u64,
+        group_id: i64,
+    ) -> Result<(), DomainError> {
+        self.apply_rate_limit(
+            self.rate_limiter.charge_nxdomain(request.client_ip),
+            "nxdomain",
+            request,
+            elapsed_us,
+            group_id,
+        )
     }
 
     pub async fn execute(&self, request: &DnsRequest) -> Result<DnsResolution, DomainError> {
@@ -560,50 +626,27 @@ impl HandleDnsQueryUseCase {
 
         let group_id = self.block_filter.resolve_group(request.client_ip);
 
-        match self.rate_limiter.check(request.client_ip, false) {
-            RateLimitDecision::Allow => {}
-            RateLimitDecision::DryRunWouldRefuse => {
-                tracing::debug!(client = %request.client_ip, "[dry-run] would rate-limit");
-            }
-            RateLimitDecision::Refuse => {
-                self.log(&QueryLog {
-                    blocked: true,
-                    response_status: Some("RATE_LIMITED"),
-                    block_source: Some(BlockSource::RateLimit),
-                    ..Self::base_query_log(request, elapsed_us(), group_id)
-                });
-                return Err(DomainError::DnsRateLimited);
-            }
-            RateLimitDecision::Slip => {
-                self.log(&QueryLog {
-                    blocked: true,
-                    response_status: Some("RATE_LIMITED_TC"),
-                    block_source: Some(BlockSource::RateLimit),
-                    ..Self::base_query_log(request, elapsed_us(), group_id)
-                });
-                return Err(DomainError::DnsRateLimitedSlip);
-            }
-        }
+        self.apply_rate_limit(
+            self.rate_limiter.check(request.client_ip),
+            "queries",
+            request,
+            elapsed_us,
+            group_id,
+        )?;
 
-        if self.cookie_guard.is_enabled() && self.cookie_guard.requires_valid_cookie() {
+        if let Some(guard) = self.cookie_guard.as_ref().filter(|g| g.is_strict()) {
             let opt = request
                 .edns_cookie
                 .as_ref()
                 .map(|c| c.as_bytes())
                 .unwrap_or(&[]);
-            // RFC 7873 §5.2.3: in strict mode both an absent/malformed cookie
-            // (Invalid) AND a bootstrapping-only client cookie (NoCookie) must
-            // be refused — the client must supply a valid server cookie.
-            match self.cookie_guard.check(request.client_ip, opt) {
-                CookieVerdict::Valid => {}
-                CookieVerdict::Invalid | CookieVerdict::NoCookie => {
-                    tracing::debug!(
-                        domain = %request.domain,
-                        client = %request.client_ip,
-                        "DNS cookie validation failed (strict mode)"
-                    );
-                    return Err(DomainError::DnsCookieInvalid);
-                }
+            if !guard.has_valid_cookie(request.client_ip, opt) {
+                tracing::debug!(
+                    domain = %request.domain,
+                    client = %request.client_ip,
+                    "DNS cookie validation failed (strict mode)"
+                );
+                return Err(DomainError::DnsCookieInvalid);
             }
         }
 
@@ -648,7 +691,6 @@ impl HandleDnsQueryUseCase {
                 }
             }
 
-            // DGA Detection — Phase 1 (hot-path guard)
             if let DgaVerdict::Detected {
                 signal,
                 measured,
@@ -665,7 +707,6 @@ impl HandleDnsQueryUseCase {
                 self.apply_dga_action(request, signal, elapsed_us(), group_id)?;
             }
 
-            // DGA Detection — Phase 2 (flagged check)
             if let Some(ref store) = self.dga_flag_store {
                 if store.is_flagged(&request.domain) {
                     self.apply_dga_action(request, "flagged_domain", elapsed_us(), group_id)?;
@@ -698,9 +739,7 @@ impl HandleDnsQueryUseCase {
 
         if let Some(cached) = self.resolver.try_cache(&dns_query) {
             if cached.has_response_data() {
-                if !explicitly_allowed
-                    && (self.nxdomain_hijack_guard.is_hijacked_response(&cached)
-                        || self.response_ip_filter_guard.has_blocked_ip(&cached))
+                if !explicitly_allowed && self.is_suspicious_cached_answer(&request.domain, &cached)
                 {
                     // Fall through to full resolve path for logging and action.
                 } else {
@@ -713,6 +752,9 @@ impl HandleDnsQueryUseCase {
                     return Ok(cached);
                 }
             } else if cached.cache_hit {
+                if !cached.local_nxdomain {
+                    self.charge_nxdomain(request, elapsed_us, group_id)?;
+                }
                 self.log(&QueryLog {
                     cache_hit: true,
                     response_status: Some("NXDOMAIN"),
@@ -736,11 +778,7 @@ impl HandleDnsQueryUseCase {
                     });
                     return Err(DomainError::Blocked);
                 }
-                if !explicitly_allowed
-                    && self
-                        .rebinding_guard
-                        .is_rebinding_attempt(&request.domain, &resolution)
-                {
+                if !explicitly_allowed && self.is_rebinding_attempt(&request.domain, &resolution) {
                     self.log(&QueryLog {
                         blocked: true,
                         response_status: Some("BLOCKED"),
@@ -754,6 +792,7 @@ impl HandleDnsQueryUseCase {
                 {
                     match self.nxdomain_hijack_guard.action() {
                         NxdomainHijackAction::Block => {
+                            self.charge_nxdomain(request, elapsed_us, group_id)?;
                             self.log(&QueryLog {
                                 blocked: true,
                                 response_status: Some("NXDOMAIN_HIJACK"),
@@ -796,7 +835,7 @@ impl HandleDnsQueryUseCase {
                 // is enforced; Insecure/Indeterminate/errors fail open.
                 if self.dnssec_enforce
                     && !request.checking_disabled
-                    && resolution.dnssec_status == Some(DnssecStatus::Bogus.as_str())
+                    && resolution.dnssec_status == Some(DnssecStatus::Bogus)
                 {
                     self.log(&QueryLog {
                         dnssec_status: resolution.dnssec_status,
@@ -828,6 +867,7 @@ impl HandleDnsQueryUseCase {
                 Ok(resolution)
             }
             Err(DomainError::LocalNxDomain) => {
+                // LAN traffic, like a PTR sweep: never charged to the NXDOMAIN budget.
                 self.log(&QueryLog {
                     response_status: Some("LOCAL_DNS"),
                     ..Self::base_query_log(request, elapsed_us(), group_id)
@@ -841,6 +881,7 @@ impl HandleDnsQueryUseCase {
                             self.emit_tunneling_event(request, true);
                             self.emit_dga_event(request);
                         }
+                        self.charge_nxdomain(request, elapsed_us, group_id)?;
                         "NXDOMAIN"
                     }
                     DomainError::QueryTimeout => "TIMEOUT",

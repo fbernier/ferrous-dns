@@ -1,57 +1,61 @@
 use axum::{
     extract::State,
     http::{header, HeaderValue, Method},
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use ferrous_dns_api::{create_api_router_with_openapi, metrics_routes, AppState};
 use ferrous_dns_api_pihole::{create_pihole_router_with_openapi, PiholeAppState};
-use ferrous_dns_infrastructure::dns::server::DnsServerHandler;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
+use utoipa::openapi::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
+use super::doh::{dns_query_handler, DohContext};
 use super::web_tls;
 
-pub async fn start_doh_server(
-    bind_addr: SocketAddr,
-    handler: Arc<DnsServerHandler>,
-) -> anyhow::Result<()> {
+pub async fn start_doh_server(bind_addr: SocketAddr, doh: Arc<DohContext>) -> anyhow::Result<()> {
     info!(
         bind_address = %bind_addr,
         endpoint = format!("http://{}/dns-query", bind_addr),
         "Starting DoH server (DNS-over-HTTPS, RFC 8484)"
     );
 
-    let app = Router::new()
-        .route(
-            "/dns-query",
-            get(crate::server::doh::dns_query_handler).post(crate::server::doh::dns_query_handler),
-        )
-        .layer(axum::Extension(handler));
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let listener = TcpListener::bind(&bind_addr).await?;
 
     info!("DoH server ready on {}", bind_addr);
 
-    axum::serve(listener, app).await?;
+    serve_doh(listener, doh).await
+}
+
+/// Serves the dedicated plain-HTTP DoH endpoint on an already bound listener.
+pub async fn serve_doh(listener: TcpListener, doh: Arc<DohContext>) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/dns-query", get(dns_query_handler).post(dns_query_handler))
+        .layer(axum::Extension(doh));
+
+    // The handler attributes each query to the socket peer.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn start_web_server(
     bind_addr: SocketAddr,
     ferrous_state: AppState,
-    pihole_state: PiholeAppState,
+    pihole_state: Option<PiholeAppState>,
     cors_allowed_origins: &[String],
-    pihole_compat: bool,
     metrics_enabled: bool,
-    doh_handler: Option<Arc<DnsServerHandler>>,
+    doh: Option<Arc<DohContext>>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> anyhow::Result<()> {
     let scheme = if tls_config.is_some() {
@@ -60,7 +64,7 @@ pub async fn start_web_server(
         "http"
     };
 
-    if pihole_compat {
+    if pihole_state.is_some() {
         info!(
             bind_address = %bind_addr,
             dashboard_url = format!("{}://{}", scheme, bind_addr),
@@ -81,16 +85,15 @@ pub async fn start_web_server(
         ferrous_state,
         pihole_state,
         cors_allowed_origins,
-        pihole_compat,
         metrics_enabled,
-        doh_handler,
+        doh,
     );
 
     if let Some(tls_cfg) = tls_config {
         info!("Web server started successfully (HTTPS)");
         web_tls::start_https_web_server(bind_addr, app, tls_cfg).await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(&bind_addr).await?;
         info!("Web server started successfully");
         axum::serve(
             listener,
@@ -120,107 +123,115 @@ fn build_strict_cors(allowed_origins: &[String]) -> CorsLayer {
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
 }
 
+/// An API's routes plus its `/openapi.json` spec and Scalar UI at `/docs`.
+fn api_branch(router: Router, spec: OpenApi) -> Router {
+    let json = spec.clone();
+    Router::new()
+        .route(
+            "/openapi.json",
+            get(move || {
+                let json = json.clone();
+                async move { Json(json) }
+            }),
+        )
+        .merge(Router::from(Scalar::with_url("/docs", spec)))
+        .merge(router)
+}
+
+const HTML: &str = "text/html; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+const JS: &str = "application/javascript; charset=utf-8";
+const SVG: &str = "image/svg+xml; charset=utf-8";
+
+/// Mounts files embedded from `web/static`, one `url => (file, content type)`
+/// row each, so a route cannot drift from the file it serves.
+macro_rules! static_files {
+    ($router:expr, { $($url:literal => ($file:literal, $mime:expr)),* $(,)? }) => {
+        $router$(
+            .route(
+                $url,
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, $mime)],
+                        include_str!(concat!("../../../../web/static/", $file)),
+                    )
+                }),
+            )
+        )*
+    };
+}
+
+/// The web app. The Pi-hole API, when `pihole_state` is given, takes `/api`
+/// and moves the Ferrous API to `/ferrous/api`.
 fn create_app(
     ferrous_state: AppState,
-    pihole_state: PiholeAppState,
+    pihole_state: Option<PiholeAppState>,
     cors_allowed_origins: &[String],
-    pihole_compat: bool,
     metrics_enabled: bool,
-    doh_handler: Option<Arc<DnsServerHandler>>,
+    doh: Option<Arc<DohContext>>,
 ) -> Router {
+    let pihole_compat = pihole_state.is_some();
     // Clone before the state is moved into the API router so the bare
     // `/metrics` route can carry its own copy.
     let metrics_state = metrics_enabled.then(|| ferrous_state.clone());
     let (ferrous_router, ferrous_openapi) = create_api_router_with_openapi(ferrous_state);
-    let ferrous_branch = Router::new()
-        .route(
-            "/openapi.json",
-            get({
-                let spec = ferrous_openapi.clone();
-                move || {
-                    let spec = spec.clone();
-                    async move { Json(spec) }
-                }
-            }),
-        )
-        .merge(Router::from(Scalar::with_url("/docs", ferrous_openapi)))
-        .merge(ferrous_router);
+    let ferrous_branch = api_branch(ferrous_router, ferrous_openapi);
 
-    let router = if pihole_compat {
-        let (pihole_router, pihole_openapi) = create_pihole_router_with_openapi(pihole_state);
-        let pihole_branch = Router::new()
-            .route(
-                "/openapi.json",
-                get({
-                    let spec = pihole_openapi.clone();
-                    move || {
-                        let spec = spec.clone();
-                        async move { Json(spec) }
-                    }
-                }),
-            )
-            .merge(Router::from(Scalar::with_url("/docs", pihole_openapi)))
-            .merge(pihole_router);
-        Router::new()
-            .nest("/api", pihole_branch)
-            .nest("/ferrous/api", ferrous_branch)
-    } else {
-        Router::new().nest("/api", ferrous_branch)
+    let router = match pihole_state {
+        Some(state) => {
+            let (pihole_router, pihole_openapi) = create_pihole_router_with_openapi(state);
+            Router::new()
+                .nest("/api", api_branch(pihole_router, pihole_openapi))
+                .nest("/ferrous/api", ferrous_branch)
+        }
+        None => Router::new().nest("/api", ferrous_branch),
     };
 
-    let mut app = router
-        .route(
-            "/ferrous-config.js",
-            get(ferrous_config_js_handler).with_state(pihole_compat),
-        )
-        .route("/static/shared.css", get(shared_css_handler))
-        .route("/static/shared.js", get(shared_js_handler))
-        .route("/static/logo.svg", get(logo_svg_handler))
-        .route("/static/dashboard.css", get(dashboard_css_handler))
-        .route("/static/dashboard.js", get(dashboard_js_handler))
-        .route("/static/queries.css", get(queries_css_handler))
-        .route("/static/queries.js", get(queries_js_handler))
-        .route("/static/cache-control.css", get(cache_control_css_handler))
-        .route("/static/cache-control.js", get(cache_control_js_handler))
-        .route("/static/dnssec.css", get(dnssec_css_handler))
-        .route("/static/dnssec.js", get(dnssec_js_handler))
-        .route("/static/clients.css", get(clients_css_handler))
-        .route("/static/clients.js", get(clients_js_handler))
-        .route("/static/groups.css", get(groups_css_handler))
-        .route("/static/groups.js", get(groups_js_handler))
-        .route(
-            "/static/local-dns-settings.css",
-            get(local_dns_settings_css_handler),
-        )
-        .route(
-            "/static/local-dns-settings.js",
-            get(local_dns_settings_js_handler),
-        )
-        .route("/static/settings.css", get(settings_css_handler))
-        .route("/static/settings.js", get(settings_js_handler))
-        .route("/static/dns-filter.css", get(dns_filter_css_handler))
-        .route("/static/dns-filter.js", get(dns_filter_js_handler))
-        .route(
-            "/static/block-services.css",
-            get(block_services_css_handler),
-        )
-        .route("/static/block-services.js", get(block_services_js_handler))
-        .route("/static/login.css", get(login_css_handler))
-        .route("/static/login.js", get(login_js_handler))
-        .route("/", get(index_handler))
-        .route("/login.html", get(login_handler))
-        .route("/dashboard.html", get(dashboard_handler))
-        .route("/queries.html", get(queries_handler))
-        .route("/cache-control.html", get(cache_control_handler))
-        .route("/dnssec.html", get(dnssec_handler))
-        .route("/clients.html", get(clients_handler))
-        .route("/groups.html", get(groups_handler))
-        .route("/local-dns-settings.html", get(local_dns_settings_handler))
-        .route("/settings.html", get(settings_handler))
-        .route("/dns-filter.html", get(dns_filter_handler))
-        .route("/block-services.html", get(block_services_handler))
-        .layer(CompressionLayer::new().gzip(true))
-        .layer(build_cors_layer(cors_allowed_origins));
+    let router = router.route(
+        "/ferrous-config.js",
+        get(ferrous_config_js_handler).with_state(pihole_compat),
+    );
+    let mut app = static_files!(router, {
+        "/static/shared.css" => ("shared.css", CSS),
+        "/static/shared.js" => ("shared.js", JS),
+        "/static/logo.svg" => ("logo.svg", SVG),
+        "/static/dashboard.css" => ("dashboard.css", CSS),
+        "/static/dashboard.js" => ("dashboard.js", JS),
+        "/static/queries.css" => ("queries.css", CSS),
+        "/static/queries.js" => ("queries.js", JS),
+        "/static/cache-control.css" => ("cache-control.css", CSS),
+        "/static/cache-control.js" => ("cache-control.js", JS),
+        "/static/dnssec.css" => ("dnssec.css", CSS),
+        "/static/dnssec.js" => ("dnssec.js", JS),
+        "/static/clients.css" => ("clients.css", CSS),
+        "/static/clients.js" => ("clients.js", JS),
+        "/static/groups.css" => ("groups.css", CSS),
+        "/static/groups.js" => ("groups.js", JS),
+        "/static/local-dns-settings.css" => ("local-dns-settings.css", CSS),
+        "/static/local-dns-settings.js" => ("local-dns-settings.js", JS),
+        "/static/settings.css" => ("settings.css", CSS),
+        "/static/settings.js" => ("settings.js", JS),
+        "/static/dns-filter.css" => ("dns-filter.css", CSS),
+        "/static/dns-filter.js" => ("dns-filter.js", JS),
+        "/static/block-services.css" => ("block-services.css", CSS),
+        "/static/block-services.js" => ("block-services.js", JS),
+        "/static/login.css" => ("login.css", CSS),
+        "/static/login.js" => ("login.js", JS),
+        "/" => ("index.html", HTML),
+        "/login.html" => ("login.html", HTML),
+        "/dashboard.html" => ("dashboard.html", HTML),
+        "/queries.html" => ("queries.html", HTML),
+        "/cache-control.html" => ("cache-control.html", HTML),
+        "/dnssec.html" => ("dnssec.html", HTML),
+        "/clients.html" => ("clients.html", HTML),
+        "/groups.html" => ("groups.html", HTML),
+        "/local-dns-settings.html" => ("local-dns-settings.html", HTML),
+        "/settings.html" => ("settings.html", HTML),
+        "/dns-filter.html" => ("dns-filter.html", HTML),
+        "/block-services.html" => ("block-services.html", HTML),
+    })
+    .layer(CompressionLayer::new().gzip(true))
+    .layer(build_cors_layer(cors_allowed_origins));
 
     // Bare unauthenticated `/metrics`, mounted outside the `/api` nest (and thus
     // outside the auth layer) per the Prometheus scrape convention.
@@ -228,14 +239,10 @@ fn create_app(
         app = app.merge(metrics_routes(state));
     }
 
-    if let Some(handler) = doh_handler {
+    if let Some(doh) = doh {
         app = app
-            .route(
-                "/dns-query",
-                get(crate::server::doh::dns_query_handler)
-                    .post(crate::server::doh::dns_query_handler),
-            )
-            .layer(axum::Extension(handler));
+            .route("/dns-query", get(dns_query_handler).post(dns_query_handler))
+            .layer(axum::Extension(doh));
     }
 
     app
@@ -266,152 +273,3 @@ async fn ferrous_config_js_handler(State(pihole_compat): State<bool>) -> impl In
         body,
     )
 }
-
-async fn shared_css_handler() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../../../../web/static/shared.css"),
-    )
-}
-
-async fn shared_js_handler() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../../../../web/static/shared.js"),
-    )
-}
-
-async fn logo_svg_handler() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
-        include_str!("../../../../web/static/logo.svg"),
-    )
-}
-
-async fn index_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/index.html"))
-}
-
-async fn login_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/login.html"))
-}
-
-async fn dashboard_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/dashboard.html"))
-}
-
-async fn queries_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/queries.html"))
-}
-
-async fn cache_control_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/cache-control.html"))
-}
-
-async fn dnssec_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/dnssec.html"))
-}
-
-async fn clients_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/clients.html"))
-}
-
-async fn groups_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/groups.html"))
-}
-
-async fn local_dns_settings_handler() -> Html<&'static str> {
-    Html(include_str!(
-        "../../../../web/static/local-dns-settings.html"
-    ))
-}
-
-async fn settings_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/settings.html"))
-}
-
-async fn dns_filter_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/dns-filter.html"))
-}
-
-async fn block_services_handler() -> Html<&'static str> {
-    Html(include_str!("../../../../web/static/block-services.html"))
-}
-
-macro_rules! css_handler {
-    ($name:ident, $path:expr) => {
-        async fn $name() -> impl IntoResponse {
-            (
-                [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                include_str!($path),
-            )
-        }
-    };
-}
-
-macro_rules! js_handler {
-    ($name:ident, $path:expr) => {
-        async fn $name() -> impl IntoResponse {
-            (
-                [(
-                    header::CONTENT_TYPE,
-                    "application/javascript; charset=utf-8",
-                )],
-                include_str!($path),
-            )
-        }
-    };
-}
-
-css_handler!(
-    dashboard_css_handler,
-    "../../../../web/static/dashboard.css"
-);
-js_handler!(dashboard_js_handler, "../../../../web/static/dashboard.js");
-css_handler!(queries_css_handler, "../../../../web/static/queries.css");
-js_handler!(queries_js_handler, "../../../../web/static/queries.js");
-css_handler!(
-    cache_control_css_handler,
-    "../../../../web/static/cache-control.css"
-);
-js_handler!(
-    cache_control_js_handler,
-    "../../../../web/static/cache-control.js"
-);
-css_handler!(dnssec_css_handler, "../../../../web/static/dnssec.css");
-js_handler!(dnssec_js_handler, "../../../../web/static/dnssec.js");
-css_handler!(clients_css_handler, "../../../../web/static/clients.css");
-js_handler!(clients_js_handler, "../../../../web/static/clients.js");
-css_handler!(groups_css_handler, "../../../../web/static/groups.css");
-js_handler!(groups_js_handler, "../../../../web/static/groups.js");
-css_handler!(
-    local_dns_settings_css_handler,
-    "../../../../web/static/local-dns-settings.css"
-);
-js_handler!(
-    local_dns_settings_js_handler,
-    "../../../../web/static/local-dns-settings.js"
-);
-css_handler!(settings_css_handler, "../../../../web/static/settings.css");
-js_handler!(settings_js_handler, "../../../../web/static/settings.js");
-css_handler!(
-    dns_filter_css_handler,
-    "../../../../web/static/dns-filter.css"
-);
-js_handler!(
-    dns_filter_js_handler,
-    "../../../../web/static/dns-filter.js"
-);
-css_handler!(
-    block_services_css_handler,
-    "../../../../web/static/block-services.css"
-);
-js_handler!(
-    block_services_js_handler,
-    "../../../../web/static/block-services.js"
-);
-css_handler!(login_css_handler, "../../../../web/static/login.css");
-js_handler!(login_js_handler, "../../../../web/static/login.js");

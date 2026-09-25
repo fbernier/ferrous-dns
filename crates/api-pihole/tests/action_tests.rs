@@ -8,14 +8,10 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-// ---------------------------------------------------------------------------
-// POST /action/gravity
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn gravity_returns_success() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -41,14 +37,10 @@ async fn gravity_returns_success() {
     assert_eq!(json["status"], "success", "status must be 'success'");
 }
 
-// ---------------------------------------------------------------------------
-// POST /action/restartdns
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn restartdns_returns_success() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -74,14 +66,10 @@ async fn restartdns_returns_success() {
     assert_eq!(json["status"], "success", "status must be 'success'");
 }
 
-// ---------------------------------------------------------------------------
-// POST /action/flush/logs
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn flush_logs_returns_success_on_empty_database() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let response = app
         .oneshot(
@@ -121,7 +109,7 @@ async fn flush_logs_clears_query_log_entries() {
         .await
         .expect("failed to backdate query log entries");
 
-    let app = helpers::create_pihole_test_app(pool.clone(), None).await;
+    let app = helpers::create_pihole_test_app(pool.clone()).await;
 
     // Flush logs
     let response = app
@@ -138,7 +126,7 @@ async fn flush_logs_clears_query_log_entries() {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Verify via GET /stats/summary that total is now 0
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
     let response = app
         .oneshot(
             Request::builder()

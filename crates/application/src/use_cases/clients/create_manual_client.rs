@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{Client, DomainError};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -8,24 +9,20 @@ use crate::ports::{BlockFilterEnginePort, ClientRepository, GroupRepository};
 pub struct CreateManualClientUseCase {
     client_repo: Arc<dyn ClientRepository>,
     group_repo: Arc<dyn GroupRepository>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl CreateManualClientUseCase {
     pub fn new(
         client_repo: Arc<dyn ClientRepository>,
         group_repo: Arc<dyn GroupRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
         Self {
             client_repo,
             group_repo,
-            block_filter_engine: None,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
     }
 
     #[instrument(skip(self))]
@@ -37,10 +34,7 @@ impl CreateManualClientUseCase {
         mac_address: Option<String>,
     ) -> Result<Client, DomainError> {
         if let Some(gid) = group_id {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
         let initial = self.client_repo.get_or_create(ip_address).await?;
@@ -69,10 +63,8 @@ impl CreateManualClientUseCase {
         );
 
         if group_assigned {
-            if let Some(ref engine) = self.block_filter_engine {
-                if let Err(e) = engine.load_client_groups().await {
-                    error!(error = %e, "Failed to reload client groups after manual client creation");
-                }
+            if let Err(e) = self.block_filter_engine.load_client_groups().await {
+                error!(error = %e, "Failed to reload client groups after manual client creation");
             }
         }
 

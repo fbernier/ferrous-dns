@@ -16,9 +16,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    if let Ok(rrsig) = RrsigRecord::parse(data, data) {
+    if let Ok(rrsig) = RrsigRecord::parse(data) {
         let _ = rrsig.is_valid_at(0);
-        let _ = rrsig.is_expired(u32::MAX);
         let _ = rrsig.to_string();
     }
 

@@ -1,10 +1,11 @@
+use crate::repositories::{db_err, is_fk_violation, is_unique_violation, parse_db_action, sql_now};
 use async_trait::async_trait;
 use fancy_regex::Regex;
-use ferrous_dns_application::ports::RegexFilterRepository;
+use ferrous_dns_application::ports::{RegexFilterRepository, RegexFilterUpdate};
 use ferrous_dns_domain::{DomainAction, DomainError, RegexFilter};
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tracing::{error, instrument};
+use tracing::instrument;
 
 type RegexFilterRow = (
     i64,
@@ -13,7 +14,7 @@ type RegexFilterRow = (
     String,
     i64,
     Option<String>,
-    i64,
+    bool,
     String,
     String,
 );
@@ -33,10 +34,10 @@ impl SqliteRegexFilterRepository {
             id: Some(id),
             name: Arc::from(name.as_str()),
             pattern: Arc::from(pattern.as_str()),
-            action: action.parse::<DomainAction>().unwrap_or(DomainAction::Deny),
+            action: parse_db_action(&action),
             group_id,
             comment: comment.map(|s| Arc::from(s.as_str())),
-            enabled: enabled != 0,
+            enabled,
             created_at: Some(created_at),
             updated_at: Some(updated_at),
         }
@@ -44,7 +45,7 @@ impl SqliteRegexFilterRepository {
 
     fn validate_regex_syntax(pattern: &str) -> Result<(), DomainError> {
         Regex::new(pattern).map(|_| ()).map_err(|e| {
-            DomainError::InvalidRegexFilter(format!("Invalid regex pattern '{}': {}", pattern, e))
+            DomainError::InvalidRegexFilter(format!("Invalid regex pattern '{pattern}': {e}"))
         })
     }
 }
@@ -63,7 +64,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
     ) -> Result<RegexFilter, DomainError> {
         Self::validate_regex_syntax(&pattern)?;
 
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = sql_now();
 
         let row = sqlx::query_as::<_, RegexFilterRow>(
             "INSERT INTO regex_filters (name, pattern, action, group_id, comment, enabled, created_at, updated_at)
@@ -75,20 +76,18 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
         .bind(action.to_str())
         .bind(group_id)
         .bind(&comment)
-        .bind(if enabled { 1i64 } else { 0i64 })
+        .bind(enabled)
         .bind(&now)
         .bind(&now)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint failed") {
-                DomainError::InvalidRegexFilter(format!(
-                    "Regex filter '{}' already exists",
-                    name
-                ))
+            if is_unique_violation(&e) {
+                DomainError::AlreadyExists(format!("Regex filter '{name}' already exists"))
+            } else if is_fk_violation(&e) {
+                DomainError::GroupNotFound(group_id)
             } else {
-                error!(error = %e, "Failed to create regex filter");
-                DomainError::DatabaseError(e.to_string())
+                db_err("Failed to create regex filter")(e)
             }
         })?;
 
@@ -104,10 +103,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query regex filter by id");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query regex filter by id"))?;
 
         Ok(row.map(Self::row_to_filter))
     }
@@ -120,67 +116,60 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query all regex filters");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query all regex filters"))?;
 
         Ok(rows.into_iter().map(Self::row_to_filter).collect())
     }
 
     #[instrument(skip(self))]
-    async fn update(
-        &self,
-        id: i64,
-        name: Option<String>,
-        pattern: Option<String>,
-        action: Option<DomainAction>,
-        group_id: Option<i64>,
-        comment: Option<String>,
-        enabled: Option<bool>,
-    ) -> Result<RegexFilter, DomainError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        let current = self
-            .get_by_id(id)
-            .await?
-            .ok_or(DomainError::RegexFilterNotFound(id))?;
-
-        let final_name = name.unwrap_or_else(|| current.name.to_string());
-        let final_pattern = pattern.unwrap_or_else(|| current.pattern.to_string());
-        let final_action = action.unwrap_or(current.action);
-        let final_group_id = group_id.unwrap_or(current.group_id);
-        let final_comment: Option<String> =
-            comment.or_else(|| current.comment.as_ref().map(|s| s.to_string()));
-        let final_enabled = enabled.unwrap_or(current.enabled);
-
-        Self::validate_regex_syntax(&final_pattern)?;
+    async fn update(&self, id: i64, update: RegexFilterUpdate) -> Result<RegexFilter, DomainError> {
+        let RegexFilterUpdate {
+            name,
+            pattern,
+            action,
+            group_id,
+            comment,
+            enabled,
+        } = update;
+        let replace_comment = comment.is_some();
+        let comment = comment.flatten();
+        if let Some(p) = &pattern {
+            Self::validate_regex_syntax(p)?;
+        }
 
         let row = sqlx::query_as::<_, RegexFilterRow>(
             "UPDATE regex_filters
-             SET name = ?, pattern = ?, action = ?, group_id = ?, comment = ?, enabled = ?, updated_at = ?
+             SET name = COALESCE(?, name),
+                 pattern = COALESCE(?, pattern),
+                 action = COALESCE(?, action),
+                 group_id = COALESCE(?, group_id),
+                 comment = CASE WHEN ? THEN ? ELSE comment END,
+                 enabled = COALESCE(?, enabled),
+                 updated_at = ?
              WHERE id = ?
              RETURNING id, name, pattern, action, group_id, comment, enabled, created_at, updated_at",
         )
-        .bind(&final_name)
-        .bind(&final_pattern)
-        .bind(final_action.to_str())
-        .bind(final_group_id)
-        .bind(&final_comment)
-        .bind(if final_enabled { 1i64 } else { 0i64 })
-        .bind(&now)
+        .bind(&name)
+        .bind(&pattern)
+        .bind(action.map(|a| a.to_str()))
+        .bind(group_id)
+        .bind(replace_comment)
+        .bind(&comment)
+        .bind(enabled)
+        .bind(sql_now())
         .bind(id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint failed") {
-                DomainError::InvalidRegexFilter(format!(
+            if is_unique_violation(&e) {
+                DomainError::AlreadyExists(format!(
                     "Regex filter '{}' already exists",
-                    final_name
+                    name.as_deref().unwrap_or_default()
                 ))
+            } else if let Some(gid) = group_id.filter(|_| is_fk_violation(&e)) {
+                DomainError::GroupNotFound(gid)
             } else {
-                error!(error = %e, "Failed to update regex filter");
-                DomainError::DatabaseError(e.to_string())
+                db_err("Failed to update regex filter")(e)
             }
         })?;
 
@@ -194,10 +183,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to delete regex filter");
-                DomainError::DatabaseError(e.to_string())
-            })?;
+            .map_err(db_err("Failed to delete regex filter"))?;
 
         if result.rows_affected() == 0 {
             return Err(DomainError::RegexFilterNotFound(id));
@@ -214,10 +200,7 @@ impl RegexFilterRepository for SqliteRegexFilterRepository {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to query enabled regex filters");
-            DomainError::DatabaseError(e.to_string())
-        })?;
+        .map_err(db_err("Failed to query enabled regex filters"))?;
 
         Ok(rows.into_iter().map(Self::row_to_filter).collect())
     }

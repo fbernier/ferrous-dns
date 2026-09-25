@@ -1,17 +1,14 @@
-pub mod balanced;
-pub mod failover;
+mod balanced;
+mod failover;
 pub mod health;
-pub mod parallel;
+mod parallel;
 pub mod pool;
-pub mod query;
+mod query;
 pub mod strategy;
 pub mod upstream_health_adapter;
 pub mod upstream_reload_adapter;
 
-pub use balanced::BalancedStrategy;
-pub use failover::FailoverStrategy;
 pub use health::{HealthChecker, ServerHealth, ServerStatus};
-pub use parallel::ParallelStrategy;
 pub use pool::{PoolGroupEntry, PoolManager};
 pub use strategy::{Strategy, UpstreamResult};
 pub use upstream_health_adapter::UpstreamHealthAdapter;

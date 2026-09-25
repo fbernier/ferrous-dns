@@ -6,9 +6,9 @@
 //! 2026-10-11.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ferrous_dns_domain::{RecordType, UpstreamPool, UpstreamStrategy};
+use ferrous_dns_domain::{DnssecStatus, UpstreamPool, UpstreamStrategy};
 use ferrous_dns_infrastructure::dns::dnssec::{
-    ChainVerifier, DnskeyRecord, DnssecCache, TrustAnchorKey, TrustAnchorStore, ValidationResult,
+    ChainVerifier, DnskeyRecord, DnssecCache, TrustAnchorKey, TrustAnchorStore,
 };
 use ferrous_dns_infrastructure::dns::PoolManager;
 use std::str::FromStr;
@@ -263,6 +263,7 @@ async fn live_root_chain_verifier() -> ChainVerifier {
         pool_manager,
         TrustAnchorStore::new(),
         Arc::new(DnssecCache::new()),
+        5000,
     )
 }
 
@@ -274,11 +275,8 @@ async fn live_root_chain_verifier() -> ChainVerifier {
 async fn live_embedded_anchors_bootstrap_the_root() {
     let mut verifier = live_root_chain_verifier().await;
 
-    let result = verifier
-        .verify_chain(".", RecordType::DNSKEY)
-        .await
-        .unwrap();
-    assert_eq!(result, ValidationResult::Secure);
+    let result = verifier.verify_chain(".").await;
+    assert_eq!(result, DnssecStatus::Secure);
 
     let root_keys = verifier
         .get_zone_keys(".")

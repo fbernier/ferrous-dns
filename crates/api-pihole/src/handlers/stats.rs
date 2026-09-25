@@ -2,6 +2,7 @@ use axum::extract::{Query, State};
 use axum::Json;
 use chrono::{Timelike, Utc};
 use ferrous_dns_application::ports::TimeGranularity;
+use ferrous_dns_domain::DomainError;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -21,8 +22,9 @@ pub const TOP_ITEMS_LIMIT: u32 = 25;
 
 const RECENT_BLOCKED_SCAN_LIMIT: u32 = 200;
 
-/// Known internal source_stats keys that are not upstream servers.
-const INTERNAL_SOURCE_KEYS: &[&str] = &["cache", "local_dns", "blocked", "safe_search"];
+/// Longest `from` window honoured: past any retention, and small enough that
+/// the repository's hours-to-timestamp arithmetic cannot overflow.
+const MAX_PERIOD_HOURS: f32 = 24.0 * 366.0 * 10.0;
 
 /// Query parameters for database endpoints (`/stats/database/*`).
 #[derive(Debug, Deserialize)]
@@ -34,7 +36,10 @@ pub struct DatabaseQueryParams {
 
 impl DatabaseQueryParams {
     pub(crate) fn period(&self) -> f32 {
-        self.from.unwrap_or(STATS_PERIOD_HOURS)
+        match self.from {
+            Some(hours) if hours.is_finite() => hours.clamp(0.0, MAX_PERIOD_HOURS),
+            _ => STATS_PERIOD_HOURS,
+        }
     }
 
     pub(crate) fn limit(&self) -> u32 {
@@ -73,7 +78,8 @@ pub async fn get_summary(
     };
 
     let cache_hits = stats.source_stats.get("cache").copied().unwrap_or(0);
-    let forwarded = total.saturating_sub(blocked).saturating_sub(cache_hits);
+    // Only upstream answers are forwarded; local records and failures are not.
+    let forwarded = forwarded_count(&stats.source_stats);
 
     let query_types: HashMap<String, u64> = stats
         .queries_by_type
@@ -88,22 +94,18 @@ pub async fn get_summary(
             total,
             blocked,
             percent_blocked,
-            // TODO: implement unique domain count via dedicated query
             unique_domains: 0,
             forwarded,
             cached: cache_hits,
-            // TODO: compute queries-per-second from uptime + total
             frequency: 0.0,
             types: query_types,
         },
         clients: ClientSummary {
             active: stats.unique_clients,
-            // TODO: distinguish total (all-time) from active (period) clients
             total: stats.unique_clients,
         },
         gravity: GravitySummary {
             domains_being_blocked,
-            // TODO: populate from blocklist last-sync timestamp
             last_update: 0,
         },
         status: if state.blocking.block_filter_engine.is_blocking_enabled() {
@@ -136,12 +138,11 @@ pub async fn get_history(
     State(state): State<PiholeAppState>,
     Query(params): Query<DatabaseQueryParams>,
 ) -> Result<Json<HistoryResponse>, PiholeApiError> {
-    // Glance requires exactly 145 ten-minute buckets covering ~24h of data.
     const BUCKET_COUNT: usize = 145;
     const BUCKET_MINUTES: i64 = 10;
 
     // Fetch slightly more than 24h to cover all 145 buckets regardless of alignment.
-    let period_hours = params.from.unwrap_or(25.0) as u32;
+    let period_hours = params.from.unwrap_or(25.0);
     let buckets = state
         .query
         .get_timeline
@@ -154,8 +155,7 @@ pub async fn get_history(
         .map(|b| (b.timestamp, (b.total, b.blocked, b.unblocked)))
         .collect();
 
-    // Generate the grid of 145 timestamps aligned to 10-minute boundaries.
-    // The grid ends at the current 10-minute boundary (exclusive of partial bucket).
+    // The newest bucket starts at the current 10-minute boundary.
     let now = Utc::now();
     let current_minute = (now.minute() / BUCKET_MINUTES as u32) * BUCKET_MINUTES as u32;
     let grid_end = now
@@ -203,25 +203,47 @@ pub async fn get_top_blocked(
     State(state): State<PiholeAppState>,
     Query(params): Query<DatabaseQueryParams>,
 ) -> Result<Json<TopDomainsResponse>, PiholeApiError> {
+    Ok(Json(top_domains(&state, &params, true).await?))
+}
+
+async fn top_domains(
+    state: &PiholeAppState,
+    params: &DatabaseQueryParams,
+    blocked: bool,
+) -> Result<TopDomainsResponse, DomainError> {
     let period = params.period();
     let limit = params.limit();
 
-    let (domains_raw, stats) = tokio::join!(
-        state.query.get_top_blocked_domains.execute(limit, period),
+    let (domain_list, stats) = tokio::join!(
+        async {
+            if blocked {
+                state
+                    .query
+                    .get_top_blocked_domains
+                    .execute(limit, period)
+                    .await
+            } else {
+                state
+                    .query
+                    .get_top_allowed_domains
+                    .execute(limit, period)
+                    .await
+            }
+        },
         state.query.get_stats.execute(period),
     );
 
-    let domains = domains_raw?
+    let domains = domain_list?
         .into_iter()
         .map(|(domain, count)| TopDomainEntry { domain, count })
         .collect();
     let stats = stats?;
 
-    Ok(Json(TopDomainsResponse {
+    Ok(TopDomainsResponse {
         domains,
         total_queries: stats.queries_total,
         blocked_queries: stats.queries_blocked,
-    }))
+    })
 }
 
 /// Pi-hole v6 GET /api/stats/top_clients
@@ -326,46 +348,13 @@ pub async fn get_top_domains(
     State(state): State<PiholeAppState>,
     Query(params): Query<DatabaseQueryParams>,
 ) -> Result<Json<TopDomainsResponse>, PiholeApiError> {
-    let period = params.period();
-    let limit = params.limit();
-    let is_blocked = params.blocked.unwrap_or(false);
-
-    let (domain_list, stats) = tokio::join!(
-        async {
-            if is_blocked {
-                state
-                    .query
-                    .get_top_blocked_domains
-                    .execute(limit, period)
-                    .await
-            } else {
-                state
-                    .query
-                    .get_top_allowed_domains
-                    .execute(limit, period)
-                    .await
-            }
-        },
-        state.query.get_stats.execute(period),
-    );
-
-    let domains = domain_list?
-        .into_iter()
-        .map(|(domain, count)| TopDomainEntry { domain, count })
-        .collect();
-    let stats = stats?;
-
-    Ok(Json(TopDomainsResponse {
-        domains,
-        total_queries: stats.queries_total,
-        blocked_queries: stats.queries_blocked,
-    }))
+    let blocked = params.blocked.unwrap_or(false);
+    Ok(Json(top_domains(&state, &params, blocked).await?))
 }
 
 /// Pi-hole v6 GET /api/stats/upstreams
 ///
 /// Returns upstream DNS server usage statistics.
-/// Upstream keys are identified by exclusion of known internal source names.
 #[utoipa::path(
     get,
     path = "/stats/upstreams",
@@ -386,9 +375,8 @@ pub async fn get_upstreams(
 
     let upstreams: HashMap<String, u64> = stats
         .source_stats
-        .iter()
-        .filter(|(key, _)| !INTERNAL_SOURCE_KEYS.contains(&key.as_str()))
-        .map(|(key, count)| (key.clone(), *count))
+        .into_iter()
+        .filter(|(key, _)| is_upstream_key(key))
         .collect();
 
     let forwarded_queries: u64 = upstreams.values().sum();
@@ -403,8 +391,6 @@ pub async fn get_upstreams(
 /// Pi-hole v6 GET /api/stats/recent_blocked
 ///
 /// Returns the most recently blocked domain.
-// TODO: replace with a dedicated use case (GetMostRecentBlockedUseCase)
-// using `WHERE blocked = 1 ORDER BY timestamp DESC LIMIT 1` in the repository
 #[utoipa::path(
     get,
     path = "/stats/recent_blocked",
@@ -429,4 +415,18 @@ pub async fn get_recent_blocked(
         .map(|q| q.domain.to_string());
 
     Ok(Json(RecentBlockedResponse { domain }))
+}
+
+/// `source_stats` keys upstreams as `"{pool}:{server}"`; the other keys
+/// (`cache`, `local_dns`, block sources) never contain a colon.
+fn is_upstream_key(key: &str) -> bool {
+    key.contains(':')
+}
+
+fn forwarded_count(source_stats: &HashMap<String, u64>) -> u64 {
+    source_stats
+        .iter()
+        .filter(|(key, _)| is_upstream_key(key))
+        .map(|(_, count)| count)
+        .sum()
 }

@@ -1,3 +1,4 @@
+use crate::use_cases::groups::require_group;
 use ferrous_dns_domain::{BlockedService, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -43,10 +44,7 @@ impl BlockServiceUseCase {
             .get_by_id(service_id)
             .ok_or_else(|| DomainError::ServiceNotFoundInCatalog(service_id.to_string()))?;
 
-        self.group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        require_group(self.group_repo.as_ref(), group_id).await?;
 
         let blocked = self
             .blocked_service_repo

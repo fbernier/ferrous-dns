@@ -1,7 +1,5 @@
 use axum::extract::State;
 use axum::Json;
-use ferrous_dns_domain::Config;
-use tracing::info;
 
 use crate::{dto::action::ActionResponse, errors::PiholeApiError, state::PiholeAppState};
 
@@ -28,8 +26,8 @@ pub async fn gravity(
 
 /// Pi-hole v6 POST /api/action/restartdns — reload configuration.
 ///
-/// Re-reads the config file from disk and updates the shared config.
-/// No process restart is needed — Ferrous DNS applies changes in-memory.
+/// Re-reads the config file like `POST /api/config/reload`: command-line
+/// overrides re-applied, upstream pools hot-reloaded. No process restart.
 #[utoipa::path(
     post,
     path = "/action/restartdns",
@@ -43,12 +41,8 @@ pub async fn gravity(
 pub async fn restartdns(
     State(state): State<PiholeAppState>,
 ) -> Result<Json<ActionResponse>, PiholeApiError> {
-    if let Some(ref path) = state.system.config_path {
-        let new_config = Config::load(Some(path.as_ref()), Default::default())
-            .map_err(|e| PiholeApiError(ferrous_dns_domain::DomainError::IoError(e.to_string())))?;
-        let mut config_guard = state.system.config.write().await;
-        *config_guard = new_config;
-        info!("Configuration reloaded from {path}");
+    if let Some(reload) = state.system.reload_config.clone() {
+        reload.execute().await?;
     }
 
     Ok(Json(ActionResponse {

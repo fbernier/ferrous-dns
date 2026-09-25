@@ -32,6 +32,9 @@ impl MfaRepository for NoMfaRepository {
     async fn enable(&self, _u: &str) -> Result<(), DomainError> {
         Ok(())
     }
+    async fn advance_totp_step(&self, _u: &str, _s: u64) -> Result<bool, DomainError> {
+        Ok(true)
+    }
     async fn delete_all(&self, _u: &str) -> Result<(), DomainError> {
         Ok(())
     }
@@ -68,7 +71,7 @@ impl MfaRepository for NoMfaRepository {
     ) -> Result<Option<WebauthnCredential>, DomainError> {
         Ok(None)
     }
-    async fn update_credential_counter(&self, _c: &str, _n: i64) -> Result<(), DomainError> {
+    async fn update_credential(&self, _c: &str, _n: i64, _p: &str) -> Result<(), DomainError> {
         Ok(())
     }
     async fn delete_credential(&self, _id: i64, _u: &str) -> Result<(), DomainError> {
@@ -171,6 +174,16 @@ impl SessionRepository for InMemorySessionRepository {
     }
     async fn delete_expired(&self) -> Result<u64, DomainError> {
         Ok(0)
+    }
+    async fn delete_other_sessions(
+        &self,
+        username: &str,
+        keep_id: &str,
+    ) -> Result<u64, DomainError> {
+        let mut sessions = self.sessions.lock().await;
+        let before = sessions.len();
+        sessions.retain(|s| s.username.as_ref() != username || s.id.as_ref() == keep_id);
+        Ok((before - sessions.len()) as u64)
     }
     async fn get_all_active(&self) -> Result<Vec<AuthSession>, DomainError> {
         Ok(self.sessions.lock().await.clone())
@@ -336,6 +349,39 @@ async fn login_with_correct_password_creates_session() {
     assert_eq!(stored[0].id, session.id);
 }
 
+/// A session TTL chrono cannot add to now refuses the login; it used to panic
+/// the server (release builds abort on panic).
+#[tokio::test]
+async fn login_with_an_unrepresentable_session_ttl_fails_without_panicking() {
+    let session_repo: Arc<dyn SessionRepository> = Arc::new(InMemorySessionRepository::new());
+    let login_uc = LoginUseCase::new(
+        Arc::new(TestUserProvider {
+            admin: make_admin_user("$hashed$"),
+        }),
+        session_repo.clone(),
+        Arc::new(TestPasswordHasher),
+        no_mfa(),
+        Arc::new(AuthConfig {
+            session_ttl_hours: u32::MAX,
+            ..AuthConfig::default()
+        }),
+    );
+
+    let result = login_uc
+        .execute(
+            "admin",
+            "correct-password",
+            false,
+            PEER,
+            "127.0.0.1",
+            "agent",
+        )
+        .await;
+
+    assert!(matches!(result, Err(DomainError::ConfigError(_))));
+    assert!(session_repo.get_all_active().await.unwrap().is_empty());
+}
+
 /// Login with wrong password returns InvalidCredentials.
 #[tokio::test]
 async fn login_with_wrong_password_fails() {
@@ -474,6 +520,9 @@ impl MfaRepository for TotpEnrolledMfaRepository {
     async fn enable(&self, _u: &str) -> Result<(), DomainError> {
         Ok(())
     }
+    async fn advance_totp_step(&self, _u: &str, _s: u64) -> Result<bool, DomainError> {
+        Ok(true)
+    }
     async fn delete_all(&self, _u: &str) -> Result<(), DomainError> {
         Ok(())
     }
@@ -531,7 +580,7 @@ impl MfaRepository for TotpEnrolledMfaRepository {
     ) -> Result<Option<WebauthnCredential>, DomainError> {
         Ok(None)
     }
-    async fn update_credential_counter(&self, _c: &str, _n: i64) -> Result<(), DomainError> {
+    async fn update_credential(&self, _c: &str, _n: i64, _p: &str) -> Result<(), DomainError> {
         Ok(())
     }
     async fn delete_credential(&self, _id: i64, _u: &str) -> Result<(), DomainError> {
@@ -555,8 +604,8 @@ impl ferrous_dns_application::ports::TotpService for FixedTotpService {
     fn qr_svg(&self, _u: &str) -> Result<String, DomainError> {
         Ok("<svg/>".to_string())
     }
-    fn verify(&self, _secret: &str, code: &str) -> Result<bool, DomainError> {
-        Ok(code == "123456")
+    fn verify(&self, _secret: &str, code: &str) -> Result<Option<u64>, DomainError> {
+        Ok((code == "123456").then_some(1))
     }
 }
 
@@ -607,7 +656,7 @@ async fn totp_enrolled_login_accepts_totp_and_single_use_recovery_codes() {
             challenge_token,
             methods,
         } => {
-            assert!(methods.contains(&"totp"));
+            assert!(methods.contains(&MfaMethod::Totp));
             challenge_token
         }
         LoginOutcome::Authenticated(_) => panic!("expected MfaRequired"),
@@ -830,6 +879,7 @@ impl WebauthnService for UnconfiguredWebauthnService {
         &self,
         _r: serde_json::Value,
         _s: &str,
+        _p: &[String],
     ) -> Result<AuthenticatedCredential, DomainError> {
         Err(DomainError::WebauthnNotConfigured)
     }
@@ -897,6 +947,7 @@ impl WebauthnService for DiscoverableOkWebauthnService {
         &self,
         _r: serde_json::Value,
         _s: &str,
+        _p: &[String],
     ) -> Result<AuthenticatedCredential, DomainError> {
         Err(DomainError::WebauthnNotConfigured)
     }
@@ -915,6 +966,7 @@ impl WebauthnService for DiscoverableOkWebauthnService {
         Ok(AuthenticatedCredential {
             credential_id: "cred-1".to_string(),
             sign_count: 99,
+            passkey_json: "{}".to_string(),
         })
     }
 }
@@ -936,6 +988,9 @@ impl MfaRepository for DiscoverableMfaRepo {
     }
     async fn enable(&self, _u: &str) -> Result<(), DomainError> {
         Ok(())
+    }
+    async fn advance_totp_step(&self, _u: &str, _s: u64) -> Result<bool, DomainError> {
+        Ok(true)
     }
     async fn delete_all(&self, _u: &str) -> Result<(), DomainError> {
         Ok(())
@@ -989,7 +1044,7 @@ impl MfaRepository for DiscoverableMfaRepo {
             last_used_at: None,
         }))
     }
-    async fn update_credential_counter(&self, _c: &str, n: i64) -> Result<(), DomainError> {
+    async fn update_credential(&self, _c: &str, n: i64, _p: &str) -> Result<(), DomainError> {
         self.persisted_count
             .store(n, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -1096,15 +1151,4 @@ async fn discoverable_passkey_login_rejected_when_webauthn_not_configured() {
         Err(other) => panic!("expected WebauthnNotConfigured, got {other:?}"),
         Ok(_) => panic!("discoverable login must not start when WebAuthn is unconfigured"),
     }
-}
-
-/// Constant-time comparison works correctly (uses subtle crate directly).
-#[test]
-fn timing_safe_eq_basic_correctness() {
-    use subtle::ConstantTimeEq;
-    let eq = |a: &[u8], b: &[u8]| -> bool { a.ct_eq(b).into() };
-    assert!(eq(b"token123", b"token123"));
-    assert!(!eq(b"token123", b"token456"));
-    assert!(!eq(b"short", b"longer-value"));
-    assert!(eq(b"", b""));
 }

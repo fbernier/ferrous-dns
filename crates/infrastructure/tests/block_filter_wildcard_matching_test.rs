@@ -116,11 +116,10 @@ async fn build_engine(
 
     if let Some(list_url) = source_url {
         sqlx::query(
-            "INSERT INTO blocklist_sources (name, url, group_id, enabled)
-             VALUES ('regression-fixture', ?, ?, 1)",
+            "INSERT INTO blocklist_sources (name, url, enabled)
+             VALUES ('regression-fixture', ?, 1)",
         )
         .bind(list_url)
-        .bind(DEFAULT_GROUP_ID)
         .execute(&pool)
         .await
         .expect("seed blocklist source");

@@ -3,14 +3,15 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use ferrous_dns_domain::{DomainAction, DomainError};
+use ferrous_dns_application::ports::ManagedDomainUpdate;
+use ferrous_dns_domain::DomainError;
 use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     dto::{
-        CreateManagedDomainRequest, ManagedDomainQuery, ManagedDomainResponse,
-        PaginatedManagedDomains, UpdateManagedDomainRequest,
+        managed_domain::parse_action, CreateManagedDomainRequest, ManagedDomainQuery,
+        ManagedDomainResponse, PaginatedManagedDomains, UpdateManagedDomainRequest,
     },
     errors::ApiError,
     state::AppState,
@@ -80,12 +81,7 @@ async fn get_managed_domain_by_id(
         .get_managed_domains
         .get_by_id(id)
         .await?
-        .ok_or_else(|| {
-            ApiError(DomainError::NotFound(format!(
-                "Managed domain {} not found",
-                id
-            )))
-        })?;
+        .ok_or(ApiError(DomainError::ManagedDomainNotFound(id)))?;
     Ok(Json(ManagedDomainResponse::from_domain(domain)))
 }
 
@@ -104,12 +100,7 @@ async fn create_managed_domain(
     State(state): State<AppState>,
     Json(req): Json<CreateManagedDomainRequest>,
 ) -> Result<(StatusCode, Json<ManagedDomainResponse>), ApiError> {
-    let action = req.action.parse::<DomainAction>().ok().ok_or_else(|| {
-        ApiError(DomainError::InvalidDomainName(format!(
-            "Invalid action '{}': must be 'allow' or 'deny'",
-            req.action
-        )))
-    })?;
+    let action = parse_action(&req.action)?;
 
     let group_id = req.group_id.unwrap_or(1);
     let enabled = req.enabled.unwrap_or(true);
@@ -143,27 +134,21 @@ async fn update_managed_domain(
     Path(id): Path<i64>,
     Json(req): Json<UpdateManagedDomainRequest>,
 ) -> Result<Json<ManagedDomainResponse>, ApiError> {
-    let action = match req.action {
-        Some(ref s) => Some(s.parse::<DomainAction>().ok().ok_or_else(|| {
-            ApiError(DomainError::InvalidDomainName(format!(
-                "Invalid action '{}': must be 'allow' or 'deny'",
-                s
-            )))
-        })?),
-        None => None,
-    };
+    let action = req.action.as_deref().map(parse_action).transpose()?;
 
     let domain = state
         .blocking
         .update_managed_domain
         .execute(
             id,
-            req.name,
-            req.domain,
-            action,
-            req.group_id,
-            req.comment,
-            req.enabled,
+            ManagedDomainUpdate {
+                name: req.name,
+                domain: req.domain,
+                action,
+                group_id: req.group_id,
+                comment: req.comment,
+                enabled: req.enabled,
+            },
         )
         .await?;
 

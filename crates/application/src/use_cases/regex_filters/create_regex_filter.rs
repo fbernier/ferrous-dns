@@ -1,3 +1,5 @@
+use crate::use_cases::groups::require_group;
+use ferrous_dns_domain::value_objects::validators::validate_comment;
 use ferrous_dns_domain::{DomainAction, DomainError, RegexFilter};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -35,13 +37,9 @@ impl CreateRegexFilterUseCase {
     ) -> Result<RegexFilter, DomainError> {
         RegexFilter::validate_name(&name).map_err(DomainError::InvalidRegexFilter)?;
         RegexFilter::validate_pattern(&pattern).map_err(DomainError::InvalidRegexFilter)?;
-        RegexFilter::validate_comment(&comment.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidRegexFilter)?;
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidRegexFilter)?;
 
-        self.group_repo
-            .get_by_id(group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound(group_id))?;
+        require_group(self.group_repo.as_ref(), group_id).await?;
 
         let filter = self
             .repo

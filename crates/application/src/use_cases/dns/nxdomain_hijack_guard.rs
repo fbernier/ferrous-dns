@@ -21,7 +21,6 @@ impl NxdomainHijackGuard {
         }
     }
 
-    /// Creates a disabled guard that never blocks.
     pub(super) fn disabled() -> Self {
         Self {
             action: NxdomainHijackAction::Block,
@@ -29,7 +28,6 @@ impl NxdomainHijackGuard {
         }
     }
 
-    /// Returns the configured action for detected hijacks.
     pub(super) fn action(&self) -> NxdomainHijackAction {
         self.action
     }
@@ -70,6 +68,7 @@ mod tests {
             addresses: Arc::new(ips),
             cache_hit: false,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: None,
             cname_chain: Arc::from([]),
             upstream_server: None,

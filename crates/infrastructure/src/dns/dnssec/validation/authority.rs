@@ -10,13 +10,13 @@
 //! only need a way to look up the DNSKEYs of an already-validated zone, which
 //! they pass in as [`KeyLookup`].
 
-use super::super::crypto::SignatureVerifier;
+use super::super::crypto;
 use super::super::types::{DnskeyRecord, RrsigRecord};
 use super::denial::{VerifiedNsec, VerifiedNsec3};
-use crate::dns::forwarding::record_type_map::RecordTypeMapper;
 use hickory_proto::dnssec::rdata::DNSSECRData;
 use hickory_proto::rr::domain::Label;
 use hickory_proto::rr::{Name, RData, Record};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -24,6 +24,23 @@ use tracing::debug;
 /// chain of trust. Returning `None` means "no authenticated keys for this zone",
 /// which makes every RRSIG naming it unverifiable.
 pub type KeyLookup<'a> = &'a dyn Fn(&str) -> Option<Arc<[DnskeyRecord]>>;
+
+/// Current UNIX time in seconds, truncated to `u32` (the RRSIG serial-number domain).
+pub(crate) fn now_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
+/// Builds an FQDN (trailing dot) hickory [`Name`], or `None` on parse error.
+pub(crate) fn to_fqdn(domain: &str) -> Option<Name> {
+    if domain.ends_with('.') {
+        Name::from_str(domain).ok()
+    } else {
+        Name::from_str(&format!("{domain}.")).ok()
+    }
+}
 
 /// True when `zone` is `qname` itself or one of its ancestors, i.e. `zone`
 /// encloses `qname`. Label comparison is the DNS-canonical (case-folded)
@@ -49,7 +66,6 @@ pub fn rrset_is_authentic(
     rtype: hickory_proto::rr::RecordType,
     rrset: &[Record],
     sigs: &[Record],
-    crypto: &SignatureVerifier,
     now_secs: u32,
     key_lookup: KeyLookup<'_>,
 ) -> bool {
@@ -78,26 +94,15 @@ pub fn rrset_is_authentic(
             outcome = "signer-not-enclosing";
             continue;
         }
-        let Some(type_covered) = RecordTypeMapper::from_hickory(input.type_covered) else {
+        let Some(rr) = RrsigRecord::from_hickory(rrsig) else {
             continue;
-        };
-        let rr = RrsigRecord {
-            type_covered,
-            algorithm: u8::from(input.algorithm),
-            labels: input.num_labels,
-            original_ttl: input.original_ttl,
-            signature_expiration: input.sig_expiration.get(),
-            signature_inception: input.sig_inception.get(),
-            key_tag: input.key_tag,
-            signer_name: input.signer_name.to_string(),
-            signature: rrsig.sig().to_vec(),
         };
         let Some(keys) = key_lookup(&rr.signer_name) else {
             outcome = "no-keys";
             continue;
         };
         for key in keys.iter() {
-            match crypto.verify_rrsig_with_name(&rr, key, owner, rrset, now_secs) {
+            match crypto::verify_rrsig_with_name(&rr, key, owner, rrset, now_secs) {
                 Ok(true) => return true,
                 Ok(false) => outcome = "sig-false",
                 Err(_) => outcome = "sig-err",
@@ -112,7 +117,6 @@ pub fn rrset_is_authentic(
 /// authority section.
 pub fn collect_verified_denial<'a>(
     authority: &'a [Record],
-    crypto: &SignatureVerifier,
     now_secs: u32,
     key_lookup: KeyLookup<'_>,
 ) -> (Vec<VerifiedNsec3<'a>>, Vec<VerifiedNsec<'a>>) {
@@ -127,7 +131,6 @@ pub fn collect_verified_denial<'a>(
                     record.record_type(),
                     std::slice::from_ref(record),
                     authority,
-                    crypto,
                     now_secs,
                     key_lookup,
                 ) =>
@@ -150,7 +153,6 @@ pub fn collect_verified_denial<'a>(
                     record.record_type(),
                     std::slice::from_ref(record),
                     authority,
-                    crypto,
                     now_secs,
                     key_lookup,
                 ) =>

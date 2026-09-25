@@ -4,7 +4,7 @@ use ferrous_dns_infrastructure::dns::{HealthChecker, PoolManager};
 use std::sync::Arc;
 use tracing::info;
 
-pub(super) fn setup_health_checker(config: &Config) -> Option<Arc<HealthChecker>> {
+pub(super) fn setup_health_checker(config: &Config) -> Arc<HealthChecker> {
     let checker = Arc::new(HealthChecker::new(
         config.dns.health_check.failure_threshold,
         config.dns.health_check.success_threshold,
@@ -14,12 +14,12 @@ pub(super) fn setup_health_checker(config: &Config) -> Option<Arc<HealthChecker>
         timeout_ms = config.dns.health_check.timeout,
         "Health checker enabled"
     );
-    Some(checker)
+    checker
 }
 
 /// Anti-spoofing hardening for upstream A/AAAA queries. DNS Cookies are always
 /// on (graceful); 0x20 case randomization follows the config flag.
-pub(super) fn hardening_opts(config: &Config) -> HardeningOpts {
+fn hardening_opts(config: &Config) -> HardeningOpts {
     HardeningOpts {
         cookie: true,
         qname_0x20: config.dns.qname_case_randomization,
@@ -28,41 +28,38 @@ pub(super) fn hardening_opts(config: &Config) -> HardeningOpts {
 
 pub(super) async fn setup_pool_manager(
     config: &Config,
-    health_checker: Option<Arc<HealthChecker>>,
+    health_checker: &Arc<HealthChecker>,
 ) -> anyhow::Result<Arc<PoolManager>> {
     Ok(Arc::new(
-        PoolManager::new(config.dns.pools.clone(), health_checker)
+        PoolManager::new(config.dns.pools.clone(), Some(Arc::clone(health_checker)))
             .await?
             .with_hardening(hardening_opts(config)),
     ))
 }
 
 pub(super) fn start_health_checker_task(
-    health_checker: Option<Arc<HealthChecker>>,
+    checker: Arc<HealthChecker>,
     pool_manager: &Arc<PoolManager>,
     config: &Config,
 ) {
-    if let Some(checker) = health_checker {
-        // Weak ref so the probe loop reads the live pool set each tick (picking up
-        // hot reloads) without forming an Arc cycle with the PoolManager.
-        let pm_weak = Arc::downgrade(pool_manager);
-        let checker_clone = checker.clone();
-        let interval = config.dns.health_check.interval;
-        let timeout = config.dns.health_check.timeout;
-        tokio::spawn(async move {
-            checker_clone
-                .run(
-                    move || {
-                        pm_weak
-                            .upgrade()
-                            .map(|pm| pm.get_all_arc_protocols())
-                            .unwrap_or_default()
-                    },
-                    interval,
-                    timeout,
-                )
-                .await;
-        });
-        info!("Health checker background task started");
-    }
+    // Weak ref so the probe loop reads the live pool set each tick (picking up
+    // hot reloads) without forming an Arc cycle with the PoolManager.
+    let pm_weak = Arc::downgrade(pool_manager);
+    let interval = config.dns.health_check.interval;
+    let timeout = config.dns.health_check.timeout;
+    tokio::spawn(async move {
+        checker
+            .run(
+                move || {
+                    pm_weak
+                        .upgrade()
+                        .map(|pm| pm.get_all_arc_protocols())
+                        .unwrap_or_default()
+                },
+                interval,
+                timeout,
+            )
+            .await;
+    });
+    info!("Health checker background task started");
 }

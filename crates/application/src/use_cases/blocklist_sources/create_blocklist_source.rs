@@ -1,4 +1,6 @@
+use crate::use_cases::groups::require_group;
 use async_trait::async_trait;
+use ferrous_dns_domain::value_objects::validators::{validate_comment, validate_url};
 use ferrous_dns_domain::{BlocklistSource, DomainError};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
@@ -10,24 +12,20 @@ use crate::ports::{
 pub struct CreateBlocklistSourceUseCase {
     repo: Arc<dyn BlocklistSourceRepository>,
     group_repo: Arc<dyn GroupRepository>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl CreateBlocklistSourceUseCase {
     pub fn new(
         repo: Arc<dyn BlocklistSourceRepository>,
         group_repo: Arc<dyn GroupRepository>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
         Self {
             repo,
             group_repo,
-            block_filter_engine: None,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
     }
 
     #[instrument(skip(self))]
@@ -41,10 +39,8 @@ impl CreateBlocklistSourceUseCase {
     ) -> Result<BlocklistSource, DomainError> {
         let source = self.persist(name, url, group_ids, comment, enabled).await?;
 
-        if let Some(ref engine) = self.block_filter_engine {
-            if let Err(e) = engine.reload().await {
-                error!(error = %e, "Failed to reload block filter after blocklist source creation");
-            }
+        if let Err(e) = self.block_filter_engine.reload().await {
+            error!(error = %e, "Failed to reload block filter after blocklist source creation");
         }
 
         Ok(source)
@@ -60,17 +56,11 @@ impl CreateBlocklistSourceUseCase {
     ) -> Result<BlocklistSource, DomainError> {
         BlocklistSource::validate_name(&name).map_err(DomainError::InvalidBlocklistSource)?;
 
-        BlocklistSource::validate_url(&url.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidBlocklistSource)?;
-
-        BlocklistSource::validate_comment(&comment.as_deref().map(Arc::from))
-            .map_err(DomainError::InvalidBlocklistSource)?;
+        validate_url(url.as_deref()).map_err(DomainError::InvalidBlocklistSource)?;
+        validate_comment(comment.as_deref()).map_err(DomainError::InvalidBlocklistSource)?;
 
         for &gid in &group_ids {
-            self.group_repo
-                .get_by_id(gid)
-                .await?
-                .ok_or(DomainError::GroupNotFound(gid))?;
+            require_group(self.group_repo.as_ref(), gid).await?;
         }
 
         let source = self

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver};
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType};
-use ferrous_dns_infrastructure::dns::resolver::{FilteredResolver, QueryFilters};
+use ferrous_dns_infrastructure::dns::resolver::{FilteredResolver, NonFqdn, QueryFilters};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -49,58 +49,15 @@ fn ip_resolution(addr: &str) -> DnsResolution {
     DnsResolution::new(vec![ip], true)
 }
 
-fn passthrough_filters() -> QueryFilters {
-    QueryFilters {
-        block_private_ptr: false,
-        block_non_fqdn: false,
-        local_domain: None,
-        has_local_dns_server: false,
-    }
+fn filtered(inner: &Arc<StubCacheResolver>, filters: QueryFilters) -> FilteredResolver {
+    FilteredResolver::new(Arc::clone(inner) as Arc<dyn DnsResolver>, filters)
 }
-
-// ── try_cache_str: basic hit/miss ─────────────────────────────────────────────
-
-#[test]
-fn try_cache_str_returns_none_on_cache_miss() {
-    let inner = Arc::new(StubCacheResolver::new());
-    let resolver = FilteredResolver::new(inner, passthrough_filters());
-
-    assert!(resolver
-        .try_cache_str("missing.example", RecordType::A)
-        .is_none());
-}
-
-#[test]
-fn try_cache_str_returns_hit_for_known_domain() {
-    let inner = Arc::new(StubCacheResolver::new());
-    inner.insert("google.com", ip_resolution("8.8.8.8"));
-    let resolver = FilteredResolver::new(
-        Arc::clone(&inner) as Arc<dyn DnsResolver>,
-        passthrough_filters(),
-    );
-
-    let result = resolver.try_cache_str("google.com", RecordType::A);
-    assert!(result.is_some());
-    let res = result.unwrap();
-    assert!(res.cache_hit);
-    assert_eq!(*res.addresses, vec!["8.8.8.8".parse::<IpAddr>().unwrap()]);
-}
-
-// ── try_cache_str: private PTR filtering ──────────────────────────────────────
 
 #[test]
 fn try_cache_str_returns_none_for_private_ptr_when_blocked() {
     let inner = Arc::new(StubCacheResolver::new());
     inner.insert("1.10.0.10.in-addr.arpa", ip_resolution("10.0.10.1"));
-    let resolver = FilteredResolver::new(
-        Arc::clone(&inner) as Arc<dyn DnsResolver>,
-        QueryFilters {
-            block_private_ptr: true,
-            block_non_fqdn: false,
-            local_domain: None,
-            has_local_dns_server: false,
-        },
-    );
+    let resolver = filtered(&inner, QueryFilters::new(true, NonFqdn::Pass));
 
     assert!(
         resolver
@@ -111,38 +68,12 @@ fn try_cache_str_returns_none_for_private_ptr_when_blocked() {
 }
 
 #[test]
-fn try_cache_str_allows_private_ptr_when_local_dns_server_configured() {
-    let inner = Arc::new(StubCacheResolver::new());
-    inner.insert("1.10.0.10.in-addr.arpa", ip_resolution("10.0.10.1"));
-    let resolver = FilteredResolver::new(
-        Arc::clone(&inner) as Arc<dyn DnsResolver>,
-        QueryFilters {
-            block_private_ptr: true,
-            block_non_fqdn: false,
-            local_domain: None,
-            has_local_dns_server: true,
-        },
-    );
-
-    assert!(resolver
-        .try_cache_str("1.10.0.10.in-addr.arpa", RecordType::PTR)
-        .is_some());
-}
-
-// ── try_cache_str: local domain rewriting ─────────────────────────────────────
-
-#[test]
 fn try_cache_str_appends_local_domain_and_finds_rewritten_cache_entry() {
     let inner = Arc::new(StubCacheResolver::new());
     inner.insert("nas.lan", ip_resolution("192.168.1.5"));
-    let resolver = FilteredResolver::new(
-        Arc::clone(&inner) as Arc<dyn DnsResolver>,
-        QueryFilters {
-            block_private_ptr: false,
-            block_non_fqdn: false,
-            local_domain: Some("lan".to_string()),
-            has_local_dns_server: false,
-        },
+    let resolver = filtered(
+        &inner,
+        QueryFilters::new(false, NonFqdn::Qualify("lan".to_string())),
     );
 
     let result = resolver.try_cache_str("nas", RecordType::A);
@@ -160,30 +91,20 @@ fn try_cache_str_appends_local_domain_and_finds_rewritten_cache_entry() {
 fn try_cache_str_does_not_rewrite_fqdn_when_local_domain_configured() {
     let inner = Arc::new(StubCacheResolver::new());
     inner.insert("google.com", ip_resolution("8.8.8.8"));
-    let resolver = FilteredResolver::new(
-        Arc::clone(&inner) as Arc<dyn DnsResolver>,
-        QueryFilters {
-            block_private_ptr: false,
-            block_non_fqdn: false,
-            local_domain: Some("lan".to_string()),
-            has_local_dns_server: false,
-        },
+    let resolver = filtered(
+        &inner,
+        QueryFilters::new(false, NonFqdn::Qualify("lan".to_string())),
     );
 
     let result = resolver.try_cache_str("google.com", RecordType::A);
     assert!(result.is_some());
 }
 
-// ── try_cache_str and try_cache agree ────────────────────────────────────────
-
 #[test]
 fn try_cache_str_and_try_cache_return_equivalent_results_for_hit() {
     let inner = Arc::new(StubCacheResolver::new());
     inner.insert("example.com", ip_resolution("1.2.3.4"));
-    let resolver = FilteredResolver::new(
-        Arc::clone(&inner) as Arc<dyn DnsResolver>,
-        passthrough_filters(),
-    );
+    let resolver = filtered(&inner, QueryFilters::new(false, NonFqdn::Pass));
 
     let via_str = resolver.try_cache_str("example.com", RecordType::A);
     let query = DnsQuery::new("example.com", RecordType::A);

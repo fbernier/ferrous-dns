@@ -1,35 +1,26 @@
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
 use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Compact tracking key: client subnet hash + apex domain hash.
 ///
 /// Register-sized (16 bytes) for efficient DashMap lookup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TrackingKey {
     pub subnet: u64,
     pub apex_hash: u64,
 }
 
-impl Hash for TrackingKey {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.subnet);
-        state.write_u64(self.apex_hash);
-    }
-}
-
 /// Per-client per-apex-domain statistics for tunneling analysis.
 ///
 /// All fields are atomic for lock-free concurrent updates.
-/// Approximate size: ~80 bytes per entry.
 pub struct ClientApexStats {
     pub query_count: AtomicU32,
     pub unique_subdomain_count: AtomicU32,
     pub txt_query_count: AtomicU32,
     pub nxdomain_count: AtomicU32,
-    pub total_count: AtomicU32,
     pub last_seen_ns: AtomicU64,
     pub window_start_ns: AtomicU64,
     /// 256-bit mini bloom filter for approximate unique subdomain counting.
@@ -43,7 +34,6 @@ impl ClientApexStats {
             unique_subdomain_count: AtomicU32::new(0),
             txt_query_count: AtomicU32::new(0),
             nxdomain_count: AtomicU32::new(0),
-            total_count: AtomicU32::new(0),
             last_seen_ns: AtomicU64::new(now_ns),
             window_start_ns: AtomicU64::new(now_ns),
             mini_bloom: [
@@ -61,7 +51,6 @@ impl ClientApexStats {
         self.unique_subdomain_count.store(0, Ordering::Relaxed);
         self.txt_query_count.store(0, Ordering::Relaxed);
         self.nxdomain_count.store(0, Ordering::Relaxed);
-        self.total_count.store(0, Ordering::Relaxed);
         self.window_start_ns.store(now_ns, Ordering::Relaxed);
         for slot in &self.mini_bloom {
             slot.store(0, Ordering::Relaxed);
@@ -89,32 +78,14 @@ impl ClientApexStats {
 /// Sharded concurrent map for per-client per-apex statistics.
 pub type StatsMap = DashMap<TrackingKey, ClientApexStats, FxBuildHasher>;
 
-/// Creates a new stats map with FxBuildHasher for fast hashing.
-pub fn new_stats_map() -> StatsMap {
-    DashMap::with_hasher(FxBuildHasher)
-}
-
-/// Computes a subnet key from an IP address using the given prefix lengths.
-pub fn subnet_key_from_ip(ip: std::net::IpAddr, v4_prefix: u8, v6_prefix: u8) -> u64 {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let bits = u32::from(v4);
-            let mask = if v4_prefix >= 32 {
-                0
-            } else {
-                u32::MAX << (32 - v4_prefix)
-            };
-            (bits & mask) as u64
-        }
-        std::net::IpAddr::V6(v6) => {
-            let bits = u128::from(v6);
-            let mask = if v6_prefix >= 128 {
-                0
-            } else {
-                u128::MAX << (128 - v6_prefix)
-            };
-            ((bits & mask) >> 64) as u64
-        }
+/// Groups clients by /24 (IPv4) or /48 (IPv6) so one host rotating addresses
+/// inside its allocation is still counted as one client.
+pub fn subnet_key_from_ip(ip: IpAddr) -> u64 {
+    // IPv4-mapped IPv6 (dual-stack sockets) would otherwise collapse every
+    // IPv4 client into the single ::/48 key.
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => u64::from(u32::from(v4) & (u32::MAX << 8)),
+        IpAddr::V6(v6) => ((u128::from(v6) & (u128::MAX << 80)) >> 64) as u64,
     }
 }
 

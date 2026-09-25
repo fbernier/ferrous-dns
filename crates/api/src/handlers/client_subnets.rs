@@ -3,7 +3,9 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use tracing::{debug, error};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::debug;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -31,19 +33,21 @@ async fn get_all_subnets(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ClientSubnetResponse>>, ApiError> {
     let subnets = state.clients.get_client_subnets.get_all().await?;
-    let mut responses = Vec::new();
-    for subnet in subnets {
-        let group_name = state
-            .groups
-            .get_groups
-            .get_by_id(subnet.group_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|g| g.name.to_string());
-
-        responses.push(ClientSubnetResponse::from_subnet(subnet, group_name));
-    }
+    let group_names: HashMap<i64, Arc<str>> = state
+        .groups
+        .get_groups
+        .get_all()
+        .await?
+        .into_iter()
+        .filter_map(|g| Some((g.id?, g.name)))
+        .collect();
+    let responses: Vec<ClientSubnetResponse> = subnets
+        .into_iter()
+        .map(|subnet| {
+            let group_name = group_names.get(&subnet.group_id).map(|n| n.to_string());
+            ClientSubnetResponse::from_subnet(subnet, group_name)
+        })
+        .collect();
     debug!(count = responses.len(), "Subnets retrieved successfully");
     Ok(Json(responses))
 }
@@ -68,10 +72,6 @@ async fn create_subnet(
         .create_client_subnet
         .execute(req.subnet_cidr, req.group_id, req.comment)
         .await?;
-
-    if let Err(e) = state.clients.subnet_matcher.refresh().await {
-        error!(error = %e, "Failed to refresh subnet matcher");
-    }
 
     let group_name = state
         .groups
@@ -104,10 +104,6 @@ async fn delete_subnet(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     state.clients.delete_client_subnet.execute(id).await?;
-
-    if let Err(e) = state.clients.subnet_matcher.refresh().await {
-        error!(error = %e, "Failed to refresh subnet matcher");
-    }
 
     Ok(StatusCode::NO_CONTENT)
 }

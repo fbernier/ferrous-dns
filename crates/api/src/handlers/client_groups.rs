@@ -32,14 +32,5 @@ pub async fn assign_client_to_group(
         .execute(client_id, req.group_id)
         .await?;
 
-    Ok(Json(ClientResponse {
-        id: client.id.unwrap_or(0),
-        ip_address: client.ip_address.to_string(),
-        mac_address: client.mac_address.map(|s| s.to_string()),
-        hostname: client.hostname.map(|s| s.to_string()),
-        first_seen: client.first_seen.unwrap_or_default(),
-        last_seen: client.last_seen.unwrap_or_default(),
-        query_count: client.query_count,
-        group_id: client.group_id,
-    }))
+    Ok(Json(ClientResponse::from(client)))
 }

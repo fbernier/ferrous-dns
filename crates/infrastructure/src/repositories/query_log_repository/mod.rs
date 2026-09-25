@@ -8,10 +8,11 @@ use crate::dns::cache::coarse_clock::coarse_now_secs;
 use crate::drop_counter::DropCounter;
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{
-    PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
+    PageAt, PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
 };
-use ferrous_dns_domain::query_log::{DnssecStats, QueryLogFilter};
+use ferrous_dns_domain::entities::query_log::{DnssecStats, QueryLogFilter};
 use ferrous_dns_domain::{config::DatabaseConfig, DomainError, QueryLog, QueryStats};
+use reader::DomainVerdict;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -113,12 +114,11 @@ impl QueryLogRepository for SqliteQueryLogRepository {
     async fn get_recent_paged(
         &self,
         limit: u32,
-        offset: u32,
+        page: PageAt,
         period_hours: f32,
-        cursor: Option<i64>,
         filter: &QueryLogFilter,
     ) -> Result<PagedQueryResult, DomainError> {
-        reader::get_recent_paged(&self.read_pool, limit, offset, period_hours, cursor, filter).await
+        reader::get_recent_paged(&self.read_pool, limit, page, period_hours, filter).await
     }
 
     async fn get_stats(&self, period_hours: f32) -> Result<QueryStats, DomainError> {
@@ -131,7 +131,7 @@ impl QueryLogRepository for SqliteQueryLogRepository {
 
     async fn get_timeline(
         &self,
-        period_hours: u32,
+        period_hours: f32,
         granularity: TimeGranularity,
     ) -> Result<Vec<TimelineBucket>, DomainError> {
         timeline::get_timeline(&self.read_pool, period_hours, granularity).await
@@ -153,7 +153,7 @@ impl QueryLogRepository for SqliteQueryLogRepository {
         limit: u32,
         period_hours: f32,
     ) -> Result<Vec<(String, u64)>, DomainError> {
-        reader::get_top_blocked_domains(&self.read_pool, limit, period_hours).await
+        reader::get_top_domains(&self.read_pool, DomainVerdict::Blocked, limit, period_hours).await
     }
 
     async fn get_top_allowed_domains(
@@ -161,7 +161,7 @@ impl QueryLogRepository for SqliteQueryLogRepository {
         limit: u32,
         period_hours: f32,
     ) -> Result<Vec<(String, u64)>, DomainError> {
-        reader::get_top_allowed_domains(&self.read_pool, limit, period_hours).await
+        reader::get_top_domains(&self.read_pool, DomainVerdict::Allowed, limit, period_hours).await
     }
 
     async fn get_distinct_recent_domains(
@@ -169,7 +169,7 @@ impl QueryLogRepository for SqliteQueryLogRepository {
         limit: u32,
         period_hours: f32,
     ) -> Result<Vec<(String, u64)>, DomainError> {
-        reader::get_distinct_recent_domains(&self.read_pool, limit, period_hours).await
+        reader::get_top_domains(&self.read_pool, DomainVerdict::Any, limit, period_hours).await
     }
 
     async fn get_top_clients(

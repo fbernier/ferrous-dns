@@ -3,11 +3,9 @@ use crate::ClientProtocol;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-/// RFC 7873 cookie option data (EDNS option code 10).
-///
-/// Contains the client cookie (8 bytes) optionally followed by a server
-/// cookie (8–32 bytes). Maximum total size per RFC 7873 is 40 bytes.
-/// Stored inline on the stack — zero heap allocation.
+/// RFC 7873 cookie option data (EDNS option code 10): an 8-byte client
+/// cookie, optionally followed by an 8–32-byte server cookie. Stored inline,
+/// so it costs no heap allocation.
 #[derive(Debug, Clone, Copy)]
 pub struct EdnsCookie {
     buf: [u8; 40],
@@ -15,37 +13,29 @@ pub struct EdnsCookie {
 }
 
 impl EdnsCookie {
-    /// Creates an `EdnsCookie` from a byte slice.
-    ///
-    /// Silently truncates input longer than 40 bytes; RFC 7873 §4 defines
-    /// that as the maximum. Callers should validate the length before
-    /// interpreting the contents.
-    pub fn from_bytes(data: &[u8]) -> Self {
-        let copy_len = data.len().min(40);
-        let mut buf = [0u8; 40];
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-        Self {
-            buf,
-            len: copy_len as u8,
-        }
+    /// RFC 7873 §5.2.2: any other option length is a FORMERR.
+    #[inline]
+    pub const fn is_valid_len(len: usize) -> bool {
+        matches!(len, 8 | 16..=40)
     }
 
-    /// Returns the raw cookie bytes.
+    /// `None` when `data` has a length RFC 7873 does not allow.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if !Self::is_valid_len(data.len()) {
+            return None;
+        }
+        let mut buf = [0u8; 40];
+        buf[..data.len()].copy_from_slice(data);
+        Some(Self {
+            buf,
+            len: data.len() as u8,
+        })
+    }
+
+    // Tiny accessor read per query from other crates; keep it inlinable there.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
-    }
-
-    /// Returns the number of bytes stored.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    /// Returns `true` when no bytes are stored.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
 
@@ -54,11 +44,8 @@ pub struct DnsRequest {
     pub domain: Arc<str>,
     pub record_type: RecordType,
     pub client_ip: IpAddr,
-    /// Raw bytes from the EDNS OPT option code 10 (DNS Cookie, RFC 7873).
-    /// Contains the client cookie (8 bytes) optionally followed by a server
-    /// cookie (8–32 bytes). Absent when the client sends no OPT record or
-    /// does not include option code 10.
-    /// Stored inline — zero heap allocation.
+    /// The query's EDNS COOKIE option (RFC 7873). Absent when the client sends
+    /// no OPT record or no option code 10.
     pub edns_cookie: Option<EdnsCookie>,
     /// The client's CD (Checking Disabled) header bit (RFC 4035). When `true`,
     /// the client wants to perform its own DNSSEC validation, so the resolver
@@ -81,19 +68,16 @@ impl DnsRequest {
         }
     }
 
-    /// Attaches raw EDNS cookie option data (option code 10) to this request.
-    pub fn with_cookie(mut self, data: &[u8]) -> Self {
-        self.edns_cookie = Some(EdnsCookie::from_bytes(data));
+    pub fn with_cookie(mut self, cookie: EdnsCookie) -> Self {
+        self.edns_cookie = Some(cookie);
         self
     }
 
-    /// Sets the client's CD (Checking Disabled) bit.
     pub fn with_checking_disabled(mut self, cd: bool) -> Self {
         self.checking_disabled = cd;
         self
     }
 
-    /// Records the transport the query arrived on.
     pub fn with_protocol(mut self, protocol: ClientProtocol) -> Self {
         self.protocol = Some(protocol);
         self

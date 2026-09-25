@@ -1,13 +1,14 @@
 use crate::ports::{BlockFilterEnginePort, QueryLogRepository};
 use ferrous_dns_domain::DomainError;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Default corpus size when the caller does not specify one.
 pub const DEFAULT_BACKTEST_LIMIT: u32 = 20_000;
 /// Hard cap on corpus size to bound work and response size.
-pub const MAX_BACKTEST_LIMIT: u32 = 50_000;
+const MAX_BACKTEST_LIMIT: u32 = 50_000;
 /// Max number of affected domains returned as a sample.
-pub const SAMPLE_LIMIT: usize = 100;
+const SAMPLE_LIMIT: usize = 100;
 
 /// Which way the candidate ruleset is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,22 @@ pub enum CandidateAction {
     Deny,
     /// Candidate is an allowlist: measure what it would newly free.
     Allow,
+}
+
+impl FromStr for CandidateAction {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("deny") {
+            Ok(Self::Deny)
+        } else if s.eq_ignore_ascii_case("allow") {
+            Ok(Self::Allow)
+        } else {
+            Err(DomainError::InvalidInput(format!(
+                "invalid action '{s}': must be 'deny' or 'allow'"
+            )))
+        }
+    }
 }
 
 /// Request to simulate a candidate allow/deny ruleset (not yet applied) against
@@ -108,6 +125,11 @@ impl BacktestBlocklistsUseCase {
             .map(|r| r.trim().to_string())
             .filter(|r| !r.is_empty())
             .collect();
+        if list_lines.is_empty() && regexes.is_empty() {
+            return Err(DomainError::InvalidInput(
+                "provide at least one domain/list line or regex".to_string(),
+            ));
+        }
 
         let limit = limit.clamp(1, MAX_BACKTEST_LIMIT);
         let corpus = self

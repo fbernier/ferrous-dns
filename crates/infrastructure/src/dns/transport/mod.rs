@@ -9,14 +9,13 @@ pub mod tls;
 pub mod udp;
 pub mod udp_pool;
 
-use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
-use ferrous_dns_domain::{DnsProtocol, DomainError};
+use ferrous_dns_domain::{DnsProtocol, DomainError, UpstreamAddr};
 use rustc_hash::FxBuildHasher;
+use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-
-pub use udp_pool::{PoolStats, UdpSocketPool};
 
 // RFC 8484 §6 bounds application/dns-message independently of HTTP framing.
 const MAX_DOH_MESSAGE_SIZE: usize = u16::MAX as usize;
@@ -25,24 +24,6 @@ fn doh_response_too_large(url: &str) -> DomainError {
     DomainError::IoError(format!(
         "DoH response from {url} exceeds {MAX_DOH_MESSAGE_SIZE} bytes"
     ))
-}
-
-#[derive(Debug)]
-pub struct TransportResponse {
-    pub bytes: bytes::Bytes,
-
-    pub protocol_used: &'static str,
-}
-
-#[async_trait]
-pub trait DnsTransport: Send + Sync {
-    async fn send(
-        &self,
-        message_bytes: &[u8],
-        timeout: Duration,
-    ) -> Result<TransportResponse, DomainError>;
-
-    fn protocol_name(&self) -> &'static str;
 }
 
 pub enum Transport {
@@ -63,33 +44,18 @@ impl Transport {
         &self,
         message_bytes: &[u8],
         timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
+    ) -> Result<Bytes, DomainError> {
         match self {
-            Self::Udp(t) => DnsTransport::send(t, message_bytes, timeout).await,
-            Self::Tcp(t) => DnsTransport::send(t, message_bytes, timeout).await,
+            Self::Udp(t) => t.send(message_bytes, timeout).await,
+            Self::Tcp(t) => t.send(message_bytes, timeout).await,
             #[cfg(feature = "dns-over-rustls")]
-            Self::Tls(t) => DnsTransport::send(t, message_bytes, timeout).await,
+            Self::Tls(t) => t.send(message_bytes, timeout).await,
             #[cfg(feature = "dns-over-https")]
-            Self::Https(t) => DnsTransport::send(t, message_bytes, timeout).await,
+            Self::Https(t) => t.send(message_bytes, timeout).await,
             #[cfg(feature = "dns-over-h3")]
-            Self::H3(t) => DnsTransport::send(t, message_bytes, timeout).await,
+            Self::H3(t) => t.send(message_bytes, timeout).await,
             #[cfg(feature = "dns-over-quic")]
-            Self::Quic(t) => DnsTransport::send(t, message_bytes, timeout).await,
-        }
-    }
-
-    pub fn protocol_name(&self) -> &'static str {
-        match self {
-            Self::Udp(_) => "UDP",
-            Self::Tcp(_) => "TCP",
-            #[cfg(feature = "dns-over-rustls")]
-            Self::Tls(_) => "TLS",
-            #[cfg(feature = "dns-over-https")]
-            Self::Https(_) => "HTTPS",
-            #[cfg(feature = "dns-over-h3")]
-            Self::H3(_) => "H3",
-            #[cfg(feature = "dns-over-quic")]
-            Self::Quic(_) => "QUIC",
+            Self::Quic(t) => t.send(message_bytes, timeout).await,
         }
     }
 }
@@ -115,31 +81,26 @@ fn create_transport(protocol: &DnsProtocol) -> Result<Transport, DomainError> {
         #[cfg(feature = "dns-over-rustls")]
         DnsProtocol::Tls { addr, hostname } => Ok(Transport::Tls(tls::TlsTransport::new(
             addr.clone(),
-            Arc::clone(hostname),
-        ))),
+            hostname,
+        )?)),
 
         #[cfg(not(feature = "dns-over-rustls"))]
-        DnsProtocol::Tls { addr, .. } => {
-            tracing::warn!("TLS feature not enabled, falling back to TCP for {}", addr);
-            Ok(Transport::Tcp(tcp::TcpTransport::new(addr.clone())))
-        }
+        DnsProtocol::Tls { addr, .. } => Err(feature_disabled("TLS", "dns-over-rustls", addr)),
 
         #[cfg(feature = "dns-over-https")]
         DnsProtocol::Https {
             url,
             hostname,
             resolved_addrs,
+            ..
         } => Ok(Transport::Https(https::HttpsTransport::new(
             url.to_string(),
-            hostname.to_string(),
+            hostname,
             resolved_addrs.clone(),
         ))),
 
         #[cfg(not(feature = "dns-over-https"))]
-        DnsProtocol::Https { url, .. } => Err(DomainError::InvalidDomainName(format!(
-            "HTTPS feature not enabled. Enable 'dns-over-https' feature to use: {}",
-            url
-        ))),
+        DnsProtocol::Https { url, .. } => Err(feature_disabled("HTTPS", "dns-over-https", url)),
 
         #[cfg(feature = "dns-over-quic")]
         DnsProtocol::Quic { addr, hostname } => Ok(Transport::Quic(quic::QuicTransport::new(
@@ -148,25 +109,89 @@ fn create_transport(protocol: &DnsProtocol) -> Result<Transport, DomainError> {
         ))),
 
         #[cfg(not(feature = "dns-over-quic"))]
-        DnsProtocol::Quic { addr, .. } => Err(DomainError::InvalidDomainName(format!(
-            "QUIC feature not enabled. Enable 'dns-over-quic' feature to use: {}",
-            addr
-        ))),
+        DnsProtocol::Quic { addr, .. } => Err(feature_disabled("QUIC", "dns-over-quic", addr)),
 
         #[cfg(feature = "dns-over-h3")]
         DnsProtocol::H3 {
             url,
+            hostname,
+            port,
             resolved_addrs,
-            ..
         } => Ok(Transport::H3(h3::H3Transport::new(
-            url.to_string(),
+            url,
+            hostname,
+            *port,
             resolved_addrs.clone(),
         ))),
 
         #[cfg(not(feature = "dns-over-h3"))]
-        DnsProtocol::H3 { url, .. } => Err(DomainError::InvalidDomainName(format!(
-            "H3 feature not enabled. Enable 'dns-over-h3' feature to use: {}",
-            url
-        ))),
+        DnsProtocol::H3 { url, .. } => Err(feature_disabled("H3", "dns-over-h3", url)),
     }
+}
+
+#[cfg(not(all(
+    feature = "dns-over-rustls",
+    feature = "dns-over-https",
+    feature = "dns-over-quic",
+    feature = "dns-over-h3"
+)))]
+fn feature_disabled(
+    protocol: &str,
+    feature: &str,
+    endpoint: &impl std::fmt::Display,
+) -> DomainError {
+    DomainError::ConfigError(format!(
+        "{protocol} feature not enabled. Enable '{feature}' feature to use: {endpoint}"
+    ))
+}
+
+fn require_resolved(addr: &UpstreamAddr, label: &str) -> Result<SocketAddr, DomainError> {
+    addr.socket_addr().ok_or_else(|| {
+        DomainError::IoError(format!(
+            "{label} transport requires resolved address, got: {addr}"
+        ))
+    })
+}
+
+/// Client TLS for encrypted upstreams: webpki roots and session resumption.
+fn tls_client_config() -> rustls::ClientConfig {
+    // `builder()` needs a process-wide provider; a second install is a harmless error.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    config.resumption = rustls::client::Resumption::in_memory_sessions(64);
+    config
+}
+
+/// A QUIC client endpoint bound to `bind` that negotiates `alpn`.
+#[cfg(any(feature = "dns-over-quic", feature = "dns-over-h3"))]
+fn quic_client_endpoint(bind: SocketAddr, alpn: &[u8]) -> Result<quinn::Endpoint, String> {
+    let mut tls = tls_client_config();
+    tls.alpn_protocols = vec![alpn.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+        .map_err(|e| format!("QUIC TLS config: {e}"))?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport));
+    let mut endpoint = quinn::Endpoint::client(bind)
+        .map_err(|e| format!("QUIC client endpoint on {bind}: {e}"))?;
+    endpoint.set_default_client_config(config);
+    Ok(endpoint)
+}
+
+/// The endpoint of the address family of `addr`, or the error that kept it from binding.
+#[cfg(any(feature = "dns-over-quic", feature = "dns-over-h3"))]
+fn endpoint_for<'a>(
+    addr: &SocketAddr,
+    v4: &'a Result<quinn::Endpoint, String>,
+    v6: &'a Result<quinn::Endpoint, String>,
+) -> Result<&'a quinn::Endpoint, DomainError> {
+    let endpoint = if addr.is_ipv4() { v4 } else { v6 };
+    endpoint
+        .as_ref()
+        .map_err(|e| DomainError::IoError(e.clone()))
 }

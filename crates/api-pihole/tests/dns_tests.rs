@@ -11,7 +11,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn get_blocking_returns_status() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -35,7 +35,7 @@ async fn get_blocking_returns_status() {
 #[tokio::test]
 async fn get_blocking_response_has_timer_field() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
         .oneshot(
@@ -58,78 +58,168 @@ async fn get_blocking_response_has_timer_field() {
     );
 }
 
-#[tokio::test]
-async fn set_blocking_disable_returns_success() {
-    let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
-
+async fn post_blocking(app: &axum::Router, body: &'static str) -> Value {
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/dns/blocking")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"blocking":false}"#))
+                .body(Body::from(body))
                 .expect("request"),
         )
         .await
         .expect("response");
-
     assert_eq!(resp.status(), StatusCode::OK);
-
     let body = resp.into_body().collect().await.expect("body").to_bytes();
-    let json: Value = serde_json::from_slice(&body).expect("json");
+    serde_json::from_slice(&body).expect("json")
+}
 
-    assert!(!json["blocking"].as_bool().unwrap());
+async fn get_status(app: &axum::Router) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dns/blocking")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    serde_json::from_slice(&body).expect("json")
+}
+
+async fn blocking_enabled(app: &axum::Router) -> bool {
+    get_status(app).await["blocking"]
+        .as_bool()
+        .expect("blocking must be a bool")
 }
 
 #[tokio::test]
-async fn set_blocking_enable_returns_success() {
+async fn disabling_blocking_is_applied_to_the_engine() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/dns/blocking")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"blocking":true}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    post_blocking(&app, r#"{"blocking":false}"#).await;
 
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = resp.into_body().collect().await.expect("body").to_bytes();
-    let json: Value = serde_json::from_slice(&body).expect("json");
-
-    assert!(json["blocking"].as_bool().unwrap());
+    assert!(!blocking_enabled(&app).await);
 }
 
 #[tokio::test]
-async fn set_blocking_with_timer_returns_success() {
+async fn enabling_blocking_after_a_disable_is_applied_to_the_engine() {
     let pool = helpers::create_test_db().await;
-    let app = helpers::create_pihole_test_app(pool, None).await;
+    let app = helpers::create_pihole_test_app(pool).await;
+
+    post_blocking(&app, r#"{"blocking":false}"#).await;
+    post_blocking(&app, r#"{"blocking":true}"#).await;
+
+    assert!(blocking_enabled(&app).await);
+}
+
+#[tokio::test]
+async fn disable_with_timer_re_enables_blocking_when_it_expires() {
+    let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
+    tokio::time::pause();
+
+    let reply = post_blocking(&app, r#"{"blocking":false,"timer":60}"#).await;
+    assert_eq!(reply["timer"], 60);
+    // Let the spawned timer task arm its sleep before the clock moves.
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    assert!(
+        !blocking_enabled(&app).await,
+        "still disabled before expiry"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    assert!(blocking_enabled(&app).await, "re-enabled after expiry");
+    assert!(get_status(&app).await["timer"].is_null());
+}
+
+#[tokio::test]
+async fn get_reports_the_seconds_left_on_a_pending_timer() {
+    let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
+    tokio::time::pause();
+
+    post_blocking(&app, r#"{"blocking":false,"timer":60}"#).await;
+    let status = get_status(&app).await;
+    assert_eq!(status["blocking"], false);
+    let left = status["timer"].as_u64().expect("timer must be a number");
+    assert!(
+        (1..=60).contains(&left),
+        "timer {left} must be within (0, 60]"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(20)).await;
+    assert_eq!(get_status(&app).await["timer"], 40);
+}
+
+#[tokio::test]
+async fn enable_with_timer_disables_blocking_when_it_expires() {
+    let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
+    tokio::time::pause();
+
+    post_blocking(&app, r#"{"blocking":false}"#).await;
+    let reply = post_blocking(&app, r#"{"blocking":true,"timer":5}"#).await;
+    assert_eq!(reply["timer"], 5);
+    assert!(
+        blocking_enabled(&app).await,
+        "enabled until the timer fires"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(!blocking_enabled(&app).await, "flipped back after expiry");
+}
+
+#[tokio::test]
+async fn a_new_request_cancels_the_pending_timer() {
+    let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
+    tokio::time::pause();
+
+    post_blocking(&app, r#"{"blocking":false,"timer":60}"#).await;
+    tokio::task::yield_now().await;
+    let reply = post_blocking(&app, r#"{"blocking":false}"#).await;
+    assert!(reply["timer"].is_null());
+    assert!(get_status(&app).await["timer"].is_null());
+
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+    assert!(!blocking_enabled(&app).await);
+}
+
+#[tokio::test]
+async fn an_unrepresentable_timer_is_rejected() {
+    let pool = helpers::create_test_db().await;
+    let app = helpers::create_pihole_test_app(pool).await;
 
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/dns/blocking")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"blocking":false,"timer":60}"#))
+                .body(Body::from(format!(
+                    r#"{{"blocking":false,"timer":{}}}"#,
+                    u64::MAX
+                )))
                 .expect("request"),
         )
         .await
         .expect("response");
 
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = resp.into_body().collect().await.expect("body").to_bytes();
-    let json: Value = serde_json::from_slice(&body).expect("json");
-
-    assert!(!json["blocking"].as_bool().unwrap());
-    assert_eq!(json["timer"].as_u64().unwrap(), 60);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        blocking_enabled(&app).await,
+        "a rejected request changes nothing"
+    );
 }

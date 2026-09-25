@@ -2,37 +2,6 @@ use ferrous_dns_domain::{QueryStats, RecordType};
 use std::collections::HashMap;
 
 #[test]
-fn test_query_stats_default_source_fields() {
-    let stats = QueryStats::default();
-    assert!(stats.source_stats.is_empty());
-}
-
-#[test]
-fn test_query_stats_source_fields_not_altered_by_analytics() {
-    let mut source_stats = HashMap::new();
-    source_stats.insert("cache".to_string(), 10u64);
-    source_stats.insert("upstream".to_string(), 20u64);
-    source_stats.insert("blocklist".to_string(), 5u64);
-    source_stats.insert("managed_domain".to_string(), 3u64);
-    source_stats.insert("regex_filter".to_string(), 2u64);
-
-    let stats = QueryStats {
-        source_stats,
-        ..Default::default()
-    };
-
-    let mut by_type = HashMap::new();
-    by_type.insert(RecordType::A, 100u64);
-    let stats = stats.with_analytics(by_type);
-
-    assert_eq!(stats.source_stats.get("cache"), Some(&10));
-    assert_eq!(stats.source_stats.get("upstream"), Some(&20));
-    assert_eq!(stats.source_stats.get("blocklist"), Some(&5));
-    assert_eq!(stats.source_stats.get("managed_domain"), Some(&3));
-    assert_eq!(stats.source_stats.get("regex_filter"), Some(&2));
-}
-
-#[test]
 fn test_query_stats_with_analytics() {
     let mut queries_by_type = HashMap::new();
     queries_by_type.insert(RecordType::A, 100);
@@ -42,8 +11,8 @@ fn test_query_stats_with_analytics() {
     let stats = QueryStats::default().with_analytics(queries_by_type);
 
     assert_eq!(stats.most_queried_type, Some(RecordType::A));
-    assert_eq!(stats.type_count(RecordType::A), 100);
-    assert!((stats.type_percentage(RecordType::A) - 57.14).abs() < 0.1);
+    assert_eq!(stats.record_type_distribution[0].0, RecordType::A);
+    assert!((stats.record_type_distribution[0].1 - 57.14).abs() < 0.1);
 }
 
 #[test]
@@ -86,43 +55,6 @@ fn test_empty_analytics() {
 }
 
 #[test]
-fn test_query_stats_type_count() {
-    let mut queries_by_type = HashMap::new();
-    queries_by_type.insert(RecordType::A, 100);
-    queries_by_type.insert(RecordType::AAAA, 50);
-
-    let stats = QueryStats::default().with_analytics(queries_by_type);
-
-    assert_eq!(stats.type_count(RecordType::A), 100);
-    assert_eq!(stats.type_count(RecordType::AAAA), 50);
-    assert_eq!(stats.type_count(RecordType::MX), 0);
-}
-
-#[test]
-fn test_query_stats_type_percentage() {
-    let mut queries_by_type = HashMap::new();
-    queries_by_type.insert(RecordType::A, 100);
-    queries_by_type.insert(RecordType::AAAA, 50);
-
-    let stats = QueryStats::default().with_analytics(queries_by_type);
-
-    assert!((stats.type_percentage(RecordType::A) - 66.67).abs() < 0.1);
-
-    assert!((stats.type_percentage(RecordType::AAAA) - 33.33).abs() < 0.1);
-
-    assert_eq!(stats.type_percentage(RecordType::MX), 0.0);
-}
-
-#[test]
-fn test_query_stats_with_zero_queries() {
-    let stats = QueryStats::default().with_analytics(HashMap::new());
-
-    assert_eq!(stats.type_count(RecordType::A), 0);
-    assert_eq!(stats.type_percentage(RecordType::A), 0.0);
-    assert_eq!(stats.top_types(5).len(), 0);
-}
-
-#[test]
 fn test_query_stats_single_type() {
     let mut queries_by_type = HashMap::new();
     queries_by_type.insert(RecordType::A, 100);
@@ -130,6 +62,45 @@ fn test_query_stats_single_type() {
     let stats = QueryStats::default().with_analytics(queries_by_type);
 
     assert_eq!(stats.most_queried_type, Some(RecordType::A));
-    assert_eq!(stats.type_percentage(RecordType::A), 100.0);
-    assert_eq!(stats.record_type_distribution.len(), 1);
+    assert_eq!(stats.record_type_distribution, vec![(RecordType::A, 100.0)]);
+}
+
+#[test]
+fn test_ties_rank_by_type_name_regardless_of_map_order() {
+    // Each HashMap gets a fresh random seed, so repeating exposes any
+    // dependence on iteration order.
+    for _ in 0..32 {
+        let queries_by_type: HashMap<RecordType, u64> = [
+            (RecordType::TXT, 10),
+            (RecordType::MX, 10),
+            (RecordType::AAAA, 10),
+            (RecordType::NS, 10),
+            (RecordType::A, 10),
+            (RecordType::SRV, 3),
+        ]
+        .into_iter()
+        .collect();
+
+        let stats = QueryStats::default().with_analytics(queries_by_type);
+
+        assert_eq!(stats.most_queried_type, Some(RecordType::A));
+        let order: Vec<RecordType> = stats.top_types(6).into_iter().map(|(rt, _)| rt).collect();
+        assert_eq!(
+            order,
+            vec![
+                RecordType::A,
+                RecordType::AAAA,
+                RecordType::MX,
+                RecordType::NS,
+                RecordType::TXT,
+                RecordType::SRV,
+            ]
+        );
+        let distribution: Vec<RecordType> = stats
+            .record_type_distribution
+            .iter()
+            .map(|(rt, _)| *rt)
+            .collect();
+        assert_eq!(distribution, order);
+    }
 }

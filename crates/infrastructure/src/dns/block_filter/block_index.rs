@@ -64,6 +64,7 @@ pub struct RegexRule {
     pub regex: Regex,
 }
 
+#[derive(Default)]
 pub struct AllowlistIndex {
     pub global_exact: DashSet<CompactString, FxBuildHasher>,
     pub global_wildcard: SuffixTrie,
@@ -72,15 +73,6 @@ pub struct AllowlistIndex {
 }
 
 impl AllowlistIndex {
-    pub fn new() -> Self {
-        Self {
-            global_exact: DashSet::with_hasher(FxBuildHasher),
-            global_wildcard: SuffixTrie::new(),
-            group_exact: HashMap::new(),
-            group_wildcard: HashMap::new(),
-        }
-    }
-
     #[inline]
     pub fn is_allowed(&self, domain: &str, group_id: i64) -> bool {
         if let Some(set) = self.group_exact.get(&group_id) {
@@ -100,12 +92,6 @@ impl AllowlistIndex {
             return true;
         }
         false
-    }
-}
-
-impl Default for AllowlistIndex {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -134,9 +120,9 @@ impl BlockIndex {
             total_blocked_domains: 0,
             exact: DashMap::with_hasher(FxBuildHasher),
             bloom: AtomicBloom::new(1000, 0.001),
-            wildcard: SuffixTrie::new(),
+            wildcard: SuffixTrie::default(),
             patterns: Vec::new(),
-            allowlists: AllowlistIndex::new(),
+            allowlists: AllowlistIndex::default(),
             managed_denies: HashMap::new(),
             managed_deny_wildcards: HashMap::new(),
             allow_regex_patterns: HashMap::new(),
@@ -188,12 +174,11 @@ impl BlockIndex {
                 }
             }
 
-            // Deny regexes are hand-written rules, so they have to resolve
-            // ahead of the downloaded lists: a domain that matches both used to
-            // come back as a plain `Block`, which the blocking toggle and any
-            // bypass window would then release despite the manual rule. The
-            // scan is not free, but `evaluate` runs once per domain per group
-            // and is then memoized by the decision cache.
+            // Deny regexes are hand-written rules, so they resolve ahead of
+            // the downloaded lists: a plain `Block` would be released by the
+            // blocking toggle and any bypass window despite the manual rule.
+            // The scan is not free, but `evaluate` runs once per domain per
+            // group and is then memoized by the decision cache.
             if let Some(regexes) = self.block_regex_patterns.get(&group_id) {
                 for rule in regexes {
                     if rule.regex.is_match(domain).unwrap_or(false) {
@@ -206,9 +191,7 @@ impl BlockIndex {
         // The bloom filter is built from exact entries only, so it can vouch
         // for `exact` and nothing else. A miss must NOT short-circuit the whole
         // lookup: suffix (wildcard) and substring rules are keyed on parts of
-        // the name that were never inserted into the filter, so gating them on
-        // it made them unreachable for every domain that was not already an
-        // exact entry.
+        // the name that were never inserted into the filter.
         if self.bloom.check(&domain) {
             if let Some(entry) = self.exact.get(domain) {
                 let matched = entry.value() & mask;
@@ -262,7 +245,7 @@ impl BlockIndex {
     /// Read-only, exhaustive attribution of how the static filter index evaluates
     /// `domain` for `group_id`.
     ///
-    /// Unlike [`BlockIndex::is_blocked`], this collects ALL matching rules (allow
+    /// Unlike [`BlockIndex::evaluate`], this collects ALL matching rules (allow
     /// and block) and resolves them to named sources. It never mutates any cache
     /// and deliberately skips the bloom short-circuit so the result is exhaustive.
     /// Dynamic runtime rules (schedule, CNAME, rebinding, …) are out of scope.

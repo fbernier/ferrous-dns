@@ -1,6 +1,6 @@
+use super::require_resolved;
 use super::udp_pool::UdpSocketPool;
-use super::{DnsTransport, TransportResponse};
-use async_trait::async_trait;
+use bytes::Bytes;
 use ferrous_dns_domain::{DomainError, UpstreamAddr};
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
@@ -12,55 +12,28 @@ use tracing::debug;
 static DEFAULT_UDP_POOL: LazyLock<Arc<UdpSocketPool>> =
     LazyLock::new(|| Arc::new(UdpSocketPool::new(4, 64)));
 
-pub fn validate_response_id(
-    query_bytes: &[u8],
-    response_bytes: &[u8],
-    server: SocketAddr,
-) -> Result<(), DomainError> {
-    if query_bytes.len() < 2 || response_bytes.len() < 2 {
-        return Err(DomainError::IoError(format!(
-            "DNS response from {} is too short to contain a message ID",
-            server
-        )));
-    }
-    let query_id = u16::from_be_bytes([query_bytes[0], query_bytes[1]]);
-    let response_id = u16::from_be_bytes([response_bytes[0], response_bytes[1]]);
-    if query_id != response_id {
-        return Err(DomainError::IoError(format!(
-            "DNS message ID mismatch from {}: expected {}, got {}",
-            server, query_id, response_id
-        )));
-    }
-    Ok(())
-}
-
-fn validate_response_source(from: SocketAddr, expected: SocketAddr) -> Result<(), DomainError> {
-    if from.ip() != expected.ip() {
-        return Err(DomainError::IoError(format!(
-            "UDP response from unexpected source: expected {}, got {}",
-            expected.ip(),
-            from.ip()
-        )));
-    }
-    Ok(())
-}
-
 const MAX_UDP_RESPONSE_SIZE: usize = 4096;
+
+fn same_message_id(query_bytes: &[u8], response_bytes: &[u8]) -> bool {
+    matches!(
+        (query_bytes.get(..2), response_bytes.get(..2)),
+        (Some(query_id), Some(response_id)) if query_id == response_id
+    )
+}
 
 /// Receive datagrams on `socket` until one arrives from the expected server
 /// with the matching DNS message ID, or `deadline` passes.
 ///
 /// The socket comes from a pool and is not connected, so it may deliver a late
 /// response left over from a previous query on it, or a datagram from any
-/// other source. Both checks below reject such datagrams; a rejected datagram
-/// is dropped and the loop keeps waiting until the deadline, since it says
-/// nothing about the query currently in flight.
+/// other source. Both are dropped and the loop keeps waiting until the
+/// deadline, since they say nothing about the query currently in flight.
 async fn recv_matching(
     socket: &UdpSocket,
     query_bytes: &[u8],
     server_addr: SocketAddr,
     deadline: Instant,
-) -> Result<bytes::Bytes, DomainError> {
+) -> Result<Bytes, DomainError> {
     let mut recv_buf = [0u8; MAX_UDP_RESPONSE_SIZE];
 
     loop {
@@ -89,15 +62,19 @@ async fn recv_matching(
                 Ok(Ok(v)) => v,
             };
 
-        if validate_response_source(from_addr, server_addr).is_err() {
+        // Port too: any other socket on the server's host is off-path; canonical IPs absorb v4-mapped peers.
+        if from_addr.ip().to_canonical() != server_addr.ip().to_canonical()
+            || from_addr.port() != server_addr.port()
+        {
             debug!(
                 server = %server_addr,
-                actual = %from_addr.ip(),
+                actual = %from_addr,
                 "Draining UDP datagram from unexpected source (anti-spoofing)"
             );
             continue;
         }
-        if validate_response_id(query_bytes, &recv_buf[..bytes_received], server_addr).is_err() {
+        let response = &recv_buf[..bytes_received];
+        if !same_message_id(query_bytes, response) {
             debug!(
                 server = %server_addr,
                 "Draining stale/duplicate UDP datagram (message ID mismatch)"
@@ -105,126 +82,45 @@ async fn recv_matching(
             continue;
         }
 
-        return Ok(bytes::Bytes::copy_from_slice(&recv_buf[..bytes_received]));
+        return Ok(Bytes::copy_from_slice(response));
     }
 }
 
 pub struct UdpTransport {
     upstream_addr: UpstreamAddr,
-    pool: Option<Arc<UdpSocketPool>>,
+    pool: Arc<UdpSocketPool>,
 }
 
 impl UdpTransport {
     pub fn new(upstream_addr: UpstreamAddr) -> Self {
-        Self {
-            upstream_addr,
-            pool: Some(Arc::clone(&DEFAULT_UDP_POOL)),
-        }
+        Self::with_pool(upstream_addr, Arc::clone(&DEFAULT_UDP_POOL))
     }
 
     pub fn with_pool(upstream_addr: UpstreamAddr, pool: Arc<UdpSocketPool>) -> Self {
         Self {
             upstream_addr,
-            pool: Some(pool),
+            pool,
         }
     }
 
-    fn resolved_addr(&self) -> Result<SocketAddr, DomainError> {
-        self.upstream_addr.socket_addr().ok_or_else(|| {
-            DomainError::IoError(format!(
-                "UDP transport requires resolved address, got: {}",
-                self.upstream_addr
-            ))
-        })
-    }
-
-    async fn send_with_pool(
+    pub async fn send(
         &self,
         message_bytes: &[u8],
         timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
-        let server_addr = self.resolved_addr()?;
+    ) -> Result<Bytes, DomainError> {
+        let server_addr = require_resolved(&self.upstream_addr, "UDP")?;
 
-        if let Some(pool) = &self.pool {
-            // Admission, send, and receive share the caller's single query budget.
-            let deadline = Instant::now() + timeout;
-            let mut pooled = tokio::time::timeout_at(deadline, pool.acquire(server_addr))
-                .await
-                // Local saturation must stay failover-eligible, like any transport timeout.
-                .map_err(|_| DomainError::TransportTimeout {
-                    server: server_addr.to_string(),
-                })?
-                .map_err(|e| DomainError::IoError(format!("Failed to acquire UDP socket: {e}")))?;
-
-            let socket = pooled.socket();
-
-            let bytes_sent =
-                tokio::time::timeout_at(deadline, socket.send_to(message_bytes, server_addr))
-                    .await
-                    .map_err(|_| {
-                        DomainError::IoError(format!(
-                            "Timeout sending UDP query to {}",
-                            server_addr
-                        ))
-                    })?
-                    .map_err(|e| {
-                        DomainError::IoError(format!(
-                            "Failed to send UDP query to {}: {}",
-                            server_addr, e
-                        ))
-                    })?;
-
-            debug!(
-                server = %server_addr,
-                bytes_sent = bytes_sent,
-                pooled = true,
-                "UDP query sent"
-            );
-
-            // On any failure (incl. timeout) the socket may still have our
-            // response in flight, so poison it rather than returning it to the
-            // pool where it would corrupt the next query.
-            let bytes = match recv_matching(socket, message_bytes, server_addr, deadline).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    pooled.poison();
-                    return Err(e);
-                }
-            };
-
-            debug!(
-                server = %server_addr,
-                bytes_received = bytes.len(),
-                pooled = true,
-                "UDP response received"
-            );
-
-            Ok(TransportResponse {
-                bytes,
-                protocol_used: "UDP",
-            })
-        } else {
-            self.send_without_pool(message_bytes, timeout).await
-        }
-    }
-
-    async fn send_without_pool(
-        &self,
-        message_bytes: &[u8],
-        timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
-        let server_addr = self.resolved_addr()?;
+        // Admission, send, and receive share the caller's single query budget.
         let deadline = Instant::now() + timeout;
-
-        let bind_addr: SocketAddr = if server_addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
-
-        let socket = UdpSocket::bind(bind_addr)
+        let mut pooled = tokio::time::timeout_at(deadline, self.pool.acquire(server_addr))
             .await
-            .map_err(|e| DomainError::IoError(format!("Failed to bind UDP socket: {}", e)))?;
+            // Local saturation must stay failover-eligible, like any transport timeout.
+            .map_err(|_| DomainError::TransportTimeout {
+                server: server_addr.to_string(),
+            })?
+            .map_err(|e| DomainError::IoError(format!("Failed to acquire UDP socket: {e}")))?;
+
+        let socket = pooled.socket();
 
         let bytes_sent =
             tokio::time::timeout_at(deadline, socket.send_to(message_bytes, server_addr))
@@ -239,40 +135,25 @@ impl UdpTransport {
                     ))
                 })?;
 
-        debug!(
-            server = %server_addr,
-            bytes_sent = bytes_sent,
-            pooled = false,
-            "UDP query sent"
-        );
+        debug!(server = %server_addr, bytes_sent, "UDP query sent");
 
-        let bytes = recv_matching(&socket, message_bytes, server_addr, deadline).await?;
+        // On any failure (incl. timeout) the socket may still have our
+        // response in flight, so poison it rather than returning it to the
+        // pool where it would corrupt the next query.
+        let bytes = match recv_matching(socket, message_bytes, server_addr, deadline).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                pooled.poison();
+                return Err(e);
+            }
+        };
 
         debug!(
             server = %server_addr,
             bytes_received = bytes.len(),
-            pooled = false,
             "UDP response received"
         );
 
-        Ok(TransportResponse {
-            bytes,
-            protocol_used: "UDP",
-        })
-    }
-}
-
-#[async_trait]
-impl DnsTransport for UdpTransport {
-    async fn send(
-        &self,
-        message_bytes: &[u8],
-        timeout: Duration,
-    ) -> Result<TransportResponse, DomainError> {
-        self.send_with_pool(message_bytes, timeout).await
-    }
-
-    fn protocol_name(&self) -> &'static str {
-        "UDP"
+        Ok(bytes)
     }
 }

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use ferrous_dns_application::ports::HostnameResolver;
 use ferrous_dns_domain::{DomainError, RecordType};
-use hickory_proto::rr::RData;
-use std::net::IpAddr;
+use hickory_proto::rr::{RData, Record};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -12,7 +12,7 @@ use crate::dns::load_balancer::PoolManager;
 pub struct PtrHostnameResolver {
     pool_manager: Arc<PoolManager>,
     timeout_secs: u64,
-    local_dns_server: Option<String>,
+    local_dns_server: Option<SocketAddr>,
 }
 
 impl PtrHostnameResolver {
@@ -24,7 +24,7 @@ impl PtrHostnameResolver {
         }
     }
 
-    pub fn with_local_dns_server(mut self, server: Option<String>) -> Self {
+    pub fn with_local_dns_server(mut self, server: Option<SocketAddr>) -> Self {
         self.local_dns_server = server;
         self
     }
@@ -39,12 +39,17 @@ impl PtrHostnameResolver {
                 )
             }
             IpAddr::V6(ipv6) => {
-                let mut nibbles = Vec::new();
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                // 32 nibbles, each followed by a dot, then "ip6.arpa".
+                let mut name = String::with_capacity(72);
                 for byte in ipv6.octets().iter().rev() {
-                    nibbles.push(format!("{:x}", byte & 0x0f));
-                    nibbles.push(format!("{:x}", (byte >> 4) & 0x0f));
+                    name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                    name.push('.');
+                    name.push(char::from(HEX[usize::from(byte >> 4)]));
+                    name.push('.');
                 }
-                format!("{}.ip6.arpa", nibbles.join("."))
+                name.push_str("ip6.arpa");
+                name
             }
         }
     }
@@ -59,6 +64,20 @@ impl PtrHostnameResolver {
     }
 }
 
+/// First PTR target as a display hostname, without the root label's trailing dot.
+fn first_ptr(records: &[Record]) -> Option<String> {
+    records.iter().find_map(|record| match &record.data {
+        RData::PTR(ptr) => {
+            let mut name = ptr.to_utf8();
+            if name.len() > 1 && name.ends_with('.') {
+                name.pop();
+            }
+            Some(name)
+        }
+        _ => None,
+    })
+}
+
 #[async_trait]
 impl HostnameResolver for PtrHostnameResolver {
     async fn resolve_hostname(&self, ip: IpAddr) -> Result<Option<String>, DomainError> {
@@ -71,23 +90,24 @@ impl HostnameResolver for PtrHostnameResolver {
             "Performing PTR lookup"
         );
 
-        if let Some(ref server) = self.local_dns_server {
+        if let Some(server) = self.local_dns_server {
             if Self::is_private_or_local(&ip) {
-                let forwarder = DnsForwarder::new().with_hardening(self.pool_manager.hardening());
+                let forwarder = DnsForwarder::new(self.pool_manager.hardening());
                 match forwarder
                     .query(server, &reverse_domain, &RecordType::PTR, timeout_ms)
                     .await
                 {
                     Ok(result) => {
-                        for record in &result.raw_answers {
-                            if let RData::PTR(ptr) = &record.data {
-                                let hostname = ptr.to_utf8();
-                                debug!(ip = %ip, hostname = %hostname, server = %server, "PTR lookup via local DNS server successful");
-                                return Ok(Some(hostname));
+                        let hostname = first_ptr(&result.message.answers);
+                        match &hostname {
+                            Some(h) => {
+                                debug!(ip = %ip, hostname = %h, server = %server, "PTR lookup via local DNS server successful")
+                            }
+                            None => {
+                                debug!(ip = %ip, server = %server, "PTR lookup via local DNS server returned no records")
                             }
                         }
-                        debug!(ip = %ip, server = %server, "PTR lookup via local DNS server returned no records");
-                        return Ok(None);
+                        return Ok(hostname);
                     }
                     Err(e) => {
                         debug!(ip = %ip, server = %server, error = %e, "PTR lookup via local DNS server failed, falling back to upstream");
@@ -103,21 +123,48 @@ impl HostnameResolver for PtrHostnameResolver {
             .await
         {
             Ok(result) => {
-                for record in &result.response.raw_answers {
-                    if let RData::PTR(ptr) = &record.data {
-                        let hostname = ptr.to_utf8();
-                        debug!(ip = %ip, hostname = %hostname, "PTR lookup successful");
-                        return Ok(Some(hostname));
-                    }
+                let hostname = first_ptr(&result.response.message.answers);
+                match &hostname {
+                    Some(h) => debug!(ip = %ip, hostname = %h, "PTR lookup successful"),
+                    None => debug!(ip = %ip, "PTR lookup returned no records"),
                 }
-
-                debug!(ip = %ip, "PTR lookup returned no records");
-                Ok(None)
+                Ok(hostname)
             }
             Err(e) => {
                 debug!(ip = %ip, error = %e, reverse_domain = %reverse_domain, "PTR lookup failed");
                 Ok(None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_ptr;
+    use hickory_proto::rr::rdata::{A, PTR};
+    use hickory_proto::rr::{Name, RData, Record};
+    use std::str::FromStr;
+
+    fn record(rdata: RData) -> Record {
+        let owner = Name::from_str("10.1.168.192.in-addr.arpa.").expect("owner");
+        Record::from_rdata(owner, 60, rdata)
+    }
+
+    #[test]
+    fn test_first_ptr_strips_root_dot_and_skips_non_ptr_records() {
+        let target = Name::from_str("printer.lan.").expect("target");
+        let records = [
+            record(RData::A(A::new(192, 168, 1, 10))),
+            record(RData::PTR(PTR(target))),
+        ];
+        assert_eq!(first_ptr(&records).as_deref(), Some("printer.lan"));
+    }
+
+    #[test]
+    fn test_first_ptr_without_ptr_records_is_none() {
+        assert_eq!(
+            first_ptr(&[record(RData::A(A::new(192, 168, 1, 10)))]),
+            None
+        );
     }
 }

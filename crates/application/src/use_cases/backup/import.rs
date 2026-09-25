@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use ferrous_dns_domain::{Config, DomainError};
-use tokio::sync::RwLock;
+use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, instrument, warn};
 
 use crate::ports::{
@@ -13,53 +13,43 @@ use super::snapshot::{BackupSnapshot, ImportSummary};
 
 const SUPPORTED_VERSION: &str = "1";
 
-/// Returns `true` for errors that represent a pre-existing entity (idempotent import).
-///
-/// When a group or blocklist source already exists, the repository returns
-/// `InvalidGroupName` / `InvalidBlocklistSource` with an "already exists" message.
-/// These are expected during re-import and must not be surfaced as failures.
+/// Pre-existing entities are expected on re-import and are skipped silently.
 fn is_duplicate_error(e: &DomainError) -> bool {
-    match e {
-        DomainError::InvalidGroupName(msg) | DomainError::InvalidBlocklistSource(msg) => {
-            msg.contains("already exists")
-        }
-        _ => false,
-    }
+    matches!(e, DomainError::AlreadyExists(_))
+}
+
+/// The live config an import restores into, and the file it is saved to.
+/// `writer` is the lock every config writer holds for its read-modify-write.
+pub struct ConfigDestination {
+    pub config: Arc<RwLock<Config>>,
+    pub writer: Arc<Mutex<()>>,
+    pub persistence: Arc<dyn ConfigFilePersistence>,
+    pub path: Option<String>,
 }
 
 pub struct ImportConfigUseCase {
-    config: Arc<RwLock<Config>>,
-    config_file_persistence: Arc<dyn ConfigFilePersistence>,
-    config_path: Option<String>,
+    destination: ConfigDestination,
     group_creator: Arc<dyn GroupCreator>,
     blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
     local_record_creator: Arc<dyn LocalRecordCreator>,
-    block_filter_engine: Option<Arc<dyn BlockFilterEnginePort>>,
+    block_filter_engine: Arc<dyn BlockFilterEnginePort>,
 }
 
 impl ImportConfigUseCase {
     pub fn new(
-        config: Arc<RwLock<Config>>,
-        config_file_persistence: Arc<dyn ConfigFilePersistence>,
-        config_path: Option<String>,
+        destination: ConfigDestination,
         group_creator: Arc<dyn GroupCreator>,
         blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
         local_record_creator: Arc<dyn LocalRecordCreator>,
+        block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     ) -> Self {
         Self {
-            config,
-            config_file_persistence,
-            config_path,
+            destination,
             group_creator,
             blocklist_source_creator,
             local_record_creator,
-            block_filter_engine: None,
+            block_filter_engine,
         }
-    }
-
-    pub fn with_block_filter(mut self, engine: Arc<dyn BlockFilterEnginePort>) -> Self {
-        self.block_filter_engine = Some(engine);
-        self
     }
 
     #[instrument(skip(self, snapshot), name = "import_config")]
@@ -83,10 +73,8 @@ impl ImportConfigUseCase {
         // The creator above deliberately skips the per-source reload, so the
         // whole batch costs one block index rebuild instead of one each.
         if blocklist_sources_imported > 0 {
-            if let Some(ref engine) = self.block_filter_engine {
-                if let Err(e) = engine.reload().await {
-                    error!(error = %e, "Failed to reload block filter after backup import");
-                }
+            if let Err(e) = self.block_filter_engine.reload().await {
+                error!(error = %e, "Failed to reload block filter after backup import");
             }
         }
 
@@ -118,28 +106,29 @@ impl ImportConfigUseCase {
     }
 
     async fn apply_config(&self, snapshot: &BackupSnapshot, errors: &mut Vec<String>) -> bool {
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
-            None => {
-                let discovered = Config::get_config_path();
-                match discovered {
-                    Some(p) => p,
-                    None => {
-                        let msg = "No config file path available — config section not restored.";
-                        warn!(msg);
-                        errors.push(msg.to_string());
-                        return false;
-                    }
-                }
-            }
+        let Some(path) = &self.destination.path else {
+            let msg = "No config file path available — config section not restored.";
+            warn!(msg);
+            errors.push(msg.to_string());
+            return false;
         };
 
-        let mut new_config = self.config.read().await.clone();
+        // Merged and stored under the write guard: a writer that slipped in
+        // between reading and storing would be overwritten.
+        let _writer = self.destination.writer.lock().await;
+        let mut config = self.destination.config.write().await;
+        let mut new_config = config.clone();
 
         let sc = &snapshot.config;
         new_config.server.dns_port = sc.server.dns_port;
         new_config.server.web_port = sc.server.web_port;
-        new_config.server.bind_address = sc.server.bind_address.clone();
+        match ferrous_dns_domain::config::server::parse_bind_host(&sc.server.bind_address) {
+            Ok(ip) => new_config.server.bind_address = ip,
+            Err(e) => {
+                errors.push(format!("Config section not restored: {e}"));
+                return false;
+            }
+        }
         new_config.server.pihole_compat = sc.server.pihole_compat;
         new_config.server.web_tls.enabled = sc.server.tls_enabled;
         new_config.server.web_tls.tls_cert_path = sc.server.tls_cert_path.clone();
@@ -157,7 +146,7 @@ impl ImportConfigUseCase {
                 ferrous_dns_domain::DnssecMode::Off
             });
         }
-        new_config.dns.cache_eviction_strategy = sc.dns.cache_eviction_strategy.clone();
+        new_config.dns.cache_eviction_strategy = sc.dns.cache_eviction_strategy;
         new_config.dns.cache_max_entries = sc.dns.cache_max_entries;
         new_config.dns.cache_min_hit_rate = sc.dns.cache_min_hit_rate;
         new_config.dns.cache_min_frequency = sc.dns.cache_min_frequency;
@@ -198,12 +187,18 @@ impl ImportConfigUseCase {
         new_config.auth.webauthn.rp_id = sc.auth.webauthn_rp_id.clone();
         new_config.auth.webauthn.rp_origin = sc.auth.webauthn_rp_origin.clone();
 
+        if let Err(e) = new_config.validate() {
+            errors.push(format!("Config section not restored: {e}"));
+            return false;
+        }
+
         match self
-            .config_file_persistence
-            .save_config_to_file(&new_config, &path)
+            .destination
+            .persistence
+            .save_config_to_file(&new_config, path)
         {
             Ok(_) => {
-                *self.config.write().await = new_config;
+                *config = new_config;
                 true
             }
             Err(e) => {
@@ -289,11 +284,15 @@ impl ImportConfigUseCase {
 
         for record in &snapshot.data.local_records {
             {
-                let config = self.config.read().await;
+                let config = self.destination.config.read().await;
+                // A and AAAA for the same name are distinct records, so the type is part of the key.
                 let already_exists = config.dns.local_records.iter().any(|r| {
                     r.hostname == record.hostname
                         && r.domain.as_deref().unwrap_or("")
                             == record.domain.as_deref().unwrap_or("")
+                        && r.record_type
+                            .as_str()
+                            .eq_ignore_ascii_case(&record.record_type)
                 });
                 if already_exists {
                     skipped += 1;
@@ -301,18 +300,19 @@ impl ImportConfigUseCase {
                 }
             }
 
-            match self
-                .local_record_creator
-                .create_local_record(
-                    record.hostname.clone(),
-                    record.domain.clone(),
-                    record.ip.clone(),
-                    record.record_type.clone(),
-                    record.ttl,
-                )
-                .await
-            {
-                Ok(_) => imported += 1,
+            let parsed = LocalDnsRecord::parse(
+                record.hostname.clone(),
+                record.domain.clone(),
+                &record.ip,
+                &record.record_type,
+                record.ttl,
+            );
+            let created = match parsed {
+                Ok(parsed) => self.local_record_creator.create_local_record(parsed).await,
+                Err(e) => Err(e),
+            };
+            match created {
+                Ok(()) => imported += 1,
                 Err(e) => {
                     warn!(hostname = %record.hostname, error = %e, "Skipping local record during import");
                     skipped += 1;

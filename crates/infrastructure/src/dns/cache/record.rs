@@ -14,6 +14,9 @@ const FLAG_PERMANENT: u8 = 0b100;
 /// path must still be able to schedule the fast, unpaced repair. Only
 /// `FLAG_REFRESHING` — a resolution actually in flight — blocks that.
 const FLAG_REFRESH_QUEUED: u8 = 0b1000;
+/// Set when the answer came from the configured local DNS server, so a hit
+/// stays exempt from checks that trust local answers (rebinding, NXDOMAIN budget).
+const FLAG_LOCAL_DNS: u8 = 0b1_0000;
 const STALE_GRACE_PERIOD_MULTIPLIER: u64 = 2;
 
 #[repr(align(64))]
@@ -134,12 +137,29 @@ impl CachedRecord {
         self.flags.load(AtomicOrdering::Relaxed) & FLAG_PERMANENT != 0
     }
 
+    /// Marks an answer from the local DNS server; see [`Self::is_local_dns`].
+    #[inline]
+    pub fn with_local_dns(mut self) -> Self {
+        *self.flags.get_mut() |= FLAG_LOCAL_DNS;
+        self
+    }
+
+    /// Whether the local DNS server gave this answer. Never cleared: a renewal
+    /// re-resolves the same name, which the same server owns.
     #[inline(always)]
-    pub fn is_expired(&self) -> bool {
+    pub fn is_local_dns(&self) -> bool {
+        self.flags.load(AtomicOrdering::Relaxed) & FLAG_LOCAL_DNS != 0
+    }
+
+    /// Seconds a client may hold the answer. A permanent entry never expires,
+    /// so it reports its configured TTL rather than the distance to `u64::MAX`.
+    #[inline(always)]
+    pub fn remaining_ttl_at_secs(&self, now_secs: u64) -> u32 {
         if self.is_permanent() {
-            return false;
+            self.ttl
+        } else {
+            self.expires_at_secs.saturating_sub(now_secs) as u32
         }
-        coarse_now_secs() >= self.expires_at_secs
     }
 
     #[inline(always)]

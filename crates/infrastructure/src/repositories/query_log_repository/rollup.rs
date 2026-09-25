@@ -2,7 +2,7 @@
 //! reference definitions live in the `*_query_log_rollups` migrations.
 
 use super::writer::QueryLogEntry;
-use ferrous_dns_domain::{BlockSource, QuerySource, RecordType};
+use ferrous_dns_domain::{BlockSource, DnssecStatus, QuerySource, RecordType};
 use sqlx::query::Query;
 use sqlx::sqlite::{Sqlite, SqliteArguments, SqliteConnection};
 use sqlx::SqlitePool;
@@ -106,11 +106,10 @@ impl MinuteCounters {
         if let Some(status) = e.dnssec_status {
             self.dnssec_validated += 1;
             match status {
-                "Secure" => self.dnssec_secure += 1,
-                "Insecure" => self.dnssec_insecure += 1,
-                "Bogus" => self.dnssec_bogus += 1,
-                "Indeterminate" => self.dnssec_indeterminate += 1,
-                _ => {}
+                DnssecStatus::Secure => self.dnssec_secure += 1,
+                DnssecStatus::Insecure => self.dnssec_insecure += 1,
+                DnssecStatus::Bogus => self.dnssec_bogus += 1,
+                DnssecStatus::Indeterminate => self.dnssec_indeterminate += 1,
             }
         }
         if let Some(us) = e.response_time_us {
@@ -151,19 +150,19 @@ fn bump<K: PartialEq>(counts: &mut Vec<(K, i64)>, key: K) {
 
 impl MinuteRollup {
     pub fn add(&mut self, e: &QueryLogEntry) {
-        let counters = match self
+        let i = match self
             .by_source
-            .iter_mut()
-            .find(|(s, _)| *s == e.query_source)
+            .iter()
+            .position(|(s, _)| *s == e.query_source)
         {
-            Some((_, c)) => c,
+            Some(i) => i,
             None => {
                 self.by_source
                     .push((e.query_source, MinuteCounters::default()));
-                &mut self.by_source.last_mut().expect("just pushed").1
+                self.by_source.len() - 1
             }
         };
-        counters.add(e);
+        self.by_source[i].1.add(e);
 
         if e.query_source != QuerySource::Client {
             return;
