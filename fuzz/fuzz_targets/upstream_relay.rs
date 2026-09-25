@@ -126,8 +126,24 @@ fuzz_target!(|upstream: &[u8]| {
     if dnssec_ok || ad {
         return;
     }
-    let cached =
-        wire_response::cache_form(upstream, u32::MAX, 0..=u32::MAX).expect("relayed but not cacheable");
+    // The cache form keeps the DNSSEC RRs a DO client may ask for later, so it
+    // walks exactly what relaying to a DO client walks; stripping them for this
+    // client may have skipped a malformed one.
+    let with_do = EdnsReply {
+        dnssec_ok: true,
+        cookie: None,
+        ede: None,
+    };
+    let cached = wire_response::cache_form(upstream, u32::MAX, 0..=u32::MAX);
+    let relays_with_do = wire_response::relay_with_edns(upstream, ID, rd, ad, Some(&with_do));
+    assert_eq!(
+        cached.is_some(),
+        relays_with_do.is_some(),
+        "cacheable iff relayable to a DO client"
+    );
+    let Some(cached) = cached else {
+        return;
+    };
     let served = wire_response::relay_cached(&cached, ID, rd, edns, u32::MAX)
         .expect("relayed but not served from the cache");
     let mut served = Message::from_vec(&served).expect("the cache form served an invalid message");

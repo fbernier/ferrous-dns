@@ -417,3 +417,33 @@ fn relay_keeps_a_name_whose_labels_run_into_the_dropped_opt() {
         assert_eq!(msg.additionals, source.additionals);
     }
 }
+
+/// `crash-a616f390` from the `upstream_relay` target: an RRSIG with an empty
+/// RDATA behind the upstream OPT. Once the OPT is dropped, every later record
+/// is copied field by field. A client without DO never sees the RRSIG, so its
+/// relay drops it unread; the cache form keeps DNSSEC RRs for DO clients,
+/// walks it and declines. The harness had assumed anything relayed is
+/// cacheable. The contract is that the cache form and the DO relay accept the
+/// same messages.
+#[test]
+fn a_malformed_rrsig_is_stripped_for_plain_clients_but_never_cached() {
+    let upstream = b"\x00\x00\x81\x80\x00\x01\x00\x00\x00\x00\x00\x02\x07example\x03com\x00\
+                     \x00\x01\x00\x01\
+                     \x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x00\
+                     \xc0\x0c\x00\x2e\x00\x01\x00\x00\x00\x3c\x00\x00";
+    let plain = EdnsReply {
+        dnssec_ok: false,
+        cookie: None,
+        ede: None,
+    };
+    let with_do = EdnsReply {
+        dnssec_ok: true,
+        ..plain
+    };
+    let relayed = wire_response::relay_with_edns(upstream, 1, true, false, Some(&plain))
+        .expect("a plain client gets the answer without the RRSIG");
+    let msg = Message::from_vec(&relayed).unwrap();
+    assert!(msg.additionals.is_empty() && msg.edns.is_some());
+    assert!(wire_response::relay_with_edns(upstream, 1, true, false, Some(&with_do)).is_none());
+    assert!(wire_response::cache_form(upstream, 60, 0..=u32::MAX).is_none());
+}
