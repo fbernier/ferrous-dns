@@ -75,7 +75,7 @@ type BreakConfig = fn(&mut Config);
 
 #[test]
 fn values_that_panic_spin_or_disable_a_component_are_rejected_naming_the_key() {
-    let cases: [(&str, BreakConfig); 37] = [
+    let cases: [(&str, BreakConfig); 36] = [
         ("dns.query_timeout", |c| c.dns.query_timeout = 0),
         ("dns.cache_max_entries", |c| c.dns.cache_max_entries = 0),
         ("dns.cache_compaction_interval", |c| {
@@ -119,9 +119,6 @@ fn values_that_panic_spin_or_disable_a_component_are_rejected_naming_the_key() {
         }),
         ("dns.dga_detection.stale_entry_ttl_secs", |c| {
             c.dns.dga_detection.stale_entry_ttl_secs = 0
-        }),
-        ("database.queries_log_stored", |c| {
-            c.database.queries_log_stored = 0
         }),
         ("database.query_log_channel_capacity", |c| {
             c.database.query_log_channel_capacity = 0
@@ -193,6 +190,7 @@ fn zero_where_zero_has_a_meaning_is_accepted() {
     config.dns.rate_limit.slip_ratio = 0;
     config.dns.rate_limit.tcp_max_connections_per_ip = 0;
     config.database.wal_autocheckpoint = 0;
+    config.database.queries_log_stored = 0;
     config.database.sqlite_mmap_size_mb = 0;
     config.database.read_busy_timeout_secs = 0;
     config.auth.login_rate_limit_attempts = 0;

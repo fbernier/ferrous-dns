@@ -86,7 +86,7 @@ cache_adaptive_thresholds = false
 | `"lru"` | Least Recently Used — evicts entries not accessed recently | Bursty workloads |
 | `"lfu-k"` | LFU-K — scores hit frequency over a sliding window (see LFU-K parameters below) | Workloads whose popular set drifts |
 
-Names are case-insensitive (`hitrate` and `lfuk` are accepted too). Any other value is a configuration error: the server refuses to start, and the API rejects the update.
+Names are case-insensitive (`hitrate` and `lfuk` are accepted too). Any other value in the config file, such as `"hit-rate"`, runs as `"hit_rate"` with a warning in the log, which is what earlier releases did with it; the API rejects the update.
 
 For most home and office deployments, `"hit_rate"` gives the best results as it preserves entries for frequently visited sites regardless of recency.
 

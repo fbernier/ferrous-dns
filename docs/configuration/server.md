@@ -59,6 +59,8 @@ doq_enabled      = true
 doq_bind_address = "192.168.1.10"   # DoQ only on the LAN address
 ```
 
+Like `bind_address`, each override must be an IP literal. A hostname on a listener that is running (for DoH: `doh_enabled` with a `doh_port`) stops startup; on one that is off it is ignored with a warning in the log.
+
 See [Encrypted DNS](#encrypted-dns) for the full list of options.
 
 ### DoH client identity {#doh-client-identity}

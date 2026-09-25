@@ -18,7 +18,7 @@ client_tracking_interval = 60
 |:-------|:--------|:------------|
 | `path` | `./ferrous-dns.db` | Path to the SQLite database file |
 | `log_queries` | `true` | Store every DNS query for analytics and the query log dashboard |
-| `queries_log_stored` | `30` | Days to retain query log entries before automatic cleanup |
+| `queries_log_stored` | `30` | Days to retain query log entries. Cleanup runs at startup and then daily; `0` deletes every entry at each run |
 | `client_tracking_interval` | `60` | Minimum seconds between consecutive last-seen DB writes per client IP |
 
 ---

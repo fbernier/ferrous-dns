@@ -692,6 +692,58 @@ async fn test_update_config_rejects_a_zero_compaction_interval() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
 }
 
+/// A config file with any of these loads with the default instead, but the
+/// API rejects them.
+#[tokio::test]
+async fn test_update_config_rejects_zeros_a_config_file_loads_as_the_default() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, path) = test_app(pool).await;
+    let before = config.read().await.clone();
+
+    for (key, body) in [
+        (
+            "dns.cache_max_entries",
+            serde_json::json!({ "dns": { "cache_max_entries": 0 } }),
+        ),
+        (
+            "auth.session_ttl_hours",
+            serde_json::json!({ "auth": { "session_ttl_hours": 0 } }),
+        ),
+        (
+            "auth.remember_me_days",
+            serde_json::json!({ "auth": { "remember_me_days": 3_000_000 } }),
+        ),
+        (
+            "auth.login_rate_limit_window_secs",
+            serde_json::json!({ "auth": { "login_rate_limit_window_secs": 0 } }),
+        ),
+    ] {
+        let (status, json) = post_config(router.clone(), body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}");
+        assert!(
+            json["error"].as_str().unwrap_or_default().contains(key),
+            "error should name {key}, got: {}",
+            json["error"]
+        );
+    }
+    let after = config.read().await;
+    assert_eq!(after.dns.cache_max_entries, before.dns.cache_max_entries);
+    assert_eq!(
+        (
+            after.auth.session_ttl_hours,
+            after.auth.remember_me_days,
+            after.auth.login_rate_limit_window_secs
+        ),
+        (
+            before.auth.session_ttl_hours,
+            before.auth.remember_me_days,
+            before.auth.login_rate_limit_window_secs
+        )
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+}
+
 #[tokio::test]
 async fn test_update_config_rejects_session_ttls_past_the_representable_date() {
     let pool = create_test_db().await;
@@ -748,6 +800,36 @@ async fn test_update_config_rejects_an_unknown_block_mode() {
     assert_eq!(
         config.read().await.blocking.block_mode,
         ferrous_dns_domain::BlockResponseMode::NullIp
+    );
+}
+
+/// A config file with this spelling loads as hit_rate, but the API only takes
+/// a known name.
+#[tokio::test]
+async fn test_update_config_rejects_an_unknown_cache_eviction_strategy() {
+    let pool = create_test_db().await;
+    let (TestApp { router, config, .. }, _path) = test_app(pool).await;
+    config.write().await.dns.cache_eviction_strategy =
+        ferrous_dns_domain::config::CacheEvictionStrategy::Lfu;
+
+    let (status, json) = post_config(
+        router,
+        serde_json::json!({ "dns": { "cache_eviction_strategy": "hit-rate" } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cache_eviction_strategy"),
+        "error should name the key, got: {}",
+        json["error"]
+    );
+    assert_eq!(
+        config.read().await.dns.cache_eviction_strategy,
+        ferrous_dns_domain::config::CacheEvictionStrategy::Lfu
     );
 }
 

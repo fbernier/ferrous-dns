@@ -39,23 +39,29 @@ impl Default for DnsCookiesConfig {
     }
 }
 
+/// How to fix a malformed `server_secret`, appended to its parse error.
+const SECRET_FIX: &str = "generate one with `openssl rand -hex 32`, set it to \"\" for a secret \
+     regenerated at each start, or turn cookies off with dns.dns_cookies.enabled = false";
+
 /// Parses a configured secret: empty (after trimming) is `None`, otherwise it
 /// must be exactly 64 hex digits.
-fn parse_server_secret(text: &str) -> Result<Option<[u8; 32]>, String> {
+pub(super) fn parse_server_secret(text: &str) -> Result<Option<[u8; 32]>, String> {
     let hex = text.trim().as_bytes();
     if hex.is_empty() {
         return Ok(None);
     }
     if hex.len() != 64 {
         return Err(format!(
-            "dns_cookies.server_secret must be exactly 64 hex characters (32 bytes), got {}",
-            hex.len()
+            "dns.dns_cookies.server_secret must be 64 hex digits (32 bytes), got {} characters; {SECRET_FIX}",
+            text.trim().chars().count()
         ));
     }
     let mut secret = [0u8; 32];
     for (byte, &[high, low]) in secret.iter_mut().zip(hex.as_chunks::<2>().0) {
         let (Some(high), Some(low)) = (hex_digit(high), hex_digit(low)) else {
-            return Err("dns_cookies.server_secret contains invalid hex characters".to_string());
+            return Err(format!(
+                "dns.dns_cookies.server_secret contains characters that are not hex digits; {SECRET_FIX}"
+            ));
         };
         *byte = high << 4 | low;
     }

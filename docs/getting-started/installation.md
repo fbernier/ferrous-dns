@@ -265,6 +265,34 @@ These flags override the matching values from the config file:
 
 ---
 
+## Upgrading {#upgrading}
+
+Stop the server, replace the binary or pull the new image, and start it again with the same config file and database. Read these notes first: this release changes a few behaviours that an existing install can notice.
+
+### Config values rewritten at load
+
+Some config values that earlier releases started with are now invalid, mostly because they sat on a disabled feature or broke only the component they sized: a hostname in a disabled listener's `*_bind_address`, a malformed `server_secret` with cookies off, an unknown `cache_eviction_strategy` such as `"hit-rate"`, a hostname in `local_dns_server`, and zeros such as `query_timeout = 0`. The server still starts with them. Each is replaced by what earlier releases effectively ran with, or by the default, and logged at `WARN` with the key, the value and what is used instead. Check the first log lines after the upgrade:
+
+```bash
+docker logs ferrous-dns 2>&1 | grep "Invalid config value"
+```
+
+Values that made earlier releases fail to start or crash still stop startup. `queries_log_stored = 0` keeps its meaning: every run of the daily cleanup deletes the whole query log. The full list is under [Loading the Config File](../configuration/ferrous-dns-toml.md#loading-the-config-file). The dashboard and the API reject all of these values.
+
+### DoH behind a reverse proxy
+
+DoH requests now believe `X-Forwarded-For` and `X-Real-IP` only from the addresses in `[server] trusted_proxies`, which by default is loopback only. A reverse proxy on another host or on a Docker bridge network must be listed there. Otherwise every DoH query is attributed to the proxy's address, so per-client groups and rules stop applying to DoH clients. See [DoH client identity](../configuration/server.md#doh-client-identity).
+
+### Upstream EDNS options are no longer relayed
+
+Answers relayed from an upstream carry Ferrous DNS's own OPT record. The upstream's options, including its Extended DNS Errors (EDE) and NSID, no longer reach clients. See [EDNS buffer size and truncation](../features/security-hardening.md#edns-buffer-size-and-truncation).
+
+### One-time query log rebuild
+
+The first start rebuilds the `query_log` table, and the server answers queries only once that is done. On large databases this takes a while: about 9 seconds for 3 million rows on an NVMe drive, and noticeably longer on a Raspberry Pi SD card. The database file also grows by about 70% until it is vacuumed. To reclaim the space, stop the server and run `sqlite3 ferrous-dns.db 'VACUUM;'`, which needs free disk space about the size of the file.
+
+---
+
 ## Platform support
 
 | Platform            | Status                                                                 |

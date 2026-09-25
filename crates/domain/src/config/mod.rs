@@ -9,6 +9,7 @@ pub mod dns_cookies;
 pub mod dnssec;
 pub mod encrypted_dns;
 pub mod health;
+mod legacy;
 pub mod local_records;
 pub mod logging;
 pub mod nxdomain_hijack;

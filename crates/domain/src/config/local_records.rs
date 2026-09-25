@@ -124,7 +124,8 @@ pub(super) fn deserialize_lenient<'de, D: Deserializer<'de>>(
                     ip = %fields.ip,
                     record_type = %fields.record_type,
                     error = %e,
-                    "Skipping a dns.local_records entry that cannot be served"
+                    "Skipping a dns.local_records entry that cannot be served; \
+                     the next local-record save removes it from the config file"
                 );
                 None
             }

@@ -5,6 +5,7 @@ use super::blocking::BlockingConfig;
 use super::database::DatabaseConfig;
 use super::dns::DnsConfig;
 use super::dns64::Dns64Config;
+use super::legacy;
 use super::logging::LoggingConfig;
 use super::server::ServerConfig;
 use super::upstream::UpstreamPool;
@@ -30,11 +31,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// Parses a `ferrous-dns.toml` document. Call [`Config::validate`] once
-    /// every override is applied.
+    /// Parses a `ferrous-dns.toml` document, rewriting with a warning each
+    /// value earlier releases ran with but this one rejects. Call
+    /// [`Config::validate`] once every override is applied.
     pub fn from_toml_str(contents: &str) -> Result<Self, DomainError> {
-        let mut config: Self = toml::from_str(contents)
-            .map_err(|e| DomainError::ConfigError(format!("Failed to parse config: {e}")))?;
+        let parse_error =
+            |e: toml::de::Error| DomainError::ConfigError(format!("Failed to parse config: {e}"));
+        let mut doc: toml::Table = toml::from_str(contents).map_err(parse_error)?;
+        legacy::normalize_document(&mut doc);
+        let mut config = Self::deserialize(doc).map_err(parse_error)?;
+        legacy::normalize_values(&mut config);
         config.normalize_pools();
         Ok(config)
     }
@@ -142,10 +148,6 @@ impl Config {
             (
                 "dns.dga_detection.stale_entry_ttl_secs",
                 dns.dga_detection.stale_entry_ttl_secs == 0,
-            ),
-            (
-                "database.queries_log_stored",
-                database.queries_log_stored == 0,
             ),
             (
                 "database.query_log_channel_capacity",

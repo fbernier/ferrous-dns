@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_strategy_fails_to_load_naming_the_value() {
+    fn unknown_strategy_is_a_parse_error_naming_the_value() {
         let err = toml::from_str::<Holder>("strategy = \"fifo\"").unwrap_err();
         assert!(err.to_string().contains("fifo"), "{err}");
     }
