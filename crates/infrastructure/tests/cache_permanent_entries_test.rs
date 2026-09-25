@@ -48,7 +48,7 @@ fn test_permanent_entry_reports_its_configured_ttl() {
     let cache = make_cache();
     cache.insert_permanent("nas.home.lan", RecordType::A, make_ip_data("10.0.0.5"), 300);
 
-    let (_, _, remaining) = cache
+    let (_, _, remaining, _) = cache
         .get("nas.home.lan", &RecordType::A)
         .expect("permanent entry must be readable");
 
@@ -79,7 +79,7 @@ fn test_permanent_entry_ttl_survives_a_second_read_from_l1() {
 
     // First read promotes into the thread-local L1; the second is served from it.
     let _ = cache.get("printer.home.lan", &RecordType::A);
-    let (_, _, remaining) = cache
+    let (_, _, remaining, _) = cache
         .get("printer.home.lan", &RecordType::A)
         .expect("permanent entry must still be readable");
 
@@ -109,7 +109,7 @@ fn test_clear_preserves_permanent_entries() {
         "an upstream answer must not survive a flush"
     );
 
-    let (data, _, remaining) = cache
+    let (data, _, remaining, _) = cache
         .get("nas.home.lan", &RecordType::A)
         .expect("a local DNS record must survive a flush — nothing reloads it");
     assert_eq!(
@@ -169,7 +169,7 @@ fn test_upstream_insert_does_not_replace_a_permanent_entry() {
         None,
     );
 
-    let (data, _, _) = cache
+    let (data, _, _, _) = cache
         .get("nas.home.lan", &RecordType::A)
         .expect("the local record is still readable");
     assert_eq!(

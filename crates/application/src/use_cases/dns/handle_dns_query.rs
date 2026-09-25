@@ -573,6 +573,51 @@ impl HandleDnsQueryUseCase {
             .is_some_and(|guard| guard.is_rebinding_attempt(domain, resolution))
     }
 
+    /// Applies a rate-limit decision for `budget`: `Err` carries the configured
+    /// action for a response over it, which is logged here.
+    fn apply_rate_limit(
+        &self,
+        decision: RateLimitDecision,
+        budget: &'static str,
+        request: &DnsRequest,
+        elapsed_us: impl Fn() -> u64,
+        group_id: i64,
+    ) -> Result<(), DomainError> {
+        let (status, error) = match decision {
+            RateLimitDecision::Allow => return Ok(()),
+            RateLimitDecision::DryRunWouldRefuse => {
+                tracing::debug!(client = %request.client_ip, budget, "[dry-run] would rate-limit");
+                return Ok(());
+            }
+            RateLimitDecision::Refuse => ("RATE_LIMITED", DomainError::DnsRateLimited),
+            RateLimitDecision::Slip => ("RATE_LIMITED_TC", DomainError::DnsRateLimitedSlip),
+        };
+        self.log(&QueryLog {
+            blocked: true,
+            response_status: Some(status),
+            block_source: Some(BlockSource::RateLimit),
+            ..Self::base_query_log(request, elapsed_us(), group_id)
+        });
+        Err(error)
+    }
+
+    /// Charges an NXDOMAIN answer to the client's NXDOMAIN budget; `Err` when
+    /// this answer is over it. Callers skip answers from the local DNS server.
+    fn charge_nxdomain(
+        &self,
+        request: &DnsRequest,
+        elapsed_us: impl Fn() -> u64,
+        group_id: i64,
+    ) -> Result<(), DomainError> {
+        self.apply_rate_limit(
+            self.rate_limiter.charge_nxdomain(request.client_ip),
+            "nxdomain",
+            request,
+            elapsed_us,
+            group_id,
+        )
+    }
+
     pub async fn execute(&self, request: &DnsRequest) -> Result<DnsResolution, DomainError> {
         let tsc_start = tsc_timer::now();
         let elapsed_us = || tsc_timer::elapsed_us_since(tsc_start);
@@ -581,30 +626,13 @@ impl HandleDnsQueryUseCase {
 
         let group_id = self.block_filter.resolve_group(request.client_ip);
 
-        match self.rate_limiter.check(request.client_ip) {
-            RateLimitDecision::Allow => {}
-            RateLimitDecision::DryRunWouldRefuse => {
-                tracing::debug!(client = %request.client_ip, "[dry-run] would rate-limit");
-            }
-            RateLimitDecision::Refuse => {
-                self.log(&QueryLog {
-                    blocked: true,
-                    response_status: Some("RATE_LIMITED"),
-                    block_source: Some(BlockSource::RateLimit),
-                    ..Self::base_query_log(request, elapsed_us(), group_id)
-                });
-                return Err(DomainError::DnsRateLimited);
-            }
-            RateLimitDecision::Slip => {
-                self.log(&QueryLog {
-                    blocked: true,
-                    response_status: Some("RATE_LIMITED_TC"),
-                    block_source: Some(BlockSource::RateLimit),
-                    ..Self::base_query_log(request, elapsed_us(), group_id)
-                });
-                return Err(DomainError::DnsRateLimitedSlip);
-            }
-        }
+        self.apply_rate_limit(
+            self.rate_limiter.check(request.client_ip),
+            "queries",
+            request,
+            elapsed_us,
+            group_id,
+        )?;
 
         if let Some(guard) = self.cookie_guard.as_ref().filter(|g| g.is_strict()) {
             let opt = request
@@ -724,7 +752,9 @@ impl HandleDnsQueryUseCase {
                     return Ok(cached);
                 }
             } else if cached.cache_hit {
-                self.rate_limiter.charge_nxdomain(request.client_ip);
+                if !cached.local_nxdomain {
+                    self.charge_nxdomain(request, elapsed_us, group_id)?;
+                }
                 self.log(&QueryLog {
                     cache_hit: true,
                     response_status: Some("NXDOMAIN"),
@@ -762,7 +792,7 @@ impl HandleDnsQueryUseCase {
                 {
                     match self.nxdomain_hijack_guard.action() {
                         NxdomainHijackAction::Block => {
-                            self.rate_limiter.charge_nxdomain(request.client_ip);
+                            self.charge_nxdomain(request, elapsed_us, group_id)?;
                             self.log(&QueryLog {
                                 blocked: true,
                                 response_status: Some("NXDOMAIN_HIJACK"),
@@ -837,7 +867,7 @@ impl HandleDnsQueryUseCase {
                 Ok(resolution)
             }
             Err(DomainError::LocalNxDomain) => {
-                self.rate_limiter.charge_nxdomain(request.client_ip);
+                // LAN traffic, like a PTR sweep: never charged to the NXDOMAIN budget.
                 self.log(&QueryLog {
                     response_status: Some("LOCAL_DNS"),
                     ..Self::base_query_log(request, elapsed_us(), group_id)
@@ -847,11 +877,11 @@ impl HandleDnsQueryUseCase {
             Err(e) => {
                 let response_status = match &e {
                     DomainError::NxDomain => {
-                        self.rate_limiter.charge_nxdomain(request.client_ip);
                         if !explicitly_allowed {
                             self.emit_tunneling_event(request, true);
                             self.emit_dga_event(request);
                         }
+                        self.charge_nxdomain(request, elapsed_us, group_id)?;
                         "NXDOMAIN"
                     }
                     DomainError::QueryTimeout => "TIMEOUT",

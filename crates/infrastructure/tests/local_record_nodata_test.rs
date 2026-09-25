@@ -270,7 +270,7 @@ async fn test_coalesced_followers_keep_local_nodata() {
             &self,
             domain: &str,
             kind: &RecordType,
-        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
+        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>, bool)> {
             self.cache.get(domain, kind)
         }
 
@@ -298,8 +298,9 @@ async fn test_coalesced_followers_keep_local_nodata() {
             data: CachedData,
             ttl: u32,
             status: Option<CachedDnssecStatus>,
+            local_dns: bool,
         ) {
-            self.cache.insert(domain, kind, data, ttl, status);
+            DnsCacheAccess::insert(&*self.cache, domain, kind, data, ttl, status, local_dns);
         }
     }
 

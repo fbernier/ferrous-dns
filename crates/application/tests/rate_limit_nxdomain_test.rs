@@ -13,19 +13,20 @@ const NX_PER_SECOND: u32 = 2;
 /// NXDOMAIN burst capacity is twice the per-second budget.
 const NX_BURST: u32 = NX_PER_SECOND * 2;
 
-fn rate_limit(dry_run: bool) -> RateLimitConfig {
+fn rate_limit(dry_run: bool, slip_ratio: u32) -> RateLimitConfig {
     RateLimitConfig {
         enabled: true,
         queries_per_second: 1,
         burst_size: 1000,
         nxdomain_per_second: NX_PER_SECOND,
-        slip_ratio: 0,
+        slip_ratio,
         dry_run,
         ..RateLimitConfig::default()
     }
 }
 
-async fn use_case(dry_run: bool) -> HandleDnsQueryUseCase {
+/// Upstream-style NXDOMAINs: the resolver reports `Err(NxDomain)`.
+async fn use_case(config: RateLimitConfig) -> HandleDnsQueryUseCase {
     let resolver = MockDnsResolver::new();
     resolver
         .set_response_error("nx.example.com", DomainError::NxDomain)
@@ -41,7 +42,7 @@ async fn use_case(dry_run: bool) -> HandleDnsQueryUseCase {
         Arc::new(MockBlockFilterEngine::new()),
         Arc::new(MockQueryLogRepository::new()),
     )
-    .with_rate_limiter(Arc::new(DnsRateLimiter::new(&rate_limit(dry_run))))
+    .with_rate_limiter(Arc::new(DnsRateLimiter::new(&config)))
 }
 
 fn request(domain: &str) -> DnsRequest {
@@ -49,8 +50,8 @@ fn request(domain: &str) -> DnsRequest {
 }
 
 #[tokio::test]
-async fn client_over_its_nxdomain_budget_is_rate_limited() {
-    let use_case = use_case(false).await;
+async fn only_nxdomain_answers_over_budget_are_rate_limited() {
+    let use_case = use_case(rate_limit(false, 0)).await;
 
     for _ in 0..NX_BURST {
         assert!(matches!(
@@ -59,29 +60,44 @@ async fn client_over_its_nxdomain_budget_is_rate_limited() {
         ));
     }
 
-    // Well inside the general budget, but the NXDOMAIN budget is spent.
-    assert!(matches!(
-        use_case.execute(&request("ok.example.com")).await,
-        Err(DomainError::DnsRateLimited)
-    ));
-}
-
-#[tokio::test]
-async fn resolving_answers_do_not_spend_the_nxdomain_budget() {
-    let use_case = use_case(false).await;
-
-    for _ in 0..NX_BURST * 4 {
+    for _ in 0..3 {
+        // The spent budget does not refuse the client's resolving queries...
         assert!(use_case.execute(&request("ok.example.com")).await.is_ok());
+        // ...only its next NXDOMAIN answer.
+        assert!(matches!(
+            use_case.execute(&request("nx.example.com")).await,
+            Err(DomainError::DnsRateLimited)
+        ));
     }
 }
 
 #[tokio::test]
-async fn dry_run_lets_a_client_over_its_nxdomain_budget_through() {
-    let use_case = use_case(true).await;
+async fn over_budget_nxdomain_answers_follow_the_slip_ratio() {
+    let use_case = use_case(rate_limit(false, 2)).await;
 
     for _ in 0..NX_BURST {
         let _ = use_case.execute(&request("nx.example.com")).await;
     }
 
+    assert!(matches!(
+        use_case.execute(&request("nx.example.com")).await,
+        Err(DomainError::DnsRateLimitedSlip)
+    ));
+    assert!(matches!(
+        use_case.execute(&request("nx.example.com")).await,
+        Err(DomainError::DnsRateLimited)
+    ));
     assert!(use_case.execute(&request("ok.example.com")).await.is_ok());
+}
+
+#[tokio::test]
+async fn dry_run_lets_nxdomain_answers_over_budget_through() {
+    let use_case = use_case(rate_limit(true, 0)).await;
+
+    for _ in 0..NX_BURST * 2 {
+        assert!(matches!(
+            use_case.execute(&request("nx.example.com")).await,
+            Err(DomainError::NxDomain)
+        ));
+    }
 }

@@ -13,15 +13,18 @@ pub enum LocalRecordStatus {
 }
 
 pub trait DnsCacheAccess: Send + Sync {
+    /// A hit's data, DNSSEC status, remaining TTL, and whether the local DNS
+    /// server gave the answer.
     fn get(
         &self,
         domain: &str,
         record_type: &RecordType,
-    ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)>;
+    ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>, bool)>;
 
     /// Checks the requested type and name ownership in one lookup.
     fn local_record_status(&self, domain: &str, record_type: &RecordType) -> LocalRecordStatus;
 
+    /// `local_dns` marks an answer from the local DNS server, which its hits report.
     fn insert(
         &self,
         domain: &str,
@@ -29,6 +32,7 @@ pub trait DnsCacheAccess: Send + Sync {
         data: CachedData,
         ttl: u32,
         dnssec_status: Option<CachedDnssecStatus>,
+        local_dns: bool,
     );
 
     /// Counts an upstream failure that was deliberately not cached as a

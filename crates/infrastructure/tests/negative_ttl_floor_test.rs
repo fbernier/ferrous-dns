@@ -52,7 +52,7 @@ fn should_apply_300s_floor_on_negative_cache() {
     );
 
     let result = cache.get(&Arc::from("nothere.com"), &RecordType::A);
-    let (data, dnssec, remaining) = result.expect("negative entry must be retrievable");
+    let (data, dnssec, remaining, _) = result.expect("negative entry must be retrievable");
 
     assert!(matches!(data, CachedData::NegativeResponse));
     assert!(dnssec.is_none());
@@ -77,7 +77,7 @@ fn should_cap_at_3600s_for_huge_negative_ttl() {
     );
 
     let result = cache.get(&Arc::from("longlived.com"), &RecordType::A);
-    let (_data, _dnssec, remaining) = result.expect("negative entry must be retrievable");
+    let (_data, _dnssec, remaining, _) = result.expect("negative entry must be retrievable");
     let remaining_ttl = remaining.expect("negative entry carries a remaining TTL");
     assert!(
         remaining_ttl <= 3600,
@@ -99,7 +99,7 @@ fn should_preserve_positive_record_ttl_exactly() {
     );
 
     let result = cache.get(&Arc::from("positive.com"), &RecordType::A);
-    let (_data, _dnssec, remaining) = result.expect("positive entry must be retrievable");
+    let (_data, _dnssec, remaining, _) = result.expect("positive entry must be retrievable");
     let remaining_ttl = remaining.expect("positive entry carries a remaining TTL");
     assert!(
         (4..=5).contains(&remaining_ttl),

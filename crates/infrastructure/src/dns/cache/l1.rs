@@ -10,11 +10,14 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-type L1Hit = (Arc<Vec<IpAddr>>, CachedDnssecStatus, u32);
+/// Addresses, DNSSEC status, whether the local DNS server answered, remaining TTL.
+type L1Hit = (Arc<Vec<IpAddr>>, CachedDnssecStatus, bool, u32);
 
 struct L1Entry {
     addresses: Arc<Vec<IpAddr>>,
     dnssec_status: CachedDnssecStatus,
+    // Sits in the padding after `dnssec_status`: the entry stays 24 bytes.
+    local_dns: bool,
     expires_secs: u64,
 }
 
@@ -97,7 +100,12 @@ fn lookup_l1(key_str: &str) -> Option<L1Hit> {
             let now = coarse_now_secs();
             if now < entry.expires_secs {
                 let remaining = (entry.expires_secs - now).min(u32::MAX as u64) as u32;
-                return Some((Arc::clone(&entry.addresses), entry.dnssec_status, remaining));
+                return Some((
+                    Arc::clone(&entry.addresses),
+                    entry.dnssec_status,
+                    entry.local_dns,
+                    remaining,
+                ));
             }
             state.cache.pop(key_str);
         }
@@ -112,6 +120,7 @@ pub fn l1_insert(
     record_type: &RecordType,
     addresses: Arc<Vec<IpAddr>>,
     dnssec_status: CachedDnssecStatus,
+    local_dns: bool,
     expires_secs: u64,
 ) {
     let type_str = record_type.as_str();
@@ -127,6 +136,7 @@ pub fn l1_insert(
             L1Entry {
                 addresses,
                 dnssec_status,
+                local_dns,
                 expires_secs,
             },
         );

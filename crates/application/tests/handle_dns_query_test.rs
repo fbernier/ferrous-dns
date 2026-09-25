@@ -33,6 +33,7 @@ fn cached_resolution(ip: &str) -> DnsResolution {
 fn local_dns_resolution(ip: &str) -> DnsResolution {
     DnsResolution {
         local_dns: true,
+        local_nxdomain: false,
         ..DnsResolution::new(vec![ip.parse().unwrap()], false)
     }
 }
@@ -711,6 +712,7 @@ fn try_cache_wire_direct_returns_none_when_domain_blocked() {
         addresses: Arc::new(vec![]),
         cache_hit: true,
         local_dns: false,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,

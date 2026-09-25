@@ -11,6 +11,9 @@ pub struct DnsResolution {
     pub addresses: Arc<Vec<IpAddr>>,
     pub cache_hit: bool,
     pub local_dns: bool,
+    /// A cached NXDOMAIN from the local DNS server. Separate from `local_dns`,
+    /// which on an empty answer marks an authoritative local NODATA.
+    pub local_nxdomain: bool,
     pub dnssec_status: Option<DnssecStatus>,
     pub cname_chain: Arc<[Arc<str>]>,
     pub upstream_server: Option<Arc<str>>,
@@ -31,6 +34,7 @@ impl DnsResolution {
             addresses: Arc::new(addresses),
             cache_hit,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: None,
             cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
             upstream_server: None,

@@ -1121,7 +1121,7 @@ fn test_stale_while_revalidate_returns_nonzero_ttl() {
 
     let result = cache.get(&Arc::from("stale-test.com"), &RecordType::CNAME);
 
-    if let Some((_, _, Some(ttl))) = result {
+    if let Some((_, _, Some(ttl), _)) = result {
         assert!(
             ttl >= 1,
             "TTL retornado para record stale-while-revalidate deve ser >= 1, foi {}",

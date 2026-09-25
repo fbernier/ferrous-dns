@@ -18,8 +18,31 @@ pub(crate) const MIN_NEGATIVE_TTL: u32 = 300;
 /// NXDOMAIN can linger if the upstream advertises an unreasonable SOA TTL.
 const MAX_NEGATIVE_TTL: u32 = 3_600;
 
+/// Marks an entry from the local DNS server in the top bit of its expiry,
+/// which epoch seconds never reach; the entry stays one `u64`.
+const LOCAL_DNS_BIT: u64 = 1 << 63;
+
 struct NegativeEntry {
-    expires_at_secs: u64,
+    expiry_and_source: u64,
+}
+
+impl NegativeEntry {
+    fn new(expires_at_secs: u64, local_dns: bool) -> Self {
+        let source = if local_dns { LOCAL_DNS_BIT } else { 0 };
+        Self {
+            expiry_and_source: (expires_at_secs & !LOCAL_DNS_BIT) | source,
+        }
+    }
+
+    #[inline]
+    fn expires_at_secs(&self) -> u64 {
+        self.expiry_and_source & !LOCAL_DNS_BIT
+    }
+
+    #[inline]
+    fn is_local_dns(&self) -> bool {
+        self.expiry_and_source & LOCAL_DNS_BIT != 0
+    }
 }
 
 pub struct NegativeDnsCache {
@@ -42,38 +65,39 @@ impl NegativeDnsCache {
         }
     }
 
-    pub fn get(&self, domain: &str, record_type: &RecordType) -> Option<u32> {
+    /// Remaining TTL and whether the local DNS server gave the answer.
+    pub fn get(&self, domain: &str, record_type: &RecordType) -> Option<(u32, bool)> {
         let key = CacheKey::from_lowercase(domain, *record_type);
         let now = coarse_now_secs();
 
         match self.cache.get(&key) {
             Some(entry) => {
-                let expires = entry.value().expires_at_secs;
+                let expires = entry.value().expires_at_secs();
                 if now < expires {
-                    return Some(expires.saturating_sub(now) as u32);
+                    return Some((
+                        expires.saturating_sub(now) as u32,
+                        entry.value().is_local_dns(),
+                    ));
                 }
                 drop(entry);
-                self.cache.remove_if(&key, |_, v| v.expires_at_secs <= now);
+                self.cache
+                    .remove_if(&key, |_, v| v.expires_at_secs() <= now);
                 None
             }
             None => None,
         }
     }
 
-    pub fn insert(&self, domain: &str, record_type: RecordType, ttl: u32) {
+    pub fn insert(&self, domain: &str, record_type: RecordType, ttl: u32, local_dns: bool) {
         let ttl = ttl.clamp(MIN_NEGATIVE_TTL, MAX_NEGATIVE_TTL);
         let now = coarse_now_secs();
         self.cache
             .evict_if_full::<EVICTION_BATCH_SIZE>(self.max_entries, |entry| {
-                now >= entry.expires_at_secs
+                now >= entry.expires_at_secs()
             });
         let key = CacheKey::from_lowercase(domain, record_type);
-        self.cache.insert(
-            key,
-            NegativeEntry {
-                expires_at_secs: now + ttl as u64,
-            },
-        );
+        self.cache
+            .insert(key, NegativeEntry::new(now + ttl as u64, local_dns));
     }
 
     pub fn remove(&self, domain: &str, record_type: &RecordType) {
@@ -91,7 +115,7 @@ impl NegativeDnsCache {
     /// entries elsewhere would otherwise hold capacity until read again.
     pub fn purge_expired(&self, now_secs: u64) -> usize {
         self.cache
-            .retain(|_, entry| now_secs < entry.expires_at_secs)
+            .retain(|_, entry| now_secs < entry.expires_at_secs())
     }
 
     pub fn len(&self) -> usize {
@@ -114,16 +138,16 @@ mod tests {
         for i in 0..capacity {
             cache.cache.insert(
                 CacheKey::new(&format!("zone{i}.example"), RecordType::A),
-                NegativeEntry { expires_at_secs: 0 },
+                NegativeEntry::new(0, false),
             );
         }
         // Keep the sampled prefix live and leave the rest expired. Updating
         // values preserves iteration order; release every guard before insert.
         for mut entry in cache.cache.iter_mut().take(EVICTION_BATCH_SIZE) {
-            entry.value_mut().expires_at_secs = u64::MAX;
+            *entry.value_mut() = NegativeEntry::new(u64::MAX, false);
         }
 
-        cache.insert("new.example", RecordType::A, 600);
+        cache.insert("new.example", RecordType::A, 600, false);
 
         // A bounded scan finds no expired entries and evicts one fallback key.
         // Filtering before taking the budget would remove the expired suffix.

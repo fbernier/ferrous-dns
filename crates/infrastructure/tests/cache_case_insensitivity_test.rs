@@ -103,7 +103,7 @@ fn should_share_negative_cache_across_case_variants() {
         "Negative cache must be case-insensitive: inserted `BadDomain.COM`, queried `baddomain.com`"
     );
 
-    let (data, _dnssec, _ttl) = result.unwrap();
+    let (data, _dnssec, _ttl, _) = result.unwrap();
     assert!(
         matches!(data, CachedData::NegativeResponse),
         "Expected NegativeResponse, got {:?}",

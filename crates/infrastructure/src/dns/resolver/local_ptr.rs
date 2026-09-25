@@ -179,6 +179,7 @@ pub(super) fn ptr_resolution(
         addresses: Arc::new(Vec::new()),
         cache_hit: false,
         local_dns,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,

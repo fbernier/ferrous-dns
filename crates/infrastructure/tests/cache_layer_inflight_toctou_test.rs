@@ -88,6 +88,7 @@ fn preload(cache: &dyn DnsCacheAccess, domain: &str, record_type: RecordType, ad
         }),
         300,
         Some(CachedDnssecStatus::Insecure),
+        false,
     );
 }
 
@@ -164,7 +165,7 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
             &self,
             domain: &str,
             record_type: &RecordType,
-        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
+        ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>, bool)> {
             let is_target = domain == self.target_domain && *record_type == self.target_type;
             if !is_target {
                 return self.inner.get(domain, record_type);
@@ -204,9 +205,10 @@ async fn should_wake_followers_with_cached_result_when_leader_finds_cache_hit() 
             data: CachedData,
             ttl: u32,
             dnssec_status: Option<CachedDnssecStatus>,
+            local_dns: bool,
         ) {
             self.inner
-                .insert(domain, record_type, data, ttl, dnssec_status);
+                .insert(domain, record_type, data, ttl, dnssec_status, local_dns);
         }
     }
 

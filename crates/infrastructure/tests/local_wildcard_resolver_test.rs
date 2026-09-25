@@ -35,6 +35,7 @@ fn upstream_resolution() -> DnsResolution {
         addresses: Arc::new(vec![ip("93.184.216.34")]),
         cache_hit: false,
         local_dns: false,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: Some(Arc::from("1.1.1.1:53")),

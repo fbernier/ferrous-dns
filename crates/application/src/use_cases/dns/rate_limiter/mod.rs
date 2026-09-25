@@ -78,8 +78,8 @@ impl DnsRateLimiter {
         }
     }
 
-    /// Checks whether a query from `client_ip` should be allowed. A subnet
-    /// that has spent its NXDOMAIN budget is limited like one out of tokens.
+    /// Checks whether a query from `client_ip` should be allowed under the
+    /// subnet's general budget.
     ///
     /// This is called on the DNS hot path — zero allocations, atomic-only state.
     #[inline]
@@ -94,18 +94,48 @@ impl DnsRateLimiter {
         let now_ns = coarse_now_ns();
         let key = self.grouping.key(client_ip);
 
-        let allowed = {
-            let bucket = self
-                .buckets
-                .entry(key)
-                .or_insert_with(|| TokenBucket::new(self.burst, self.nx_qps, now_ns));
-            bucket.try_consume(now_ns, self.qps, self.burst, self.nx_qps)
-        };
+        let allowed = self
+            .buckets
+            .entry(key)
+            .or_insert_with(|| TokenBucket::new(self.burst, self.nx_qps, now_ns))
+            .try_consume(now_ns, self.qps, self.burst, self.nx_qps);
 
         if allowed {
+            RateLimitDecision::Allow
+        } else {
+            self.over_budget()
+        }
+    }
+
+    /// Charges an NXDOMAIN answer for `client_ip` against its subnet's
+    /// NXDOMAIN budget (BIND RRL `nxdomains-per-second`) and decides that
+    /// answer: only an NXDOMAIN over budget gets the configured action, and
+    /// the subnet's other queries are never limited by it.
+    pub fn charge_nxdomain(&self, client_ip: IpAddr) -> RateLimitDecision {
+        if !self.enabled || self.nx_qps == 0 {
+            return RateLimitDecision::Allow;
+        }
+        if self.whitelist.contains(client_ip) {
             return RateLimitDecision::Allow;
         }
 
+        let now_ns = coarse_now_ns();
+        let key = self.grouping.key(client_ip);
+        let covered = self
+            .buckets
+            .entry(key)
+            .or_insert_with(|| TokenBucket::new(self.burst, self.nx_qps, now_ns))
+            .try_charge_nxdomain(now_ns, self.qps, self.burst, self.nx_qps);
+
+        if covered {
+            RateLimitDecision::Allow
+        } else {
+            self.over_budget()
+        }
+    }
+
+    /// The configured action for a response over one of the budgets.
+    fn over_budget(&self) -> RateLimitDecision {
         if self.dry_run {
             return RateLimitDecision::DryRunWouldRefuse;
         }
@@ -118,25 +148,6 @@ impl DnsRateLimiter {
         }
 
         RateLimitDecision::Refuse
-    }
-
-    /// Charges an NXDOMAIN answer sent to `client_ip` against its subnet's
-    /// NXDOMAIN budget. The answer is only known after resolution, so the
-    /// budget is enforced on the subnet's next [`Self::check`].
-    pub fn charge_nxdomain(&self, client_ip: IpAddr) {
-        if !self.enabled || self.nx_qps == 0 {
-            return;
-        }
-        if self.whitelist.contains(client_ip) {
-            return;
-        }
-
-        let now_ns = coarse_now_ns();
-        let key = self.grouping.key(client_ip);
-        self.buckets
-            .entry(key)
-            .or_insert_with(|| TokenBucket::new(self.burst, self.nx_qps, now_ns))
-            .charge_nxdomain(now_ns, self.qps, self.burst, self.nx_qps);
     }
 
     /// Lightweight check for the cache fast path: returns `true` if the client
@@ -155,7 +166,7 @@ impl DnsRateLimiter {
         }
         let key = self.grouping.key(client_ip);
         match self.buckets.get(&key) {
-            Some(bucket) => bucket.has_tokens(self.nx_qps),
+            Some(bucket) => bucket.has_tokens(),
             None => true,
         }
     }
@@ -282,37 +293,26 @@ mod tests {
     }
 
     #[test]
-    fn spent_nxdomain_budget_limits_the_subnets_next_queries() {
+    fn only_the_over_budget_nxdomain_gets_the_action() {
         // NX budget = nx_qps * NX_BURST_MULTIPLIER = 1 * 2 = 2 answers.
         let mut config = config_with_burst(20);
         config.nxdomain_per_second = 1;
         config.slip_ratio = 2;
         let limiter = DnsRateLimiter::new(&config);
 
-        assert_eq!(limiter.check(CLIENT), RateLimitDecision::Allow);
-        limiter.charge_nxdomain(CLIENT);
-        assert_eq!(limiter.check(CLIENT), RateLimitDecision::Allow);
-        limiter.charge_nxdomain(CLIENT);
-
+        assert_eq!(limiter.charge_nxdomain(CLIENT), RateLimitDecision::Allow);
+        assert_eq!(limiter.charge_nxdomain(CLIENT), RateLimitDecision::Allow);
         // Over budget: handled by the configured action (slip, then refuse).
-        assert!(!limiter.is_allowed(CLIENT));
-        assert_eq!(limiter.check(CLIENT), RateLimitDecision::Slip);
-        assert_eq!(limiter.check(CLIENT), RateLimitDecision::Refuse);
+        assert_eq!(limiter.charge_nxdomain(CLIENT), RateLimitDecision::Slip);
+        assert_eq!(limiter.charge_nxdomain(CLIENT), RateLimitDecision::Refuse);
 
-        // Another subnet is unaffected.
+        // The subnet's other queries are still admitted.
+        assert!(limiter.is_allowed(CLIENT));
+        assert_eq!(limiter.check(CLIENT), RateLimitDecision::Allow);
+
+        // Another subnet has its own NXDOMAIN budget.
         let other: IpAddr = "10.0.9.1".parse().unwrap();
-        assert_eq!(limiter.check(other), RateLimitDecision::Allow);
-    }
-
-    #[test]
-    fn noerror_traffic_does_not_touch_the_nxdomain_budget() {
-        let mut config = config_with_burst(20);
-        config.nxdomain_per_second = 1;
-        let limiter = DnsRateLimiter::new(&config);
-
-        for _ in 0..20 {
-            assert_eq!(limiter.check(CLIENT), RateLimitDecision::Allow);
-        }
+        assert_eq!(limiter.charge_nxdomain(other), RateLimitDecision::Allow);
     }
 
     #[test]
@@ -321,9 +321,12 @@ mod tests {
         config.dry_run = true;
         let limiter = DnsRateLimiter::new(&config);
 
-        limiter.charge_nxdomain(CLIENT);
-        limiter.charge_nxdomain(CLIENT);
-        assert_eq!(limiter.check(CLIENT), RateLimitDecision::DryRunWouldRefuse);
+        assert_eq!(limiter.charge_nxdomain(CLIENT), RateLimitDecision::Allow);
+        assert_eq!(limiter.charge_nxdomain(CLIENT), RateLimitDecision::Allow);
+        assert_eq!(
+            limiter.charge_nxdomain(CLIENT),
+            RateLimitDecision::DryRunWouldRefuse
+        );
     }
 
     #[test]
@@ -336,9 +339,8 @@ mod tests {
         for config in [whitelisted, unbudgeted] {
             let limiter = DnsRateLimiter::new(&config);
             for _ in 0..10 {
-                limiter.charge_nxdomain(CLIENT);
+                assert_eq!(limiter.charge_nxdomain(CLIENT), RateLimitDecision::Allow);
             }
-            assert_eq!(limiter.check(CLIENT), RateLimitDecision::Allow);
         }
     }
 

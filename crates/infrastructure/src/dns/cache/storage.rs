@@ -165,11 +165,13 @@ impl DnsCache {
         self.cache.len() >= self.max_entries
     }
 
+    /// A hit's data, DNSSEC status, remaining TTL, and whether the local DNS
+    /// server gave the answer.
     pub fn get(
         &self,
         domain: &str,
         record_type: &RecordType,
-    ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
+    ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>, bool)> {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
 
@@ -177,7 +179,9 @@ impl DnsCache {
         // so reads never decide membership. L1 mirrors L2's address answers,
         // so only an A or AAAA probe is worth its lookup.
         if matches!(record_type, RecordType::A | RecordType::AAAA) {
-            if let Some((arc_data, dnssec_status, remaining_ttl)) = l1_get(domain, record_type) {
+            if let Some((arc_data, dnssec_status, local_dns, remaining_ttl)) =
+                l1_get(domain, record_type)
+            {
                 self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
                 return Some((
                     CachedData::IpAddresses(super::data::CachedAddresses {
@@ -185,6 +189,7 @@ impl DnsCache {
                     }),
                     Some(dnssec_status),
                     Some(remaining_ttl),
+                    local_dns,
                 ));
             }
         }
@@ -193,9 +198,14 @@ impl DnsCache {
         let in_bloom = self.bloom.check(&borrowed);
 
         if !in_bloom {
-            if let Some(remaining_ttl) = self.negative.get(domain, record_type) {
+            if let Some((remaining_ttl, local_dns)) = self.negative.get(domain, record_type) {
                 self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
-                return Some((CachedData::NegativeResponse, None, Some(remaining_ttl)));
+                return Some((
+                    CachedData::NegativeResponse,
+                    None,
+                    Some(remaining_ttl),
+                    local_dns,
+                ));
             }
             self.metrics.misses.fetch_add(1, AtomicOrdering::Relaxed);
             return None;
@@ -231,6 +241,7 @@ impl DnsCache {
                     record.data.clone(),
                     Some(record.dnssec_status),
                     Some(STALE_SERVE_TTL),
+                    record.is_local_dns(),
                 ));
             }
 
@@ -249,19 +260,26 @@ impl DnsCache {
                     record.data.clone(),
                     Some(record.dnssec_status),
                     Some(remaining_ttl),
+                    record.is_local_dns(),
                 ));
             }
         }
 
-        if let Some(remaining_ttl) = self.negative.get(domain, record_type) {
+        if let Some((remaining_ttl, local_dns)) = self.negative.get(domain, record_type) {
             self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
-            return Some((CachedData::NegativeResponse, None, Some(remaining_ttl)));
+            return Some((
+                CachedData::NegativeResponse,
+                None,
+                Some(remaining_ttl),
+                local_dns,
+            ));
         }
 
         self.metrics.misses.fetch_add(1, AtomicOrdering::Relaxed);
         None
     }
 
+    /// Caches an upstream answer; [`DnsCacheAccess::insert`] also caches local ones.
     pub fn insert(
         &self,
         domain: &str,
@@ -269,6 +287,19 @@ impl DnsCache {
         data: CachedData,
         ttl: u32,
         dnssec_status: Option<CachedDnssecStatus>,
+    ) {
+        self.store(domain, record_type, data, ttl, dnssec_status, false);
+    }
+
+    /// `local_dns` marks an answer from the local DNS server, which its hits report.
+    fn store(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        data: CachedData,
+        ttl: u32,
+        dnssec_status: Option<CachedDnssecStatus>,
+        local_dns: bool,
     ) {
         let domain = normalize_domain(domain);
         let domain = domain.as_ref();
@@ -281,7 +312,7 @@ impl DnsCache {
             // break the refresh/access-window cycle, while deflating negatives
             // would defeat the 300s floor that keeps NXDOMAINs from escaping
             // to upstream on every repeated miss.
-            self.negative.insert(domain, record_type, ttl);
+            self.negative.insert(domain, record_type, ttl, local_dns);
             return;
         }
 
@@ -294,6 +325,11 @@ impl DnsCache {
         let maybe_l1_addresses = data.as_ip_addresses().cloned();
 
         let record = CachedRecord::new(data, ttl, record_type, dnssec_status);
+        let record = if local_dns {
+            record.with_local_dns()
+        } else {
+            record
+        };
         let expires_secs = record.expires_at_secs;
 
         self.bloom.set(&key);
@@ -318,6 +354,7 @@ impl DnsCache {
                 &record_type,
                 addresses,
                 dnssec_status.unwrap_or(CachedDnssecStatus::Unknown),
+                local_dns,
                 expires_secs,
             );
         }
@@ -365,6 +402,7 @@ impl DnsCache {
                 &record_type,
                 addresses,
                 CachedDnssecStatus::Unknown,
+                false,
                 coarse_now_secs() + ttl as u64,
             );
         }
@@ -621,6 +659,7 @@ impl DnsCache {
                     record_type,
                     addresses,
                     record.dnssec_status,
+                    record.is_local_dns(),
                     record.expires_at_secs,
                 );
             }
@@ -659,6 +698,7 @@ impl DnsCache {
                 record_type,
                 Arc::clone(&entry.addresses),
                 record.dnssec_status,
+                record.is_local_dns(),
                 expires_secs,
             );
         }
@@ -889,7 +929,7 @@ impl DnsCacheAccess for DnsCache {
         &self,
         domain: &str,
         record_type: &RecordType,
-    ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>)> {
+    ) -> Option<(CachedData, Option<CachedDnssecStatus>, Option<u32>, bool)> {
         DnsCache::get(self, domain, record_type)
     }
 
@@ -917,8 +957,9 @@ impl DnsCacheAccess for DnsCache {
         data: CachedData,
         ttl: u32,
         dnssec_status: Option<CachedDnssecStatus>,
+        local_dns: bool,
     ) {
-        DnsCache::insert(self, domain, record_type, data, ttl, dnssec_status);
+        self.store(domain, record_type, data, ttl, dnssec_status, local_dns);
     }
 
     fn record_transient_upstream_error(&self) {

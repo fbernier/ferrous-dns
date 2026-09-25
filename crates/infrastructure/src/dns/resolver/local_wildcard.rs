@@ -234,6 +234,7 @@ fn local_answer(addresses: Vec<IpAddr>, ttl: Option<u32>) -> DnsResolution {
         // guard from treating our own LAN address as an attack, and the query
         // log from reporting the answer as an upstream one.
         local_dns: true,
+        local_nxdomain: false,
         dnssec_status: None,
         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
         upstream_server: None,

@@ -29,7 +29,7 @@ local_dns_server = "10.0.0.1:53"
 | `block_private_ptr` | `true` | Block PTR lookups for private/RFC-1918 IP ranges |
 | `block_non_fqdn` | `false` | Block queries for non-fully-qualified domain names |
 | `local_domain` | — | Local domain suffix appended to short hostnames |
-| `local_dns_server` | — | Router/DHCP server used for PTR lookups and client hostname resolution: `IP:port`, or a bare IP for port 53 |
+| `local_dns_server` | — | Router/DHCP server used for PTR lookups and client hostname resolution: `IP:port`, or a bare IP for port 53. A hostname in the file is ignored with a warning, leaving local forwarding off; the API rejects it |
 | `mdns_enabled` | `false` | Enable the passive mDNS/Bonjour listener (UDP 5353 multicast) for device discovery. In Docker this needs host networking — see [Installation](../getting-started/installation.md#docker) |
 | `rebinding_protection_enabled` | `true` | Block public domains that resolve to private/RFC-1918 (or IPv6 ULA/link-local) addresses — see [DNS Rebinding Protection](../features/malware-detection.md#dns-rebinding-protection) |
 | `rebinding_allowlist` | `[]` | Exact domain names exempt from rebinding protection regardless of resolved IP (split-horizon DNS) |
@@ -327,7 +327,7 @@ doq_max_connections_per_ip = 15
 | `ipv4_prefix_len` | `24` | IPv4 prefix length for subnet grouping (e.g. 24 = /24) |
 | `ipv6_prefix_len` | `48` | IPv6 prefix length for subnet grouping (e.g. 48 = /48) |
 | `whitelist` | `[]` | CIDRs that bypass rate limiting entirely |
-| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN answers per subnet; a subnet that spends it is rate-limited until it refills. 0 = no NXDOMAIN budget |
+| `nxdomain_per_second` | `50` | Separate, stricter budget for NXDOMAIN answers per subnet; only an NXDOMAIN answer over it is limited, never the subnet's other queries. `local_dns_server` answers are not charged. 0 = no NXDOMAIN budget |
 | `slip_ratio` | `0` | Every Nth rate-limited UDP response sends TC=1 (forcing TCP retry). 0 = disabled |
 | `dry_run` | `false` | Log rate-limit events without refusing queries |
 | `stale_entry_ttl_secs` | `300` | Seconds before an idle subnet bucket is evicted from memory |

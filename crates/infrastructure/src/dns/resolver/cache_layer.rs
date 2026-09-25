@@ -30,6 +30,7 @@ impl InflightResult {
             addresses: Arc::clone(&self.addresses),
             cache_hit: true,
             local_dns: self.local_dns,
+            local_nxdomain: false,
             dnssec_status: self.dnssec_status,
             cname_chain: Arc::clone(&self.cname_chain),
             upstream_server: None,
@@ -98,38 +99,44 @@ impl CachedResolver {
 
     fn check_cache_str(&self, domain: &str, record_type: RecordType) -> Option<DnsResolution> {
         let local_status = self.cache.local_record_status(domain, &record_type);
-        let (data, dnssec_status, min_ttl) = match local_status {
+        let (data, dnssec_status, min_ttl, local_answer) = match local_status {
             // A configured address owns the name, not only its record type.
             // Answer before ordinary cached data so stale upstream data cannot win.
-            LocalRecordStatus::MissingType => (CachedData::NegativeResponse, None, None),
+            LocalRecordStatus::MissingType => (CachedData::NegativeResponse, None, None, false),
             LocalRecordStatus::Present | LocalRecordStatus::NotLocal => {
                 self.cache.get(domain, &record_type)?
             }
         };
 
-        let (addresses, cname_chain, upstream_wire_data) = match data {
+        // A local server's NXDOMAIN must not read as `local_dns`, which on an
+        // empty answer means NODATA.
+        let (addresses, cname_chain, upstream_wire_data, local_nxdomain) = match data {
             CachedData::IpAddresses(entry) => {
-                (entry.addresses, Arc::clone(&EMPTY_CNAME_CHAIN), None)
+                (entry.addresses, Arc::clone(&EMPTY_CNAME_CHAIN), None, false)
             }
             CachedData::CanonicalName(name) => {
-                (Arc::clone(&EMPTY_ADDRESSES), Arc::from([name]), None)
+                (Arc::clone(&EMPTY_ADDRESSES), Arc::from([name]), None, false)
             }
             CachedData::WireData(bytes) => (
                 Arc::clone(&EMPTY_ADDRESSES),
                 Arc::clone(&EMPTY_CNAME_CHAIN),
                 Some(bytes),
+                false,
             ),
             CachedData::NegativeResponse => (
                 Arc::clone(&EMPTY_ADDRESSES),
                 Arc::clone(&EMPTY_CNAME_CHAIN),
                 None,
+                local_answer,
             ),
         };
 
         Some(DnsResolution {
             addresses,
             cache_hit: true,
-            local_dns: local_status != LocalRecordStatus::NotLocal,
+            local_dns: (local_answer && !local_nxdomain)
+                || local_status != LocalRecordStatus::NotLocal,
+            local_nxdomain,
             dnssec_status: dnssec_status.and_then(CachedDnssecStatus::to_domain),
             cname_chain,
             upstream_server: None,
@@ -144,13 +151,14 @@ impl CachedResolver {
         self.check_cache_str(query.domain.as_ref(), query.record_type)
     }
 
-    fn insert_negative(&self, query: &DnsQuery, ttl: u32) {
+    fn insert_negative(&self, query: &DnsQuery, ttl: u32, local_dns: bool) {
         self.cache.insert(
             query.domain.as_ref(),
             query.record_type,
             CachedData::NegativeResponse,
             ttl,
             Some(CachedDnssecStatus::Insecure),
+            local_dns,
         );
     }
 
@@ -173,10 +181,12 @@ impl CachedResolver {
                     CachedData::WireData(wire_data.clone()),
                     resolution.min_ttl.unwrap_or(self.cache_ttl).max(1),
                     Some(dnssec_status),
+                    resolution.local_dns,
                 ),
                 None => self.insert_negative(
                     query,
                     resolution.negative_soa_ttl.unwrap_or(MIN_NEGATIVE_TTL),
+                    resolution.local_dns,
                 ),
             }
             return;
@@ -191,6 +201,7 @@ impl CachedResolver {
             }),
             ttl,
             Some(dnssec_status),
+            resolution.local_dns,
         );
 
         // Also cache the chain's final target under its own name, so a direct
@@ -218,6 +229,7 @@ impl CachedResolver {
                     }),
                     ttl,
                     Some(dnssec_status),
+                    resolution.local_dns,
                 );
             }
         }
@@ -254,11 +266,7 @@ impl CachedResolver {
         }
 
         if let Some(cached) = self.check_cache(query) {
-            return if !cached.has_response_data() {
-                Err(DomainError::NxDomain)
-            } else {
-                Ok(cached)
-            };
+            return Self::cached_outcome(cached);
         }
 
         self.resolve(query).await
@@ -280,11 +288,7 @@ impl CachedResolver {
         if let Some(cached) = self.check_cache(query) {
             self.publish_inflight(&guard.key, &cached);
             guard.defuse();
-            return if !cached.has_response_data() {
-                Err(DomainError::NxDomain)
-            } else {
-                Ok(cached)
-            };
+            return Self::cached_outcome(cached);
         }
 
         let result = self.inner.resolve(query).await;
@@ -298,13 +302,26 @@ impl CachedResolver {
             // Only an authoritative "no such name" is safe to cache: a
             // transient failure cached as NXDOMAIN would outlive the outage by
             // the whole negative TTL. The guard releases the followers.
-            Err(DomainError::NxDomain | DomainError::LocalNxDomain) => {
-                self.insert_negative(query, MIN_NEGATIVE_TTL);
+            Err(DomainError::NxDomain) => self.insert_negative(query, MIN_NEGATIVE_TTL, false),
+            Err(DomainError::LocalNxDomain) => {
+                self.insert_negative(query, MIN_NEGATIVE_TTL, true);
             }
             Err(_) => self.cache.record_transient_upstream_error(),
         }
 
         result
+    }
+
+    /// A cache hit as `resolve` reports it: a negative entry is an error, which
+    /// keeps saying whether the local DNS server gave it.
+    fn cached_outcome(cached: DnsResolution) -> Result<DnsResolution, DomainError> {
+        if cached.has_response_data() {
+            Ok(cached)
+        } else if cached.local_nxdomain {
+            Err(DomainError::LocalNxDomain)
+        } else {
+            Err(DomainError::NxDomain)
+        }
     }
 
     /// Removes the in-flight entry for `key` and publishes `resolution` to its

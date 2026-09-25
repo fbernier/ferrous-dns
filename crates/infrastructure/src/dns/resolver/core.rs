@@ -84,6 +84,7 @@ impl CoreResolver {
                         addresses: Arc::new(response.addresses),
                         cache_hit: false,
                         local_dns: true,
+                        local_nxdomain: false,
                         dnssec_status: None,
                         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
                         upstream_server: Some(Arc::clone(display)),
@@ -167,6 +168,7 @@ impl DnsResolver for CoreResolver {
             addresses,
             cache_hit: false,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: None,
             cname_chain: if cname_chain.is_empty() {
                 Arc::clone(&EMPTY_CNAME_CHAIN)

@@ -171,7 +171,7 @@ fn test_stale_get_without_sender_still_works() {
     coarse_clock::tick();
 
     let result = cache.get(&Arc::from("no-sender.com"), &RecordType::CNAME);
-    if let Some((_, _, Some(ttl))) = result {
+    if let Some((_, _, Some(ttl), _)) = result {
         assert!(
             ttl >= 1,
             "Stale entry must return valid TTL even without sender; got {ttl}"

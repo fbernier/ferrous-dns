@@ -66,6 +66,7 @@ impl DnsResolver for CnameChainResolver {
             addresses: Arc::new(self.addresses.clone()),
             cache_hit: false,
             local_dns: false,
+            local_nxdomain: false,
             dnssec_status: self.dnssec_status,
             cname_chain,
             upstream_server: None,
@@ -192,7 +193,7 @@ async fn should_inherit_dnssec_status_from_qname_entry() {
     // Hop to a fresh OS thread so the L2 path runs and surfaces the stored
     // DNSSEC status.
     let cache_clone = Arc::clone(&cache);
-    let (_, dnssec, _) = std::thread::spawn(move || {
+    let (_, dnssec, _, _) = std::thread::spawn(move || {
         cache_clone
             .get("secure-target.example", &RecordType::A)
             .expect("target entry must be cached")
@@ -229,7 +230,7 @@ async fn should_not_overwrite_a_local_record_with_a_cname_target() {
         .await
         .unwrap();
 
-    let (data, _, _) = cache
+    let (data, _, _, _) = cache
         .get("nas.home.lan", &RecordType::A)
         .expect("the local record must still answer");
     assert_eq!(

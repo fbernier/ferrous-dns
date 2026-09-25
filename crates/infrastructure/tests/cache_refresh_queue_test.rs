@@ -800,6 +800,6 @@ async fn test_bogus_refresh_drops_the_entry_instead_of_renewing_it() {
     assert!(
         cached.is_none(),
         "the Bogus answer must not be cached: {:?}",
-        cached.map(|(data, status, _)| (data.as_ip_addresses().cloned(), status))
+        cached.map(|(data, status, _, _)| (data.as_ip_addresses().cloned(), status))
     );
 }
